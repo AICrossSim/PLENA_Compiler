@@ -1,7 +1,6 @@
-from assembler.parser import load_isa_definitions, load_isa_settings, parse_asm_file
+from compiler.assembler.parser import load_isa_definitions, load_isa_settings, parse_asm_file
 from utils.load_config import load_svh_settings
 import torch
-from cfl_tools import PROJECT_PATH
 from pathlib import Path
 import argparse
 
