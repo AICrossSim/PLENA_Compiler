@@ -10,6 +10,7 @@ from .preload_addr_reg import preload_addr_reg_asm
 from .projection_asm import projection_asm
 from .reset_reg_asm import reset_fpreg_asm, reset_reg_asm
 from .silu_asm import silu_asm
+from .store_act_asm import store_act_asm
 
 __all__ = [
     "batched_matmul_asm",
@@ -28,4 +29,5 @@ __all__ = [
     "reset_reg_asm",
     "rms_norm_asm",
     "silu_asm",
+    "store_act_asm",
 ]
