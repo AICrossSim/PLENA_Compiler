@@ -1,14 +1,11 @@
-from typing import List
-
-
 def silu_asm(
     const_one_fp_address: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     activation_base_address: int,
     scratchpad_base_address: int,
     vlen: int,
     batch_size: int,
-    hidden_dim: int
+    hidden_dim: int,
 ) -> str:
     """
     Generate assembly code for SiLU activation.

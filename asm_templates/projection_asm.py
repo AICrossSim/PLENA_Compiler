@@ -1,5 +1,3 @@
-from typing import List, Optional
-
 IMM2_BOUND = 2**18
 
 
@@ -8,14 +6,14 @@ def projection_asm(
     blen: int,
     batch: int,
     hidden_size: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     w_base_hbm_offset_reg: int,
     activation_base_address: int,
     result_base_address: int,
     rope_enabled: bool = False,
     rope_hbm_offset_reg: int = 0,
     rope_on_chip_address: int = 0,
-    out_features: Optional[int] = None,
+    out_features: int | None = None,
 ) -> str:
     """
     Generates optimized assembly code for matrix multiplication (linear layer).
@@ -57,16 +55,6 @@ def projection_asm(
     w_hbm_offset_register = alive_registers[4]
     result_reg = alive_registers[5]
 
-    # Compute loop bounds
-    num_output_tiles = out_features // blen   # Output tiles (columns of weight)
-    num_weight_tiles = in_features // mlen    # Accumulation tiles (rows of weight)
-    tiles_per_mlen = mlen // blen             # Tiles fit in one MLEN block
-
-    # Memory layout constants
-    weight_tile_size = mlen * mlen            # 4096 for mlen=64
-    act_tile_stride = mlen * blen             # 256 for mlen=64, blen=4
-    hbm_row_stride = mlen * out_features      # Stride between weight row blocks in HBM
-
     # Build assembly as list of lines
     lines = ["; Projection Generation (Optimized)"]
     lines.append(f"; Linear: (batch, {in_features}) @ ({in_features}, {out_features}) -> (batch, {out_features})")
@@ -83,28 +71,34 @@ def projection_asm(
     lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address}")
     lines.append(f"S_ADDI_INT gp{result_reg}, gp0, {result_base_address}")
 
-    for weight_row in range (out_features // blen):
+    for weight_row in range(out_features // blen):
         if weight_row % (mlen // blen) == 0:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
             lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp0, {weight_row * blen} ")
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
-            for weight_col in range (hidden_size // mlen):
-                lines.append(f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 ")
+            for weight_col in range(hidden_size // mlen):
+                lines.append(
+                    f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
+                )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
                 lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen * out_features} ")
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
-            lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} ")
-        for act_col in range (batch // blen):
+            lines.append(
+                f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
+            )
+        for act_col in range(batch // blen):
             lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address + act_col * mlen * blen} ")
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
-            for inner_loop_index in range (hidden_size // mlen):
+            for inner_loop_index in range(hidden_size // mlen):
                 lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                 lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
-            lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")    # lines.append f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {activation_base_address} \n"
+            lines.append(
+                f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} "
+            )  # lines.append f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {activation_base_address} \n"
         if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_features // blen - 1:
             lines.append(f"S_ADDI_INT gp{result_reg}, gp{result_reg}, {mlen * batch} ")
 

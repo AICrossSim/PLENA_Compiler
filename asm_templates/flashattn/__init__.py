@@ -12,27 +12,21 @@ Modules:
     overall: Main flash_attn_asm function that orchestrates all components
 """
 
-from .qkt import qkt_multiply
 from .online_softmax import online_softmax_code
-from .pv import computing_pv_code
 from .output import computing_o_code, computing_row_wise_scaling_code
-from .reset import reset_fpsram_code, reset_vssram_code, reset_kv_prefetch
 from .overall import flash_attn_asm
+from .pv import computing_pv_code
+from .qkt import qkt_multiply
+from .reset import reset_fpsram_code, reset_kv_prefetch, reset_vssram_code
 
 __all__ = [
-    # QKT multiplication
-    "qkt_multiply",
-    # Online softmax
-    "online_softmax_code",
-    # PV multiplication
-    "computing_pv_code",
-    # Output computation
     "computing_o_code",
+    "computing_pv_code",
     "computing_row_wise_scaling_code",
-    # Reset utilities
-    "reset_fpsram_code",
-    "reset_vssram_code",
-    "reset_kv_prefetch",
-    # Main function
     "flash_attn_asm",
+    "online_softmax_code",
+    "qkt_multiply",
+    "reset_fpsram_code",
+    "reset_kv_prefetch",
+    "reset_vssram_code",
 ]

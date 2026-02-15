@@ -1,8 +1,8 @@
-import sys
 import os
+import sys
+
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
-from typing import Dict, Any, List
 
 # Add the parent directory to the path so we can import the parser
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -92,7 +92,7 @@ def get_actual_execution_shapes(model, input_ids, num_layers, hidden_size):
 
     # Forward pass
     with torch.no_grad():
-        output = model(input_ids)
+        _output = model(input_ids)
 
     # Remove hooks
     for hook in hooks:
@@ -304,7 +304,7 @@ def test_model():
     if execution_order == expected_sequence:
         print("✅ Execution order is correct")
     else:
-        print(f"❌ Execution order mismatch:")
+        print("❌ Execution order mismatch:")
         print(f"   Expected: {expected_sequence}")
         print(f"   Actual:   {execution_order}")
         all_passed = False

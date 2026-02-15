@@ -1,7 +1,5 @@
 """QKT multiplication assembly code generation for Flash Attention."""
 
-from typing import List
-
 IMM2_BOUND = 2**18 - 1
 
 
@@ -9,7 +7,7 @@ def qkt_multiply(
     d: int,
     mlen: int,
     stage: str,
-    alive_registers: List[int],
+    alive_registers: list[int],
     q_base_address: int,
     k_base_hbm_offset_reg: int,
     q_head_index: int,

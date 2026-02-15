@@ -1,7 +1,7 @@
-from typing import Dict, Any, Optional, List
+from typing import Any
+
 import torch
-import torch.fx as fx
-from transformers import AutoModel, AutoConfig
+from transformers import AutoConfig, AutoModel
 
 
 class LLMModelParser:
@@ -20,7 +20,7 @@ class LLMModelParser:
         except Exception as e:
             raise ValueError(f"Failed to load model {self.model_name_or_path}: {e}")
 
-    def extract_critical_dimensions(self) -> Dict[str, Any]:
+    def extract_critical_dimensions(self) -> dict[str, Any]:
         """Extract dimensions for attention, RMSNorm, FFN operations"""
         if self.config is None:
             self.load_model()
@@ -44,7 +44,7 @@ class LLMModelParser:
 
         return dimensions
 
-    def _extract_attention_dimensions(self) -> Dict[str, Any]:
+    def _extract_attention_dimensions(self) -> dict[str, Any]:
         """Extract attention-specific dimensions"""
         attention_dims = {}
 
@@ -63,7 +63,7 @@ class LLMModelParser:
 
         return attention_dims
 
-    def _extract_ffn_dimensions(self) -> Dict[str, Any]:
+    def _extract_ffn_dimensions(self) -> dict[str, Any]:
         """Extract FFN (Feed-Forward Network) dimensions"""
         ffn_dims = {}
 
@@ -76,7 +76,7 @@ class LLMModelParser:
 
         return ffn_dims
 
-    def _extract_rms_norm_dimensions(self) -> Dict[str, Any]:
+    def _extract_rms_norm_dimensions(self) -> dict[str, Any]:
         """Extract RMSNorm dimensions"""
         rms_dims = {}
 
@@ -87,7 +87,7 @@ class LLMModelParser:
 
         return rms_dims
 
-    def create_symbolic_graph(self, batch_size: int = 1, seq_len: int = 512) -> Dict[str, Any]:
+    def create_symbolic_graph(self, batch_size: int = 1, seq_len: int = 512) -> dict[str, Any]:
         """Create a symbolic graph with execution orders"""
         # TODO: this is in fixed ordering and thus would only support only LlamaForCausalLM architecture such as AICrossSim/clm-60m that we know the detail
         # TODO: Additional work is needed to make it more flexible (maybe use MASEGraph or torch.fx)
@@ -306,7 +306,7 @@ class LLMModelParser:
 
         # Print symbolic graph summary
         if self.symbolic_graph:
-            print(f"\n=== Symbolic Graph ===")
+            print("\n=== Symbolic Graph ===")
             print(f"Total Operations: {self.symbolic_graph['total_nodes']}")
 
             # Group operations by category

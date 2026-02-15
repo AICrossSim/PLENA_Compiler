@@ -1,15 +1,13 @@
 """Output computation assembly code generation for Flash Attention."""
 
-from typing import List
-
 IMM2_BOUND = 2**18 - 1
 
 
 def computing_o_code(
     mlen: int,
     stage: str,
-    alive_registers_int: List[int],
-    alive_registers_fp: List[int],
+    alive_registers_int: list[int],
+    alive_registers_fp: list[int],
     m_res_base_address: int,
     pv_base_address: int,
     o_old_base_address: int,
@@ -58,7 +56,9 @@ def computing_o_code(
         # load m_res (using indirect addressing)
         generated_code += f"S_LD_FP f{m_res_fp_register}, gp{m_res_vector_address_register}, 0 \n"
         # boardcast m_res to multiply with a row of a block of O_old and write to o_old
-        generated_code += f"V_MUL_VF gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, f{m_res_fp_register}, 1 \n"
+        generated_code += (
+            f"V_MUL_VF gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, f{m_res_fp_register}, 1 \n"
+        )
         # # add pv row to o_old
         generated_code += f"V_ADD_VV gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, gp{pv_vector_address_register}, 1 \n"
         # # update o_old base address
@@ -70,10 +70,12 @@ def computing_o_code(
         generated_code += f"C_LOOP_END gp{loop_register} \n"
         # now o_old should contain the result of the current o, diag(exp(m_res)) * O_old + PV
     else:
-            # load m_res (using indirect addressing)
+        # load m_res (using indirect addressing)
         generated_code += f"S_LD_FP f{m_res_fp_register}, gp{m_res_vector_address_register}, 0 \n"
         # boardcast m_res to multiply with a row of a block of O_old and write to o_old
-        generated_code += f"V_MUL_VF gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, f{m_res_fp_register}, 1 \n"
+        generated_code += (
+            f"V_MUL_VF gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, f{m_res_fp_register}, 1 \n"
+        )
         # # add pv row to o_old
         generated_code += f"V_ADD_VV gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, gp{pv_vector_address_register}, 1 \n"
     return generated_code
@@ -82,8 +84,8 @@ def computing_o_code(
 def computing_row_wise_scaling_code(
     mlen: int,
     stage: str,
-    alive_registers_int: List[int],
-    alive_registers_fp: List[int],
+    alive_registers_int: list[int],
+    alive_registers_fp: list[int],
     o_old_base_address: int,
     l_old_base_address: int,
     o_row_stride: int,
@@ -122,7 +124,9 @@ def computing_row_wise_scaling_code(
         # multiply o_old with the inverse of l_old (use mask to select head's elements)
         generated_code += f"V_MUL_VF gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, f{l_old_fp_register}, {mask_en} \n"
         # update o_old base address
-        generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, {o_row_stride} \n"
+        generated_code += (
+            f"S_ADDI_INT gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, {o_row_stride} \n"
+        )
         # update l_old address
         generated_code += f"S_ADDI_INT gp{l_old_vector_address_register}, gp{l_old_vector_address_register}, 1 \n"
         generated_code += f"C_LOOP_END gp{loop_register} \n"

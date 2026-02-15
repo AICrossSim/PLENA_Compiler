@@ -1,13 +1,11 @@
 """Main Flash Attention assembly code generation - orchestrates all components."""
 
-from typing import List
-
-from .qkt import qkt_multiply
+from ..reset_reg_asm import reset_fpreg_asm, reset_reg_asm, reset_vmask_asm
 from .online_softmax import online_softmax_code
-from .pv import computing_pv_code
 from .output import computing_o_code, computing_row_wise_scaling_code
-from .reset import reset_fpsram_code, reset_vssram_code, reset_kv_prefetch
-from ..reset_reg_asm import reset_reg_asm, reset_fpreg_asm, reset_vmask_asm
+from .pv import computing_pv_code
+from .qkt import qkt_multiply
+from .reset import reset_fpsram_code, reset_kv_prefetch, reset_vssram_code
 
 IMM2_BOUND = 2**18 - 1
 
@@ -22,8 +20,8 @@ def flash_attn_asm(
     d: int,
     q_len: int,
     kv_len: int,
-    alive_registers_int: List[int],
-    alive_registers_fp: List[int],
+    alive_registers_int: list[int],
+    alive_registers_fp: list[int],
     vector_sram_base_address: int,
     fp_sram_start_address: int,
     k_base_hbm_offset_reg: int,
@@ -91,41 +89,41 @@ def flash_attn_asm(
     for kv_head_index in range(hkv):
         # loop over per kv head kv_len // MLEN
         for _ in range(k_seq_iteration_number):
-            print(f" Computing {q_index_2_kv_index_ratio } Q heads for KV head {kv_head_index} in GQA mode")
+            print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in GQA mode")
 
             # Reset m_fp_sram_start_address for each iteration
             m_fp_sram_start_address = fp_sram_start_address
 
             # Reset m old for every q_index_2_kv_index_ratio q heads with -inf
             generated_code += reset_fpsram_code(
-                reset_start_address =   m_fp_sram_start_address,
-                per_stride_dim      =   br,
-                stride_dist         =   3 * br,
-                reset_amount        =   q_index_2_kv_index_ratio,
-                reset_val_address   =   2,
-                alive_registers_fp  =   alive_registers_fp[0:1],
-                alive_registers_int =   alive_registers_int[0:4],
+                reset_start_address=m_fp_sram_start_address,
+                per_stride_dim=br,
+                stride_dist=3 * br,
+                reset_amount=q_index_2_kv_index_ratio,
+                reset_val_address=2,
+                alive_registers_fp=alive_registers_fp[0:1],
+                alive_registers_int=alive_registers_int[0:4],
             )
 
             # Reset l with zeros
             generated_code += reset_fpsram_code(
-                reset_start_address =   m_fp_sram_start_address + 2 * br,
-                per_stride_dim      =   br,
-                stride_dist         =   3 * br,
-                reset_amount        =   q_index_2_kv_index_ratio,
-                reset_val_address   =   0,
-                alive_registers_fp  =   alive_registers_fp[0:1],
-                alive_registers_int =   alive_registers_int[0:4],
+                reset_start_address=m_fp_sram_start_address + 2 * br,
+                per_stride_dim=br,
+                stride_dist=3 * br,
+                reset_amount=q_index_2_kv_index_ratio,
+                reset_val_address=0,
+                alive_registers_fp=alive_registers_fp[0:1],
+                alive_registers_int=alive_registers_int[0:4],
             )
 
             # Reset O_old with zeros
             generated_code += reset_vssram_code(
-                reset_start_address =   o_old_base_address,
-                vect_dim            =   vlen,
-                per_stride_dim      =   d,
-                reset_stride        =   q_index_2_kv_index_ratio * br,
-                reset_amount        =   q_index_2_kv_index_ratio,
-                alive_registers_int =   alive_registers_int[0:3],
+                reset_start_address=o_old_base_address,
+                vect_dim=vlen,
+                per_stride_dim=d,
+                reset_stride=q_index_2_kv_index_ratio * br,
+                reset_amount=q_index_2_kv_index_ratio,
+                alive_registers_int=alive_registers_int[0:3],
             )
 
             # # loop over per q_index_2_kv_index_ratio q heads (q_len // MLEN), compute q_index_2_kv_index_ratio heads in parallel.
@@ -135,15 +133,15 @@ def flash_attn_asm(
                 # Q row stride = (hq * d) / mlen = total elements per token / mlen
                 stored_m_fp_res_address = m_fp_sram_start_address + br
                 generated_code += qkt_multiply(
-                    d                       =   d,
-                    mlen                    =   mlen,
-                    stage                   =   stage,
-                    alive_registers         =   alive_registers_int[0:2],
-                    q_base_address          =   q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
-                    k_base_hbm_offset_reg   =   k_base_hbm_offset_reg,
-                    q_head_index            =   kv_head_index * q_index_2_kv_index_ratio,
-                    k_head_index            =   kv_head_index,
-                    s_base_address          =   s_base_address + kv_head_index * br * bc
+                    d=d,
+                    mlen=mlen,
+                    stage=stage,
+                    alive_registers=alive_registers_int[0:2],
+                    q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                    k_base_hbm_offset_reg=k_base_hbm_offset_reg,
+                    q_head_index=kv_head_index * q_index_2_kv_index_ratio,
+                    k_head_index=kv_head_index,
+                    s_base_address=s_base_address + kv_head_index * br * bc,
                 )
                 generated_code += reset_reg_asm(alive_registers_int[0:2])
 

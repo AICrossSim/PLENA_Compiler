@@ -2,7 +2,8 @@
 
 import sys
 from pathlib import Path
-from parser import LLMModelParser, HardwareParser
+
+from parser import LLMModelParser, hardware_parser
 from passes.code_gen import code_gen_pass
 from passes.utilization_report import analyse_overall_utilization
 from scheduler import gen_scheduler
@@ -45,30 +46,30 @@ def run():
         "model_name": model_path,
         "architecture": getattr(parser.config, "architectures", ["Unknown"])[0] if parser.config else "Unknown",
         "batch_size": 4,
-        "context_length" : dimensions.get("max_position_embeddings", "Unknown"),
+        "context_length": dimensions.get("max_position_embeddings", "Unknown"),
         "vocab_size": dimensions.get("vocab_size", "Unknown"),
         "hidden_size": dimensions.get("hidden_size", "Unknown"),
         "intermediate_size": dimensions.get("ffn", {}).get("intermediate_size", 4096),
         "num_key_value_heads": dimensions.get("attention", {}).get("num_key_value_heads", "Unknown"),
         "num_attention_heads": dimensions.get("attention", {}).get("num_attention_heads", "Unknown"),
         "num_layers": dimensions.get("num_hidden_layers", "Unknown"),
-        "head_dim" : dimensions.get("hidden_size", "Unknown") // dimensions.get("num_attention_heads", 1),
-        "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6)
+        "head_dim": dimensions.get("hidden_size", "Unknown") // dimensions.get("num_attention_heads", 1),
+        "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6),
     }
 
     # Run code generation pass
     if mode == "utilization":
-        M = 64
-        K = 64
-        N = 64
-        print(f"\nRunning utilization analysis...")
-        utilization_report = analyse_overall_utilization(symbolic_graph, model_info, M, K, N)
+        m_dim = 64
+        k_dim = 64
+        n_dim = 64
+        print("\nRunning utilization analysis...")
+        utilization_report = analyse_overall_utilization(symbolic_graph, model_info, m_dim, k_dim, n_dim)
         print(f"Utilization Report:\n{utilization_report}")
         return
-    
-    hardware_config = HardwareParser(hardware_config_path, precision_config_path)
+
+    hardware_config = hardware_parser(hardware_config_path, precision_config_path)
     scheduler = gen_scheduler(hardware_config, model_info, mem_layout_lib_path, reg_assignment_lib_path)
-    print(f"\nRunning code generation pass...")
+    print("\nRunning code generation pass...")
     generated_asm = code_gen_pass(symbolic_graph, model_info, hardware_config, scheduler)
 
     # Save generated code
@@ -78,7 +79,7 @@ def run():
     print(f"Generated assembly code saved to: {output_file}")
 
     # Print a preview of the generated code
-    print(f"\nGenerated code preview (first 20 lines):")
+    print("\nGenerated code preview (first 20 lines):")
     print("=" * 50)
     lines = generated_asm.split("\n")
     for i, line in enumerate(lines[:20]):

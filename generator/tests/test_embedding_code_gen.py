@@ -3,12 +3,15 @@
 Test script for attention code generation
 """
 
-import sys
 import os
+import sys
 from pathlib import Path
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from passes.code_gen import _generate_embedding_code
 from assembler import AssemblyToBinary
+
+from passes.code_gen import _generate_embedding_code
+
 
 def test_embeddings_code_generation():
     """Test the embeddings code generation function"""
@@ -17,36 +20,15 @@ def test_embeddings_code_generation():
     test_node = {
         "name": "embeddings",
         "operation_type": "embeddings",
-        "dimensions": {
-            "hidden_size": 4096,
-            "num_attention_heads": 32,
-            "head_dim": 128,
-            "num_key_value_heads": 8
-        }
+        "dimensions": {"hidden_size": 4096, "num_attention_heads": 32, "head_dim": 128, "num_key_value_heads": 8},
     }
-    hardware_config = {
-        "mlen" : 256,
-        "blen" : 4
-    }
-    model_info = {
-        "batch_size" : 4,
-        "vocab_size" : 128256
-    }
-    scheduler = {
-        "activation_base_address": 0,
-        "register_assignment": {
-            "hbm_addr_reg": {
-                "token_table_offset": 0
-            }
-        }
-    }
+    hardware_config = {"mlen": 256, "blen": 4}
+    model_info = {"batch_size": 4, "vocab_size": 128256}
+    scheduler = {"activation_base_address": 0, "register_assignment": {"hbm_addr_reg": {"token_table_offset": 0}}}
 
     # Generate the assembly code
     generated_code = _generate_embedding_code(
-        test_node,
-        model_info=model_info,
-        hardware_config=hardware_config,
-        scheduler=scheduler
+        test_node, model_info=model_info, hardware_config=hardware_config, scheduler=scheduler
     )
 
     # Write out assembly
@@ -66,4 +48,3 @@ if __name__ == "__main__":
     isa_def_path = Path(__file__).resolve().parents[2] / "src" / "definitions" / "operation.svh"
     assembler = AssemblyToBinary(isa_def_path, config_path)
     assembler.generate_binary("generated_embedding_assembly.asm", "generated_embedding_assembly.mem")
-    

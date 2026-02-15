@@ -1,7 +1,9 @@
-import os
-from typing import Dict, List, Any, Optional
+from typing import Any
 
-def _report_flash_attn_utilization(node: Dict[str, Any], model_info: Dict[str, Any], context_len: int, M: int, N: int, K: int) -> None:
+
+def _report_flash_attn_utilization(
+    node: dict[str, Any], model_info: dict[str, Any], context_len: int, m: int, n: int, k: int
+) -> None:
     """
     Report the utilization of flash attention for a given node.
     """
@@ -16,36 +18,36 @@ def _report_flash_attn_utilization(node: Dict[str, Any], model_info: Dict[str, A
     theoretical_operation = 0
     attainable_operation = 0
     overall_operation_amount = 0
-    
+
     # Decoding
     # Projection
-    operation_amount = ((head_dim * num_attn_heads)  // M) * ( hidden_size // K) + ((head_dim * num_kv_heads) // M) * ( hidden_size// K) * 2
-    overall_operation_amount    += operation_amount
-    attainable_operation        += operation_amount * (M * K * batch_size)
-    theoretical_operation       += operation_amount * (M * K * N)
+    operation_amount = ((head_dim * num_attn_heads) // m) * (hidden_size // k) + ((head_dim * num_kv_heads) // m) * (
+        hidden_size // k
+    ) * 2
+    overall_operation_amount += operation_amount
+    attainable_operation += operation_amount * (m * k * batch_size)
+    theoretical_operation += operation_amount * (m * k * n)
     breakpoint()
     # QKT
-    operation_amount =  batch_size * num_attn_heads * (head_dim // K) * (input_token_size // N)
-    overall_operation_amount    += operation_amount
-    attainable_operation        += operation_amount * (M * K)
-    theoretical_operation       += operation_amount * (M * K * N)
+    operation_amount = batch_size * num_attn_heads * (head_dim // k) * (input_token_size // n)
+    overall_operation_amount += operation_amount
+    attainable_operation += operation_amount * (m * k)
+    theoretical_operation += operation_amount * (m * k * n)
 
     # PV
-    operation_amount =  batch_size * num_attn_heads * (input_token_size // K) * (head_dim // N)
-    overall_operation_amount    += operation_amount
-    attainable_operation        += operation_amount * (M * K)
-    theoretical_operation       += operation_amount * (M * K * N)
-    
+    operation_amount = batch_size * num_attn_heads * (input_token_size // k) * (head_dim // n)
+    overall_operation_amount += operation_amount
+    attainable_operation += operation_amount * (m * k)
+    theoretical_operation += operation_amount * (m * k * n)
+
     return [operation_amount, attainable_operation, theoretical_operation]
 
 
-
-def _report_embedding_utilization(node: Dict[str, Any], model_info: Dict[str, Any], M: int, N: int, K: int) -> None:
+def _report_embedding_utilization(node: dict[str, Any], model_info: dict[str, Any], m: int, n: int, k: int) -> None:
     """
     Report the utilization of flash attention for a given node.
     """
-    
-    dims = node["dimensions"]
+
     batch_size = model_info["batch_size"]
     hidden_size = model_info["hidden_size"]
 
@@ -53,15 +55,14 @@ def _report_embedding_utilization(node: Dict[str, Any], model_info: Dict[str, An
     attainable_operation = 0
 
     # Assuming Decoding only
-    operation_amount = (hidden_size // M) * (hidden_size // K)
-    attainable_operation += operation_amount * (M * K * batch_size)
-    theoretical_operation += operation_amount * (M * K * N)
+    operation_amount = (hidden_size // m) * (hidden_size // k)
+    attainable_operation += operation_amount * (m * k * batch_size)
+    theoretical_operation += operation_amount * (m * k * n)
 
     return [operation_amount, attainable_operation, theoretical_operation]
 
 
-
-def _report_ffn_utilization(node: Dict[str, Any], model_info: Dict[str, Any], M: int, N: int, K: int) -> None:
+def _report_ffn_utilization(node: dict[str, Any], model_info: dict[str, Any], m: int, n: int, k: int) -> None:
     """
     Report the utilization of flash attention for a given node.
     """
@@ -75,42 +76,41 @@ def _report_ffn_utilization(node: Dict[str, Any], model_info: Dict[str, Any], M:
     attainable_operation = 0
 
     # Up Projection
-    operation_amount = (intermediate_size // M) * (hidden_size // K)
+    operation_amount = (intermediate_size // m) * (hidden_size // k)
     overall_operation_amount += operation_amount
-    attainable_operation += operation_amount * (M * K * batch_size)
-    theoretical_operation += operation_amount * (M * K * N)
+    attainable_operation += operation_amount * (m * k * batch_size)
+    theoretical_operation += operation_amount * (m * k * n)
 
     # Gate Projection
-    operation_amount = (intermediate_size // M) * (hidden_size // K)
+    operation_amount = (intermediate_size // m) * (hidden_size // k)
     overall_operation_amount += operation_amount
-    attainable_operation += operation_amount * (M * K * batch_size)
-    theoretical_operation += operation_amount * (M * K * N)
+    attainable_operation += operation_amount * (m * k * batch_size)
+    theoretical_operation += operation_amount * (m * k * n)
 
     # Down Projection
-    operation_amount = (hidden_size // M) * (intermediate_size // K)
+    operation_amount = (hidden_size // m) * (intermediate_size // k)
     overall_operation_amount += operation_amount
-    attainable_operation += operation_amount * (M * K * batch_size)
-    theoretical_operation += operation_amount * (M * K * N)
+    attainable_operation += operation_amount * (m * k * batch_size)
+    theoretical_operation += operation_amount * (m * k * n)
 
     return [overall_operation_amount, attainable_operation, theoretical_operation]
 
 
-def _report_utilization(node: Dict[str, Any], model_info: Dict[str, Any], M: int, K: int, N: int) -> str:
+def _report_utilization(node: dict[str, Any], model_info: dict[str, Any], m: int, k: int, n: int) -> str:
     """Generate assembly code for a single symbolic graph node."""
     operation_type = node["operation_type"]
-    node_name = node["name"]
-    gemm_operation = 0
 
     if operation_type == "embedding":
-        return _report_embedding_utilization(node, model_info, M, K, N)
+        return _report_embedding_utilization(node, model_info, m, k, n)
     elif operation_type == "attention":
-        return _report_flash_attn_utilization(node, model_info, 1024, M, K, N)
+        return _report_flash_attn_utilization(node, model_info, 1024, m, k, n)
     elif operation_type == "ffn":
-        return _report_ffn_utilization(node, model_info, M, K, N)
+        return _report_ffn_utilization(node, model_info, m, k, n)
     else:
         return [0, 0, 0]
-    
-def _report_lm_head_utilization(model_info: Dict[str, Any], M: int, K: int, N: int) -> str:
+
+
+def _report_lm_head_utilization(model_info: dict[str, Any], m: int, k: int, n: int) -> str:
     """
     Report the utilization of LM head for a given node.
     """
@@ -122,15 +122,16 @@ def _report_lm_head_utilization(model_info: Dict[str, Any], M: int, K: int, N: i
     attainable_operation = 0
 
     # Assuming Decoding only
-    operation_amount = (vocab_size // M) * (hidden_size // K)
-    attainable_operation += operation_amount * (M * K * batch_size)
-    theoretical_operation += operation_amount * (M * K * N)
+    operation_amount = (vocab_size // m) * (hidden_size // k)
+    attainable_operation += operation_amount * (m * k * batch_size)
+    theoretical_operation += operation_amount * (m * k * n)
 
     return [operation_amount, attainable_operation, theoretical_operation]
-    
 
 
-def analyse_overall_utilization(symbolic_graph: Dict[str, Any], model_info: Dict[str, Any], M: int, K: int, N: int) -> str:
+def analyse_overall_utilization(
+    symbolic_graph: dict[str, Any], model_info: dict[str, Any], m: int, k: int, n: int
+) -> str:
     """
     Transform the complete symbolic graph into assembly code.
 
@@ -149,27 +150,27 @@ def analyse_overall_utilization(symbolic_graph: Dict[str, Any], model_info: Dict
     node_map = {node["name"]: node for node in nodes}
 
     overall_operations = {"embedding": 0, "attention": 0, "ffn": 0, "lm_head": 0}
-    overall_attainable_FLOPS = {"embedding": 0, "attention": 0, "ffn": 0, "lm_head": 0}
-    overall_theoretical_FLOPS = {"embedding": 0, "attention": 0, "ffn": 0, "lm_head": 0}
+    overall_attainable_flops = {"embedding": 0, "attention": 0, "ffn": 0, "lm_head": 0}
+    overall_theoretical_flops = {"embedding": 0, "attention": 0, "ffn": 0, "lm_head": 0}
 
     # Generate code for each node in execution order
     for node_name in execution_order:
         if node_name in node_map:
             node = node_map[node_name]
-            single_op_operation = _report_utilization(node, model_info, M, K, N)
+            single_op_operation = _report_utilization(node, model_info, m, k, n)
             operation_type = node["operation_type"]
             if operation_type in ["embedding", "attention", "ffn"]:
                 overall_operations[operation_type] += single_op_operation[0]
-                overall_attainable_FLOPS[operation_type] += single_op_operation[1]
-                overall_theoretical_FLOPS[operation_type] += single_op_operation[2]
+                overall_attainable_flops[operation_type] += single_op_operation[1]
+                overall_theoretical_flops[operation_type] += single_op_operation[2]
 
-    single_op_operation = _report_lm_head_utilization(model_info, M, K, N)
+    single_op_operation = _report_lm_head_utilization(model_info, m, k, n)
     overall_operations["lm_head"] += single_op_operation[0]
-    overall_attainable_FLOPS["lm_head"] += single_op_operation[1]
-    overall_theoretical_FLOPS["lm_head"] += single_op_operation[2]
+    overall_attainable_flops["lm_head"] += single_op_operation[1]
+    overall_theoretical_flops["lm_head"] += single_op_operation[2]
 
     return {
         "operations": overall_operations,
-        "attainable_FLOPS": overall_attainable_FLOPS,
-        "theoretical_FLOPS": overall_theoretical_FLOPS
+        "attainable_FLOPS": overall_attainable_flops,
+        "theoretical_FLOPS": overall_theoretical_flops,
     }

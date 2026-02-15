@@ -1,4 +1,4 @@
+from .hardware_parser import hardware_parser
 from .llm_parser import LLMModelParser
-from .hardware_parser import HardwareParser
 
-__all__ = ["LLMModelParser", "HardwareParser"]
+__all__ = ["LLMModelParser", "hardware_parser"]
