@@ -10,6 +10,7 @@ def computing_pv_code(
     blen: int,
     mlen: int,
     vlen: int,
+    stage: str,
     alive_registers: List[int],
     p_base_address: int,
     v_base_hbm_offset_reg: int,
@@ -22,7 +23,8 @@ def computing_pv_code(
     """
     Compute PV = P @ V and write directly to packed output format.
 
-    Single Head PV Multiplication. (MLEN, MLEN) @ (MLEN, H_QKV) -> (MLEN, H_QKV)
+    Single Head PV Multiplication. (MLEN, MLEN) @ (MLEN, H_QKV) -> (MLEN, H_QKV) Prefill Version
+    Single Head PV Multiplication. (1, MLEN) @ (MLEN, H_QKV) -> (MLEN, H_QKV) Decode Version
 
     Args:
         head_dim: dimension per head
@@ -70,38 +72,50 @@ def computing_pv_code(
     generated_code += f"S_ADDI_INT gp{v_base_register}, gp0, {v_msram_base} \n"
 
     # Output starts at output_base + head_offset (for this head's column position)
-    generated_code += f"S_ADDI_INT gp{out_base_register}, gp0, {output_base_address + head_offset} \n"
-    generated_code += f"S_ADDI_INT gp{out_col_register}, gp0, {output_base_address + head_offset} \n"
+    generated_code += f"S_ADDI_INT gp{out_base_register}, gp0, {output_base_address + head_offset * head_dim} \n"
 
-    # Loop structure:
-    # - outer loop over column blocks of V (head_dim // blen iterations)
-    # - inner loop over row blocks (mlen // blen iterations)
-    outer_loop_count = head_dim // blen  # Number of column blocks
-    inner_loop_count = mlen // blen      # Number of row blocks
 
-    generated_code += f"C_LOOP_START gp{outer_loop_register}, {outer_loop_count} \n"
-    generated_code += f"C_LOOP_START gp{inner_loop_register}, {inner_loop_count} \n"
+    if stage == "prefill":
+        # Loop structure:
+        # - outer loop over column blocks of V (head_dim // blen iterations)
+        # - inner loop over row blocks (mlen // blen iterations)
+        outer_loop_count = head_dim // blen  # Number of column blocks
+        inner_loop_count = mlen // blen      # Number of row blocks
+        generated_code += f"S_ADDI_INT gp{out_col_register}, gp0, {output_base_address + head_offset * head_dim} \n"
+        generated_code += f"C_LOOP_START gp{outer_loop_register}, {outer_loop_count} \n"
+        generated_code += f"C_LOOP_START gp{inner_loop_register}, {inner_loop_count} \n"
 
-    # M_MM: V_col_block @ P_row_block -> output block
-    generated_code += f"M_MM 0, gp{v_base_register}, gp{p_base_register} \n"
-    # Write to packed output position
-    generated_code += f"M_MM_WO gp{out_base_register}, gp0, 0 \n"
+        # M_MM: V_col_block @ P_row_block -> output block
+        generated_code += f"M_MM 0, gp{v_base_register}, gp{p_base_register} \n"
+        # Write to packed output position
+        generated_code += f"M_MM_WO gp{out_base_register}, gp0, 0 \n"
 
-    # Advance P to next row block (4 rows of mlen elements each)
-    generated_code += f"S_ADDI_INT gp{p_base_register}, gp{p_base_register}, {blen * mlen} \n"
-    # Advance output to next row block (stride is vlen * blen for packed format)
-    generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_base_register}, {vlen * blen} \n"
+        # Advance P to next row block (4 rows of mlen elements each)
+        generated_code += f"S_ADDI_INT gp{p_base_register}, gp{p_base_register}, {blen * mlen} \n"
+        # Advance output to next row block (stride is vlen * blen for packed format)
+        generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_base_register}, {vlen * blen} \n"
 
-    generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
+        generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
 
-    # After inner loop: reset P, advance to next column block
-    generated_code += f"S_ADDI_INT gp{p_base_register}, gp0, {p_start_address} \n"
-    # Move to next column position (blen elements to the right)
-    generated_code += f"S_ADDI_INT gp{out_col_register}, gp{out_col_register}, {blen} \n"
-    generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_col_register}, 0 \n"
-    # Move V to next column block
-    generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen} \n"
+        # After inner loop: reset P, advance to next column block
+        generated_code += f"S_ADDI_INT gp{p_base_register}, gp0, {p_start_address} \n"
+        # Move to next column position (blen elements to the right)
+        generated_code += f"S_ADDI_INT gp{out_col_register}, gp{out_col_register}, {blen} \n"
+        generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_col_register}, 0 \n"
+        # Move V to next column block
+        generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen} \n"
 
-    generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
-
+        generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
+    
+    else:
+        # Loop structure:
+        loop_count = head_dim // blen  # Number of column blocks
+        generated_code += f"C_LOOP_START gp{outer_loop_register}, {loop_count} \n"
+        # M_MM: V_col_block @ P_row_block -> output block
+        generated_code += f"M_MV 0, gp{v_base_register}, gp{p_base_register} \n"
+        # Write to packed output position
+        generated_code += f"M_MV_WO gp{out_base_register}, gp0, 0 \n"
+        generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_base_register}, {blen} \n"
+        generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen} \n"
+        generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
     return generated_code
