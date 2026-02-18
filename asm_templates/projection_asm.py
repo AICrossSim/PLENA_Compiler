@@ -110,14 +110,14 @@ def projection_T_asm(
     blen: int,
     batch: int,
     hidden_size: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     w_base_hbm_offset_reg: int,
     activation_base_address: int,
     result_base_address: int,
     rope_enabled: bool = False,
     rope_hbm_offset_reg: int = 0,
     rope_on_chip_address: int = 0,
-    out_features: Optional[int] = None,
+    out_features: int | None = None,
 ) -> str:
     """
     Generates assembly for transposed projection: act @ weight.T
