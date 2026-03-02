@@ -8,12 +8,42 @@ from torch.fx.passes.graph_drawer import FxGraphDrawer
 from pathlib import Path
 from collections import Counter
 
+# ---------------------------------------------------------------------------
+# Module class name → asm template module name.
+# This is the single source of truth — no TARGETS needed inside asm_templates.
+# Extend this table when adding support for new module types.
+# ---------------------------------------------------------------------------
+MODULE_TYPE_TO_TEMPLATE: Dict[str, str] = {
+    # PyTorch built-ins
+    "Linear":           "projection_asm",
+    "LayerNorm":        "normalization_asm",
+    "Embedding":        "embedding_asm",
+    "GELU":             "gelu_asm",
+    "SiLU":             "silu_asm",
+    "Conv3d":           "batched_matmul_asm",
+    # Qwen3-VL specific
+    "Qwen3VLTextRMSNorm":       "normalization_asm",
+    "Qwen3VLVisionMLP":         "ffn_asm",
+    "Qwen3VLTextMLP":           "ffn_asm",
+    "Qwen3VLVisionAttention":   "flash_attn_asm",
+    "Qwen3VLTextAttention":     "flash_attn_asm",
+    "Qwen3VLVisionPatchMerger": "projection_asm",
+    "Qwen3VLVisionPatchEmbed":  "batched_matmul_asm",
+    # Qwen2-VL (same templates, different class names)
+    "Qwen2VLTextRMSNorm":       "normalization_asm",
+    "Qwen2VLVisionMLP":         "ffn_asm",
+    "Qwen2VLTextMLP":           "ffn_asm",
+    "Qwen2VLVisionAttention":   "flash_attn_asm",
+    "Qwen2VLTextAttention":     "flash_attn_asm",
+}
+
+
 class PLENA_BACKEND:
     def __init__(self):
         self.asm_file = Path("plena.asm")
         self.template_path = "compiler.asm_templates"
-        self.ops_registry = None
-        self.load_registry()
+        self.ops_registry = {}          # call_function / call_method ops (legacy TARGETS path)
+        self.module_type_registry: Dict[str, str] = {}  # call_module: class name → template
         self._clear = False
     
     def registry_canonical_key(self, target) -> str:
@@ -56,9 +86,23 @@ class PLENA_BACKEND:
         return reg
     
     def load_registry(self) -> None:
+        """Legacy: populate ops_registry from TARGETS in asm_template modules."""
         self.ops_registry = self.build_plena_registry(self.template_path)
+
+    def build_registry_from_model(self, model: nn.Module) -> None:
+        """Scan model.named_modules() and register each discovered module type.
+
+        No TARGETS needed in asm_templates — the MODULE_TYPE_TO_TEMPLATE table
+        in this file is the only thing that needs updating when adding new ops.
+        """
+        for _, m in model.named_modules():
+            cls_name = type(m).__name__
+            if cls_name in MODULE_TYPE_TO_TEMPLATE:
+                self.module_type_registry[cls_name] = MODULE_TYPE_TO_TEMPLATE[cls_name]
+
     def print_registry(self):
-        print(self.ops_registry)
+        print("ops_registry (call_function/method):", self.ops_registry)
+        print("module_type_registry (call_module):", self.module_type_registry)
     
     def _clear_asm_file(self):
         if not self._clear:
@@ -68,7 +112,6 @@ class PLENA_BACKEND:
     def plena_backend_ops_match(self, gm: torch.fx.GraphModule, example_inputs):
         self._clear_asm_file()
 
-        # ---- helper: 从 node.meta 里取 shape/dtype/device ----
         def _tensor_meta_of(node: torch.fx.Node):
             tm = node.meta.get("tensor_meta", None)
             if tm is not None:
@@ -80,8 +123,6 @@ class PLENA_BACKEND:
 
         def _fmt_tensor_meta(kind, obj):
             if kind == "tensor_meta":
-                # TensorMetadata: shape/stride/dtype/...
-                # device 不一定有（版本差异），所以做兜底
                 dev = getattr(obj, "device", None)
                 return f"shape={tuple(obj.shape)} dtype={obj.dtype}" + (f" device={dev}" if dev is not None else "")
             if kind == "tensor":
@@ -89,7 +130,6 @@ class PLENA_BACKEND:
             return "?"
 
         def _fmt_arg(x):
-            # 递归支持 Node / tuple / list / dict
             if isinstance(x, torch.fx.Node):
                 kind, obj = _tensor_meta_of(x)
                 return f"{x.name}:{_fmt_tensor_meta(kind, obj)}"
@@ -99,19 +139,15 @@ class PLENA_BACKEND:
                 return "[" + ", ".join(_fmt_arg(i) for i in x) + "]"
             if isinstance(x, dict):
                 return "{" + ", ".join(f"{k}={_fmt_arg(v)}" for k, v in x.items()) + "}"
-            # 标量 / None / 其他对象
             return repr(x)
 
         def _fmt_node_out(n: torch.fx.Node):
             kind, obj = _tensor_meta_of(n)
             return _fmt_tensor_meta(kind, obj)
 
-        # ---- 先做一次 shape propagation（尽量填满 meta）----
         try:
             ShapeProp(gm).propagate(*example_inputs)
         except Exception as e:
-            # 不要让 shape 推导失败阻断 backend
-            # 后面会从已有 meta / fallback 打印
             pass
 
         asm_lines = []
@@ -119,13 +155,10 @@ class PLENA_BACKEND:
         asm_lines.append(f"graph id: {id(gm)}")
 
         for n in gm.graph.nodes:
-            # 输出节点自己的输出 shape（对 call_function/call_module 最有用）
             out_meta = _fmt_node_out(n)
 
             if n.op in ("call_function", "call_method"):
                 key = self.registry_canonical_key(n.target)
-
-                # 输入：把 args/kwargs 里所有 Node / Tensor 都展开
                 in_args = _fmt_arg(n.args)
                 in_kwargs = _fmt_arg(n.kwargs) if n.kwargs else "{}"
 
@@ -148,24 +181,30 @@ class PLENA_BACKEND:
 
             elif n.op == "call_module":
                 submod = gm.get_submodule(n.target)
-
-                # call_module 的输入来自 n.args / n.kwargs
+                cls_name = type(submod).__name__
                 in_args = _fmt_arg(n.args)
                 in_kwargs = _fmt_arg(n.kwargs) if n.kwargs else "{}"
 
-                asm_lines.append(
-                    f"CALL_MODULE          ; "
-                    f"name={n.target} type={type(submod).__name__} id={id(submod)} "
-                    f"in_args={in_args} in_kwargs={in_kwargs} "
-                    f"out={out_meta}"
-                )
+                if cls_name in self.module_type_registry:
+                    tmpl = self.module_type_registry[cls_name]
+                    asm_lines.append(
+                        f"SUPPORTED {tmpl:<12s} ; "
+                        f"op=call_module type={cls_name} name={n.target} "
+                        f"in_args={in_args} in_kwargs={in_kwargs} "
+                        f"out={out_meta}"
+                    )
+                else:
+                    asm_lines.append(
+                        f"UNSUPPORTED          ; "
+                        f"op=call_module type={cls_name} name={n.target} "
+                        f"in_args={in_args} in_kwargs={in_kwargs} "
+                        f"out={out_meta}"
+                    )
             elif n.op == "output":
-                # n.args[0] 是真正输出的 value（可能是 Node / tuple / list / dict）
                 out_val = n.args[0]
                 asm_lines.append(f"output       ; output={_fmt_arg(out_val)}")
 
             else:
-                # placeholder / get_attr / output 等
                 asm_lines.append(
                     f"{n.op:12s} ; {n.target} ; out={out_meta}"
                 )
