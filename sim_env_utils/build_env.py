@@ -1,5 +1,13 @@
 import logging
+import sys
 from pathlib import Path
+
+# Ensure PLENA_Simulator/tools/ is on sys.path so that the
+# 'utils', 'memory_mapping', and 'quant' packages resolve to
+# the versions shipped with this simulator (not an older plena install).
+_TOOLS_PATH = str(Path(__file__).parent.parent.parent / "tools")
+if _TOOLS_PATH not in sys.path:
+    sys.path.insert(0, _TOOLS_PATH)
 
 import torch
 from memory_mapping.rand_gen import RandomMxfpTensorGenerator

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 IMM2_BOUND = 2**18
 
 
