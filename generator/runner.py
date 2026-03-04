@@ -53,7 +53,7 @@ def run():
         "num_key_value_heads": dimensions.get("attention", {}).get("num_key_value_heads", "Unknown"),
         "num_attention_heads": dimensions.get("attention", {}).get("num_attention_heads", "Unknown"),
         "num_layers": dimensions.get("num_hidden_layers", "Unknown"),
-        "head_dim": dimensions.get("hidden_size", "Unknown") // dimensions.get("num_attention_heads", 1),
+        "head_dim": dimensions.get("attention", {}).get("head_dim", 0),
         "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6),
     }
 
