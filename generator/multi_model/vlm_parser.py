@@ -54,7 +54,7 @@ _FX_OPS: dict[Any, str] = {
 
 
 class VLMModelParser:
-    def __init__(self, model_name_or_path: str):
+    def __init__(self, model_name_or_path: str = ""):
         self.model_name_or_path = model_name_or_path
         self.config = None
         self.model = None
@@ -63,36 +63,44 @@ class VLMModelParser:
         self.backend = None
         self.plena_backend = None  # PLENA_BACKEND instance (set by load_backend)
     
-    def load_model(self):
-        try:
-            name = self.model_name_or_path.lower()
-            # ---------- Qwen3-VL ----------
-            # This is required due to the method of loading QWen3 model are unique
-            if "qwen3" in name:
-                print(f"===== Loading {name} from pretrained =====")
-                self.config = Qwen3VLConfig.from_pretrained(
-                    self.model_name_or_path,
-                    trust_remote_code=True,
-                )
-                self.processor = AutoProcessor.from_pretrained(self.model_name_or_path)
-                self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                    self.model_name_or_path,
-                    config=self.config,
-                    dtype=torch.float32,
-                    trust_remote_code=True,
-                )
-                visual = self.model.model.visual
-
-            # ---------- fallback ----------
+    def load_model(self, model = None):
+        if model is not None:
+            if isinstance(model, nn.Module):
+                self.model = model
             else:
-                self.config = AutoConfig.from_pretrained(self.model_name_or_path)
-                self.model = AutoModel.from_pretrained(self.model_name_or_path, torch_dtype=torch.float32)
-                self.model.eval()
+                raise RuntimeError(
+                    f"fail to load model from provided object: expected nn.Module, got {type(model)}"
+                )
+        else:
+            try:
+                name = self.model_name_or_path.lower()
+                # ---------- Qwen3-VL ----------
+                # This is required due to the method of loading QWen3 model are unique
+                if "qwen3" in name:
+                    print(f"===== Loading {name} from pretrained =====")
+                    self.config = Qwen3VLConfig.from_pretrained(
+                        self.model_name_or_path,
+                        trust_remote_code=True,
+                    )
+                    self.processor = AutoProcessor.from_pretrained(self.model_name_or_path)
+                    self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        self.model_name_or_path,
+                        config=self.config,
+                        dtype=torch.float32,
+                        trust_remote_code=True,
+                    )
+                    visual = self.model.model.visual
 
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load model {self.model_name_or_path}: {e}"
-            )
+                # ---------- fallback ----------
+                else:
+                    self.config = AutoConfig.from_pretrained(self.model_name_or_path)
+                    self.model = AutoModel.from_pretrained(self.model_name_or_path, torch_dtype=torch.float32)
+                    self.model.eval()
+
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load model {self.model_name_or_path}: {e}"
+                )
 
         # Auto-populate the module_type_registry from the loaded model hierarchy.
         # This replaces the old TARGETS-based discovery — no asm_templates changes needed.
@@ -170,6 +178,12 @@ class VLMModelParser:
     def print_symbolic_graph_details(self):
         ...
 
+    def trace(self):
+        m = self.model.model if hasattr(self.model, "model") else self.model
+        return self.trace_leaf_modules(
+            m, {**self.inputs}
+        )
+    
     def trace_leaf_modules(self, model: nn.Module, forward_kwargs: dict, verbose: bool = False) -> dict:
         """
         Run a forward pass and return a call tree capturing the full module hierarchy,
