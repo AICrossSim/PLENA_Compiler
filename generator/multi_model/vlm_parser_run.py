@@ -9,17 +9,13 @@ if __name__ == "__main__":
     torch.manual_seed(2061452)
     x = torch.rand(2, 4, 4096)
     print(x.shape)
-    transformer = TRANSFOMER_ENCODER.TRANSFOMER_ENCODER()
+    model = TRANSFOMER_ENCODER.TRANSFOMER_ENCODER()
     parser = VLMModelParser()
-    parser.load_model(transformer)
+    parser.load_model(model)
     parser.load_inputs({"x": x})
     trace_tree = parser.trace()
     nodes = flatten_call_tree(trace_tree)
-    model_info = {
-        "name": "TRANSFOMER_ENCODER",
-        "input_shapes": {"x": list(x.shape)},
-        "output_shapes": {"output": list(x.shape)},
-    }
+    model_info = parser.extract_model_info()
     asm = vlm_codegen(nodes, model_info)
 
     out_path = Path("./outputs/simple_run_output.asm")

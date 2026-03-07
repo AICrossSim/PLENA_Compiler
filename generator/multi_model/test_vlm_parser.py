@@ -234,6 +234,49 @@ class TestStaticAttrs(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Test suite: extract_model_info
+# ---------------------------------------------------------------------------
+
+
+class TestExtractModelInfo(unittest.TestCase):
+    def setUp(self):
+        self.parser = make_parser()
+
+    def test_custom_float_input_model_info(self):
+        model = MiniMLP(d_in=8, d_hidden=16)
+        self.parser.load_model(model)
+        self.parser.load_inputs({"x": torch.randn(2, 4, 8)})
+
+        info = self.parser.extract_model_info()
+
+        self.assertEqual(info["model_name"], "MiniMLP")
+        self.assertEqual(info["architecture"], "MiniMLP")
+        self.assertEqual(info["batch_size"], 2)
+        self.assertEqual(info["seq_len"], 4)
+        self.assertEqual(info["hidden_size"], 8)
+        self.assertEqual(info["intermediate_size"], 16)
+        self.assertEqual(info["num_layers"], 1)
+        self.assertEqual(info["input_shapes"]["x"], [2, 4, 8])
+
+    def test_custom_embedding_model_info(self):
+        model = MiniTransformer(vocab=32, d=8, n_layers=2)
+        self.parser.load_model(model)
+        self.parser.load_inputs({"ids": torch.randint(0, 32, (2, 5))})
+
+        info = self.parser.extract_model_info()
+
+        self.assertEqual(info["model_name"], "MiniTransformer")
+        self.assertEqual(info["hidden_size"], 8)
+        self.assertEqual(info["vocab_size"], 32)
+        self.assertEqual(info["batch_size"], 2)
+        self.assertEqual(info["seq_len"], 5)
+        self.assertEqual(info["num_layers"], 2)
+        self.assertEqual(info["num_attention_heads"], 1)
+        self.assertEqual(info["head_dim"], 8)
+        self.assertEqual(info["input_shapes"]["ids"], [2, 5])
+
+
+# ---------------------------------------------------------------------------
 # Test suite: flatten_call_tree
 # ---------------------------------------------------------------------------
 

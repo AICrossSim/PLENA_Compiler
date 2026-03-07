@@ -25,17 +25,13 @@ class TRANSFOMER_ENCODER (nn.Module):
         self.O = nn.Linear(4096, 4096)
     
     def forward(self, x):
-        print(x.shape)
         Q = self.Q(x)
         K = self.K(x)
         V = self.V(x)
         attn = torch.matmul(self.softmax(torch.matmul(Q, K.transpose(-2,-1))/math.sqrt(4096)), V)
         x = self.O(attn) + x
-        print(x.shape)
         x = self.layer_norm1(x)
-        print(x.shape)
         x = self.ffn(x) + x
-        print(x.shape)
         x = self.layer_norm2(x)
         
         return x

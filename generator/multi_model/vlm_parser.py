@@ -111,6 +111,224 @@ class VLMModelParser:
     def load_inputs(self, inputs):
         print("===== Loading inputs =====")
         self.inputs = inputs
+
+    def _first_tensor(self, obj: Any) -> Optional[torch.Tensor]:
+        """Return the first tensor found in a nested inputs structure."""
+        if isinstance(obj, torch.Tensor):
+            return obj
+        if isinstance(obj, dict):
+            for value in obj.values():
+                found = self._first_tensor(value)
+                if found is not None:
+                    return found
+        if isinstance(obj, (list, tuple)):
+            for value in obj:
+                found = self._first_tensor(value)
+                if found is not None:
+                    return found
+        return None
+
+    def _tensor_input_shapes(self, inputs: Any) -> dict[str, list[int]]:
+        """Collect top-level tensor input shapes for debugging / reporting."""
+        if not isinstance(inputs, dict):
+            return {}
+        return {
+            name: list(value.shape)
+            for name, value in inputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    def _infer_num_layers(self, model: nn.Module) -> int | None:
+        """Best-effort layer count for custom models."""
+        for attr in ("layers", "blocks", "h"):
+            value = getattr(model, attr, None)
+            if isinstance(value, (nn.ModuleList, list, tuple)):
+                return len(value)
+
+        for parent_attr in ("encoder", "decoder", "model"):
+            parent = getattr(model, parent_attr, None)
+            if parent is None:
+                continue
+            for attr in ("layers", "blocks", "h", "layer"):
+                value = getattr(parent, attr, None)
+                if isinstance(value, (nn.ModuleList, list, tuple)):
+                    return len(value)
+
+        return 1 if any(True for _ in model.children()) else 0
+
+    def _infer_num_attention_heads(self, model: nn.Module) -> int | None:
+        """Best-effort attention-head count for custom models."""
+        attention_like = False
+        for name, module in model.named_modules():
+            if isinstance(module, nn.MultiheadAttention):
+                return module.num_heads
+            for attr in ("num_attention_heads", "num_heads", "nhead"):
+                value = getattr(module, attr, None)
+                if isinstance(value, int) and value > 0:
+                    return value
+            lname = name.lower()
+            if lname.endswith(("q", "k", "v", "q_proj", "k_proj", "v_proj", "attn", "self_attn")):
+                attention_like = True
+            if isinstance(module, nn.Softmax):
+                attention_like = True
+
+        if attention_like:
+            return 1
+        return None
+
+    def _infer_custom_model_info(self, model: nn.Module, sample_input: Optional[torch.Tensor]) -> dict[str, Any]:
+        """Infer model-level metadata for custom nn.Module graphs."""
+        info: dict[str, Any] = {}
+
+        if sample_input is not None:
+            if sample_input.dim() >= 1:
+                info["batch_size"] = int(sample_input.shape[0])
+            if sample_input.dim() >= 2:
+                info["seq_len"] = int(sample_input.shape[1])
+            if sample_input.dtype.is_floating_point and sample_input.dim() >= 2:
+                info["hidden_size"] = int(sample_input.shape[-1])
+
+        first_embedding: Optional[nn.Embedding] = None
+        first_linear: Optional[nn.Linear] = None
+        first_norm_dim: Optional[int] = None
+        first_eps: Optional[float] = None
+        intermediate_candidates: list[int] = []
+
+        for module in model.modules():
+            if first_embedding is None and isinstance(module, nn.Embedding):
+                first_embedding = module
+
+            if first_linear is None and isinstance(module, nn.Linear):
+                first_linear = module
+
+            if isinstance(module, nn.LayerNorm):
+                if first_norm_dim is None:
+                    normalized_shape = module.normalized_shape
+                    first_norm_dim = int(normalized_shape[0] if isinstance(normalized_shape, (list, tuple)) else normalized_shape)
+                if first_eps is None:
+                    first_eps = float(module.eps)
+
+            if hasattr(module, "variance_epsilon") and hasattr(module, "weight"):
+                if first_norm_dim is None and getattr(module, "weight", None) is not None:
+                    first_norm_dim = int(module.weight.shape[0])
+                if first_eps is None:
+                    first_eps = float(module.variance_epsilon)
+
+            if isinstance(module, nn.Linear):
+                intermediate_candidates.append(int(module.out_features))
+
+        if "hidden_size" not in info:
+            if first_embedding is not None:
+                info["hidden_size"] = int(first_embedding.embedding_dim)
+            elif first_linear is not None:
+                info["hidden_size"] = int(first_linear.in_features)
+            elif first_norm_dim is not None:
+                info["hidden_size"] = first_norm_dim
+
+        hidden_size = info.get("hidden_size")
+        if hidden_size is not None:
+            larger_dims = [dim for dim in intermediate_candidates if dim > hidden_size]
+            if larger_dims:
+                info["intermediate_size"] = max(larger_dims)
+
+        if first_embedding is not None:
+            info["vocab_size"] = int(first_embedding.num_embeddings)
+
+        if first_eps is not None:
+            info["eps"] = first_eps
+
+        num_heads = self._infer_num_attention_heads(model)
+        if num_heads is not None:
+            info["num_attention_heads"] = num_heads
+            info["num_key_value_heads"] = num_heads
+
+        num_layers = self._infer_num_layers(model)
+        if num_layers is not None:
+            info["num_layers"] = num_layers
+
+        if hidden_size is not None and num_heads is not None and num_heads > 0:
+            info["head_dim"] = hidden_size // num_heads
+
+        return info
+
+    def extract_model_info(
+        self,
+        model: Optional[nn.Module] = None,
+        inputs: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Extract model-level metadata for code generation.
+
+        For HuggingFace / Qwen models, prefer config-derived fields.
+        For custom nn.Module graphs, fall back to lightweight structural
+        inference plus any loaded runtime inputs.
+        """
+        if model is None:
+            if self.model is None:
+                self.load_model()
+            model = self.model
+
+        if model is None:
+            raise RuntimeError("Failed to extract model info: no model is loaded")
+
+        active_inputs = inputs if inputs is not None else getattr(self, "inputs", None)
+        sample_input = self._first_tensor(active_inputs)
+
+        if self.config is not None:
+            cfg = self.config
+            text_cfg = getattr(cfg, "text_config", cfg)
+            vision_cfg = getattr(cfg, "vision_config", None)
+
+            model_info: dict[str, Any] = {
+                "model_name": self.model_name_or_path or type(model).__name__,
+                "architecture": getattr(cfg, "architectures", [type(model).__name__])[0],
+            }
+
+            if sample_input is not None:
+                if sample_input.dim() >= 1:
+                    model_info["batch_size"] = int(sample_input.shape[0])
+                if sample_input.dim() >= 2:
+                    model_info["seq_len"] = int(sample_input.shape[1])
+
+            for key, value in (
+                ("hidden_size", getattr(text_cfg, "hidden_size", None)),
+                ("intermediate_size", getattr(text_cfg, "intermediate_size", None)),
+                ("num_attention_heads", getattr(text_cfg, "num_attention_heads", None)),
+                ("num_key_value_heads", getattr(text_cfg, "num_key_value_heads", getattr(text_cfg, "num_attention_heads", None))),
+                ("num_layers", getattr(text_cfg, "num_hidden_layers", None)),
+                ("vocab_size", getattr(text_cfg, "vocab_size", getattr(cfg, "vocab_size", None))),
+                ("context_length", getattr(text_cfg, "max_position_embeddings", getattr(cfg, "max_position_embeddings", None))),
+                ("eps", getattr(text_cfg, "rms_norm_eps", getattr(text_cfg, "layer_norm_eps", None))),
+            ):
+                if value is not None:
+                    model_info[key] = value
+
+            hidden_size = model_info.get("hidden_size")
+            num_heads = model_info.get("num_attention_heads")
+            head_dim = getattr(text_cfg, "head_dim", None)
+            if head_dim is not None:
+                model_info["head_dim"] = head_dim
+            elif hidden_size is not None and num_heads:
+                model_info["head_dim"] = hidden_size // num_heads
+
+            if vision_cfg is not None:
+                vision_hidden = getattr(vision_cfg, "hidden_size", None)
+                if vision_hidden is not None:
+                    model_info["vision_hidden_size"] = vision_hidden
+                vision_heads = getattr(vision_cfg, "num_heads", getattr(vision_cfg, "num_attention_heads", None))
+                if vision_hidden is not None and vision_heads:
+                    model_info["vision_head_dim"] = getattr(vision_cfg, "head_dim", vision_hidden // vision_heads)
+        else:
+            model_info = {
+                "model_name": type(model).__name__,
+                "architecture": type(model).__name__,
+            }
+            model_info.update(self._infer_custom_model_info(model, sample_input))
+
+        input_shapes = self._tensor_input_shapes(active_inputs)
+        if input_shapes:
+            model_info["input_shapes"] = input_shapes
+
+        return model_info
         
     def _use_torch_fx(self) -> bool:
         if not isinstance(self.model, PreTrainedModel):
