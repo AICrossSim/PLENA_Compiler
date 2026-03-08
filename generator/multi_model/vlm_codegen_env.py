@@ -20,7 +20,7 @@ DEFAULT_HW: dict[str, Any] = {
     "mlen": 16,
     "blen": 16,
     "vlen": 16,
-    "alive_registers": [1, 2, 3, 4, 5, 6, 7, 8],
+    "alive_registers": [i for i in range(15)],
 }
 
 DEFAULT_SCHED: dict[str, Any] = {
