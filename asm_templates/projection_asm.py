@@ -126,7 +126,7 @@ def projection_asm(
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} "
-            )  # lines.append f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {activation_base_address} \n"
+            )
         if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_features // blen - 1:
             lines.append(f"S_ADDI_INT gp{result_reg}, gp{result_reg}, {mlen * batch} ")
 

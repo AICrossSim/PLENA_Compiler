@@ -11,38 +11,10 @@ def store_act_asm(
     stride_size: Optional[int] = None,
     store_amount: int = 4,
 ) -> str:
-    """
-    Generates assembly code for storing activation from VRAM back to HBM.
-    This is the reverse operation of preload_act_asm.
+    """Store activation from VRAM back to HBM (reverse of preload_act_asm).
 
-    Format:
-        VRAM: [batch, mlen, hidden/mlen] - hardware block format
-        HBM:  [batch, hidden_size] - row-major contiguous
-
-    The hardware H_STORE_V instruction handles format conversion automatically
-    when using stride mode (rstride=1), mirroring H_PREFETCH_V behavior.
-
-    VRAM address increments linearly. HBM uses stride to skip between rows.
-
-    H_STORE_V rd, rs1, rs2, rstride, precision
-        rd:        register containing VRAM source address
-        rs1:       register containing HBM offset
-        rs2:       HBM address register index (a0-a7)
-        rstride:   stride register selector (0 = no stride, 1 = use STRIDE_REG)
-        precision: 0 = Activation, 1 = KeyValue
-
-    Args:
-        vlen:             vector length (default 64)
-        batch:            batch size
-        hidden_size:      hidden dimension size
-        alive_registers:  list of 5 available GP registers
-        act_vram_offset:  source base address in VRAM
-        hbm_addr_reg:     HBM address register index (a0-a7)
-        stride_size:      HBM row stride (defaults to hidden_size)
-        store_amount:     rows per H_STORE_V (HBM_V_Writeback_Amount, default 4)
-
-    Returns:
-        Generated ISA code string.
+    VRAM layout: [batch, mlen, hidden/mlen] -> HBM: [batch, hidden_size] row-major.
+    Uses H_STORE_V with stride mode for format conversion.
     """
     generated_code = "; Store Activation Generation\n"
 

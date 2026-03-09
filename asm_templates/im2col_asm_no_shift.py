@@ -1,34 +1,12 @@
 """
-im2col ASM template for PLENA — documented-instructions-only variant.
-
-Replaces V_SHFT_V (opcode 0x32, not formally documented/supported) with:
-  V_MUL_VV   — multiply scratch row by a basis vector (isolates one element)
-  V_RED_SUM  — reduce to scalar (= the single non-zero element)
-  S_ST_FP    — write scalar to FP_SRAM at the target column position
-  S_MAP_V_FP — flush the completed im2col row from FP_SRAM → VRAM
+im2col ASM template — uses V_MUL_VV + V_RED_SUM basis-vector extraction
+instead of undocumented V_SHFT_V.
 
 Algorithm per output row m:
-  oh = m // OW,  ow = m % OW
-  for c in 0..C_in-1:
-    for kr in 0..K-1:
-      scratch = H_PREFETCH_V(hbm_off)         # K real elements at positions 0..K-1
-      for kc in 0..K-1:
-        temp = scratch * e_{kc}               # V_MUL_VV; e_{kc}[i]=1 if i==kc else 0
-        f_ex = 0                              # S_ADD_FP f_ex, f0, f0  (f0 is HW const 0)
-        f_ex += sum(temp)                     # V_RED_SUM = scratch[kc]
-        FP_SRAM[c*K*K + kr*K + kc] = f_ex    # S_ST_FP
-  VRAM[out_row_m] = FP_SRAM[0..K_col-1]      # S_MAP_V_FP
+  for each (c, kr, kc): extract input[c, oh+kr, ow+kc] via basis vector,
+  accumulate into FP_SRAM, then S_MAP_V_FP to VRAM.
 
-HBM alignment: identical to im2col_asm.py — use W_padded=64 and OW=1 so that
-  hbm_off = (c*H + oh+kr) * W_padded + ow   (ow=0) is always 64-element-aligned.
-
-Instruction counts vs V_SHFT_V variant (~4× more instructions per row):
-  V_SHFT_V path:  C_in * K * ~4  instructions per output row
-  no-shift path:  C_in * K * (2 + K*4) instructions per output row (for K=4: ~11×)
-
-Requires:
-  f0 = 0.0  (hardware constant — guaranteed by emulator, writing is a no-op)
-  fp_preload[1] = 1.0  (loaded into f1 via S_LD_FP at runtime; fp_reg starts all-zero)
+Requires: f0=0.0 (hw const), fp_preload[fp_one_reg]=1.0.
 """
 
 PREFETCH_V_AMOUNT = 4   # H_PREFETCH_V always loads this many VRAM rows
@@ -137,24 +115,8 @@ def im2col_asm_no_shift(
     lines.append("; Requires: f0=0.0 (hw const), fp_preload[1]=1.0")
     lines.append("; ============================================================")
 
-    # ------------------------------------------------------------------
-    # One-time setup: build K basis vectors e_0..e_{K-1} in VRAM.
-    #   e_kc[i] = 1.0 if i == kc else 0.0
-    #
-    # Strategy (uses only S_ST_FP and S_MAP_V_FP):
-    #   1. Zero FP_SRAM[0..K-1] with f0 (hardware constant 0.0).
-    #   2. For each kc: write 1.0 at position kc, S_MAP_V_FP to VRAM,
-    #      restore 0.0 at position kc.
-    #
-    # Note: positions K..63 in FP_SRAM are uninitialized but harmless —
-    # scratch rows have zeros at positions K..63 (HBM padding), so
-    # scratch[i] * e_kc[i] = 0 for i >= K regardless of e_kc[i].
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Load 1.0 into fp_one_reg from FP_SRAM BEFORE zeroing FP_SRAM.
-    # fp_preload[fp_one_reg] must be set to 1.0 by the caller.
-    # (fp_reg starts all-zero; fp_preload goes into FP_SRAM, not fp_reg.)
-    # ------------------------------------------------------------------
+    # Build K basis vectors e_kc in VRAM (e_kc[i] = 1.0 if i==kc else 0.0).
+    # Positions K..63 are uninitialized but harmless (HBM padding is zero).
     if fp_sram_precious_slots:
         lines.append("")
         lines.append("; -- Save precious fp_sram slots before im2col corrupts them --")
@@ -187,8 +149,7 @@ def im2col_asm_no_shift(
     lines.append(f"S_ADDI_INT gp{scratch_reg}, gp0, {scratch_vram_addr}")
     lines.append(f"S_ADDI_INT gp{temp_reg}, gp0, {temp_vram_addr}")
 
-    # Configure HBM stride register (= W_padded) and scale (= total input size)
-    # Required by H_PREFETCH_V in stride mode (mode=1).
+    # HBM stride=W_padded, scale=total input size (for H_PREFETCH_V stride mode)
     lines.append("")
     lines.append("; -- Setup: HBM stride and scale --")
     lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {W_padded}")
@@ -197,16 +158,8 @@ def im2col_asm_no_shift(
     lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {input_tensor_elems}")
     lines.append(f"C_SET_SCALE_REG gp{basis_reg}")
 
-    # ------------------------------------------------------------------
-    # Main loop: process each tile (K_col columns split into num_tiles
-    # tiles of vlen columns each), then each of the M output positions.
-    #
-    # VRAM layout is column-block-major:
-    #   tile t of output row m → vram_addr = output_vram_base + t*M*vlen + m*vlen
-    #
-    # For K_col <= vlen (num_tiles == 1) this produces identical ASM to the
-    # single-tile implementation.
-    # ------------------------------------------------------------------
+    # Main loop: tiles × output positions. VRAM is column-block-major:
+    #   vram_addr(m, t) = output_vram_base + t*M*vlen + m*vlen
     for tile_t in range(num_tiles):
         tile_start = tile_t * vlen
         tile_end   = min(tile_start + vlen, K_col)
@@ -221,9 +174,6 @@ def im2col_asm_no_shift(
             oh = m // OW
             ow = m % OW
 
-            # Column-block-major VRAM address for (row m, tile t):
-            #   col-block t base  = output_vram_base + t * M * vlen
-            #   row m within block = + m * vlen
             out_vram_addr = output_vram_base + tile_t * M * vlen + m * vlen
 
             lines.append("")
@@ -233,19 +183,14 @@ def im2col_asm_no_shift(
             )
             lines.append(f"S_ADDI_INT gp{out_reg}, gp0, {out_vram_addr}")
 
-            # Zero FP_SRAM slots that will NOT be written this tile.
-            # For full tiles every slot [0..vlen-1] gets written, so no zeroing.
-            # For the last partial tile, zero slots [tile_width..vlen-1] so that
-            # S_MAP_V_FP does not flush stale values from a previous iteration.
+            # Zero unwritten FP_SRAM slots for partial last tile
             if tile_width < vlen:
                 for pos in range(tile_width, vlen):
                     lines.append(f"S_ST_FP f0, gp0, {pos}")
 
             for c in range(C_in):
                 for kr in range(K):
-                    # Global im2col column for (c, kr, kc) = c*K*K + kr*K + kc.
-                    # Only extract kc values whose global column falls in
-                    # [tile_start, tile_end) for this tile.
+                    # kc values whose global column falls in this tile
                     contributing_kcs = [
                         kc for kc in range(K)
                         if tile_start <= c * K * K + kr * K + kc < tile_end
@@ -264,7 +209,6 @@ def im2col_asm_no_shift(
                     )
 
                     for kc in contributing_kcs:
-                        # Local FP_SRAM slot = global column index minus tile_start
                         local_pos  = c * K * K + kr * K + kc - tile_start
                         basis_addr = basis_vram_base + kc * vlen
 
@@ -280,8 +224,7 @@ def im2col_asm_no_shift(
                         )
                         lines.append(f"S_ST_FP f{fp_ex_reg}, gp0, {local_pos}")
 
-            # Flush FP_SRAM[0..vlen-1] into VRAM at (row m, tile t)
-            lines.append(f"S_MAP_V_FP gp{out_reg}, gp0, 0")
+            lines.append(f"S_MAP_V_FP gp{out_reg}, gp0, 0")  # flush to VRAM
 
     if fp_sram_precious_slots:
         lines.append("")
