@@ -3,7 +3,18 @@ from typing import Dict, List, Any, Optional
 from pathlib import Path
 import math
 
-IMM2_BOUND = 2**18
+def _load_large_int(reg: int, value: int) -> str:
+    """Generate instructions to load any non-negative integer into a GP register.
+    Uses S_LUI_INT (shifts imm left by 12) + S_ADDI_INT. Returns assembly string."""
+    upper = value >> 12
+    lower = value & 0xFFF
+    if upper:
+        code = f"S_LUI_INT gp{reg}, {upper} \n"
+        if lower:
+            code += f"S_ADDI_INT gp{reg}, gp{reg}, {lower} \n"
+    else:
+        code = f"S_ADDI_INT gp{reg}, gp0, {lower} \n"
+    return code
 
 def preload_act_asm(
     vlen: int,
@@ -31,7 +42,7 @@ def preload_act_asm(
     stride_len = vlen if stride_size is None else stride_size
 
     # Set scale offset
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {hidden_size * batch} \n"
+    generated_code += _load_large_int(a_actual_register, hidden_size * batch)
     generated_code += f"C_SET_SCALE_REG gp{a_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, 0 \n"
     generated_code += f"S_ADDI_INT gp{result_register}, gp0, {act_vram_offset} \n"
@@ -50,7 +61,6 @@ def preload_act_asm(
         generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len} \n"
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register} \n"
         a_offset_register = set_stride_register
-        assert batch * hidden_size <= IMM2_BOUND, "batch * hidden_size must be less than {IMM2_BOUND}"
         generated_code += f"C_LOOP_START gp{outer_loop_register}, {load_amount_per_hidden} \n"
         generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_actual_register}, 0 \n"
         if batch > preload_len:

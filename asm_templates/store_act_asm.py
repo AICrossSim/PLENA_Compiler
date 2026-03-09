@@ -1,8 +1,6 @@
 import math
 from typing import List, Optional
 
-IMM2_BOUND = 2**18
-
 def store_act_asm(
     vlen: int,
     batch: int,
@@ -74,8 +72,6 @@ def store_act_asm(
         generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len}\n"
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register}\n"
         hbm_base_reg = set_stride_register  # reuse after stride is set
-
-        assert batch * hidden_size <= IMM2_BOUND, f"batch * hidden_size must be less than {IMM2_BOUND}"
 
         # Outer loop: iterate over column blocks (hidden_size / vlen)
         generated_code += f"C_LOOP_START gp{outer_loop_register}, {store_amount_per_hidden}\n"

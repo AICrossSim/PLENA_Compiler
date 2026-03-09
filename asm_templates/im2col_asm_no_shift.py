@@ -53,6 +53,7 @@ def im2col_asm_no_shift(
     W_padded: int = None,
     fp_one_reg: int = 1,   # FP register holding 1.0 (must be pre-loaded via fp_preload)
     fp_ex_reg: int = 2,    # FP register used as V_RED_SUM accumulator
+    fp_sram_precious_slots: list = None,  # fp_sram slots to save before and restore after im2col
 ) -> str:
     """
     Generate PLENA assembly for on-chip im2col without V_SHFT_V.
@@ -102,15 +103,29 @@ def im2col_asm_no_shift(
 
     K_col = C_in * K * K
 
-    assert K_col <= vlen, (
-        f"K_col={K_col} exceeds vlen={vlen}; tiled im2col not supported"
-    )
     assert K <= vlen, (
         f"K={K} > vlen={vlen}; basis-vector extraction requires K <= vlen"
     )
+    num_tiles = (K_col + vlen - 1) // vlen
 
     if W_padded is None:
         W_padded = W
+
+    # Compute save f_regs for precious fp_sram slots.
+    # im2col zeroes fp_sram[0..K-1] during setup and writes fp_sram[0..K_col-1]
+    # during the main loop, corrupting any pre-loaded values in those slots.
+    # Hardware supports f_regs 0..7 only.
+    _MAX_FREG = 7
+    if fp_sram_precious_slots is None:
+        fp_sram_precious_slots = [1, 2, 3, 4, 5]
+    used_fregs = {0, fp_one_reg, fp_ex_reg}
+    # Collect available f_regs in [1..MAX_FREG] (skip f0 — hw const)
+    save_fregs = [f for f in range(1, _MAX_FREG + 1) if f not in used_fregs]
+    assert len(save_fregs) >= len(fp_sram_precious_slots), (
+        f"Not enough free f_regs ({len(save_fregs)}) for "
+        f"{len(fp_sram_precious_slots)} precious fp_sram slots"
+    )
+    save_fregs = save_fregs[:len(fp_sram_precious_slots)]
 
     lines = []
     lines.append("; ============================================================")
@@ -140,6 +155,12 @@ def im2col_asm_no_shift(
     # fp_preload[fp_one_reg] must be set to 1.0 by the caller.
     # (fp_reg starts all-zero; fp_preload goes into FP_SRAM, not fp_reg.)
     # ------------------------------------------------------------------
+    if fp_sram_precious_slots:
+        lines.append("")
+        lines.append("; -- Save precious fp_sram slots before im2col corrupts them --")
+        for slot, sv in zip(fp_sram_precious_slots, save_fregs):
+            lines.append(f"S_LD_FP f{sv}, gp0, {slot}")
+
     lines.append("")
     lines.append(f"; -- Setup: load 1.0 from FP_SRAM[{fp_one_reg}] into f{fp_one_reg} --")
     lines.append(f"; (requires fp_preload[{fp_one_reg}] = 1.0)")
@@ -177,57 +198,96 @@ def im2col_asm_no_shift(
     lines.append(f"C_SET_SCALE_REG gp{basis_reg}")
 
     # ------------------------------------------------------------------
-    # Main loop: process each of the M output positions
+    # Main loop: process each tile (K_col columns split into num_tiles
+    # tiles of vlen columns each), then each of the M output positions.
+    #
+    # VRAM layout is column-block-major:
+    #   tile t of output row m → vram_addr = output_vram_base + t*M*vlen + m*vlen
+    #
+    # For K_col <= vlen (num_tiles == 1) this produces identical ASM to the
+    # single-tile implementation.
     # ------------------------------------------------------------------
-    for m in range(M):
-        oh = m // OW
-        ow = m % OW
-        out_vram_addr = output_vram_base + m * vlen
+    for tile_t in range(num_tiles):
+        tile_start = tile_t * vlen
+        tile_end   = min(tile_start + vlen, K_col)
+        tile_width = tile_end - tile_start   # < vlen only for the last partial tile
 
         lines.append("")
-        lines.append(f"; ==== output row m={m}  oh={oh}  ow={ow} ====")
-        lines.append(f"S_ADDI_INT gp{out_reg}, gp0, {out_vram_addr}")
+        lines.append(
+            f"; ==== TILE t={tile_t}  global cols [{tile_start}..{tile_end - 1}] ===="
+        )
 
-        for c in range(C_in):
-            for kr in range(K):
-                # HBM offset for input[0, c, oh+kr, ow]:
-                #   row (c*H + oh+kr) of the padded input, element ow.
-                #   With W_padded=64 and ow=0: offset = (c*H+oh+kr)*64 — always 64-aligned.
-                hbm_offset = (c * H + oh + kr) * W_padded + ow
+        for m in range(M):
+            oh = m // OW
+            ow = m % OW
 
-                lines.append(f"; (c={c}, kr={kr})  hbm_off={hbm_offset}")
+            # Column-block-major VRAM address for (row m, tile t):
+            #   col-block t base  = output_vram_base + t * M * vlen
+            #   row m within block = + m * vlen
+            out_vram_addr = output_vram_base + tile_t * M * vlen + m * vlen
 
-                # Load K elements from HBM (stride mode=1 uses C_SET_STRIDE_REG)
-                lines.append(f"S_ADDI_INT gp{off_reg}, gp0, {hbm_offset}")
-                lines.append(
-                    f"H_PREFETCH_V gp{scratch_reg}, gp{off_reg}, "
-                    f"a{input_hbm_base_addr_reg}, 1, 0"
-                )
+            lines.append("")
+            lines.append(
+                f"; ==== tile={tile_t} output row m={m}  oh={oh}  ow={ow}  "
+                f"vram={out_vram_addr} ===="
+            )
+            lines.append(f"S_ADDI_INT gp{out_reg}, gp0, {out_vram_addr}")
 
-                # Extract element at each of the K positions
-                for kc in range(K):
-                    target_pos = c * K * K + kr * K + kc
-                    basis_addr = basis_vram_base + kc * vlen
+            # Zero FP_SRAM slots that will NOT be written this tile.
+            # For full tiles every slot [0..vlen-1] gets written, so no zeroing.
+            # For the last partial tile, zero slots [tile_width..vlen-1] so that
+            # S_MAP_V_FP does not flush stale values from a previous iteration.
+            if tile_width < vlen:
+                for pos in range(tile_width, vlen):
+                    lines.append(f"S_ST_FP f0, gp0, {pos}")
 
-                    # Point basis_reg at e_kc
+            for c in range(C_in):
+                for kr in range(K):
+                    # Global im2col column for (c, kr, kc) = c*K*K + kr*K + kc.
+                    # Only extract kc values whose global column falls in
+                    # [tile_start, tile_end) for this tile.
+                    contributing_kcs = [
+                        kc for kc in range(K)
+                        if tile_start <= c * K * K + kr * K + kc < tile_end
+                    ]
+                    if not contributing_kcs:
+                        continue
+
+                    # HBM offset for input[0, c, oh+kr, ow]
+                    hbm_offset = (c * H + oh + kr) * W_padded + ow
+
+                    lines.append(f"; (c={c}, kr={kr})  hbm_off={hbm_offset}")
+                    lines.append(f"S_ADDI_INT gp{off_reg}, gp0, {hbm_offset}")
                     lines.append(
-                        f"S_ADDI_INT gp{basis_reg}, gp0, {basis_addr}"
+                        f"H_PREFETCH_V gp{scratch_reg}, gp{off_reg}, "
+                        f"a{input_hbm_base_addr_reg}, 1, 0"
                     )
-                    # temp = scratch * e_kc  (zero everywhere except position kc)
-                    lines.append(
-                        f"V_MUL_VV gp{temp_reg}, gp{scratch_reg}, gp{basis_reg}, 0"
-                    )
-                    # Zero the V_RED_SUM accumulator (it accumulates, so must reset)
-                    lines.append(f"S_ADD_FP f{fp_ex_reg}, f0, f0")
-                    # f_ex = 0 + sum(temp) = temp[kc] = scratch[kc]
-                    lines.append(
-                        f"V_RED_SUM f{fp_ex_reg}, gp{temp_reg}, 0, 0"
-                    )
-                    # Write extracted element to its column in the im2col row
-                    lines.append(f"S_ST_FP f{fp_ex_reg}, gp0, {target_pos}")
 
-        # Flush FP_SRAM[0..K_col-1] into output VRAM row m
-        lines.append(f"S_MAP_V_FP gp{out_reg}, gp0, 0")
+                    for kc in contributing_kcs:
+                        # Local FP_SRAM slot = global column index minus tile_start
+                        local_pos  = c * K * K + kr * K + kc - tile_start
+                        basis_addr = basis_vram_base + kc * vlen
+
+                        lines.append(
+                            f"S_ADDI_INT gp{basis_reg}, gp0, {basis_addr}"
+                        )
+                        lines.append(
+                            f"V_MUL_VV gp{temp_reg}, gp{scratch_reg}, gp{basis_reg}, 0"
+                        )
+                        lines.append(f"S_ADD_FP f{fp_ex_reg}, f0, f0")
+                        lines.append(
+                            f"V_RED_SUM f{fp_ex_reg}, gp{temp_reg}, 0, 0"
+                        )
+                        lines.append(f"S_ST_FP f{fp_ex_reg}, gp0, {local_pos}")
+
+            # Flush FP_SRAM[0..vlen-1] into VRAM at (row m, tile t)
+            lines.append(f"S_MAP_V_FP gp{out_reg}, gp0, 0")
+
+    if fp_sram_precious_slots:
+        lines.append("")
+        lines.append("; -- Restore precious fp_sram slots overwritten by im2col --")
+        for slot, sv in zip(fp_sram_precious_slots, save_fregs):
+            lines.append(f"S_ST_FP f{sv}, gp0, {slot}")
 
     lines.append("")
     lines.append("; ============================================================")
