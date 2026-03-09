@@ -1,6 +1,33 @@
 from __future__ import annotations
 
-IMM2_BOUND = 2**18
+
+def _load_large_int(reg: int, value: int) -> list[str]:
+    """Generate instructions to load any non-negative integer into a GP register.
+
+    S_ADDI_INT supports 18-bit immediates (values 0..2^18-1).
+    For values < 2^18, emit a single S_ADDI_INT from gp0.
+    For values >= 2^18, use S_LUI_INT (rd = imm << 12) + optional S_ADDI_INT.
+    """
+    IMM2_BOUND = 1 << 18
+    if value < IMM2_BOUND:
+        return [f"S_ADDI_INT gp{reg}, gp0, {value}"]
+    upper = value >> 12
+    lower = value & 0xFFF
+    lines = [f"S_LUI_INT gp{reg}, {upper}"]
+    if lower:
+        lines.append(f"S_ADDI_INT gp{reg}, gp{reg}, {lower}")
+    return lines
+
+
+def _addi_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int) -> list[str]:
+    """Generate rd = rs1 + value, handling values >= 2^18 by loading into temp_reg first."""
+    IMM2_BOUND = 1 << 18
+    if value < IMM2_BOUND:
+        return [f"S_ADDI_INT gp{dest_reg}, gp{src_reg}, {value}"]
+    else:
+        lines = _load_large_int(temp_reg, value)
+        lines.append(f"S_ADD_INT gp{dest_reg}, gp{src_reg}, gp{temp_reg}")
+        return lines
 
 
 def projection_asm(
@@ -63,8 +90,7 @@ def projection_asm(
 
     # Setup scale and stride registers (use act_reg as temp)
     # Scale = total weight matrix size, Stride = output dimension
-    assert in_features * out_features < IMM2_BOUND, f"Weight size {in_features}x{out_features} exceeds IMM2_BOUND"
-    lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {in_features * out_features}")
+    lines.extend(_load_large_int(act_reg, in_features * out_features))
     lines.append(f"C_SET_SCALE_REG gp{act_reg}")
     lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {out_features}")
     lines.append(f"C_SET_STRIDE_REG gp{act_reg}")
@@ -83,7 +109,7 @@ def projection_asm(
                     f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
-                lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen * out_features} ")
+                lines.extend(_addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register))
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
@@ -158,8 +184,7 @@ def projection_T_asm(
     lines.append(f"; Linear T: (batch, {in_features}) @ ({out_features}, {in_features})^T -> (batch, {out_features})")
 
     # Scale = total weight size, Stride = in_features (row stride of weight in HBM)
-    assert in_features * out_features < IMM2_BOUND, f"Weight size {in_features}x{out_features} exceeds IMM2_BOUND"
-    lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {in_features * out_features}")
+    lines.extend(_load_large_int(act_reg, in_features * out_features))
     lines.append(f"C_SET_SCALE_REG gp{act_reg}")
     lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {in_features}")
     lines.append(f"C_SET_STRIDE_REG gp{act_reg}")
@@ -171,7 +196,7 @@ def projection_T_asm(
         if weight_row % tiles_per_mlen == 0:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
             # HBM offset: weight_row*blen rows into (out_features, in_features) layout
-            lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp0, {weight_row * blen * in_features} ")
+            lines.extend(_load_large_int(w_hbm_offset_register, weight_row * blen * in_features))
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
             for weight_col in range(hidden_size // mlen):
                 lines.append(f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 ")
