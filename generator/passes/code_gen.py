@@ -45,7 +45,7 @@ def _generate_embedding_code(
         mlen=hardware_config.get("mlen", 16),
         blen=hardware_config.get("blen", 16),
         batch=model_info.get("batch_size", 1),
-        hidden_size=dim["hidden_size"],
+        hidden_size=dim.get("hidden_size") or dim.get("embedding_dim", model_info.get("hidden_size", 64)),
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
         voc_table_row_size=vocab_size,
         activation_base_address=scheduler.get("activation_base_address", 0),
