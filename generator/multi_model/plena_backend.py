@@ -23,7 +23,7 @@ MODULE_TYPE_TO_TEMPLATE: Dict[str, str] = {
     "Conv3d":           "batched_matmul_asm",
     # Qwen3-VL specific
     "Qwen3VLTextRMSNorm":       "normalization_asm",
-    "Qwen3VLVisionMLP":         "ffn_asm",
+    "Qwen3VLVisionMLP":         "vision_mlp_plena",
     "Qwen3VLTextMLP":           "ffn_asm",
     "Qwen3VLVisionAttention":   "flash_attn_asm",
     "Qwen3VLTextAttention":     "flash_attn_asm",

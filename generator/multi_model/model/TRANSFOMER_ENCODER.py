@@ -2,33 +2,33 @@ import torch
 import torch.nn as nn
 import math
 class mlp(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_size=4096):
         super().__init__()
-        self.linear1 = nn.Linear(4096, 4*4096)
+        self.linear1 = nn.Linear(hidden_size, 4*hidden_size)
         self.act = nn.GELU()
-        self.linear2 = nn.Linear(4*4096, 4096)
+        self.linear2 = nn.Linear(4*hidden_size, hidden_size)
     
     def forward(self,x):
         x = self.linear2(self.act(self.linear1(x)))
         return x
 
 class TRANSFOMER_ENCODER (nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_size=4096):
         super().__init__()
-        self.Q = nn.Linear(4096, 4096)
-        self.K = nn.Linear(4096, 4096)
-        self.V = nn.Linear(4096, 4096)
+        self.Q = nn.Linear(hidden_size, hidden_size)
+        self.K = nn.Linear(hidden_size, hidden_size)
+        self.V = nn.Linear(hidden_size, hidden_size)
         self.softmax = nn.Softmax(-1)
-        self.layer_norm1 = nn.LayerNorm(4096)
-        self.layer_norm2 = nn.LayerNorm(4096)
-        self.ffn = mlp()
-        self.O = nn.Linear(4096, 4096)
+        self.layer_norm1 = nn.LayerNorm(hidden_size, eps=3.1415926e-5)
+        self.layer_norm2 = nn.LayerNorm(hidden_size, eps=6.6666e-5)
+        self.ffn = mlp(hidden_size)
+        self.O = nn.Linear(hidden_size, hidden_size)
     
     def forward(self, x):
         Q = self.Q(x)
         K = self.K(x)
         V = self.V(x)
-        attn = torch.matmul(self.softmax(torch.matmul(Q, K.transpose(-2,-1))/math.sqrt(4096)), V)
+        attn = torch.matmul(self.softmax(torch.matmul(Q, K.transpose(-2,-1))/math.sqrt(self.Q.in_features)), V)
         x = self.O(attn) + x
         x = self.layer_norm1(x)
         x = self.ffn(x) + x
@@ -89,5 +89,4 @@ if __name__ == "__main__":
     y = transformer(x)
     y2 = formal_transformer(x)
     print(torch.allclose(y, y2, atol=1e-6, rtol=1e-5))
-        
         

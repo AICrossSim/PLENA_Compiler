@@ -5,6 +5,7 @@ Implements compilation from high-level IR to ISA, Phase 1: Load_Batch
 
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from typing import List, Optional, Callable, Dict, Any, Tuple, Union

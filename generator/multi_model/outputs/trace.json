@@ -1,0 +1,6058 @@
+[
+  {
+    "name": "",
+    "type": "MultiLayerEncoder",
+    "order": 0,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [
+      {
+        "name": "layers.0",
+        "type": "TRANSFOMER_ENCODER",
+        "order": 1,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [
+          {
+            "name": "layers.0.Q",
+            "type": "Linear",
+            "order": 2,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%0"
+            ],
+            "in_sym_sources": {
+              "%0": ""
+            },
+            "out_syms": [
+              "%1"
+            ]
+          },
+          {
+            "name": "layers.0.K",
+            "type": "Linear",
+            "order": 3,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%0"
+            ],
+            "in_sym_sources": {
+              "%0": ""
+            },
+            "out_syms": [
+              "%2"
+            ]
+          },
+          {
+            "name": "layers.0.V",
+            "type": "Linear",
+            "order": 4,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%0"
+            ],
+            "in_sym_sources": {
+              "%0": ""
+            },
+            "out_syms": [
+              "%3"
+            ]
+          },
+          {
+            "name": "layers.0.softmax",
+            "type": "Softmax",
+            "order": 5,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  4
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                4
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [],
+            "in_syms": [
+              "%4"
+            ],
+            "in_sym_sources": {
+              "%4": ""
+            },
+            "out_syms": [
+              "%5"
+            ]
+          },
+          {
+            "name": "layers.0.O",
+            "type": "Linear",
+            "order": 6,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%6"
+            ],
+            "in_sym_sources": {
+              "%6": ""
+            },
+            "out_syms": [
+              "%7"
+            ]
+          },
+          {
+            "name": "layers.0.layer_norm1",
+            "type": "LayerNorm",
+            "order": 7,
+            "attrs": {
+              "normalized_shape": [
+                128
+              ],
+              "eps": 3.1415926e-05
+            },
+            "meta": {
+              "schema": {
+                "eps": 3.1415926e-05
+              }
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%8"
+            ],
+            "in_sym_sources": {
+              "%8": ""
+            },
+            "out_syms": [
+              "%7"
+            ]
+          },
+          {
+            "name": "layers.0.ffn",
+            "type": "mlp",
+            "order": 8,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [
+              {
+                "name": "layers.0.ffn.linear1",
+                "type": "Linear",
+                "order": 9,
+                "attrs": {
+                  "in_features": 128,
+                  "out_features": 512,
+                  "bias": true
+                },
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      128
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    512
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [
+                  {
+                    "name": "weight",
+                    "shape": [
+                      512,
+                      128
+                    ]
+                  },
+                  {
+                    "name": "bias",
+                    "shape": [
+                      512
+                    ]
+                  }
+                ],
+                "in_syms": [
+                  "%7"
+                ],
+                "in_sym_sources": {
+                  "%7": "layers.0.layer_norm1"
+                },
+                "out_syms": [
+                  "%9"
+                ]
+              },
+              {
+                "name": "layers.0.ffn.act",
+                "type": "GELU",
+                "order": 10,
+                "attrs": {},
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      512
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    512
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [],
+                "in_syms": [
+                  "%9"
+                ],
+                "in_sym_sources": {
+                  "%9": "layers.0.ffn.linear1"
+                },
+                "out_syms": [
+                  "%10"
+                ]
+              },
+              {
+                "name": "layers.0.ffn.linear2",
+                "type": "Linear",
+                "order": 11,
+                "attrs": {
+                  "in_features": 512,
+                  "out_features": 128,
+                  "bias": true
+                },
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      512
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    128
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [
+                  {
+                    "name": "weight",
+                    "shape": [
+                      128,
+                      512
+                    ]
+                  },
+                  {
+                    "name": "bias",
+                    "shape": [
+                      128
+                    ]
+                  }
+                ],
+                "in_syms": [
+                  "%10"
+                ],
+                "in_sym_sources": {
+                  "%10": "layers.0.ffn.act"
+                },
+                "out_syms": [
+                  "%8"
+                ]
+              }
+            ],
+            "weights": [],
+            "in_syms": [
+              "%7"
+            ],
+            "in_sym_sources": {
+              "%7": "layers.0.layer_norm1"
+            },
+            "out_syms": [
+              "%8"
+            ]
+          },
+          {
+            "name": "layers.0.layer_norm2",
+            "type": "LayerNorm",
+            "order": 12,
+            "attrs": {
+              "normalized_shape": [
+                128
+              ],
+              "eps": 6.6666e-05
+            },
+            "meta": {
+              "schema": {
+                "eps": 6.6666e-05
+              }
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%11"
+            ],
+            "in_sym_sources": {
+              "%11": ""
+            },
+            "out_syms": [
+              "%7"
+            ]
+          }
+        ],
+        "weights": [],
+        "in_syms": [
+          "%0"
+        ],
+        "in_sym_sources": {
+          "%0": ""
+        },
+        "out_syms": [
+          "%7"
+        ]
+      },
+      {
+        "name": "layers.1",
+        "type": "TRANSFOMER_ENCODER",
+        "order": 13,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [
+          {
+            "name": "layers.1.Q",
+            "type": "Linear",
+            "order": 14,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%7"
+            ],
+            "in_sym_sources": {
+              "%7": "layers.0"
+            },
+            "out_syms": [
+              "%6"
+            ]
+          },
+          {
+            "name": "layers.1.K",
+            "type": "Linear",
+            "order": 15,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%7"
+            ],
+            "in_sym_sources": {
+              "%7": "layers.0"
+            },
+            "out_syms": [
+              "%11"
+            ]
+          },
+          {
+            "name": "layers.1.V",
+            "type": "Linear",
+            "order": 16,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%7"
+            ],
+            "in_sym_sources": {
+              "%7": "layers.0"
+            },
+            "out_syms": [
+              "%8"
+            ]
+          },
+          {
+            "name": "layers.1.softmax",
+            "type": "Softmax",
+            "order": 17,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  4
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                4
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [],
+            "in_syms": [
+              "%4"
+            ],
+            "in_sym_sources": {
+              "%4": ""
+            },
+            "out_syms": [
+              "%5"
+            ]
+          },
+          {
+            "name": "layers.1.O",
+            "type": "Linear",
+            "order": 18,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%3"
+            ],
+            "in_sym_sources": {
+              "%3": "layers.0.V"
+            },
+            "out_syms": [
+              "%2"
+            ]
+          },
+          {
+            "name": "layers.1.layer_norm1",
+            "type": "LayerNorm",
+            "order": 19,
+            "attrs": {
+              "normalized_shape": [
+                128
+              ],
+              "eps": 3.1415926e-05
+            },
+            "meta": {
+              "schema": {
+                "eps": 3.1415926e-05
+              }
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%1"
+            ],
+            "in_sym_sources": {
+              "%1": "layers.0.Q"
+            },
+            "out_syms": [
+              "%2"
+            ]
+          },
+          {
+            "name": "layers.1.ffn",
+            "type": "mlp",
+            "order": 20,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [
+              {
+                "name": "layers.1.ffn.linear1",
+                "type": "Linear",
+                "order": 21,
+                "attrs": {
+                  "in_features": 128,
+                  "out_features": 512,
+                  "bias": true
+                },
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      128
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    512
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [
+                  {
+                    "name": "weight",
+                    "shape": [
+                      512,
+                      128
+                    ]
+                  },
+                  {
+                    "name": "bias",
+                    "shape": [
+                      512
+                    ]
+                  }
+                ],
+                "in_syms": [
+                  "%2"
+                ],
+                "in_sym_sources": {
+                  "%2": "layers.1.layer_norm1"
+                },
+                "out_syms": [
+                  "%10"
+                ]
+              },
+              {
+                "name": "layers.1.ffn.act",
+                "type": "GELU",
+                "order": 22,
+                "attrs": {},
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      512
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    512
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [],
+                "in_syms": [
+                  "%10"
+                ],
+                "in_sym_sources": {
+                  "%10": "layers.1.ffn.linear1"
+                },
+                "out_syms": [
+                  "%9"
+                ]
+              },
+              {
+                "name": "layers.1.ffn.linear2",
+                "type": "Linear",
+                "order": 23,
+                "attrs": {
+                  "in_features": 512,
+                  "out_features": 128,
+                  "bias": true
+                },
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      512
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    128
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [
+                  {
+                    "name": "weight",
+                    "shape": [
+                      128,
+                      512
+                    ]
+                  },
+                  {
+                    "name": "bias",
+                    "shape": [
+                      128
+                    ]
+                  }
+                ],
+                "in_syms": [
+                  "%9"
+                ],
+                "in_sym_sources": {
+                  "%9": "layers.1.ffn.act"
+                },
+                "out_syms": [
+                  "%1"
+                ]
+              }
+            ],
+            "weights": [],
+            "in_syms": [
+              "%2"
+            ],
+            "in_sym_sources": {
+              "%2": "layers.1.layer_norm1"
+            },
+            "out_syms": [
+              "%1"
+            ]
+          },
+          {
+            "name": "layers.1.layer_norm2",
+            "type": "LayerNorm",
+            "order": 24,
+            "attrs": {
+              "normalized_shape": [
+                128
+              ],
+              "eps": 6.6666e-05
+            },
+            "meta": {
+              "schema": {
+                "eps": 6.6666e-05
+              }
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%12"
+            ],
+            "in_sym_sources": {
+              "%12": ""
+            },
+            "out_syms": [
+              "%13"
+            ]
+          }
+        ],
+        "weights": [],
+        "in_syms": [
+          "%7"
+        ],
+        "in_sym_sources": {
+          "%7": "layers.0"
+        },
+        "out_syms": [
+          "%13"
+        ]
+      },
+      {
+        "name": "layers.2",
+        "type": "TRANSFOMER_ENCODER",
+        "order": 25,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [
+          {
+            "name": "layers.2.Q",
+            "type": "Linear",
+            "order": 26,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%13"
+            ],
+            "in_sym_sources": {
+              "%13": "layers.1"
+            },
+            "out_syms": [
+              "%12"
+            ]
+          },
+          {
+            "name": "layers.2.K",
+            "type": "Linear",
+            "order": 27,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%13"
+            ],
+            "in_sym_sources": {
+              "%13": "layers.1"
+            },
+            "out_syms": [
+              "%14"
+            ]
+          },
+          {
+            "name": "layers.2.V",
+            "type": "Linear",
+            "order": 28,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%13"
+            ],
+            "in_sym_sources": {
+              "%13": "layers.1"
+            },
+            "out_syms": [
+              "%15"
+            ]
+          },
+          {
+            "name": "layers.2.softmax",
+            "type": "Softmax",
+            "order": 29,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  4
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                4
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [],
+            "in_syms": [
+              "%4"
+            ],
+            "in_sym_sources": {
+              "%4": ""
+            },
+            "out_syms": [
+              "%5"
+            ]
+          },
+          {
+            "name": "layers.2.O",
+            "type": "Linear",
+            "order": 30,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%3"
+            ],
+            "in_sym_sources": {
+              "%3": "layers.0.V"
+            },
+            "out_syms": [
+              "%2"
+            ]
+          },
+          {
+            "name": "layers.2.layer_norm1",
+            "type": "LayerNorm",
+            "order": 31,
+            "attrs": {
+              "normalized_shape": [
+                128
+              ],
+              "eps": 3.1415926e-05
+            },
+            "meta": {
+              "schema": {
+                "eps": 3.1415926e-05
+              }
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%1"
+            ],
+            "in_sym_sources": {
+              "%1": "layers.1.ffn"
+            },
+            "out_syms": [
+              "%2"
+            ]
+          },
+          {
+            "name": "layers.2.ffn",
+            "type": "mlp",
+            "order": 32,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [
+              {
+                "name": "layers.2.ffn.linear1",
+                "type": "Linear",
+                "order": 33,
+                "attrs": {
+                  "in_features": 128,
+                  "out_features": 512,
+                  "bias": true
+                },
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      128
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    512
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [
+                  {
+                    "name": "weight",
+                    "shape": [
+                      512,
+                      128
+                    ]
+                  },
+                  {
+                    "name": "bias",
+                    "shape": [
+                      512
+                    ]
+                  }
+                ],
+                "in_syms": [
+                  "%2"
+                ],
+                "in_sym_sources": {
+                  "%2": "layers.2.layer_norm1"
+                },
+                "out_syms": [
+                  "%9"
+                ]
+              },
+              {
+                "name": "layers.2.ffn.act",
+                "type": "GELU",
+                "order": 34,
+                "attrs": {},
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      512
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    512
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [],
+                "in_syms": [
+                  "%9"
+                ],
+                "in_sym_sources": {
+                  "%9": "layers.2.ffn.linear1"
+                },
+                "out_syms": [
+                  "%10"
+                ]
+              },
+              {
+                "name": "layers.2.ffn.linear2",
+                "type": "Linear",
+                "order": 35,
+                "attrs": {
+                  "in_features": 512,
+                  "out_features": 128,
+                  "bias": true
+                },
+                "meta": {
+                  "schema": {}
+                },
+                "in": [
+                  {
+                    "shape": [
+                      2,
+                      4,
+                      512
+                    ],
+                    "dtype": "torch.float32",
+                    "device": "cpu"
+                  }
+                ],
+                "out": {
+                  "shape": [
+                    2,
+                    4,
+                    128
+                  ],
+                  "dtype": "torch.float32",
+                  "device": "cpu"
+                },
+                "children": [],
+                "weights": [
+                  {
+                    "name": "weight",
+                    "shape": [
+                      128,
+                      512
+                    ]
+                  },
+                  {
+                    "name": "bias",
+                    "shape": [
+                      128
+                    ]
+                  }
+                ],
+                "in_syms": [
+                  "%10"
+                ],
+                "in_sym_sources": {
+                  "%10": "layers.2.ffn.act"
+                },
+                "out_syms": [
+                  "%1"
+                ]
+              }
+            ],
+            "weights": [],
+            "in_syms": [
+              "%2"
+            ],
+            "in_sym_sources": {
+              "%2": "layers.2.layer_norm1"
+            },
+            "out_syms": [
+              "%1"
+            ]
+          },
+          {
+            "name": "layers.2.layer_norm2",
+            "type": "LayerNorm",
+            "order": 36,
+            "attrs": {
+              "normalized_shape": [
+                128
+              ],
+              "eps": 6.6666e-05
+            },
+            "meta": {
+              "schema": {
+                "eps": 6.6666e-05
+              }
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%6"
+            ],
+            "in_sym_sources": {
+              "%6": "layers.1.Q"
+            },
+            "out_syms": [
+              "%7"
+            ]
+          }
+        ],
+        "weights": [],
+        "in_syms": [
+          "%13"
+        ],
+        "in_sym_sources": {
+          "%13": "layers.1"
+        },
+        "out_syms": [
+          "%7"
+        ]
+      }
+    ],
+    "weights": [],
+    "in_syms": [
+      "%0"
+    ],
+    "in_sym_sources": {
+      "%0": ""
+    },
+    "out_syms": [
+      "%7"
+    ]
+  },
+  {
+    "name": "layers.0",
+    "type": "TRANSFOMER_ENCODER",
+    "order": 1,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [
+      {
+        "name": "layers.0.Q",
+        "type": "Linear",
+        "order": 2,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%0"
+        ],
+        "in_sym_sources": {
+          "%0": ""
+        },
+        "out_syms": [
+          "%1"
+        ]
+      },
+      {
+        "name": "layers.0.K",
+        "type": "Linear",
+        "order": 3,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%0"
+        ],
+        "in_sym_sources": {
+          "%0": ""
+        },
+        "out_syms": [
+          "%2"
+        ]
+      },
+      {
+        "name": "layers.0.V",
+        "type": "Linear",
+        "order": 4,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%0"
+        ],
+        "in_sym_sources": {
+          "%0": ""
+        },
+        "out_syms": [
+          "%3"
+        ]
+      },
+      {
+        "name": "layers.0.softmax",
+        "type": "Softmax",
+        "order": 5,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              4
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            4
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [],
+        "in_syms": [
+          "%4"
+        ],
+        "in_sym_sources": {
+          "%4": ""
+        },
+        "out_syms": [
+          "%5"
+        ]
+      },
+      {
+        "name": "layers.0.O",
+        "type": "Linear",
+        "order": 6,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%6"
+        ],
+        "in_sym_sources": {
+          "%6": ""
+        },
+        "out_syms": [
+          "%7"
+        ]
+      },
+      {
+        "name": "layers.0.layer_norm1",
+        "type": "LayerNorm",
+        "order": 7,
+        "attrs": {
+          "normalized_shape": [
+            128
+          ],
+          "eps": 3.1415926e-05
+        },
+        "meta": {
+          "schema": {
+            "eps": 3.1415926e-05
+          }
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%8"
+        ],
+        "in_sym_sources": {
+          "%8": ""
+        },
+        "out_syms": [
+          "%7"
+        ]
+      },
+      {
+        "name": "layers.0.ffn",
+        "type": "mlp",
+        "order": 8,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [
+          {
+            "name": "layers.0.ffn.linear1",
+            "type": "Linear",
+            "order": 9,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 512,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                512
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  512,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  512
+                ]
+              }
+            ],
+            "in_syms": [
+              "%7"
+            ],
+            "in_sym_sources": {
+              "%7": "layers.0.layer_norm1"
+            },
+            "out_syms": [
+              "%9"
+            ]
+          },
+          {
+            "name": "layers.0.ffn.act",
+            "type": "GELU",
+            "order": 10,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  512
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                512
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [],
+            "in_syms": [
+              "%9"
+            ],
+            "in_sym_sources": {
+              "%9": "layers.0.ffn.linear1"
+            },
+            "out_syms": [
+              "%10"
+            ]
+          },
+          {
+            "name": "layers.0.ffn.linear2",
+            "type": "Linear",
+            "order": 11,
+            "attrs": {
+              "in_features": 512,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  512
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  512
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%10"
+            ],
+            "in_sym_sources": {
+              "%10": "layers.0.ffn.act"
+            },
+            "out_syms": [
+              "%8"
+            ]
+          }
+        ],
+        "weights": [],
+        "in_syms": [
+          "%7"
+        ],
+        "in_sym_sources": {
+          "%7": "layers.0.layer_norm1"
+        },
+        "out_syms": [
+          "%8"
+        ]
+      },
+      {
+        "name": "layers.0.layer_norm2",
+        "type": "LayerNorm",
+        "order": 12,
+        "attrs": {
+          "normalized_shape": [
+            128
+          ],
+          "eps": 6.6666e-05
+        },
+        "meta": {
+          "schema": {
+            "eps": 6.6666e-05
+          }
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%11"
+        ],
+        "in_sym_sources": {
+          "%11": ""
+        },
+        "out_syms": [
+          "%7"
+        ]
+      }
+    ],
+    "weights": [],
+    "in_syms": [
+      "%0"
+    ],
+    "in_sym_sources": {
+      "%0": ""
+    },
+    "out_syms": [
+      "%7"
+    ]
+  },
+  {
+    "name": "layers.0.Q",
+    "type": "Linear",
+    "order": 2,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%0"
+    ],
+    "in_sym_sources": {
+      "%0": ""
+    },
+    "out_syms": [
+      "%1"
+    ]
+  },
+  {
+    "name": "layers.0.K",
+    "type": "Linear",
+    "order": 3,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%0"
+    ],
+    "in_sym_sources": {
+      "%0": ""
+    },
+    "out_syms": [
+      "%2"
+    ]
+  },
+  {
+    "name": "layers.0.V",
+    "type": "Linear",
+    "order": 4,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%0"
+    ],
+    "in_sym_sources": {
+      "%0": ""
+    },
+    "out_syms": [
+      "%3"
+    ]
+  },
+  {
+    "name": "layers.0.softmax",
+    "type": "Softmax",
+    "order": 5,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          4
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        4
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [],
+    "in_syms": [
+      "%4"
+    ],
+    "in_sym_sources": {
+      "%4": ""
+    },
+    "out_syms": [
+      "%5"
+    ]
+  },
+  {
+    "name": "layers.0.O",
+    "type": "Linear",
+    "order": 6,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%6"
+    ],
+    "in_sym_sources": {
+      "%6": ""
+    },
+    "out_syms": [
+      "%7"
+    ]
+  },
+  {
+    "name": "layers.0.layer_norm1",
+    "type": "LayerNorm",
+    "order": 7,
+    "attrs": {
+      "normalized_shape": [
+        128
+      ],
+      "eps": 3.1415926e-05
+    },
+    "meta": {
+      "schema": {
+        "eps": 3.1415926e-05
+      }
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%8"
+    ],
+    "in_sym_sources": {
+      "%8": ""
+    },
+    "out_syms": [
+      "%7"
+    ]
+  },
+  {
+    "name": "layers.0.ffn",
+    "type": "mlp",
+    "order": 8,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [
+      {
+        "name": "layers.0.ffn.linear1",
+        "type": "Linear",
+        "order": 9,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 512,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            512
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              512,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              512
+            ]
+          }
+        ],
+        "in_syms": [
+          "%7"
+        ],
+        "in_sym_sources": {
+          "%7": "layers.0.layer_norm1"
+        },
+        "out_syms": [
+          "%9"
+        ]
+      },
+      {
+        "name": "layers.0.ffn.act",
+        "type": "GELU",
+        "order": 10,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              512
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            512
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [],
+        "in_syms": [
+          "%9"
+        ],
+        "in_sym_sources": {
+          "%9": "layers.0.ffn.linear1"
+        },
+        "out_syms": [
+          "%10"
+        ]
+      },
+      {
+        "name": "layers.0.ffn.linear2",
+        "type": "Linear",
+        "order": 11,
+        "attrs": {
+          "in_features": 512,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              512
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              512
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%10"
+        ],
+        "in_sym_sources": {
+          "%10": "layers.0.ffn.act"
+        },
+        "out_syms": [
+          "%8"
+        ]
+      }
+    ],
+    "weights": [],
+    "in_syms": [
+      "%7"
+    ],
+    "in_sym_sources": {
+      "%7": "layers.0.layer_norm1"
+    },
+    "out_syms": [
+      "%8"
+    ]
+  },
+  {
+    "name": "layers.0.ffn.linear1",
+    "type": "Linear",
+    "order": 9,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 512,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        512
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          512,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          512
+        ]
+      }
+    ],
+    "in_syms": [
+      "%7"
+    ],
+    "in_sym_sources": {
+      "%7": "layers.0.layer_norm1"
+    },
+    "out_syms": [
+      "%9"
+    ]
+  },
+  {
+    "name": "layers.0.ffn.act",
+    "type": "GELU",
+    "order": 10,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          512
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        512
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [],
+    "in_syms": [
+      "%9"
+    ],
+    "in_sym_sources": {
+      "%9": "layers.0.ffn.linear1"
+    },
+    "out_syms": [
+      "%10"
+    ]
+  },
+  {
+    "name": "layers.0.ffn.linear2",
+    "type": "Linear",
+    "order": 11,
+    "attrs": {
+      "in_features": 512,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          512
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          512
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%10"
+    ],
+    "in_sym_sources": {
+      "%10": "layers.0.ffn.act"
+    },
+    "out_syms": [
+      "%8"
+    ]
+  },
+  {
+    "name": "layers.0.layer_norm2",
+    "type": "LayerNorm",
+    "order": 12,
+    "attrs": {
+      "normalized_shape": [
+        128
+      ],
+      "eps": 6.6666e-05
+    },
+    "meta": {
+      "schema": {
+        "eps": 6.6666e-05
+      }
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%11"
+    ],
+    "in_sym_sources": {
+      "%11": ""
+    },
+    "out_syms": [
+      "%7"
+    ]
+  },
+  {
+    "name": "layers.1",
+    "type": "TRANSFOMER_ENCODER",
+    "order": 13,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [
+      {
+        "name": "layers.1.Q",
+        "type": "Linear",
+        "order": 14,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%7"
+        ],
+        "in_sym_sources": {
+          "%7": "layers.0"
+        },
+        "out_syms": [
+          "%6"
+        ]
+      },
+      {
+        "name": "layers.1.K",
+        "type": "Linear",
+        "order": 15,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%7"
+        ],
+        "in_sym_sources": {
+          "%7": "layers.0"
+        },
+        "out_syms": [
+          "%11"
+        ]
+      },
+      {
+        "name": "layers.1.V",
+        "type": "Linear",
+        "order": 16,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%7"
+        ],
+        "in_sym_sources": {
+          "%7": "layers.0"
+        },
+        "out_syms": [
+          "%8"
+        ]
+      },
+      {
+        "name": "layers.1.softmax",
+        "type": "Softmax",
+        "order": 17,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              4
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            4
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [],
+        "in_syms": [
+          "%4"
+        ],
+        "in_sym_sources": {
+          "%4": ""
+        },
+        "out_syms": [
+          "%5"
+        ]
+      },
+      {
+        "name": "layers.1.O",
+        "type": "Linear",
+        "order": 18,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%3"
+        ],
+        "in_sym_sources": {
+          "%3": "layers.0.V"
+        },
+        "out_syms": [
+          "%2"
+        ]
+      },
+      {
+        "name": "layers.1.layer_norm1",
+        "type": "LayerNorm",
+        "order": 19,
+        "attrs": {
+          "normalized_shape": [
+            128
+          ],
+          "eps": 3.1415926e-05
+        },
+        "meta": {
+          "schema": {
+            "eps": 3.1415926e-05
+          }
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%1"
+        ],
+        "in_sym_sources": {
+          "%1": "layers.0.Q"
+        },
+        "out_syms": [
+          "%2"
+        ]
+      },
+      {
+        "name": "layers.1.ffn",
+        "type": "mlp",
+        "order": 20,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [
+          {
+            "name": "layers.1.ffn.linear1",
+            "type": "Linear",
+            "order": 21,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 512,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                512
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  512,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  512
+                ]
+              }
+            ],
+            "in_syms": [
+              "%2"
+            ],
+            "in_sym_sources": {
+              "%2": "layers.1.layer_norm1"
+            },
+            "out_syms": [
+              "%10"
+            ]
+          },
+          {
+            "name": "layers.1.ffn.act",
+            "type": "GELU",
+            "order": 22,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  512
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                512
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [],
+            "in_syms": [
+              "%10"
+            ],
+            "in_sym_sources": {
+              "%10": "layers.1.ffn.linear1"
+            },
+            "out_syms": [
+              "%9"
+            ]
+          },
+          {
+            "name": "layers.1.ffn.linear2",
+            "type": "Linear",
+            "order": 23,
+            "attrs": {
+              "in_features": 512,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  512
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  512
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%9"
+            ],
+            "in_sym_sources": {
+              "%9": "layers.1.ffn.act"
+            },
+            "out_syms": [
+              "%1"
+            ]
+          }
+        ],
+        "weights": [],
+        "in_syms": [
+          "%2"
+        ],
+        "in_sym_sources": {
+          "%2": "layers.1.layer_norm1"
+        },
+        "out_syms": [
+          "%1"
+        ]
+      },
+      {
+        "name": "layers.1.layer_norm2",
+        "type": "LayerNorm",
+        "order": 24,
+        "attrs": {
+          "normalized_shape": [
+            128
+          ],
+          "eps": 6.6666e-05
+        },
+        "meta": {
+          "schema": {
+            "eps": 6.6666e-05
+          }
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%12"
+        ],
+        "in_sym_sources": {
+          "%12": ""
+        },
+        "out_syms": [
+          "%13"
+        ]
+      }
+    ],
+    "weights": [],
+    "in_syms": [
+      "%7"
+    ],
+    "in_sym_sources": {
+      "%7": "layers.0"
+    },
+    "out_syms": [
+      "%13"
+    ]
+  },
+  {
+    "name": "layers.1.Q",
+    "type": "Linear",
+    "order": 14,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%7"
+    ],
+    "in_sym_sources": {
+      "%7": "layers.0"
+    },
+    "out_syms": [
+      "%6"
+    ]
+  },
+  {
+    "name": "layers.1.K",
+    "type": "Linear",
+    "order": 15,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%7"
+    ],
+    "in_sym_sources": {
+      "%7": "layers.0"
+    },
+    "out_syms": [
+      "%11"
+    ]
+  },
+  {
+    "name": "layers.1.V",
+    "type": "Linear",
+    "order": 16,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%7"
+    ],
+    "in_sym_sources": {
+      "%7": "layers.0"
+    },
+    "out_syms": [
+      "%8"
+    ]
+  },
+  {
+    "name": "layers.1.softmax",
+    "type": "Softmax",
+    "order": 17,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          4
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        4
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [],
+    "in_syms": [
+      "%4"
+    ],
+    "in_sym_sources": {
+      "%4": ""
+    },
+    "out_syms": [
+      "%5"
+    ]
+  },
+  {
+    "name": "layers.1.O",
+    "type": "Linear",
+    "order": 18,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%3"
+    ],
+    "in_sym_sources": {
+      "%3": "layers.0.V"
+    },
+    "out_syms": [
+      "%2"
+    ]
+  },
+  {
+    "name": "layers.1.layer_norm1",
+    "type": "LayerNorm",
+    "order": 19,
+    "attrs": {
+      "normalized_shape": [
+        128
+      ],
+      "eps": 3.1415926e-05
+    },
+    "meta": {
+      "schema": {
+        "eps": 3.1415926e-05
+      }
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%1"
+    ],
+    "in_sym_sources": {
+      "%1": "layers.0.Q"
+    },
+    "out_syms": [
+      "%2"
+    ]
+  },
+  {
+    "name": "layers.1.ffn",
+    "type": "mlp",
+    "order": 20,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [
+      {
+        "name": "layers.1.ffn.linear1",
+        "type": "Linear",
+        "order": 21,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 512,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            512
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              512,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              512
+            ]
+          }
+        ],
+        "in_syms": [
+          "%2"
+        ],
+        "in_sym_sources": {
+          "%2": "layers.1.layer_norm1"
+        },
+        "out_syms": [
+          "%10"
+        ]
+      },
+      {
+        "name": "layers.1.ffn.act",
+        "type": "GELU",
+        "order": 22,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              512
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            512
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [],
+        "in_syms": [
+          "%10"
+        ],
+        "in_sym_sources": {
+          "%10": "layers.1.ffn.linear1"
+        },
+        "out_syms": [
+          "%9"
+        ]
+      },
+      {
+        "name": "layers.1.ffn.linear2",
+        "type": "Linear",
+        "order": 23,
+        "attrs": {
+          "in_features": 512,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              512
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              512
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%9"
+        ],
+        "in_sym_sources": {
+          "%9": "layers.1.ffn.act"
+        },
+        "out_syms": [
+          "%1"
+        ]
+      }
+    ],
+    "weights": [],
+    "in_syms": [
+      "%2"
+    ],
+    "in_sym_sources": {
+      "%2": "layers.1.layer_norm1"
+    },
+    "out_syms": [
+      "%1"
+    ]
+  },
+  {
+    "name": "layers.1.ffn.linear1",
+    "type": "Linear",
+    "order": 21,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 512,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        512
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          512,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          512
+        ]
+      }
+    ],
+    "in_syms": [
+      "%2"
+    ],
+    "in_sym_sources": {
+      "%2": "layers.1.layer_norm1"
+    },
+    "out_syms": [
+      "%10"
+    ]
+  },
+  {
+    "name": "layers.1.ffn.act",
+    "type": "GELU",
+    "order": 22,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          512
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        512
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [],
+    "in_syms": [
+      "%10"
+    ],
+    "in_sym_sources": {
+      "%10": "layers.1.ffn.linear1"
+    },
+    "out_syms": [
+      "%9"
+    ]
+  },
+  {
+    "name": "layers.1.ffn.linear2",
+    "type": "Linear",
+    "order": 23,
+    "attrs": {
+      "in_features": 512,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          512
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          512
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%9"
+    ],
+    "in_sym_sources": {
+      "%9": "layers.1.ffn.act"
+    },
+    "out_syms": [
+      "%1"
+    ]
+  },
+  {
+    "name": "layers.1.layer_norm2",
+    "type": "LayerNorm",
+    "order": 24,
+    "attrs": {
+      "normalized_shape": [
+        128
+      ],
+      "eps": 6.6666e-05
+    },
+    "meta": {
+      "schema": {
+        "eps": 6.6666e-05
+      }
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%12"
+    ],
+    "in_sym_sources": {
+      "%12": ""
+    },
+    "out_syms": [
+      "%13"
+    ]
+  },
+  {
+    "name": "layers.2",
+    "type": "TRANSFOMER_ENCODER",
+    "order": 25,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [
+      {
+        "name": "layers.2.Q",
+        "type": "Linear",
+        "order": 26,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%13"
+        ],
+        "in_sym_sources": {
+          "%13": "layers.1"
+        },
+        "out_syms": [
+          "%12"
+        ]
+      },
+      {
+        "name": "layers.2.K",
+        "type": "Linear",
+        "order": 27,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%13"
+        ],
+        "in_sym_sources": {
+          "%13": "layers.1"
+        },
+        "out_syms": [
+          "%14"
+        ]
+      },
+      {
+        "name": "layers.2.V",
+        "type": "Linear",
+        "order": 28,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%13"
+        ],
+        "in_sym_sources": {
+          "%13": "layers.1"
+        },
+        "out_syms": [
+          "%15"
+        ]
+      },
+      {
+        "name": "layers.2.softmax",
+        "type": "Softmax",
+        "order": 29,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              4
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            4
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [],
+        "in_syms": [
+          "%4"
+        ],
+        "in_sym_sources": {
+          "%4": ""
+        },
+        "out_syms": [
+          "%5"
+        ]
+      },
+      {
+        "name": "layers.2.O",
+        "type": "Linear",
+        "order": 30,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%3"
+        ],
+        "in_sym_sources": {
+          "%3": "layers.0.V"
+        },
+        "out_syms": [
+          "%2"
+        ]
+      },
+      {
+        "name": "layers.2.layer_norm1",
+        "type": "LayerNorm",
+        "order": 31,
+        "attrs": {
+          "normalized_shape": [
+            128
+          ],
+          "eps": 3.1415926e-05
+        },
+        "meta": {
+          "schema": {
+            "eps": 3.1415926e-05
+          }
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%1"
+        ],
+        "in_sym_sources": {
+          "%1": "layers.1.ffn"
+        },
+        "out_syms": [
+          "%2"
+        ]
+      },
+      {
+        "name": "layers.2.ffn",
+        "type": "mlp",
+        "order": 32,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [
+          {
+            "name": "layers.2.ffn.linear1",
+            "type": "Linear",
+            "order": 33,
+            "attrs": {
+              "in_features": 128,
+              "out_features": 512,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  128
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                512
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  512,
+                  128
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  512
+                ]
+              }
+            ],
+            "in_syms": [
+              "%2"
+            ],
+            "in_sym_sources": {
+              "%2": "layers.2.layer_norm1"
+            },
+            "out_syms": [
+              "%9"
+            ]
+          },
+          {
+            "name": "layers.2.ffn.act",
+            "type": "GELU",
+            "order": 34,
+            "attrs": {},
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  512
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                512
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [],
+            "in_syms": [
+              "%9"
+            ],
+            "in_sym_sources": {
+              "%9": "layers.2.ffn.linear1"
+            },
+            "out_syms": [
+              "%10"
+            ]
+          },
+          {
+            "name": "layers.2.ffn.linear2",
+            "type": "Linear",
+            "order": 35,
+            "attrs": {
+              "in_features": 512,
+              "out_features": 128,
+              "bias": true
+            },
+            "meta": {
+              "schema": {}
+            },
+            "in": [
+              {
+                "shape": [
+                  2,
+                  4,
+                  512
+                ],
+                "dtype": "torch.float32",
+                "device": "cpu"
+              }
+            ],
+            "out": {
+              "shape": [
+                2,
+                4,
+                128
+              ],
+              "dtype": "torch.float32",
+              "device": "cpu"
+            },
+            "children": [],
+            "weights": [
+              {
+                "name": "weight",
+                "shape": [
+                  128,
+                  512
+                ]
+              },
+              {
+                "name": "bias",
+                "shape": [
+                  128
+                ]
+              }
+            ],
+            "in_syms": [
+              "%10"
+            ],
+            "in_sym_sources": {
+              "%10": "layers.2.ffn.act"
+            },
+            "out_syms": [
+              "%1"
+            ]
+          }
+        ],
+        "weights": [],
+        "in_syms": [
+          "%2"
+        ],
+        "in_sym_sources": {
+          "%2": "layers.2.layer_norm1"
+        },
+        "out_syms": [
+          "%1"
+        ]
+      },
+      {
+        "name": "layers.2.layer_norm2",
+        "type": "LayerNorm",
+        "order": 36,
+        "attrs": {
+          "normalized_shape": [
+            128
+          ],
+          "eps": 6.6666e-05
+        },
+        "meta": {
+          "schema": {
+            "eps": 6.6666e-05
+          }
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%6"
+        ],
+        "in_sym_sources": {
+          "%6": "layers.1.Q"
+        },
+        "out_syms": [
+          "%7"
+        ]
+      }
+    ],
+    "weights": [],
+    "in_syms": [
+      "%13"
+    ],
+    "in_sym_sources": {
+      "%13": "layers.1"
+    },
+    "out_syms": [
+      "%7"
+    ]
+  },
+  {
+    "name": "layers.2.Q",
+    "type": "Linear",
+    "order": 26,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%13"
+    ],
+    "in_sym_sources": {
+      "%13": "layers.1"
+    },
+    "out_syms": [
+      "%12"
+    ]
+  },
+  {
+    "name": "layers.2.K",
+    "type": "Linear",
+    "order": 27,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%13"
+    ],
+    "in_sym_sources": {
+      "%13": "layers.1"
+    },
+    "out_syms": [
+      "%14"
+    ]
+  },
+  {
+    "name": "layers.2.V",
+    "type": "Linear",
+    "order": 28,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%13"
+    ],
+    "in_sym_sources": {
+      "%13": "layers.1"
+    },
+    "out_syms": [
+      "%15"
+    ]
+  },
+  {
+    "name": "layers.2.softmax",
+    "type": "Softmax",
+    "order": 29,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          4
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        4
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [],
+    "in_syms": [
+      "%4"
+    ],
+    "in_sym_sources": {
+      "%4": ""
+    },
+    "out_syms": [
+      "%5"
+    ]
+  },
+  {
+    "name": "layers.2.O",
+    "type": "Linear",
+    "order": 30,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%3"
+    ],
+    "in_sym_sources": {
+      "%3": "layers.0.V"
+    },
+    "out_syms": [
+      "%2"
+    ]
+  },
+  {
+    "name": "layers.2.layer_norm1",
+    "type": "LayerNorm",
+    "order": 31,
+    "attrs": {
+      "normalized_shape": [
+        128
+      ],
+      "eps": 3.1415926e-05
+    },
+    "meta": {
+      "schema": {
+        "eps": 3.1415926e-05
+      }
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%1"
+    ],
+    "in_sym_sources": {
+      "%1": "layers.1.ffn"
+    },
+    "out_syms": [
+      "%2"
+    ]
+  },
+  {
+    "name": "layers.2.ffn",
+    "type": "mlp",
+    "order": 32,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [
+      {
+        "name": "layers.2.ffn.linear1",
+        "type": "Linear",
+        "order": 33,
+        "attrs": {
+          "in_features": 128,
+          "out_features": 512,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              128
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            512
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              512,
+              128
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              512
+            ]
+          }
+        ],
+        "in_syms": [
+          "%2"
+        ],
+        "in_sym_sources": {
+          "%2": "layers.2.layer_norm1"
+        },
+        "out_syms": [
+          "%9"
+        ]
+      },
+      {
+        "name": "layers.2.ffn.act",
+        "type": "GELU",
+        "order": 34,
+        "attrs": {},
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              512
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            512
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [],
+        "in_syms": [
+          "%9"
+        ],
+        "in_sym_sources": {
+          "%9": "layers.2.ffn.linear1"
+        },
+        "out_syms": [
+          "%10"
+        ]
+      },
+      {
+        "name": "layers.2.ffn.linear2",
+        "type": "Linear",
+        "order": 35,
+        "attrs": {
+          "in_features": 512,
+          "out_features": 128,
+          "bias": true
+        },
+        "meta": {
+          "schema": {}
+        },
+        "in": [
+          {
+            "shape": [
+              2,
+              4,
+              512
+            ],
+            "dtype": "torch.float32",
+            "device": "cpu"
+          }
+        ],
+        "out": {
+          "shape": [
+            2,
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "device": "cpu"
+        },
+        "children": [],
+        "weights": [
+          {
+            "name": "weight",
+            "shape": [
+              128,
+              512
+            ]
+          },
+          {
+            "name": "bias",
+            "shape": [
+              128
+            ]
+          }
+        ],
+        "in_syms": [
+          "%10"
+        ],
+        "in_sym_sources": {
+          "%10": "layers.2.ffn.act"
+        },
+        "out_syms": [
+          "%1"
+        ]
+      }
+    ],
+    "weights": [],
+    "in_syms": [
+      "%2"
+    ],
+    "in_sym_sources": {
+      "%2": "layers.2.layer_norm1"
+    },
+    "out_syms": [
+      "%1"
+    ]
+  },
+  {
+    "name": "layers.2.ffn.linear1",
+    "type": "Linear",
+    "order": 33,
+    "attrs": {
+      "in_features": 128,
+      "out_features": 512,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        512
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          512,
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          512
+        ]
+      }
+    ],
+    "in_syms": [
+      "%2"
+    ],
+    "in_sym_sources": {
+      "%2": "layers.2.layer_norm1"
+    },
+    "out_syms": [
+      "%9"
+    ]
+  },
+  {
+    "name": "layers.2.ffn.act",
+    "type": "GELU",
+    "order": 34,
+    "attrs": {},
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          512
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        512
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [],
+    "in_syms": [
+      "%9"
+    ],
+    "in_sym_sources": {
+      "%9": "layers.2.ffn.linear1"
+    },
+    "out_syms": [
+      "%10"
+    ]
+  },
+  {
+    "name": "layers.2.ffn.linear2",
+    "type": "Linear",
+    "order": 35,
+    "attrs": {
+      "in_features": 512,
+      "out_features": 128,
+      "bias": true
+    },
+    "meta": {
+      "schema": {}
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          512
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128,
+          512
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%10"
+    ],
+    "in_sym_sources": {
+      "%10": "layers.2.ffn.act"
+    },
+    "out_syms": [
+      "%1"
+    ]
+  },
+  {
+    "name": "layers.2.layer_norm2",
+    "type": "LayerNorm",
+    "order": 36,
+    "attrs": {
+      "normalized_shape": [
+        128
+      ],
+      "eps": 6.6666e-05
+    },
+    "meta": {
+      "schema": {
+        "eps": 6.6666e-05
+      }
+    },
+    "in": [
+      {
+        "shape": [
+          2,
+          4,
+          128
+        ],
+        "dtype": "torch.float32",
+        "device": "cpu"
+      }
+    ],
+    "out": {
+      "shape": [
+        2,
+        4,
+        128
+      ],
+      "dtype": "torch.float32",
+      "device": "cpu"
+    },
+    "children": [],
+    "weights": [
+      {
+        "name": "weight",
+        "shape": [
+          128
+        ]
+      },
+      {
+        "name": "bias",
+        "shape": [
+          128
+        ]
+      }
+    ],
+    "in_syms": [
+      "%6"
+    ],
+    "in_sym_sources": {
+      "%6": "layers.1.Q"
+    },
+    "out_syms": [
+      "%7"
+    ]
+  }
+]

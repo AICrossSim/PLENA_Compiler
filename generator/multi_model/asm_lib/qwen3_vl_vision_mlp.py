@@ -23,6 +23,7 @@ Important constraints in the current PLENA stack:
   be preloaded in FPRAM.
 """
 
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +85,15 @@ class Qwen3VLVisionMLPArtifacts:
     @property
     def asm(self) -> str:
         return self.program.compile()
+
+
+@dataclass
+class Qwen3VLVisionMLPEmission:
+    """Returned emission bundle for shared-context lowering."""
+
+    output: VRAMMatrixVar
+    created_tensors: list[str]
+    freed_tensors: list[str]
 
 
 class Qwen3VLVisionMLPCompiler:
@@ -160,35 +170,18 @@ class Qwen3VLVisionMLPCompiler:
 
         hidden_vram = prog.load_batch(hidden_state, name="hidden_state")
 
-        fc1_out = self._compile_linear(
+        emission = self.emit(
             prog=prog,
-            source=hidden_vram,
-            weight=linear_fc1_weight,
-            out_features=self.spec.intermediate_size,
-            output_name="linear_fc1_out",
-            bias=linear_fc1_bias,
+            hidden_state=hidden_vram,
+            linear_fc1_weight=linear_fc1_weight,
+            linear_fc2_weight=linear_fc2_weight,
+            namespace="vision_mlp",
+            linear_fc1_bias=linear_fc1_bias,
+            linear_fc2_bias=linear_fc2_bias,
+            free_hidden_state=True,
+            mark_result=True,
         )
-        prog.free_tensor(hidden_vram)
-
-        activated = self._apply_activation(
-            prog=prog,
-            source=fc1_out,
-            output_name="vision_mlp_act",
-        )
-        if activated.name != fc1_out.name:
-            prog.free_tensor(fc1_out)
-
-        output = self._compile_linear(
-            prog=prog,
-            source=activated,
-            weight=linear_fc2_weight,
-            out_features=self.spec.hidden_size,
-            output_name="vision_mlp_out",
-            bias=linear_fc2_bias,
-        )
-        prog.free_tensor(activated)
-
-        prog.result(output)
+        output = emission.output
 
         return Qwen3VLVisionMLPArtifacts(
             program=prog,
@@ -198,6 +191,78 @@ class Qwen3VLVisionMLPCompiler:
             linear_fc1_bias=linear_fc1_bias,
             linear_fc2_bias=linear_fc2_bias,
             output=output,
+        )
+
+    def emit(
+        self,
+        *,
+        prog: PLENAProgram,
+        hidden_state: VRAMMatrixVar,
+        linear_fc1_weight: InputVar,
+        linear_fc2_weight: InputVar,
+        namespace: str,
+        linear_fc1_bias: Optional[InputVar] = None,
+        linear_fc2_bias: Optional[InputVar] = None,
+        free_hidden_state: bool = False,
+        mark_result: bool = False,
+    ) -> Qwen3VLVisionMLPEmission:
+        """Emit one Qwen3VLVisionMLP instance into an existing shared PLENAProgram."""
+        rows, hidden_size = hidden_state.shape
+        self._validate_dim("seq_len", rows)
+        self._validate_dim("hidden_size", hidden_size)
+        self._validate_dim("intermediate_size", self.spec.intermediate_size)
+        if hidden_size != self.spec.hidden_size:
+            raise ValueError(
+                f"hidden_state width {hidden_size} does not match spec.hidden_size={self.spec.hidden_size}"
+            )
+
+        ns = self._namespace(namespace)
+        created_tensors: list[str] = []
+        freed_tensors: list[str] = []
+
+        fc1_out = self._compile_linear(
+            prog=prog,
+            source=hidden_state,
+            weight=linear_fc1_weight,
+            out_features=self.spec.intermediate_size,
+            output_name=f"{ns}_linear_fc1_out",
+            bias=linear_fc1_bias,
+        )
+        created_tensors.append(fc1_out.name)
+        if free_hidden_state:
+            prog.free_tensor(hidden_state)
+            freed_tensors.append(hidden_state.name)
+
+        activated = self._apply_activation(
+            prog=prog,
+            source=fc1_out,
+            output_name=f"{ns}_act",
+        )
+        if activated.name != fc1_out.name:
+            created_tensors.append(activated.name)
+            prog.free_tensor(fc1_out)
+            freed_tensors.append(fc1_out.name)
+
+        output = self._compile_linear(
+            prog=prog,
+            source=activated,
+            weight=linear_fc2_weight,
+            out_features=self.spec.hidden_size,
+            output_name=f"{ns}_out",
+            bias=linear_fc2_bias,
+        )
+        created_tensors.append(output.name)
+        if activated.name != output.name:
+            prog.free_tensor(activated)
+            freed_tensors.append(activated.name)
+
+        if mark_result:
+            prog.result(output)
+
+        return Qwen3VLVisionMLPEmission(
+            output=output,
+            created_tensors=created_tensors,
+            freed_tensors=freed_tensors,
         )
 
     def _compile_linear(
@@ -480,6 +545,10 @@ class Qwen3VLVisionMLPCompiler:
             raise ValueError(
                 f"{name}={value} must be a multiple of mlen={self.mlen} for the current asm_lib."
             )
+
+    def _namespace(self, namespace: str) -> str:
+        normalized = re.sub(r"[^0-9A-Za-z_]+", "_", namespace).strip("_")
+        return normalized or "vision_mlp"
 
 
 def build_qwen3_vl_vision_mlp_program(

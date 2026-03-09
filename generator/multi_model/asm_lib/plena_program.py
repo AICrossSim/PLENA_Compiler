@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Callable, Union
 from functools import wraps
 
+sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from developer_compiler import DeveloperCompiler
@@ -332,6 +333,35 @@ class PLENAProgram:
 
         var = VRAMMatrixVar(self, internal_name, (rows, cols), display_name=display_name)
         self._tensors[internal_name] = var
+        return var
+
+    def bind_vram(self, name: str, shape: Tuple[int, int], vram_addr: int) -> VRAMMatrixVar:
+        """
+        Bind an already-existing VRAM matrix into this program without allocating it.
+
+        This is used when a shared lowering needs to consume an activation that was
+        materialized by a different codegen path but still lives at a known on-chip
+        address.
+        """
+        display_name = name
+        internal_name = self._scoped_name(name)
+        rows, cols = shape
+        end_addr = vram_addr + rows * cols
+        if self._compiler.sub_matrix_manager.vram_allocator.next_free < end_addr:
+            self._compiler.sub_matrix_manager.vram_allocator.next_free = end_addr
+        self._compiler.sub_matrix_manager.add_vram_object(
+            name=internal_name,
+            shape=shape,
+            vram_addr=vram_addr,
+            dtype="fp16",
+            kind="Batch",
+            allocate_if_none=False,
+        )
+
+        var = VRAMMatrixVar(self, internal_name, shape, display_name=display_name)
+        self._tensors[internal_name] = var
+        # Sub-matrix layout is already registered by add_vram_object().
+        self._registered_vram_sub_matrices[internal_name] = True
         return var
 
     def free_tensor(self, tensor_var: TensorVar):

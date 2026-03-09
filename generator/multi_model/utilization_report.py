@@ -50,7 +50,7 @@ _FFN_HINTS = ("mlp", "ffn", "feed_forward", "gate_proj", "up_proj", "down_proj",
 _NORM_HINTS = ("norm", "layernorm", "rmsnorm")
 _VISION_HINTS = ("visual", "vision", "image", "patch", "pixel")
 _TEXT_HINTS = ("language", "text", "token", "lm_head", "embed_tokens")
-_CROSS_HINTS = ("projector", "merger", "fusion", "cross")
+_CROSS_HINTS = ("projector", "merger", "fusion", "cross", "multi_modal", "mm_projector")
 
 
 def _product(values: Iterable[int]) -> int:
@@ -147,12 +147,24 @@ def _first_meta(node: dict[str, Any], key: str) -> dict[str, Any] | None:
 
 def _guess_source_branch(name: str) -> str:
     lname = name.lower()
+    if any(token in lname for token in _CROSS_HINTS):
+        return "cross_modal"
     if any(token in lname for token in _VISION_HINTS):
         return "vision"
     if any(token in lname for token in _TEXT_HINTS):
         return "text"
-    if any(token in lname for token in _CROSS_HINTS):
+    return "shared"
+
+
+def _collapse_branch_candidates(candidates: Iterable[str]) -> str:
+    normalized = {str(candidate) for candidate in candidates if candidate not in (None, "", "__input__")}
+    if "cross_modal" in normalized:
         return "cross_modal"
+    focused = {candidate for candidate in normalized if candidate != "shared"}
+    if len(focused) > 1:
+        return "cross_modal"
+    if len(focused) == 1:
+        return next(iter(focused))
     return "shared"
 
 
@@ -431,12 +443,15 @@ def _build_symbol_table(
                 {
                     "symbol": symbol,
                     "producer": "__input__",
+                    "producer_branch": "__input__",
                     "birth_order": -1,
                     "shape": meta.get("shape"),
                     "dtype": meta.get("dtype"),
                     "device": meta.get("device"),
                     "bytes": _bytes_for(meta.get("shape"), meta.get("dtype")),
                     "alias_producers": [],
+                    "branch_candidates": {_guess_source_branch(str(node.get("name", "")))},
+                    "consumer_branches": set(),
                 },
             )
             if info.get("shape") is None and meta.get("shape") is not None:
@@ -444,24 +459,31 @@ def _build_symbol_table(
                 info["dtype"] = meta.get("dtype")
                 info["device"] = meta.get("device")
                 info["bytes"] = _bytes_for(meta.get("shape"), meta.get("dtype"))
+            info["branch_candidates"].add(_guess_source_branch(str(node.get("name", ""))))
+            info["consumer_branches"].add(_guess_source_branch(str(node.get("name", ""))))
             symbol_uses[symbol].append(int(node["order"]))
 
         for symbol, meta in output_pairs.items():
+            node_branch = _guess_source_branch(str(node.get("name", "")))
             if symbol not in symbols:
                 symbols[symbol] = {
                     "symbol": symbol,
                     "producer": node["name"],
+                    "producer_branch": node_branch,
                     "birth_order": int(node["order"]),
                     "shape": meta.get("shape"),
                     "dtype": meta.get("dtype"),
                     "device": meta.get("device"),
                     "bytes": _bytes_for(meta.get("shape"), meta.get("dtype")),
                     "alias_producers": [],
+                    "branch_candidates": {node_branch},
+                    "consumer_branches": set(),
                 }
             else:
                 existing = symbols[symbol]
                 existing_birth = int(existing["birth_order"])
                 current_order = int(node["order"])
+                existing["branch_candidates"].add(node_branch)
                 if existing_birth < 0:
                     if existing["producer"] != node["name"]:
                         existing["alias_producers"].append(node["name"])
@@ -469,6 +491,7 @@ def _build_symbol_table(
                     if existing["producer"] != node["name"]:
                         existing["alias_producers"].append(existing["producer"])
                     existing["producer"] = node["name"]
+                    existing["producer_branch"] = node_branch
                     existing["birth_order"] = current_order
                     existing["shape"] = meta.get("shape") or existing.get("shape")
                     existing["dtype"] = meta.get("dtype") or existing.get("dtype")
@@ -492,6 +515,11 @@ def _build_symbol_table(
         info["retired_after_order"] = info["last_use_order"]
         info["is_model_input"] = info["birth_order"] < 0
         info["is_model_output"] = symbol in output_symbols
+        info["source_branch"] = _collapse_branch_candidates(
+            set(info.get("branch_candidates", set()))
+            | set(info.get("consumer_branches", set()))
+            | {info.get("producer_branch", "shared")}
+        )
 
     return symbols, output_symbols
 
@@ -510,9 +538,41 @@ def _analyze_memory_timeline(
     def _live_bytes(active: set[str]) -> int:
         return sum(int(symbols[symbol]["bytes"]) for symbol in active)
 
+    def _live_bytes_by_branch(active: set[str]) -> dict[str, int]:
+        by_branch: dict[str, int] = defaultdict(int)
+        for symbol in active:
+            by_branch[str(symbols[symbol].get("source_branch", "shared"))] += int(symbols[symbol]["bytes"])
+        return dict(sorted(by_branch.items()))
+
+    def _symbols_by_branch(active: set[str]) -> dict[str, list[str]]:
+        by_branch: dict[str, list[str]] = defaultdict(list)
+        for symbol in sorted(active):
+            by_branch[str(symbols[symbol].get("source_branch", "shared"))].append(symbol)
+        return dict(by_branch)
+
     peak_bytes = _live_bytes(live_symbols)
     peak_step = -1 if peak_bytes else None
     peak_symbols = sorted(live_symbols)
+    branch_peak_summary: dict[str, dict[str, Any]] = {}
+
+    def _update_branch_peaks(order: int | None, active: set[str]) -> None:
+        branch_live = _live_bytes_by_branch(active)
+        branch_symbols = _symbols_by_branch(active)
+        for branch, live_bytes in branch_live.items():
+            peak = branch_peak_summary.setdefault(
+                branch,
+                {
+                    "peak_live_bytes": 0,
+                    "peak_live_step": None,
+                    "peak_live_symbols": [],
+                },
+            )
+            if live_bytes > peak["peak_live_bytes"]:
+                peak["peak_live_bytes"] = live_bytes
+                peak["peak_live_step"] = order
+                peak["peak_live_symbols"] = branch_symbols.get(branch, [])
+
+    _update_branch_peaks(-1 if peak_bytes else None, live_symbols)
 
     for node in ordered_nodes:
         order = int(node["order"])
@@ -528,10 +588,12 @@ def _analyze_memory_timeline(
                 allocated_symbols.append(symbol)
 
         live_after_alloc = _live_bytes(live_symbols)
+        live_after_alloc_by_branch = _live_bytes_by_branch(live_symbols)
         if live_after_alloc > peak_bytes:
             peak_bytes = live_after_alloc
             peak_step = order
             peak_symbols = sorted(live_symbols)
+        _update_branch_peaks(order, live_symbols)
 
         retired_symbols = [
             symbol
@@ -550,10 +612,17 @@ def _analyze_memory_timeline(
                 "live_bytes_before_op": live_before,
                 "live_bytes_after_alloc": live_after_alloc,
                 "live_bytes_after_retire": live_after_retire,
+                "live_bytes_by_source_branch": live_after_alloc_by_branch,
                 "allocated_symbols": allocated_symbols,
                 "retired_symbols": retired_symbols,
             }
         )
+
+    final_live_bytes_by_branch = _live_bytes_by_branch(live_symbols)
+    for branch, peak in branch_peak_summary.items():
+        peak["peak_live_bytes_human"] = _human_bytes(int(peak["peak_live_bytes"]))
+        peak["final_live_bytes"] = final_live_bytes_by_branch.get(branch, 0)
+        peak["final_live_bytes_human"] = _human_bytes(int(peak["final_live_bytes"]))
 
     summary = {
         "input_live_bytes": _live_bytes(
@@ -569,6 +638,8 @@ def _analyze_memory_timeline(
         "peak_live_symbols": peak_symbols,
         "final_live_bytes": _live_bytes(live_symbols),
         "final_live_symbols": sorted(live_symbols),
+        "by_source_branch": dict(sorted(branch_peak_summary.items())),
+        "final_live_bytes_by_source_branch": final_live_bytes_by_branch,
     }
     return timeline, summary
 
@@ -604,6 +675,79 @@ def _bucketize(nodes: list[dict[str, Any]], key: str) -> dict[str, Any]:
             "compute_utilization": _safe_ratio(bucket["useful_flops"], bucket["scheduled_flops"]),
         }
     return dict(sorted(result.items()))
+
+
+def _build_branch_analysis(
+    analysed_nodes: list[dict[str, Any]],
+    memory_summary: dict[str, Any],
+    memory_capacity: int | None,
+    *,
+    top_k: int = 5,
+) -> dict[str, Any]:
+    compute_by_branch = _bucketize(analysed_nodes, "source_branch")
+    memory_by_branch = memory_summary.get("by_source_branch", {})
+    branches = sorted(set(compute_by_branch) | set(memory_by_branch))
+    branch_analysis: dict[str, Any] = {}
+
+    for branch in branches:
+        compute = compute_by_branch.get(
+            branch,
+            {
+                "node_count": 0,
+                "input_bytes": 0,
+                "output_bytes": 0,
+                "parameter_bytes_estimate": 0,
+                "useful_flops": 0,
+                "scheduled_flops": 0,
+                "padding_waste_flops": 0,
+                "compute_utilization": None,
+            },
+        )
+        memory = memory_by_branch.get(
+            branch,
+            {
+                "peak_live_bytes": 0,
+                "peak_live_bytes_human": _human_bytes(0),
+                "peak_live_step": None,
+                "peak_live_symbols": [],
+                "final_live_bytes": 0,
+                "final_live_bytes_human": _human_bytes(0),
+            },
+        )
+        branch_nodes = [node for node in analysed_nodes if node["source_branch"] == branch]
+        hot_nodes = sorted(
+            branch_nodes,
+            key=lambda node: (
+                int(node["compute"]["scheduled_flops"]),
+                int(node["memory"]["live_bytes_after_alloc"]),
+            ),
+            reverse=True,
+        )[:top_k]
+
+        branch_analysis[branch] = {
+            **compute,
+            "peak_live_bytes": memory["peak_live_bytes"],
+            "peak_live_bytes_human": memory["peak_live_bytes_human"],
+            "peak_live_step": memory["peak_live_step"],
+            "peak_live_symbols": memory["peak_live_symbols"],
+            "final_live_bytes": memory["final_live_bytes"],
+            "final_live_bytes_human": memory["final_live_bytes_human"],
+            "memory_utilization_ratio": _safe_ratio(memory["peak_live_bytes"], memory_capacity),
+            "hot_nodes": [
+                {
+                    "order": node["order"],
+                    "name": node["name"],
+                    "type": node["type"],
+                    "semantic_group": node["semantic_group"],
+                    "compute_utilization": node["compute"]["compute_utilization"],
+                    "scheduled_flops": node["compute"]["scheduled_flops"],
+                    "live_bytes_after_alloc": node["memory"]["live_bytes_after_alloc"],
+                }
+                for node in hot_nodes
+            ],
+        }
+
+    return branch_analysis
 
 
 def analyse_trace_utilization(
@@ -701,12 +845,17 @@ def analyse_trace_utilization(
             "timeline": memory_timeline,
             "symbols": [
                 {
-                    **info,
+                    **{
+                        key: value
+                        for key, value in info.items()
+                        if key not in {"branch_candidates", "consumer_branches"}
+                    },
                     "bytes_human": _human_bytes(int(info["bytes"])),
                 }
                 for _, info in sorted(symbols.items(), key=lambda item: (int(item[1]["birth_order"]), item[0]))
             ],
         },
+        "branch_analysis": _build_branch_analysis(analysed_nodes, memory_summary, memory_capacity),
         "nodes": analysed_nodes,
     }
     return report
@@ -744,6 +893,7 @@ def render_markdown_report(report: dict[str, Any], *, top_k: int = 12) -> str:
     memory = report["memory"]
     model_info = report.get("model_info", {})
     hardware = report.get("hardware", {})
+    branch_analysis = report.get("branch_analysis", {})
     top_nodes = sorted(
         report.get("nodes", []),
         key=lambda node: (
@@ -787,6 +937,43 @@ def render_markdown_report(report: dict[str, Any], *, top_k: int = 12) -> str:
     lines.extend(_format_top_rows(list(summary["by_semantic_group"].items()), title="By Semantic Group"))
     lines.extend([""])
     lines.extend(_format_top_rows(list(summary["by_source_branch"].items()), title="By Source Branch"))
+    lines.extend([""])
+
+    for branch in ("vision", "text", "cross_modal", "shared"):
+        if branch not in branch_analysis:
+            continue
+        branch_report = branch_analysis[branch]
+        lines.extend(
+            [
+                f"## {branch.title()} Branch",
+                "",
+                f"- Nodes: {branch_report['node_count']}",
+                f"- Compute Utilization: {_format_ratio(branch_report.get('compute_utilization'))}",
+                f"- Useful FLOPs: {branch_report['useful_flops']}",
+                f"- Scheduled FLOPs: {branch_report['scheduled_flops']}",
+                f"- Peak Live Memory: {branch_report['peak_live_bytes_human']}",
+                f"- Peak Memory Utilization: {_format_ratio(branch_report.get('memory_utilization_ratio'))}",
+                f"- Peak Live Step: {branch_report.get('peak_live_step')}",
+                "",
+                "| Order | Name | Type | Semantic Group | Compute Utilization | Live Bytes After Alloc |",
+                "| ---: | --- | --- | --- | ---: | ---: |",
+            ]
+        )
+        hot_nodes = branch_report.get("hot_nodes", [])[: min(5, top_k)]
+        for node in hot_nodes:
+            lines.append(
+                "| "
+                f"{node['order']} | "
+                f"{node['name'] or '(root)'} | "
+                f"{node['type']} | "
+                f"{node['semantic_group']} | "
+                f"{_format_ratio(node.get('compute_utilization'))} | "
+                f"{node['live_bytes_after_alloc']} |"
+            )
+        if len(hot_nodes) == 0:
+            lines.append("| 0 | (none) | N/A | other | N/A | 0 |")
+        lines.extend([""])
+
     lines.extend(["", "## Hot Nodes", "", "| Order | Name | Type | Semantic Group | Compute Utilization | Live Bytes After Alloc |", "| ---: | --- | --- | --- | ---: | ---: |"])
 
     for node in top_nodes:

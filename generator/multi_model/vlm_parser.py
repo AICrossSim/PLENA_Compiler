@@ -1,3 +1,4 @@
+import json
 import operator
 import types
 from typing import Any, Dict, List, Optional
@@ -18,6 +19,13 @@ def _static_attrs(m: nn.Module) -> dict:
         return {"normalized_shape": list(m.normalized_shape), "eps": m.eps}
     if isinstance(m, nn.Embedding):
         return {"num_embeddings": m.num_embeddings, "embedding_dim": m.embedding_dim}
+    if isinstance(m, nn.Conv2d):
+        return {
+            "in_channels": m.in_channels,
+            "out_channels": m.out_channels,
+            "kernel_size": list(m.kernel_size),
+            "stride": list(m.stride),
+        }
     if isinstance(m, nn.Conv3d):
         return {
             "in_channels": m.in_channels,
@@ -41,6 +49,28 @@ def _static_attrs(m: nn.Module) -> dict:
     return {}
 
 
+def _extract_norm_eps(module_name: str, module: nn.Module, attrs: Optional[dict[str, Any]] = None) -> Optional[float]:
+    """Best-effort eps extraction for norm-like modules."""
+    norm_hint = f"{module_name} {type(module).__name__}".lower()
+    if not isinstance(module, nn.LayerNorm) and "norm" not in norm_hint:
+        return None
+
+    if isinstance(module, nn.LayerNorm):
+        return float(module.eps)
+
+    if attrs is not None:
+        value = attrs.get("eps")
+        if isinstance(value, (int, float)):
+            return float(value)
+
+    for attr_name in ("eps", "variance_epsilon", "layer_norm_eps", "rms_norm_eps", "norm_eps"):
+        value = getattr(module, attr_name, None)
+        if isinstance(value, (int, float)):
+            return float(value)
+
+    return None
+
+
 # Maps torch.fx call_function targets → ISA-relevant operation type names.
 # Extend this table when adding support for new operation types.
 _FX_OPS: dict[Any, str] = {
@@ -51,6 +81,11 @@ _FX_OPS: dict[Any, str] = {
     torch.nn.functional.relu:          "relu",
     torch.nn.functional.softmax:       "softmax",
 }
+
+_VISION_HINTS = ("visual", "vision", "image", "patch", "pixel")
+_TEXT_HINTS = ("language", "text", "token", "embed_tokens", "lm_head")
+_TEXT_INPUT_HINTS = ("input_ids", "inputs_embeds", "token", "text", "ids", "attention_mask")
+_VISION_INPUT_HINTS = ("pixel_values", "image", "images", "vision", "pixel", "patch")
 
 
 class VLMModelParser:
@@ -183,13 +218,14 @@ class VLMModelParser:
         if sample_input is not None:
             if sample_input.dim() >= 1:
                 info["batch_size"] = int(sample_input.shape[0])
-            if sample_input.dim() >= 2:
+            if sample_input.dim() in (2, 3):
                 info["seq_len"] = int(sample_input.shape[1])
-            if sample_input.dtype.is_floating_point and sample_input.dim() >= 2:
+            if sample_input.dtype.is_floating_point and sample_input.dim() in (2, 3):
                 info["hidden_size"] = int(sample_input.shape[-1])
 
         first_embedding: Optional[nn.Embedding] = None
         first_linear: Optional[nn.Linear] = None
+        first_conv: Optional[nn.Module] = None
         first_norm_dim: Optional[int] = None
         first_eps: Optional[float] = None
         intermediate_candidates: list[int] = []
@@ -200,6 +236,9 @@ class VLMModelParser:
 
             if first_linear is None and isinstance(module, nn.Linear):
                 first_linear = module
+
+            if first_conv is None and isinstance(module, (nn.Conv2d, nn.Conv3d)):
+                first_conv = module
 
             if isinstance(module, nn.LayerNorm):
                 if first_norm_dim is None:
@@ -222,6 +261,8 @@ class VLMModelParser:
                 info["hidden_size"] = int(first_embedding.embedding_dim)
             elif first_linear is not None:
                 info["hidden_size"] = int(first_linear.in_features)
+            elif first_conv is not None:
+                info["hidden_size"] = int(first_conv.out_channels)
             elif first_norm_dim is not None:
                 info["hidden_size"] = first_norm_dim
 
@@ -250,6 +291,182 @@ class VLMModelParser:
             info["head_dim"] = hidden_size // num_heads
 
         return info
+
+    def _guess_branch_from_name(self, name: str) -> Optional[str]:
+        lname = name.lower()
+        if any(token in lname for token in _VISION_HINTS):
+            return "vision"
+        if any(token in lname for token in _TEXT_HINTS):
+            return "text"
+        return None
+
+    def _branch_sample_input(self, inputs: Any, branch: str) -> Optional[torch.Tensor]:
+        if not isinstance(inputs, dict):
+            return self._first_tensor(inputs)
+
+        hints = _VISION_INPUT_HINTS if branch == "vision" else _TEXT_INPUT_HINTS
+        for hint in hints:
+            for name, value in inputs.items():
+                if isinstance(value, torch.Tensor) and hint in name.lower():
+                    return value
+        return None
+
+    def _normalize_dim_value(self, value: Any) -> Optional[int | list[int]]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Size):
+            value = list(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, (list, tuple)) and value:
+            normalized: list[int] = []
+            for item in value:
+                if not isinstance(item, (int, float)):
+                    return None
+                normalized.append(int(item))
+            return normalized if len(normalized) > 1 else normalized[0]
+        return None
+
+    def _module_descendant_count(self, module: nn.Module) -> int:
+        return sum(1 for _ in module.modules())
+
+    def _find_branch_root(self, model: nn.Module, branch: str) -> Optional[nn.Module]:
+        best_module: Optional[nn.Module] = None
+        best_score: Optional[tuple[int, int, int, int]] = None
+
+        for name, module in model.named_modules():
+            if not name:
+                continue
+            branch_guess = self._guess_branch_from_name(f"{name} {type(module).__name__}")
+            if branch_guess != branch:
+                continue
+
+            has_children = 1 if any(True for _ in module.children()) else 0
+            descendants = self._module_descendant_count(module)
+            depth = -name.count(".")
+            name_len = -len(name)
+            score = (has_children, descendants, depth, name_len)
+            if best_score is None or score > best_score:
+                best_module = module
+                best_score = score
+
+        return best_module
+
+    def _first_named_attr(
+        self,
+        model: nn.Module,
+        attr_names: tuple[str, ...],
+    ) -> Optional[int | list[int]]:
+        for attr in attr_names:
+            normalized = self._normalize_dim_value(getattr(model, attr, None))
+            if normalized is not None:
+                return normalized
+
+        for _, module in model.named_modules():
+            for attr in attr_names:
+                normalized = self._normalize_dim_value(getattr(module, attr, None))
+                if normalized is not None:
+                    return normalized
+        return None
+
+    def _infer_image_size(
+        self,
+        model: nn.Module,
+        sample_input: Optional[torch.Tensor],
+    ) -> Optional[int | list[int]]:
+        image_size = self._first_named_attr(model, ("image_size", "img_size", "image_resolution", "input_size"))
+        if image_size is not None:
+            return image_size
+
+        if isinstance(sample_input, torch.Tensor) and sample_input.dim() >= 4:
+            return [int(sample_input.shape[-2]), int(sample_input.shape[-1])]
+        return None
+
+    def _infer_patch_size(self, model: nn.Module) -> Optional[int | list[int]]:
+        patch_size = self._first_named_attr(model, ("patch_size", "patch_shape", "patch_resolution"))
+        if patch_size is not None:
+            return patch_size
+
+        for name, module in model.named_modules():
+            lname = name.lower()
+            if isinstance(module, (nn.Conv2d, nn.Conv3d)) and any(token in lname for token in ("patch", "embed", "proj")):
+                patch_size = self._normalize_dim_value(module.kernel_size)
+                if patch_size is not None:
+                    return patch_size
+        return None
+
+    def _derive_patch_num(
+        self,
+        image_size: Optional[int | list[int]],
+        patch_size: Optional[int | list[int]],
+    ) -> Optional[int]:
+        if image_size is None or patch_size is None:
+            return None
+
+        if isinstance(image_size, int) and isinstance(patch_size, int):
+            if patch_size <= 0 or image_size <= 0 or image_size % patch_size != 0:
+                return None
+            patches_per_side = image_size // patch_size
+            return patches_per_side * patches_per_side
+
+        image_dims = [image_size] if isinstance(image_size, int) else list(image_size)
+        patch_dims = [patch_size] if isinstance(patch_size, int) else list(patch_size)
+        if not image_dims or not patch_dims:
+            return None
+
+        if len(patch_dims) == 1 and len(image_dims) > 1:
+            patch_dims = patch_dims * len(image_dims)
+        elif len(image_dims) != len(patch_dims):
+            dims = min(len(image_dims), len(patch_dims))
+            image_dims = image_dims[-dims:]
+            patch_dims = patch_dims[-dims:]
+
+        patch_num = 1
+        for img_dim, patch_dim in zip(image_dims, patch_dims):
+            if patch_dim <= 0 or img_dim <= 0 or img_dim % patch_dim != 0:
+                return None
+            patch_num *= img_dim // patch_dim
+        return patch_num
+
+    def _infer_patch_num(
+        self,
+        model: nn.Module,
+        image_size: Optional[int | list[int]],
+        patch_size: Optional[int | list[int]],
+    ) -> Optional[int]:
+        patch_num = self._first_named_attr(model, ("num_patches", "patch_num", "patch_count"))
+        if isinstance(patch_num, int):
+            return patch_num
+        return self._derive_patch_num(image_size, patch_size)
+
+    def _infer_vlm_branch_info(self, model: nn.Module, inputs: Any) -> dict[str, dict[str, Any]]:
+        branch_info: dict[str, dict[str, Any]] = {}
+
+        for branch in ("text", "vision"):
+            branch_root = self._find_branch_root(model, branch)
+            if branch_root is None:
+                continue
+
+            sample_input = self._branch_sample_input(inputs, branch)
+            info = self._infer_custom_model_info(branch_root, sample_input)
+
+            if branch == "vision":
+                image_size = self._infer_image_size(branch_root, sample_input)
+                if image_size is not None:
+                    info["image_size"] = image_size
+
+                patch_size = self._infer_patch_size(branch_root)
+                if patch_size is not None:
+                    info["patch_size"] = patch_size
+
+                patch_num = self._infer_patch_num(branch_root, image_size, patch_size)
+                if patch_num is not None:
+                    info["patch_num"] = patch_num
+
+            if info:
+                branch_info[branch] = info
+
+        return branch_info
 
     def extract_model_info(
         self,
@@ -315,14 +532,67 @@ class VLMModelParser:
                 if vision_hidden is not None:
                     model_info["vision_hidden_size"] = vision_hidden
                 vision_heads = getattr(vision_cfg, "num_heads", getattr(vision_cfg, "num_attention_heads", None))
+                if vision_heads is not None:
+                    model_info["vision_num_attention_heads"] = vision_heads
+                vision_layers = getattr(vision_cfg, "num_hidden_layers", getattr(vision_cfg, "depth", None))
+                if vision_layers is not None:
+                    model_info["vision_num_layers"] = vision_layers
                 if vision_hidden is not None and vision_heads:
                     model_info["vision_head_dim"] = getattr(vision_cfg, "head_dim", vision_hidden // vision_heads)
+                image_size = self._normalize_dim_value(
+                    getattr(vision_cfg, "image_size", getattr(vision_cfg, "img_size", None))
+                )
+                if image_size is not None:
+                    model_info["image_size"] = image_size
+                patch_size = self._normalize_dim_value(
+                    getattr(vision_cfg, "patch_size", getattr(vision_cfg, "spatial_patch_size", None))
+                )
+                if patch_size is not None:
+                    model_info["patch_size"] = patch_size
+                patch_num = getattr(vision_cfg, "num_patches", None)
+                if patch_num is None:
+                    patch_num = self._derive_patch_num(image_size, patch_size)
+                if patch_num is not None:
+                    model_info["patch_num"] = int(patch_num)
         else:
             model_info = {
                 "model_name": type(model).__name__,
                 "architecture": type(model).__name__,
             }
             model_info.update(self._infer_custom_model_info(model, sample_input))
+
+            branch_info = self._infer_vlm_branch_info(model, active_inputs)
+            text_info = branch_info.get("text")
+            if text_info is not None:
+                for key in (
+                    "batch_size",
+                    "seq_len",
+                    "hidden_size",
+                    "intermediate_size",
+                    "num_attention_heads",
+                    "num_key_value_heads",
+                    "num_layers",
+                    "vocab_size",
+                    "eps",
+                    "head_dim",
+                ):
+                    if key in text_info:
+                        model_info[key] = text_info[key]
+
+            vision_info = branch_info.get("vision")
+            if vision_info is not None:
+                for src_key, dst_key in (
+                    ("hidden_size", "vision_hidden_size"),
+                    ("intermediate_size", "vision_intermediate_size"),
+                    ("num_attention_heads", "vision_num_attention_heads"),
+                    ("num_layers", "vision_num_layers"),
+                    ("head_dim", "vision_head_dim"),
+                    ("image_size", "image_size"),
+                    ("patch_size", "patch_size"),
+                    ("patch_num", "patch_num"),
+                ):
+                    if src_key in vision_info:
+                        model_info[dst_key] = vision_info[src_key]
 
         input_shapes = self._tensor_input_shapes(active_inputs)
         if input_shapes:
@@ -420,6 +690,7 @@ class VLMModelParser:
                 "in_syms":        list[str]   runtime symbol for each input tensor (parallel to "in")
                 "out_syms":       list[str]   runtime symbol for each output tensor
                 "in_sym_sources": dict        {sym: producer_module_name} ("" = model input)
+                "meta":           dict        extra per-node metadata, e.g. {"schema": {"eps": float}}
             }
 
         Use flatten_call_tree(root) to get a flat, order-sorted list.
@@ -451,11 +722,16 @@ class VLMModelParser:
             def _pre_hook(m, args, kwargs):
                 in_ts = [a for a in list(args) + list(kwargs.values()) if isinstance(a, torch.Tensor)]
                 in_syms = [_sym(t) for t in in_ts]
+                schema: dict[str, Any] = {}
+                norm_eps = _extract_norm_eps(name, m, attrs)
+                if norm_eps is not None:
+                    schema["eps"] = norm_eps
                 node = {
                     "name": name,
                     "type": mod_type,
                     "order": counter[0],
                     "attrs": attrs,
+                    "meta": {"schema": schema},
                     "in": [shape_of(t) for t in in_ts],
                     "out": None,
                     "children": [],
@@ -604,7 +880,7 @@ class VLMModelParser:
                     "source": "fx",
                     "children": [],
                 })
-
+        print("===== FX trace complete: captured {} nodes =====".format(len(nodes)))
         return nodes
 
 
@@ -652,7 +928,32 @@ def flatten_call_tree(root: dict) -> list[dict]:
         for child in node["children"]:
             _walk(child)
     _walk(root)
+    print("===== Call tree flattened: {} nodes =====".format(len(result)))
     return sorted(result, key=lambda n: n["order"])
+
+
+def export_flatten_call_tree(flattened: list[dict], output_path: str | Path) -> Path:
+    """
+    Write a flattened call tree to a standalone JSON file.
+    """
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    output_file.write_text(json.dumps(flattened, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"===== Flattened call tree exported to {output_file} =====")
+    return output_file
+
+
+def export_model_info(model_info: dict[str, Any], output_path: str | Path) -> Path:
+    """
+    Write extract_model_info output to a standalone JSON file.
+    """
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    output_file.write_text(json.dumps(model_info, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"===== Model info exported to {output_file} =====")
+    return output_file
 
 
 def combine_traces(hook_trace: dict, fx_trace: list[dict]) -> list[dict]:
@@ -683,7 +984,7 @@ if __name__ == "__main__":
     #   "combined" – hook trace visual encoder + FX trace language model, merged
     #   "compile"  – torch.compile with plena backend
     #   "export"   – torch.export symbolic graph
-    TEST_MODE = "trace"
+    TEST_MODE = "export_info"
 
     # ===== config parser =====
     parser = VLMModelParser("Qwen/Qwen3-VL-2B-Instruct")
@@ -863,3 +1164,7 @@ if __name__ == "__main__":
 
     elif TEST_MODE == "export":
         parser.create_symbolic_graph()
+        
+    elif TEST_MODE == "export_info":
+        model_info = parser.extract_model_info(parser.model, inputs)
+        export_model_info(model_info, "./outputs/model_info.json")

@@ -157,6 +157,82 @@ class MiniTransformerWithResidual(nn.Module):
         return self.norm(x)
 
 
+class BranchAttention(nn.Module):
+    """Attention-like block with an explicit num_heads attribute."""
+
+    def __init__(self, hidden_size: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.q_proj(x) + self.k_proj(x) + self.v_proj(x)
+
+
+class MiniTextBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int):
+        super().__init__()
+        self.self_attn = BranchAttention(hidden_size, num_heads)
+        self.mlp = MiniMLP(hidden_size, hidden_size * 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.self_attn(x))
+
+
+class MiniTextTower(nn.Module):
+    def __init__(self, vocab: int = 64, hidden_size: int = 12, n_layers: int = 3, num_heads: int = 3):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, hidden_size)
+        self.layers = nn.ModuleList([MiniTextBlock(hidden_size, num_heads) for _ in range(n_layers)])
+        self.norm = FakeRMSNorm(hidden_size)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
+
+
+class MiniVisionBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int):
+        super().__init__()
+        self.attn = BranchAttention(hidden_size, num_heads)
+        self.mlp = MiniMLP(hidden_size, hidden_size * 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.attn(x))
+
+
+class MiniVisionTower(nn.Module):
+    def __init__(self, image_size: int = 224, patch_size: int = 16, hidden_size: int = 32, n_layers: int = 2, num_heads: int = 4):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.patch_embed = nn.Conv2d(3, hidden_size, kernel_size=patch_size, stride=patch_size)
+        self.blocks = nn.ModuleList([MiniVisionBlock(hidden_size, num_heads) for _ in range(n_layers)])
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(pixel_values)
+        x = x.flatten(2).transpose(1, 2)
+        for block in self.blocks:
+            x = block(x)
+        return self.norm(x)
+
+
+class MiniVLMNoConfig(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.text_model = MiniTextTower(vocab=64, hidden_size=12, n_layers=3, num_heads=3)
+        self.vision_tower = MiniVisionTower(image_size=224, patch_size=16, hidden_size=32, n_layers=2, num_heads=4)
+        self.multi_modal_projector = nn.Linear(32, 12)
+
+    def forward(self, input_ids: torch.Tensor, pixel_values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.text_model(input_ids), self.vision_tower(pixel_values)
+
+
 # ---------------------------------------------------------------------------
 # Helper — create a VLMModelParser without loading any real model
 # ---------------------------------------------------------------------------
@@ -204,6 +280,14 @@ class TestStaticAttrs(unittest.TestCase):
         self.assertEqual(a["out_channels"], 16)
         self.assertEqual(a["kernel_size"], [2, 14, 14])
         self.assertEqual(a["stride"], [2, 14, 14])
+
+    def test_conv2d(self):
+        m = nn.Conv2d(3, 16, kernel_size=14, stride=14)
+        a = _static_attrs(m)
+        self.assertEqual(a["in_channels"], 3)
+        self.assertEqual(a["out_channels"], 16)
+        self.assertEqual(a["kernel_size"], [14, 14])
+        self.assertEqual(a["stride"], [14, 14])
 
     def test_fake_rms_norm(self):
         m = FakeRMSNorm(64, eps=1e-5)
@@ -274,6 +358,36 @@ class TestExtractModelInfo(unittest.TestCase):
         self.assertEqual(info["num_attention_heads"], 1)
         self.assertEqual(info["head_dim"], 8)
         self.assertEqual(info["input_shapes"]["ids"], [2, 5])
+
+    def test_custom_vlm_model_info_without_config(self):
+        model = MiniVLMNoConfig()
+        self.parser.load_model(model)
+        self.parser.load_inputs(
+            {
+                "pixel_values": torch.randn(2, 3, 224, 224),
+                "input_ids": torch.randint(0, 64, (2, 7)),
+            }
+        )
+
+        info = self.parser.extract_model_info()
+
+        self.assertEqual(info["model_name"], "MiniVLMNoConfig")
+        self.assertEqual(info["hidden_size"], 12)
+        self.assertEqual(info["num_layers"], 3)
+        self.assertEqual(info["num_attention_heads"], 3)
+        self.assertEqual(info["head_dim"], 4)
+        self.assertEqual(info["vocab_size"], 64)
+        self.assertEqual(info["batch_size"], 2)
+        self.assertEqual(info["seq_len"], 7)
+        self.assertEqual(info["vision_hidden_size"], 32)
+        self.assertEqual(info["vision_num_layers"], 2)
+        self.assertEqual(info["vision_num_attention_heads"], 4)
+        self.assertEqual(info["vision_head_dim"], 8)
+        self.assertEqual(info["image_size"], 224)
+        self.assertEqual(info["patch_size"], 16)
+        self.assertEqual(info["patch_num"], 196)
+        self.assertEqual(info["input_shapes"]["pixel_values"], [2, 3, 224, 224])
+        self.assertEqual(info["input_shapes"]["input_ids"], [2, 7])
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +538,14 @@ class TestTraceLeafModules(unittest.TestCase):
         norm = next(n for n in flat if n["name"] == "norm")
         self.assertEqual(norm["attrs"]["normalized_shape"], [16])
 
+    def test_layer_norm_eps_stored_in_meta_schema(self):
+        model = MiniMLP()
+        tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
+        flat = flatten_call_tree(tree)
+        norm = next(n for n in flat if n["name"] == "norm")
+        self.assertIn("meta", norm)
+        self.assertEqual(norm["meta"]["schema"]["eps"], model.norm.eps)
+
     # ── nested network ────────────────────────────────────────────────────
 
     def test_nested_names_present(self):
@@ -483,6 +605,14 @@ class TestTraceLeafModules(unittest.TestCase):
         norm_node = next(n for n in flat if n["name"] == "norm")
         self.assertEqual(norm_node["attrs"]["hidden_size"], 8)
         self.assertIn("eps", norm_node["attrs"])
+
+    def test_fake_rms_norm_eps_stored_in_meta_schema(self):
+        model = MiniTransformer(vocab=32, d=8, n_layers=2)
+        ids = torch.randint(0, 32, (1, 4))
+        tree = self.parser.trace_leaf_modules(model, {"ids": ids})
+        flat = flatten_call_tree(tree)
+        norm_node = next(n for n in flat if n["name"] == "norm")
+        self.assertEqual(norm_node["meta"]["schema"]["eps"], model.norm.variance_epsilon)
 
     # ── RoPE modules must appear in trace ─────────────────────────────────
 

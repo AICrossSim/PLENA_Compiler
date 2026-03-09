@@ -11,7 +11,7 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from utilization_report import analyse_trace_utilization
+from utilization_report import analyse_trace_utilization, render_markdown_report
 from vlm_parser import VLMModelParser
 
 
@@ -54,6 +54,17 @@ class TinyAttentionModel(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
         return self.o_proj(q + k + v)
+
+
+class TinyBranchVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.visual_encoder = nn.Linear(4, 4, bias=False)
+        self.language_model = nn.Linear(4, 4, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        vision_tokens = self.visual_encoder(x)
+        return self.language_model(vision_tokens)
 
 
 class TestTraceUtilizationReport(unittest.TestCase):
@@ -108,6 +119,25 @@ class TestTraceUtilizationReport(unittest.TestCase):
         self.assertEqual(report["summary"]["by_op_family"]["matmul"]["node_count"], 4)
         self.assertEqual(report["summary"]["by_semantic_group"]["attention"]["node_count"], 4)
         self.assertAlmostEqual(report["summary"]["overall_compute_utilization"], 0.75)
+
+    def test_branch_analysis_separates_vision_and_text(self):
+        model = TinyBranchVLM()
+        x = torch.randn(2, 4)
+        tree = self.parser.trace_leaf_modules(model, {"x": x})
+
+        report = analyse_trace_utilization(
+            tree,
+            hw={"tile_m": 4, "tile_k": 4, "tile_n": 4, "memory_capacity_bytes": 128},
+        )
+
+        self.assertEqual(report["branch_analysis"]["vision"]["node_count"], 1)
+        self.assertEqual(report["branch_analysis"]["text"]["node_count"], 1)
+        self.assertGreater(report["branch_analysis"]["vision"]["peak_live_bytes"], 0)
+        self.assertGreater(report["branch_analysis"]["text"]["peak_live_bytes"], 0)
+
+        markdown = render_markdown_report(report)
+        self.assertIn("## Vision Branch", markdown)
+        self.assertIn("## Text Branch", markdown)
 
 
 if __name__ == "__main__":

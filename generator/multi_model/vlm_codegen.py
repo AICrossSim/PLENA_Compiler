@@ -23,12 +23,15 @@ from vlm_codegen_generator import VLMAssemblyGenerator  # noqa: E402
 def vlm_codegen(
     nodes: list[dict],
     model_info: dict[str, Any],
+    mode: str = "default",
     hw: dict[str, Any] | None = None,
     sched: dict[str, Any] | None = None,
 ) -> str:
     """Generate PLENA assembly from traced VLM nodes."""
     env = VLMCodegenEnvironment(hw=hw, sched=sched)
     generator = VLMAssemblyGenerator(env)
+    if mode == "debug":
+        generator.debug_mode(True)
     return generator.generate(nodes, model_info)
 
 
