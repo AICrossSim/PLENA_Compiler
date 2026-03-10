@@ -13,6 +13,7 @@ import io
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.nn as nn
@@ -20,7 +21,7 @@ import torch.nn as nn
 # Make the parser package importable when run from any cwd
 sys.path.insert(0, str(Path(__file__).parent))
 
-from vlm_parser import VLMModelParser, _static_attrs, combine_traces, flatten_call_tree
+from vlm_parser import VLMModelParser, _static_attrs
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +397,9 @@ class TestExtractModelInfo(unittest.TestCase):
 
 
 class TestFlattenCallTree(unittest.TestCase):
+    def setUp(self):
+        self.parser = make_parser()
+
     def _make_tree(self):
         """
         Build a hand-crafted tree:
@@ -409,21 +413,21 @@ class TestFlattenCallTree(unittest.TestCase):
         return root
 
     def test_length(self):
-        flat = flatten_call_tree(self._make_tree())
+        flat = self.parser.flatten_call_tree(self._make_tree())
         self.assertEqual(len(flat), 4)
 
     def test_sorted_by_order(self):
-        flat = flatten_call_tree(self._make_tree())
+        flat = self.parser.flatten_call_tree(self._make_tree())
         orders = [n["order"] for n in flat]
         self.assertEqual(orders, sorted(orders))
 
     def test_all_names_present(self):
-        flat = flatten_call_tree(self._make_tree())
+        flat = self.parser.flatten_call_tree(self._make_tree())
         self.assertEqual({n["name"] for n in flat}, {"root", "a", "b", "c"})
 
     def test_single_node(self):
         root = {"name": "x", "order": 0, "children": []}
-        flat = flatten_call_tree(root)
+        flat = self.parser.flatten_call_tree(root)
         self.assertEqual(len(flat), 1)
         self.assertEqual(flat[0]["name"], "x")
 
@@ -433,7 +437,7 @@ class TestFlattenCallTree(unittest.TestCase):
         c = {"name": "c", "order": 2, "children": [d]}
         b = {"name": "b", "order": 1, "children": [c]}
         a = {"name": "a", "order": 0, "children": [b]}
-        flat = flatten_call_tree(a)
+        flat = self.parser.flatten_call_tree(a)
         self.assertEqual([n["name"] for n in flat], ["a", "b", "c", "d"])
 
 
@@ -452,6 +456,45 @@ class TestTraceLeafModules(unittest.TestCase):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
         self.assertIsInstance(tree, dict)
+        self.assertIs(tree, self.parser.traced_tree)
+
+    def test_trace_populates_flattened_traced_tree(self):
+        model = MiniMLP()
+        tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
+        self.assertEqual(self.parser.flattened_traced_tree, self.parser.flatten_call_tree(tree))
+
+    def test_trace_sets_mode(self):
+        model = MiniMLP()
+        self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
+        self.assertEqual(self.parser.mode, "trace")
+
+    def test_trace_uses_loaded_model_and_inputs_when_args_are_none(self):
+        model = MiniMLP()
+        x = torch.randn(2, 8)
+        self.parser.load_model(model)
+        self.parser.load_inputs({"x": x})
+
+        tree = self.parser.trace_leaf_modules(None, None)
+
+        self.assertEqual(tree["type"], "MiniMLP")
+        self.assertEqual(tree["in"][0]["shape"], [2, 8])
+
+    def test_trace_auto_loads_model_when_initialized_with_model_name(self):
+        parser = VLMModelParser("synthetic-model-name")
+        model = MiniMLP()
+        x = torch.randn(2, 8)
+
+        def _fake_load_model(model_arg=None):
+            self.assertIsNone(model_arg)
+            parser.model = model
+
+        parser.load_inputs({"x": x})
+        with mock.patch.object(parser, "load_model", side_effect=_fake_load_model) as load_model_mock:
+            tree = parser.trace_leaf_modules(None, None)
+
+        load_model_mock.assert_called_once_with()
+        self.assertEqual(tree["type"], "MiniMLP")
+        self.assertEqual(tree["in"][0]["shape"], [2, 8])
 
     def test_required_keys_present(self):
         model = MiniMLP()
@@ -494,7 +537,7 @@ class TestTraceLeafModules(unittest.TestCase):
     def test_execution_order_is_consecutive(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         orders = [n["order"] for n in flat]
         self.assertEqual(orders, list(range(len(flat))))
 
@@ -526,7 +569,7 @@ class TestTraceLeafModules(unittest.TestCase):
     def test_linear_attrs_captured(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         fc1 = next(n for n in flat if n["name"] == "fc1")
         self.assertEqual(fc1["attrs"]["in_features"], 8)
         self.assertEqual(fc1["attrs"]["out_features"], 16)
@@ -534,17 +577,10 @@ class TestTraceLeafModules(unittest.TestCase):
     def test_layer_norm_attrs_captured(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         norm = next(n for n in flat if n["name"] == "norm")
         self.assertEqual(norm["attrs"]["normalized_shape"], [16])
 
-    def test_layer_norm_eps_stored_in_meta_schema(self):
-        model = MiniMLP()
-        tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
-        norm = next(n for n in flat if n["name"] == "norm")
-        self.assertIn("meta", norm)
-        self.assertEqual(norm["meta"]["schema"]["eps"], model.norm.eps)
 
     # ── nested network ────────────────────────────────────────────────────
 
@@ -555,7 +591,7 @@ class TestTraceLeafModules(unittest.TestCase):
         print("== Nested Call Tree ==")
         print(tree)  # for debugging if test fails
         print("======================")
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         names = {n["name"] for n in flat}
         for expected in (
             "embed",
@@ -575,7 +611,7 @@ class TestTraceLeafModules(unittest.TestCase):
         model = MiniTransformer(vocab=32, d=8, n_layers=2)
         ids = torch.randint(0, 32, (1, 4))
         tree = self.parser.trace_leaf_modules(model, {"ids": ids})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         names = {n["name"] for n in flat}
         self.assertNotIn("blocks", names)
 
@@ -585,14 +621,14 @@ class TestTraceLeafModules(unittest.TestCase):
         model = MiniTransformer(vocab=32, d=8, n_layers=2)
         ids = torch.randint(0, 32, (1, 4))
         tree = self.parser.trace_leaf_modules(model, {"ids": ids})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         self.assertEqual(len(flat), 21)
 
     def test_embedding_attrs_nested(self):
         model = MiniTransformer(vocab=32, d=8, n_layers=2)
         ids = torch.randint(0, 32, (1, 4))
         tree = self.parser.trace_leaf_modules(model, {"ids": ids})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         embed_node = next(n for n in flat if n["name"] == "embed")
         self.assertEqual(embed_node["attrs"]["num_embeddings"], 32)
         self.assertEqual(embed_node["attrs"]["embedding_dim"], 8)
@@ -601,18 +637,11 @@ class TestTraceLeafModules(unittest.TestCase):
         model = MiniTransformer(vocab=32, d=8, n_layers=2)
         ids = torch.randint(0, 32, (1, 4))
         tree = self.parser.trace_leaf_modules(model, {"ids": ids})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         norm_node = next(n for n in flat if n["name"] == "norm")
         self.assertEqual(norm_node["attrs"]["hidden_size"], 8)
         self.assertIn("eps", norm_node["attrs"])
 
-    def test_fake_rms_norm_eps_stored_in_meta_schema(self):
-        model = MiniTransformer(vocab=32, d=8, n_layers=2)
-        ids = torch.randint(0, 32, (1, 4))
-        tree = self.parser.trace_leaf_modules(model, {"ids": ids})
-        flat = flatten_call_tree(tree)
-        norm_node = next(n for n in flat if n["name"] == "norm")
-        self.assertEqual(norm_node["meta"]["schema"]["eps"], model.norm.variance_epsilon)
 
     # ── RoPE modules must appear in trace ─────────────────────────────────
 
@@ -630,7 +659,7 @@ class TestTraceLeafModules(unittest.TestCase):
         model = ModelWithVisionRoPE()
         x = torch.randn(1, 8)
         tree = self.parser.trace_leaf_modules(model, {"x": x})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         names = {n["name"] for n in flat}
         self.assertIn("rope", names)
         rope_node = next(n for n in flat if n["name"] == "rope")
@@ -650,7 +679,7 @@ class TestTraceLeafModules(unittest.TestCase):
         model = ModelWithTextRoPE()
         x = torch.randn(1, 8)
         tree = self.parser.trace_leaf_modules(model, {"x": x})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         names = {n["name"] for n in flat}
         self.assertIn("rope", names)
         rope_node = next(n for n in flat if n["name"] == "rope")
@@ -729,14 +758,14 @@ class TestTraceLeafModulesSymbolsWeights(unittest.TestCase):
     def test_weights_is_list(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         for n in flat:
             self.assertIsInstance(n["weights"], list)
 
     def test_weight_entries_have_name_and_shape(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         fc1 = next(n for n in flat if n["name"] == "fc1")
         for w in fc1["weights"]:
             self.assertIn("name", w)
@@ -747,7 +776,7 @@ class TestTraceLeafModulesSymbolsWeights(unittest.TestCase):
         # nn.Linear(8, 16) with bias → weight [16, 8], bias [16]
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         fc1 = next(n for n in flat if n["name"] == "fc1")
         w_entry = next(w for w in fc1["weights"] if w["name"] == "weight")
         self.assertEqual(w_entry["shape"], [16, 8])
@@ -771,14 +800,14 @@ class TestTraceLeafModulesSymbolsWeights(unittest.TestCase):
     def test_in_syms_parallel_to_in(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         for n in flat:
             self.assertEqual(len(n["in_syms"]), len(n["in"]))
 
     def test_in_syms_are_strings(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         for n in flat:
             for s in n["in_syms"]:
                 self.assertIsInstance(s, str)
@@ -787,14 +816,14 @@ class TestTraceLeafModulesSymbolsWeights(unittest.TestCase):
     def test_out_syms_nonempty_for_tensor_output(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         for n in flat:
             self.assertGreater(len(n["out_syms"]), 0, f"{n['name']} has no out_syms")
 
     def test_out_syms_are_strings(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         for n in flat:
             for s in n["out_syms"]:
                 self.assertIsInstance(s, str)
@@ -805,7 +834,7 @@ class TestTraceLeafModulesSymbolsWeights(unittest.TestCase):
     def test_in_sym_sources_keys_match_in_syms(self):
         model = MiniMLP()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(2, 8)})
-        flat = flatten_call_tree(tree)
+        flat = self.parser.flatten_call_tree(tree)
         for n in flat:
             for s in n["in_syms"]:
                 self.assertIn(s, n["in_sym_sources"])
@@ -861,6 +890,7 @@ class TestFxModuleLevelTrace(unittest.TestCase):
         model = MiniBlockWithResidual()
         nodes = self.parser.trace_fx_module_level(model, _FX_LEAVES)
         self.assertIsInstance(nodes, list)
+        self.assertEqual(self.parser.mode, "fx")
 
     def test_all_nodes_tagged_fx(self):
         model = MiniMLP()
@@ -880,7 +910,7 @@ class TestFxModuleLevelTrace(unittest.TestCase):
         """Baseline: hook trace cannot see bare tensor + ops."""
         model = MiniBlockWithResidual()
         tree = self.parser.trace_leaf_modules(model, {"x": torch.randn(1, 4, 8)})
-        types = {n["type"] for n in flatten_call_tree(tree)}
+        types = {n["type"] for n in self.parser.flatten_call_tree(tree)}
         self.assertNotIn("elementwise_add", types)
 
     def test_fx_trace_captures_residuals(self):
@@ -980,7 +1010,7 @@ class TestCombineTraces(unittest.TestCase):
         self.fx_nodes = self.parser.trace_fx_module_level(self.fx_model, _FX_LEAVES)
 
     def _combined(self):
-        return combine_traces(self.hook_tree, self.fx_nodes)
+        return self.parser.combine_traces(self.hook_tree, self.fx_nodes)
 
     # ── return type ───────────────────────────────────────────────────────
 
@@ -992,7 +1022,7 @@ class TestCombineTraces(unittest.TestCase):
     def test_hook_nodes_tagged(self):
         combined = self._combined()
         hook_part = [n for n in combined if n.get("source") == "hook"]
-        self.assertEqual(len(hook_part), len(flatten_call_tree(self.hook_tree)))
+        self.assertEqual(len(hook_part), len(self.parser.flatten_call_tree(self.hook_tree)))
 
     def test_fx_nodes_tagged(self):
         combined = self._combined()

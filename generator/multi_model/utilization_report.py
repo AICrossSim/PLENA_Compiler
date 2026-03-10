@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-    from .vlm_parser import VLMModelParser, flatten_call_tree, template_qwen3_vl_inputs
+    from .vlm_parser import VLMModelParser, template_qwen3_vl_inputs
 except ImportError:
-    from vlm_parser import VLMModelParser, flatten_call_tree, template_qwen3_vl_inputs
+    from vlm_parser import VLMModelParser, template_qwen3_vl_inputs
 
 
 DEFAULT_HW: dict[str, int | None] = {
@@ -205,7 +205,7 @@ def _flatten_trace(trace_or_nodes: dict[str, Any] | list[dict[str, Any]]) -> lis
         return sorted([deepcopy(node) for node in trace_or_nodes], key=lambda node: int(node["order"]))
     if isinstance(trace_or_nodes, dict):
         if "children" in trace_or_nodes:
-            return flatten_call_tree(deepcopy(trace_or_nodes))
+            return VLMModelParser().flatten_call_tree(deepcopy(trace_or_nodes))
         if "nodes" in trace_or_nodes:
             return sorted([deepcopy(node) for node in trace_or_nodes["nodes"]], key=lambda node: int(node["order"]))
     raise TypeError("Expected a trace tree dict or a flat list of nodes")
@@ -1052,10 +1052,13 @@ def main() -> int:
     inputs = template_qwen3_vl_inputs(parser.processor, args.image, text=args.text)
     model = parser.model.model if hasattr(parser.model, "model") else parser.model
 
-    trace_tree = parser.trace_leaf_modules(
+    parser.trace_leaf_modules(
         model,
         {**inputs, "use_cache": False, "return_dict": False},
     )
+    trace_tree = parser.traced_tree
+    if trace_tree is None:
+        raise RuntimeError("traced_tree was not populated after tracing")
     model_info = parser.extract_model_info(inputs=inputs)
 
     report = analyse_trace_utilization(

@@ -14,7 +14,10 @@ def main() -> int:
 
     parser = VLMModelParser()
     parser.load_model(model)
-    trace_tree = parser.trace_leaf_modules(model, {"x": x})
+    parser.trace_leaf_modules(model, {"x": x})
+    trace_tree = parser.traced_tree
+    if trace_tree is None:
+        raise RuntimeError("traced_tree was not populated after tracing")
     model_info = parser.extract_model_info(model=model, inputs={"x": x})
 
     report = analyse_trace_utilization(

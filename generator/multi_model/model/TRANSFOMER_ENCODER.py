@@ -68,6 +68,23 @@ def copy_encoder_layer_weights(my: TRANSFOMER_ENCODER, ref: nn.TransformerEncode
 
     my.layer_norm2.weight.data.copy_(ref.norm2.weight.data)
     my.layer_norm2.bias.data.copy_(ref.norm2.bias.data)
+    
+class MultiLayerEncoder(nn.Module):
+    def __init__(self, num_layers=2, hidden_size=4096):
+        super().__init__()
+        self.layers = nn.ModuleList([TRANSFOMER_ENCODER(hidden_size) for _ in range(num_layers)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+__all__ = [
+    "TRANSFOMER_ENCODER",
+    "MultiLayerEncoder",
+    "mlp",
+    "copy_encoder_layer_weights"
+]
 
 if __name__ == "__main__":
     torch.manual_seed(2061452)

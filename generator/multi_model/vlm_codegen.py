@@ -15,7 +15,7 @@ for _p in [str(_PARSER_DIR), str(_PROJECT_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from vlm_parser import VLMModelParser, flatten_call_tree, template_qwen3_vl_inputs  # noqa: E402
+from vlm_parser import VLMModelParser, template_qwen3_vl_inputs  # noqa: E402
 from vlm_codegen_env import DEFAULT_HW, DEFAULT_SCHED, VLMCodegenEnvironment  # noqa: E402
 from vlm_codegen_generator import VLMAssemblyGenerator  # noqa: E402
 
@@ -42,7 +42,6 @@ __all__ = [
     "VLMAssemblyGenerator",
     "VLMCodegenEnvironment",
     "VLMModelParser",
-    "flatten_call_tree",
     "template_qwen3_vl_inputs",
     "vlm_codegen",
 ]
@@ -62,7 +61,9 @@ if __name__ == "__main__":
         parser.model.model,
         {**inputs, "use_cache": False, "return_dict": False},
     )
-    nodes = flatten_call_tree(trace_tree)
+    nodes = parser.flattened_traced_tree
+    if nodes is None:
+        raise RuntimeError("flattened_traced_tree was not populated after tracing")
 
     cfg = parser.config
     txt_cfg = cfg.text_config

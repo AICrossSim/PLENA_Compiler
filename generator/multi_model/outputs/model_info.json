@@ -1,20 +1,38 @@
 {
-  "model_name": "MultiLayerEncoder",
-  "architecture": "MultiLayerEncoder",
-  "batch_size": 2,
-  "seq_len": 4,
-  "hidden_size": 128,
-  "intermediate_size": 512,
-  "eps": 3.1415926e-05,
-  "num_attention_heads": 1,
-  "num_key_value_heads": 1,
-  "num_layers": 3,
+  "model_name": "Qwen/Qwen3-VL-2B-Instruct",
+  "architecture": "Qwen3VLForConditionalGeneration",
+  "batch_size": 1,
+  "seq_len": 3116,
+  "hidden_size": 2048,
+  "intermediate_size": 6144,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 8,
+  "num_layers": 28,
+  "vocab_size": 151936,
+  "context_length": 262144,
+  "eps": 1e-06,
   "head_dim": 128,
+  "vision_hidden_size": 1024,
+  "vision_num_attention_heads": 16,
+  "vision_num_layers": 24,
+  "vision_head_dim": 64,
+  "patch_size": 16,
   "input_shapes": {
-    "x": [
-      2,
-      4,
-      128
+    "input_ids": [
+      1,
+      3116
+    ],
+    "attention_mask": [
+      1,
+      3116
+    ],
+    "pixel_values": [
+      12408,
+      1536
+    ],
+    "image_grid_thw": [
+      1,
+      3
     ]
   }
 }

@@ -75,6 +75,8 @@ class TestTraceUtilizationReport(unittest.TestCase):
         model = ChainModel()
         ids = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
         tree = self.parser.trace_leaf_modules(model, {"ids": ids})
+        self.assertIs(tree, self.parser.traced_tree)
+        self.assertEqual(self.parser.mode, "trace")
 
         report = analyse_trace_utilization(
             tree,
@@ -94,6 +96,7 @@ class TestTraceUtilizationReport(unittest.TestCase):
         model = HalfLinearModel().half()
         x = torch.randn(2, 4, dtype=torch.float16)
         tree = self.parser.trace_leaf_modules(model, {"x": x})
+        self.assertIsNotNone(self.parser.flattened_traced_tree)
 
         report = analyse_trace_utilization(tree, hw={"memory_capacity_bytes": 128})
 

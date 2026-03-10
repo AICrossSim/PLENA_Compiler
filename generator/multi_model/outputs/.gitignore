@@ -5,3 +5,8 @@ preview/*.asm
 report.*
 *.md
 hardware_settings.*
+
+*model_info.json
+*_report.*
+*_trace.*
+*.asm

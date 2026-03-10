@@ -49,28 +49,6 @@ def _static_attrs(m: nn.Module) -> dict:
     return {}
 
 
-def _extract_norm_eps(module_name: str, module: nn.Module, attrs: Optional[dict[str, Any]] = None) -> Optional[float]:
-    """Best-effort eps extraction for norm-like modules."""
-    norm_hint = f"{module_name} {type(module).__name__}".lower()
-    if not isinstance(module, nn.LayerNorm) and "norm" not in norm_hint:
-        return None
-
-    if isinstance(module, nn.LayerNorm):
-        return float(module.eps)
-
-    if attrs is not None:
-        value = attrs.get("eps")
-        if isinstance(value, (int, float)):
-            return float(value)
-
-    for attr_name in ("eps", "variance_epsilon", "layer_norm_eps", "rms_norm_eps", "norm_eps"):
-        value = getattr(module, attr_name, None)
-        if isinstance(value, (int, float)):
-            return float(value)
-
-    return None
-
-
 # Maps torch.fx call_function targets → ISA-relevant operation type names.
 # Extend this table when adding support for new operation types.
 _FX_OPS: dict[Any, str] = {
@@ -97,6 +75,9 @@ class VLMModelParser:
         self.symbolic_graph = None
         self.backend = None
         self.plena_backend = None  # PLENA_BACKEND instance (set by load_backend)
+        self.mode = None
+        self.traced_tree = None
+        self.flattened_traced_tree = None
     
     def load_model(self, model = None):
         if model is not None:
@@ -107,6 +88,8 @@ class VLMModelParser:
                     f"fail to load model from provided object: expected nn.Module, got {type(model)}"
                 )
         else:
+            if isinstance(model, str) and model.strip():
+                self.model_name_or_path = model.strip()
             try:
                 name = self.model_name_or_path.lower()
                 # ---------- Qwen3-VL ----------
@@ -124,7 +107,7 @@ class VLMModelParser:
                         dtype=torch.float32,
                         trust_remote_code=True,
                     )
-                    visual = self.model.model.visual
+                    self.model.eval()
 
                 # ---------- fallback ----------
                 else:
@@ -667,12 +650,27 @@ class VLMModelParser:
         ...
 
     def trace(self):
+        self.mode = "trace"
         m = self.model.model if hasattr(self.model, "model") else self.model
         return self.trace_leaf_modules(
             m, {**self.inputs}
         )
+
+    def flatten_call_tree(self, root: dict, verbose: bool = False) -> list[dict]:
+        """Flatten a call tree into a list sorted by execution order."""
+        result = []
+
+        def _walk(node: dict):
+            result.append(node)
+            for child in node["children"]:
+                _walk(child)
+
+        _walk(root)
+        if verbose:
+            print("===== Call tree flattened: {} nodes =====".format(len(result)))
+        return sorted(result, key=lambda n: n["order"])
     
-    def trace_leaf_modules(self, model: nn.Module, forward_kwargs: dict, verbose: bool = False) -> dict:
+    def trace_leaf_modules(self, model: nn.Module = None, forward_kwargs: dict = None, verbose: bool = False) -> dict:
         """
         Run a forward pass and return a call tree capturing the full module hierarchy,
         execution order, I/O shapes, direct weight parameters, and intermediate tensor symbols.
@@ -690,16 +688,29 @@ class VLMModelParser:
                 "in_syms":        list[str]   runtime symbol for each input tensor (parallel to "in")
                 "out_syms":       list[str]   runtime symbol for each output tensor
                 "in_sym_sources": dict        {sym: producer_module_name} ("" = model input)
-                "meta":           dict        extra per-node metadata, e.g. {"schema": {"eps": float}}
+
             }
 
-        Use flatten_call_tree(root) to get a flat, order-sorted list.
+        Use flatten_call_tree(root) to get a flat, order-sorted list or 
+        use VLMModelParser.flattened_traced_tree after calling this method.
         """
+        self.mode = "trace"
         counter = [0]
         stack: list[dict] = []
         root: list[dict] = [{}]
         pre_handles = []
         post_handles = []
+        
+        if model is None:
+            if self.model is None:
+                self.load_model()
+            model = self.model
+        if forward_kwargs is None:
+            if hasattr(self, "inputs"):
+                forward_kwargs = self.inputs
+            else:
+                raise RuntimeError("No forward_kwargs provided and self.inputs is not set")
+            
 
         # Symbol tracking: tensor storage ptr → symbol name, symbol → producer module
         sym_ctr: list[int] = [0]
@@ -722,16 +733,11 @@ class VLMModelParser:
             def _pre_hook(m, args, kwargs):
                 in_ts = [a for a in list(args) + list(kwargs.values()) if isinstance(a, torch.Tensor)]
                 in_syms = [_sym(t) for t in in_ts]
-                schema: dict[str, Any] = {}
-                norm_eps = _extract_norm_eps(name, m, attrs)
-                if norm_eps is not None:
-                    schema["eps"] = norm_eps
                 node = {
                     "name": name,
                     "type": mod_type,
                     "order": counter[0],
                     "attrs": attrs,
-                    "meta": {"schema": schema},
                     "in": [shape_of(t) for t in in_ts],
                     "out": None,
                     "children": [],
@@ -787,7 +793,9 @@ class VLMModelParser:
             for h in pre_handles + post_handles:
                 h.remove()
 
-        return root[0]
+        self.traced_tree = root[0]
+        self.flattened_traced_tree = self.flatten_call_tree(self.traced_tree, verbose=verbose)
+        return self.traced_tree
 
     def trace_fx_module_level(
         self,
@@ -813,7 +821,7 @@ class VLMModelParser:
         Models with data-dependent control flow (use trace_leaf_modules instead).
         Actual tensor shapes (all "in"/"out" fields are None).
 
-        Node schema (same keys as flatten_call_tree output)
+        Node schema (same keys as the flattened trace output)
         ---------------------------------------------------
         {name, type, order, attrs, in=None, out=None, source="fx", children=[]}
 
@@ -823,6 +831,7 @@ class VLMModelParser:
         leaf_type_names : class names that should NOT be traced into.
                           Defaults to common PyTorch and Qwen3-VL types.
         """
+        self.mode = "fx"
         if leaf_type_names is None:
             leaf_type_names = {
                 # PyTorch built-ins
@@ -882,6 +891,50 @@ class VLMModelParser:
                 })
         print("===== FX trace complete: captured {} nodes =====".format(len(nodes)))
         return nodes
+    
+    def export_flatten_call_tree(self,flattened: list[dict], output_path: str | Path) -> Path:
+        """
+        Write a flattened call tree to a standalone JSON file.
+        """
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        output_file.write_text(json.dumps(flattened, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"===== Flattened call tree exported to {output_file} =====")
+        return output_file
+
+
+    def export_model_info(self, model_info: dict[str, Any], output_path: str | Path) -> Path:
+        """
+        Write extract_model_info output to a standalone JSON file.
+        """
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        output_file.write_text(json.dumps(model_info, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"===== Model info exported to {output_file} =====")
+        return output_file
+
+
+    def combine_traces(self, hook_trace: dict, fx_trace: list[dict]) -> list[dict]:
+        """
+        Merge a hook-based call tree (e.g. dynamic visual encoder) with an
+        FX-based flat trace (e.g. static text decoder) into a single flat list
+        sorted by global execution order.
+
+        Hook nodes come first (source="hook"), FX nodes follow (source="fx").
+        Orders in fx_trace are renumbered to start immediately after the last
+        hook node so the final list has consecutive 0-based orders.
+
+        Parameters
+        ----------
+        hook_trace : tree dict returned by VLMModelParser.trace_leaf_modules
+        fx_trace   : flat list returned by VLMModelParser.trace_fx_module_level
+        """
+        hook_flat = [{**n, "source": "hook"} for n in self.flatten_call_tree(hook_trace)]
+        offset = len(hook_flat)
+        fx_renumbered = [{**n, "order": offset + i} for i, n in enumerate(fx_trace)]
+        return hook_flat + fx_renumbered
 
 
 def template_qwen3_vl_inputs(
@@ -917,64 +970,8 @@ def template_qwen3_vl_inputs(
     return dict(inputs)
 
 
-def flatten_call_tree(root: dict) -> list[dict]:
-    """
-    Walk a call tree returned by trace_leaf_modules and return a flat list
-    of all nodes sorted by execution order (pre-order DFS matches call order).
-    """
-    result = []
-    def _walk(node: dict):
-        result.append(node)
-        for child in node["children"]:
-            _walk(child)
-    _walk(root)
-    print("===== Call tree flattened: {} nodes =====".format(len(result)))
-    return sorted(result, key=lambda n: n["order"])
 
 
-def export_flatten_call_tree(flattened: list[dict], output_path: str | Path) -> Path:
-    """
-    Write a flattened call tree to a standalone JSON file.
-    """
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    output_file.write_text(json.dumps(flattened, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"===== Flattened call tree exported to {output_file} =====")
-    return output_file
-
-
-def export_model_info(model_info: dict[str, Any], output_path: str | Path) -> Path:
-    """
-    Write extract_model_info output to a standalone JSON file.
-    """
-    output_file = Path(output_path)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-    output_file.write_text(json.dumps(model_info, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"===== Model info exported to {output_file} =====")
-    return output_file
-
-
-def combine_traces(hook_trace: dict, fx_trace: list[dict]) -> list[dict]:
-    """
-    Merge a hook-based call tree (e.g. dynamic visual encoder) with an
-    FX-based flat trace (e.g. static text decoder) into a single flat list
-    sorted by global execution order.
-
-    Hook nodes come first (source="hook"), FX nodes follow (source="fx").
-    Orders in fx_trace are renumbered to start immediately after the last
-    hook node so the final list has consecutive 0-based orders.
-
-    Parameters
-    ----------
-    hook_trace : tree dict returned by VLMModelParser.trace_leaf_modules
-    fx_trace   : flat list returned by VLMModelParser.trace_fx_module_level
-    """
-    hook_flat = [{**n, "source": "hook"} for n in flatten_call_tree(hook_trace)]
-    offset = len(hook_flat)
-    fx_renumbered = [{**n, "order": offset + i} for i, n in enumerate(fx_trace)]
-    return hook_flat + fx_renumbered
 
 
 if __name__ == "__main__":
@@ -984,6 +981,8 @@ if __name__ == "__main__":
     #   "combined" – hook trace visual encoder + FX trace language model, merged
     #   "compile"  – torch.compile with plena backend
     #   "export"   – torch.export symbolic graph
+    #   "export_info" – extract_model_info output only
+    
     TEST_MODE = "export_info"
 
     # ===== config parser =====
@@ -1057,7 +1056,9 @@ if __name__ == "__main__":
         tree = parser.trace_leaf_modules(
             parser.model.model, {**inputs, "use_cache": False, "return_dict": False}
         )
-        logs = flatten_call_tree(tree)
+        logs = parser.flattened_traced_tree
+        if logs is None:
+            raise RuntimeError("flattened_traced_tree was not populated after tracing")
         with open("./outputs/trace.txt", "w") as f:
             for r in logs:
                 f.write(f"Order: {r['order']:04d}\n")
@@ -1127,9 +1128,12 @@ if __name__ == "__main__":
     elif TEST_MODE == "combined":
         # Step 1 – hook trace the full model to get real I/O shapes (especially
         #           for the visual encoder where shapes are data-dependent).
-        full_tree = parser.trace_leaf_modules(
+        parser.trace_leaf_modules(
             parser.model.model, {**inputs, "use_cache": False, "return_dict": False}
         )
+        full_tree = parser.traced_tree
+        if full_tree is None:
+            raise RuntimeError("traced_tree was not populated after tracing")
         # Step 2 – extract only the visual encoder subtree.
         visual_tree = next(
             (c for c in full_tree["children"] if c["name"] == "visual"), None
@@ -1143,7 +1147,7 @@ if __name__ == "__main__":
         # Uses per-layer replication to avoid Proxy.__setitem__ in Qwen3VLTextModel.
         lang_fx = _qwen3_text_decoder_fx(parser)
         # Step 4 – merge: visual (real shapes) first, then language (residuals visible).
-        combined = combine_traces(visual_tree, lang_fx)
+        combined = parser.combine_traces(visual_tree, lang_fx)
         with open("./outputs/combined_trace.txt", "w") as f:
             for i, r in enumerate(combined):
                 _log_print(
@@ -1167,4 +1171,4 @@ if __name__ == "__main__":
         
     elif TEST_MODE == "export_info":
         model_info = parser.extract_model_info(parser.model, inputs)
-        export_model_info(model_info, "./outputs/model_info.json")
+        parser.export_model_info(model_info, "./outputs/model_info.json")
