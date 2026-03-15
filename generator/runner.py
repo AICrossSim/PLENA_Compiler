@@ -3,6 +3,13 @@
 import sys
 from pathlib import Path
 
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parent
+
+for import_root in (_PROJECT_ROOT, _THIS_DIR):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
 from parser import LLMModelParser, hardware_parser
 from passes.code_gen import code_gen_pass
 from passes.utilization_report import analyse_overall_utilization
@@ -10,9 +17,9 @@ from scheduler import gen_scheduler
 
 
 def run():
-    if len(sys.argv) < 3:
-        print("Usage: python runner.py <model_name_or_path> <output_file.asm>")
-        print("Example: python runner.py AICrossSim/clm-60m output.asm")
+    if len(sys.argv) < 4:
+        print("Usage: python runner.py <mode> <model_name_or_path> <output_file.asm>")
+        print("Example: python runner.py compiler AICrossSim/clm-60m output.asm")
         return
     mode = sys.argv[1]
     model_path = sys.argv[2]
@@ -24,7 +31,7 @@ def run():
     # Validate that output file ends with .asm
     if not output_file.endswith(".asm"):
         print("Error: Output file must end with .asm extension")
-        print("Example: python runner.py AICrossSim/clm-60m output.asm")
+        print("Example: python runner.py compiler AICrossSim/clm-60m output.asm")
         return
 
     print(f"Loading model: {model_path}")

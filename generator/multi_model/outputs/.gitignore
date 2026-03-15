@@ -1,0 +1,12 @@
+vlm_output.asm
+simple_run_output.asm
+preview/*.asm
+*.txt
+report.*
+*.md
+hardware_settings.*
+
+*model_info.json
+*_report.*
+*_trace.*
+*.asm

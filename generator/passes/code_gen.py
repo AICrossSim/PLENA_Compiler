@@ -5,8 +5,15 @@ This module transforms the symbolic graph representation of a LLM model
 into assembly code using predefined templates for different operation types.
 """
 
+import sys
 from pathlib import Path
 from typing import Any
+
+_THIS_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _THIS_DIR.parent.parent
+
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from asm_templates import (
     elementwise_add_asm,
@@ -20,7 +27,7 @@ from asm_templates import (
 
 def _load_template(template_name: str) -> str:
     """Load assembly template from file."""
-    templates_dir = Path(__file__).parent.parent / "asm_templates"
+    templates_dir = _PROJECT_ROOT / "asm_templates"
     template_path = templates_dir / f"{template_name}.asm"
 
     if not template_path.exists():

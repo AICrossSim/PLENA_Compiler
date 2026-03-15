@@ -6,10 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.7.1",
-    "transformers>=4.40.0",
+    "transformers>=4.57.0",
     "huggingface-hub>=0.20.0",
     "requests>=2.31.0",
     "tomlkit>=0.13.2",
+    "pillow>=12.1.1",
+    "qwen-vl-utils>=0.0.14",
+    "torchvision>=0.22.1",
 ]
 
 [dependency-groups]
