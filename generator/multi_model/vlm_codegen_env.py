@@ -153,11 +153,13 @@ class VLMCodegenEnvironment:
                 "Qwen3VLVisionMLP": "vision_mlp_plena",
                 "Qwen3VLVisionPatchEmbed": "conv3d",
                 "Qwen3VLVisionPatchMerger": "linear",
+                
                 "Qwen2VLTextRMSNorm": "rms_norm",
                 "Qwen2VLTextAttention": "text_attention",
                 "Qwen2VLTextMLP": "ffn",
                 "Qwen2VLVisionAttention": "vision_attention",
                 "Qwen2VLVisionMLP": "vision_mlp_plena",
+                
                 "elementwise_add": "elementwise_add",
                 "mlp": "mlp",
             }

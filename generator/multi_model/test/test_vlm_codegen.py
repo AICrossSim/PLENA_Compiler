@@ -8,9 +8,15 @@ import sys
 import unittest
 from pathlib import Path
 
-# Make generator/multi_model importable when run from any cwd.
-sys.path.insert(0, str(Path(__file__).parent))
+TEST_DIR = Path(__file__).resolve().parent
+MODULE_ROOT = TEST_DIR.parent
+ASM_LIB_ROOT = MODULE_ROOT / "asm_lib"
 
+# Make generator/multi_model and asm_lib importable when run from any cwd.
+sys.path.insert(0, str(MODULE_ROOT))
+sys.path.insert(0, str(ASM_LIB_ROOT))
+
+from vlm_codegen_handlers import LoweringResult
 from vlm_codegen_env import VLMCodegenEnvironment
 from vlm_codegen_generator import VLMAssemblyGenerator
 
@@ -121,13 +127,29 @@ def _layer_norm_nodes(*, hidden_sizes: list[int]) -> list[dict]:
     return nodes
 
 
+def _custom_kernel_node() -> dict:
+    return {
+        "name": "custom.kernel",
+        "type": "CustomKernel",
+        "order": 0,
+        "attrs": {},
+        "in": [_tensor_meta([1, 64, 128])],
+        "out": _tensor_meta([1, 64, 128]),
+        "children": [],
+        "weights": [],
+        "in_syms": ["%0"],
+        "in_sym_sources": {"%0": "model_input"},
+        "out_syms": ["%1"],
+    }
+
+
 class TestVLMCodegenSharedContext(unittest.TestCase):
     def test_qwen3_vision_mlp_uses_dedicated_op_key(self):
         env = VLMCodegenEnvironment()
         self.assertEqual(env.operation_for("Qwen3VLVisionMLP"), "vision_mlp_plena")
 
     def test_generate_mixed_lowering_and_shared_program(self):
-        env = VLMCodegenEnvironment()
+        env = VLMCodegenEnvironment(hw={"mlen": 64})
         generator = VLMAssemblyGenerator(env)
         asm = generator.generate(
             _vision_mlp_nodes(),
@@ -197,7 +219,7 @@ class TestVLMCodegenSharedContext(unittest.TestCase):
         self.assertEqual(asm.count("\nLayerNorm:\n"), 1)
 
     def test_debug_mode_omits_emitted_isa_but_keeps_context_dump(self):
-        env = VLMCodegenEnvironment()
+        env = VLMCodegenEnvironment(hw={"mlen": 64})
         generator = VLMAssemblyGenerator(env)
         generator.debug_mode(True)
 
@@ -276,6 +298,42 @@ class TestVLMCodegenSharedContext(unittest.TestCase):
         )
 
         self.assertIn("weight_reg=q_weight_offset:a2", asm)
+
+    def test_generator_can_register_external_handler(self):
+        env = VLMCodegenEnvironment()
+        env.register_type("CustomKernel", "custom_kernel")
+        generator = VLMAssemblyGenerator(env, auto_register_default_handlers=False)
+
+        def custom_handler(
+            codegen: VLMAssemblyGenerator,
+            node: dict,
+            model_info: dict,
+        ) -> LoweringResult:
+            del model_info
+            activation_addr, _ = codegen.resolve_input_activation(node)
+            codegen.bind_template_outputs(node, activation_addr)
+            return codegen.wrap_template(
+                "; external handler body\n",
+                reuse_label=node["type"],
+                comments=[f"custom_activation={activation_addr}"],
+            )
+
+        generator.register_handler("custom_kernel", custom_handler)
+
+        asm = generator.generate(
+            [_custom_kernel_node()],
+            {
+                "model_name": "custom-handler",
+                "hidden_size": 128,
+                "num_layers": 1,
+                "num_attention_heads": 2,
+            },
+        )
+
+        self.assertIn("call CustomKernel:", asm)
+        self.assertIn("\nCustomKernel:\n", asm)
+        self.assertIn("custom_activation=0", asm)
+        self.assertIn("generated once", asm)
 
 
 if __name__ == "__main__":

@@ -18,8 +18,13 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
-# Make the parser package importable when run from any cwd
-sys.path.insert(0, str(Path(__file__).parent))
+TEST_DIR = Path(__file__).resolve().parent
+MODULE_ROOT = TEST_DIR.parent
+ASM_LIB_ROOT = MODULE_ROOT / "asm_lib"
+
+# Make generator/multi_model and asm_lib importable when run from any cwd.
+sys.path.insert(0, str(MODULE_ROOT))
+sys.path.insert(0, str(ASM_LIB_ROOT))
 
 from vlm_parser import VLMModelParser, _static_attrs
 
