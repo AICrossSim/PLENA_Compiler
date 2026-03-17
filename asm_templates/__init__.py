@@ -14,6 +14,8 @@ from .silu_asm import silu_asm
 __all__ = [
     "batched_matmul_asm",
     "elementwise_add_asm",
+    "csr_dense_mm_asm",
+    "csr_store_asm",
     "embedding_asm",
     "ffn_asm",
     "ffn_intermediate_asm",
