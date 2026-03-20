@@ -6,4 +6,4 @@
 *.dir
 
 __pycache__
-
+.venv
