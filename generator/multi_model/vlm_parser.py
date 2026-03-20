@@ -1,6 +1,5 @@
 import json
 import operator
-import types
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 from PIL import Image
@@ -587,13 +586,16 @@ class VLMModelParser:
         if not isinstance(self.model, PreTrainedModel):
             return False
 
+        # Qwen-VL forward contains proxy-iteration patterns that are not
+        # compatible with torch.fx.symbolic_trace on Python 3.13.
+        # Route these models through torch.export instead.
         return self.model.config.model_type in {
             "qwen3_vl",
             "qwen2_vl",
             "qwen_vl",
         }
     
-    def _torch_fx_symbolic_graph(self) -> fx.GraphModule:
+    def _torch_export_symbolic_graph(self) -> fx.GraphModule:
         if self.inputs is None:
             raise RuntimeError("Failed to load inputs")
 
@@ -608,6 +610,33 @@ class VLMModelParser:
         )
         gm: fx.GraphModule = exported.graph_module
         return gm
+    
+    def _torch_fx_symbolic_trace(self) -> fx.GraphModule:
+        if self.inputs is None:
+            raise RuntimeError("Failed to load inputs")
+        
+        model_cls = type(self.model)
+        has_forward_attr = "forward" in model_cls.__dict__
+        class_forward = getattr(model_cls, "forward")
+        unwrapped_forward = inspect.unwrap(class_forward)
+
+        # fx.trace() reads getattr(type(root), "forward"), not instance.forward.
+        # Patch the class method temporarily so concrete_args works with wrapped
+        # transformers forward() implementations on Python 3.13.
+        patched_forward = False
+        if unwrapped_forward is not class_forward:
+            setattr(model_cls, "forward", unwrapped_forward)
+            patched_forward = True
+
+        try:
+            traced = fx.symbolic_trace(self.model, concrete_args=self.inputs)
+        finally:
+            if patched_forward:
+                if has_forward_attr:
+                    setattr(model_cls, "forward", class_forward)
+                else:
+                    delattr(model_cls, "forward")
+        return traced
     
     def load_backend(self,backend_fn=None,mode="default"):
 
@@ -641,8 +670,19 @@ class VLMModelParser:
             self.load_model()
 
         if self._use_torch_fx():
-            print("Using torch fx")
-            return self._torch_fx_symbolic_graph()
+            print("Using torch export")
+            return self._torch_export_symbolic_graph()
+        else:
+            print("Using torch fx symbolic_trace")
+            try:
+                return self._torch_fx_symbolic_trace()
+            except Exception as e:
+                # Keep custom models on symbolic_trace by default, but provide
+                # a robust fallback when tracing hits FX control-flow limits.
+                print(f"symbolic_trace failed ({type(e).__name__}): {e}")
+                print("Fallback to torch export")
+                return self._torch_export_symbolic_graph()
+    
     
     def print_summary(self):
         ...
@@ -983,7 +1023,7 @@ if __name__ == "__main__":
     #   "export"   – torch.export symbolic graph
     #   "export_info" – extract_model_info output only
     
-    TEST_MODE = "export_info"
+    TEST_MODE = "fx_symbolic"
 
     # ===== config parser =====
     parser = VLMModelParser("Qwen/Qwen3-VL-2B-Instruct")
@@ -1166,7 +1206,7 @@ if __name__ == "__main__":
     elif TEST_MODE == "compile":
         parser.torch_compile_with_plena_backend(parser.model, inputs)
 
-    elif TEST_MODE == "export":
+    elif TEST_MODE == "fx_symbolic":
         parser.create_symbolic_graph()
         
     elif TEST_MODE == "export_info":
