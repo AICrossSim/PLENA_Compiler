@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image
 import torch
 import torch.fx as fx
-from transformers import AutoModel, AutoConfig, AutoProcessor, PreTrainedModel, Qwen3VLForConditionalGeneration, Qwen3VLConfig
+from transformers import AutoModel, AutoConfig, AutoProcessor, PreTrainedModel, Qwen3VLForConditionalGeneration, Qwen3VLConfig  # noqa: E402
 import torch.nn as nn
 import inspect
 
