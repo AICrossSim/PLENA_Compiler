@@ -27,7 +27,7 @@ from plena.ops.plena.norm_ops import rms_norm_plena, layer_norm_plena
 from plena.ops.plena.ffn_ops import ffn_plena
 from plena.ops.plena.attention_ops import flash_attention_plena
 
-from quant.quantizer.hardware_quantizer.mxfp import _mx_fp_quantize_hardware
+from tools.quant.quantizer.hardware_quantizer.mxfp import _mx_fp_quantize_hardware
 
 
 # ---------------------------------------------------------------------------
