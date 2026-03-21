@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from math import prod
 from typing import Any
 
-from asm_lib.plena_program import FPVar, InputVar, PLENAProgram, TensorVar, VRAMMatrixVar
+from .kernel_compilers.plena.compiler.plena_program import (
+    FPVar,
+    InputVar,
+    PLENAProgram,
+    TensorVar,
+    VRAMMatrixVar,
+)
 
 
 def safe_codegen_name(raw: str, prefix: str = "") -> str:

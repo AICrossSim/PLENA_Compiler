@@ -10,14 +10,12 @@ import torch
 import torch.nn as nn
 
 TEST_DIR = Path(__file__).resolve().parent
-MODULE_ROOT = TEST_DIR.parent
-ASM_LIB_ROOT = MODULE_ROOT / "asm_lib"
+PROJECT_ROOT = TEST_DIR.parent.parent
 
-sys.path.insert(0, str(MODULE_ROOT))
-sys.path.insert(0, str(ASM_LIB_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from utilization_report import analyse_trace_utilization, render_markdown_report
-from vlm_parser import VLMModelParser
+from multi_model.utilization_report import analyse_trace_utilization, render_markdown_report
+from multi_model.vlm_parser import VLMModelParser
 
 
 def make_parser() -> VLMModelParser:

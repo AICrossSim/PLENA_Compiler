@@ -8,24 +8,17 @@ Usage:
     isa_str, info = compile_module(model, (x,))
 """
 
-import sys
-from pathlib import Path
 from typing import Dict, List, NamedTuple, Set, Tuple
-
-_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(_root))
-sys.path.insert(0, str(_root / "tools"))
-sys.path.insert(0, str(_root / "compiler/generator/multi_model/asm_lib"))
 
 import torch
 import torch.nn as nn
 from torch.export.graph_signature import InputKind
 
-from plena_program import PLENAProgram
-from plena.ops.plena.linear_ops import linear_plena
-from plena.ops.plena.norm_ops import rms_norm_plena, layer_norm_plena
-from plena.ops.plena.ffn_ops import ffn_plena
-from plena.ops.plena.attention_ops import flash_attention_plena
+from ..ops.plena.attention_ops import flash_attention_plena
+from ..ops.plena.ffn_ops import ffn_plena
+from ..ops.plena.linear_ops import linear_plena
+from ..ops.plena.norm_ops import layer_norm_plena, rms_norm_plena
+from .plena_program import PLENAProgram
 
 from tools.quant.quantizer.hardware_quantizer.mxfp import _mx_fp_quantize_hardware
 
@@ -164,7 +157,7 @@ def _handle_sdpa(prog, node, tensor_map):
     (e.g. outputs of linear projections), we store them to HBM first via prog.store().
     """
     import math
-    from plena_program import InputVar as _InputVar
+    from .plena_program import InputVar as _InputVar
 
     args = node.args
     q_node = args[0]

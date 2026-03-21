@@ -2,9 +2,22 @@ from pathlib import Path
 
 import torch
 
-from model import TRANSFOMER_ENCODER
-from utilization_report import analyse_trace_utilization, render_markdown_report
-from vlm_parser import VLMModelParser
+if __package__ in (None, ""):
+    import sys
+
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+
+    from multi_model import OUTPUTS_DIR
+    from multi_model.model import TRANSFOMER_ENCODER
+    from multi_model.utilization_report import analyse_trace_utilization, render_markdown_report
+    from multi_model.vlm_parser import VLMModelParser
+else:
+    from . import OUTPUTS_DIR
+    from .model import TRANSFOMER_ENCODER
+    from .utilization_report import analyse_trace_utilization, render_markdown_report
+    from .vlm_parser import VLMModelParser
 
 
 def main() -> int:
@@ -26,7 +39,7 @@ def main() -> int:
         hw={"tile_m": 64, "tile_k": 64, "tile_n": 64},
     )
 
-    out_path = Path(__file__).resolve().parent / "outputs" / "report.md"
+    out_path = OUTPUTS_DIR / "report.md"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(render_markdown_report(report), encoding="utf-8")
 

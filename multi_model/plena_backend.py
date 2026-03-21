@@ -8,6 +8,8 @@ from torch.fx.passes.graph_drawer import FxGraphDrawer
 from pathlib import Path
 from collections import Counter
 
+from . import OUTPUTS_DIR
+
 # ---------------------------------------------------------------------------
 # Module class name → asm template module name.
 # This is the single source of truth — no TARGETS needed inside asm_templates.
@@ -40,8 +42,8 @@ MODULE_TYPE_TO_TEMPLATE: Dict[str, str] = {
 
 class PLENA_BACKEND:
     def __init__(self):
-        self.asm_file = Path("plena.asm")
-        self.template_path = "compiler.asm_templates"
+        self.asm_file = OUTPUTS_DIR / "plena.asm"
+        self.template_path = "asm_templates"
         self.ops_registry = {}          # call_function / call_method ops (legacy TARGETS path)
         self.module_type_registry: Dict[str, str] = {}  # call_module: class name → template
         self._clear = False
@@ -214,7 +216,8 @@ class PLENA_BACKEND:
         print("=== PLENA ASM ===")
         print(asm_text)
 
-        out_path = Path("/home/yw7422/FYP/Coprocessor_for_Llama/compiler/parser/outputs/plena.asm")
+        out_path = OUTPUTS_DIR / "plena.asm"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.open("a").write(asm_text + "\n")
 
         def run(*args, **kwargs):
@@ -237,16 +240,20 @@ class PLENA_BACKEND:
         print("==== gm.code ====")
         print(gm.code)
 
-        Path("/home/yw7422/FYP/Coprocessor_for_Llama/compiler/parser/outputs/captured_gm.py").write_text(gm.code)
+        out_path = OUTPUTS_DIR / "captured_gm.py"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(gm.code)
         gm.recompile()
         return gm.forward
 
     def plena_backend_svg_gm(self, gm: torch.fx.GraphModule, example_inputs):
         drawer = FxGraphDrawer(gm, "compiled_graph")
         dot = drawer.get_dot_graph()
-        dot.write_svg("/home/yw7422/FYP/Coprocessor_for_Llama/compiler/parser/outputs/compiled_graph.svg")
+        out_path = OUTPUTS_DIR / "compiled_graph.svg"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        dot.write_svg(str(out_path))
 
-        print("Wrote compiled_graph.svg")
+        print(f"Wrote {out_path}")
         gm.recompile()
         return gm.forward
 

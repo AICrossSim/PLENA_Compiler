@@ -4,20 +4,25 @@ Compatibility wrapper for VLM assembly code generation.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any
 
-_PARSER_DIR = Path(__file__).parent
-_PROJECT_ROOT = _PARSER_DIR.parent.parent
+if __package__ in (None, ""):
+    import sys
 
-for _p in [str(_PARSER_DIR), str(_PROJECT_ROOT)]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
 
-from vlm_parser import VLMModelParser, template_qwen3_vl_inputs  # noqa: E402
-from vlm_codegen_env import DEFAULT_HW, DEFAULT_SCHED, VLMCodegenEnvironment  # noqa: E402
-from vlm_codegen_generator import VLMAssemblyGenerator  # noqa: E402
+    from multi_model import INPUTS_DIR, OUTPUTS_DIR  # noqa: E402
+    from multi_model.vlm_codegen_env import DEFAULT_HW, DEFAULT_SCHED, VLMCodegenEnvironment  # noqa: E402
+    from multi_model.vlm_codegen_generator import VLMAssemblyGenerator  # noqa: E402
+    from multi_model.vlm_parser import VLMModelParser, template_qwen3_vl_inputs  # noqa: E402
+else:
+    from . import INPUTS_DIR, OUTPUTS_DIR
+    from .vlm_codegen_env import DEFAULT_HW, DEFAULT_SCHED, VLMCodegenEnvironment
+    from .vlm_codegen_generator import VLMAssemblyGenerator
+    from .vlm_parser import VLMModelParser, template_qwen3_vl_inputs
 
 
 def vlm_codegen(
@@ -51,7 +56,7 @@ if __name__ == "__main__":
     import torch
 
     MODEL_NAME = "Qwen/Qwen3-VL-2B-Instruct"
-    IMAGE_PATH = "./inputs/img/image.png"
+    IMAGE_PATH = INPUTS_DIR / "img" / "image.png"
 
     parser = VLMModelParser(MODEL_NAME)
     parser.load_model()
@@ -97,7 +102,7 @@ if __name__ == "__main__":
 
     asm = vlm_codegen(nodes, model_info)
 
-    out_path = Path("./outputs/vlm_output.asm")
+    out_path = OUTPUTS_DIR / "vlm_output.asm"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(asm)
 

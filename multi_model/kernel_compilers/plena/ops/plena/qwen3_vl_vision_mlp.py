@@ -24,17 +24,10 @@ Important constraints in the current PLENA stack:
 """
 
 import re
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
-CURRENT_DIR = Path(__file__).parent
-PROJECT_ROOT = CURRENT_DIR.parent.parent.parent
-sys.path.insert(0, str(CURRENT_DIR))
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from plena_program import InputVar, PLENAProgram, VRAMMatrixVar
+from ...compiler.plena_program import InputVar, PLENAProgram, VRAMMatrixVar
 
 
 @dataclass(frozen=True)

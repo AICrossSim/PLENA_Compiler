@@ -19,7 +19,7 @@ Alignment requirement:
   With W_padded=64 and ow=0 (OW=1): offset = (c*H + oh+kr) * 64 → always aligned.
 """
 
-from plena.ops.plena.linear_ops import linear_plena
+from .linear_ops import linear_plena
 
 
 _PREFETCH_V_AMOUNT = 4   # H_PREFETCH_V always loads this many VRAM rows
@@ -65,7 +65,7 @@ def conv2d_plena(
         VRAMMatrixVar for the output, shape (M, C_out).
     """
     # Lazy imports to avoid circular dependencies at module load time
-    from compiler.asm_templates.im2col_asm_no_shift import (
+    from asm_templates.im2col_asm_no_shift import (
         im2col_asm_no_shift,
         PREFETCH_V_AMOUNT,
     )

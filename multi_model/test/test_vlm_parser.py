@@ -19,14 +19,12 @@ import torch
 import torch.nn as nn
 
 TEST_DIR = Path(__file__).resolve().parent
-MODULE_ROOT = TEST_DIR.parent
-ASM_LIB_ROOT = MODULE_ROOT / "asm_lib"
+PROJECT_ROOT = TEST_DIR.parent.parent
 
-# Make generator/multi_model and asm_lib importable when run from any cwd.
-sys.path.insert(0, str(MODULE_ROOT))
-sys.path.insert(0, str(ASM_LIB_ROOT))
+# Make the repository root importable when run from any cwd.
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from vlm_parser import VLMModelParser, _static_attrs
+from multi_model.vlm_parser import VLMModelParser, _static_attrs
 
 
 # ---------------------------------------------------------------------------

@@ -6,17 +6,24 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from model.TRANSFOMER_ENCODER import TRANSFOMER_ENCODER, MultiLayerEncoder
-from utilization_report import (
-    DEFAULT_HW,
-    analyse_trace_utilization,
-    render_markdown_report,
-)
-from vlm_codegen import vlm_codegen
-from vlm_parser import (
-    VLMModelParser,
-    template_qwen3_vl_inputs,
-)
+if __package__ in (None, ""):
+    import sys
+
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+
+    from multi_model import OUTPUTS_DIR
+    from multi_model.model.TRANSFOMER_ENCODER import TRANSFOMER_ENCODER, MultiLayerEncoder
+    from multi_model.utilization_report import DEFAULT_HW, analyse_trace_utilization, render_markdown_report
+    from multi_model.vlm_codegen import vlm_codegen
+    from multi_model.vlm_parser import VLMModelParser, template_qwen3_vl_inputs
+else:
+    from . import OUTPUTS_DIR
+    from .model.TRANSFOMER_ENCODER import TRANSFOMER_ENCODER, MultiLayerEncoder
+    from .utilization_report import DEFAULT_HW, analyse_trace_utilization, render_markdown_report
+    from .vlm_codegen import vlm_codegen
+    from .vlm_parser import VLMModelParser, template_qwen3_vl_inputs
 
 
 def _parse_args() -> argparse.Namespace:
@@ -55,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=2061452, help="Torch random seed.")
     parser.add_argument(
         "--output-prefix",
-        default="./outputs/run",
+        default=str(OUTPUTS_DIR / "run"),
         help="Output prefix. Writes trace/model-info/ASM/report files under this prefix.",
     )
     parser.add_argument(

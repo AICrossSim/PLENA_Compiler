@@ -1,0 +1,13 @@
+# Core runtime
+torch>=2.7.1
+torchvision>=0.22.1
+transformers>=4.57.0
+huggingface-hub>=0.20.0
+pillow>=12.1.1
+PyYAML>=6.0.2
+
+# Qwen3-VL input preparation
+qwen-vl-utils>=0.0.14
+
+# Optional: used by graph export paths in plena_backend.py
+pydot>=1.4.2

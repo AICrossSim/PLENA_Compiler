@@ -7,16 +7,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
-from asm_lib.plena_program import VRAMMatrixVar
-from asm_lib.qwen3_vl_vision_mlp import (
+from .kernel_compilers.plena.compiler.plena_program import VRAMMatrixVar
+from .kernel_compilers.plena.ops.plena.qwen3_vl_vision_mlp import (
     GELUTanhFPRAMConstants,
     Qwen3VLVisionMLPCompiler,
     Qwen3VLVisionMLPSpec,
 )
-from vlm_codegen_context import safe_codegen_name
+from .vlm_codegen_context import safe_codegen_name
 
 if TYPE_CHECKING:
-    from vlm_codegen_generator import VLMAssemblyGenerator
+    from .vlm_codegen_generator import VLMAssemblyGenerator
 
 
 @dataclass

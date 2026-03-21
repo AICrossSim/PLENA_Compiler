@@ -19,10 +19,16 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterable
 
-try:
+if __package__ in (None, ""):
+    import sys
+
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+
+    from multi_model.vlm_parser import VLMModelParser, template_qwen3_vl_inputs
+else:
     from .vlm_parser import VLMModelParser, template_qwen3_vl_inputs
-except ImportError:
-    from vlm_parser import VLMModelParser, template_qwen3_vl_inputs
 
 
 DEFAULT_HW: dict[str, int | None] = {

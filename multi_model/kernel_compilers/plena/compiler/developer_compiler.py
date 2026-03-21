@@ -3,13 +3,8 @@ Developer Compiler for PLENA
 Implements compilation from high-level IR to ISA, Phase 1: Load_Batch
 """
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
 from typing import List, Optional, Callable, Dict, Any, Tuple, Union
-from sub_matrix_manager import SubMatrixManager, MatrixBlockLayout, SubMatrixInfo, VRAMMatrixBlockLayout, MLEN, BLEN
+from .sub_matrix_manager import SubMatrixManager, MatrixBlockLayout, SubMatrixInfo, VRAMMatrixBlockLayout, MLEN, BLEN
 from asm_templates import (
     preload_act_asm,
     reset_reg_asm,
@@ -2572,7 +2567,7 @@ class DeveloperCompiler:
         gp_regs = self.register_allocator.allocate_gp(2)
         
         # 设置 V 的 HBM 地址寄存器
-        from compiler.asm_templates import preload_addr_reg_asm
+        from asm_templates import preload_addr_reg_asm
         isa_code += preload_addr_reg_asm(
             addr_reg_to_set=[v_hbm_reg],
             available_registers=gp_regs,

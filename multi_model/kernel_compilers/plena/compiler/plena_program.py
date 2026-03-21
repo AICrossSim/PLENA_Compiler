@@ -1,14 +1,9 @@
 """PLENAProgram high-level compiler interface."""
 
-import sys
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Callable, Union
 from functools import wraps
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
-from developer_compiler import DeveloperCompiler
+from .developer_compiler import DeveloperCompiler
 # ISA generation is fully delegated to DeveloperCompiler; this file does not directly generate ISA
 
 

@@ -7,10 +7,10 @@ from __future__ import annotations
 from math import prod
 from typing import Any, Mapping
 
-from asm_lib.plena_program import VRAMMatrixVar
-from vlm_codegen_context import matrix_shape_from_meta
-from vlm_codegen_env import VLMCodegenEnvironment
-from vlm_codegen_handlers import (
+from .kernel_compilers.plena.compiler.plena_program import VRAMMatrixVar
+from .vlm_codegen_context import matrix_shape_from_meta
+from .vlm_codegen_env import VLMCodegenEnvironment
+from .vlm_codegen_handlers import (
     LoweringResult,
     RuntimeActivationBinding,
     RuntimeParameterBinding,

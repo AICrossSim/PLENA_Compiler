@@ -1,6 +1,6 @@
 """PLENA backend implementation for FFN operator."""
 
-from compiler.asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
+from asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
 
 
 def ffn_plena(prog, input_var, w_gate, w_up, w_down):

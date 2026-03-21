@@ -4,18 +4,10 @@ Environment and registration layer for VLM assembly code generation.
 
 from __future__ import annotations
 
-import sys
 from copy import deepcopy
-from pathlib import Path
 from typing import Any, Callable
 
-_THIS_DIR = Path(__file__).parent
-_PROJECT_ROOT = _THIS_DIR.parent.parent
-
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-from vlm_codegen_context import VLMSharedCodegenContext
+from .vlm_codegen_context import VLMSharedCodegenContext
 
 
 DEFAULT_HW: dict[str, Any] = {

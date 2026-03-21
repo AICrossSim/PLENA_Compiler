@@ -6,9 +6,21 @@ from PIL import Image
 import torch
 import torch.fx as fx
 from transformers import AutoModel, AutoConfig, AutoProcessor, PreTrainedModel, Qwen3VLForConditionalGeneration, Qwen3VLConfig
-from plena_backend import PLENA_BACKEND
 import torch.nn as nn
 import inspect
+
+if __package__ in (None, ""):
+    import sys
+
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(_PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(_PROJECT_ROOT))
+
+    from multi_model import INPUTS_DIR, OUTPUTS_DIR
+    from multi_model.plena_backend import PLENA_BACKEND
+else:
+    from . import INPUTS_DIR, OUTPUTS_DIR
+    from .plena_backend import PLENA_BACKEND
 
 def _static_attrs(m: nn.Module) -> dict:
     """Extract weight shapes and scalar hyperparams from a module at registration time."""
@@ -1029,7 +1041,7 @@ if __name__ == "__main__":
     parser = VLMModelParser("Qwen/Qwen3-VL-2B-Instruct")
     parser.load_backend(mode="default")  # ["default", "print", "dump", "viz"]
     parser.load_model()
-    inputs = template_qwen3_vl_inputs(parser.processor, "./inputs/img/image.png")
+    inputs = template_qwen3_vl_inputs(parser.processor, INPUTS_DIR / "img" / "image.png")
     parser.load_inputs(inputs)
 
     def _log_print(f, s: str) -> None:
@@ -1099,7 +1111,8 @@ if __name__ == "__main__":
         logs = parser.flattened_traced_tree
         if logs is None:
             raise RuntimeError("flattened_traced_tree was not populated after tracing")
-        with open("./outputs/trace.txt", "w") as f:
+        trace_output_path = OUTPUTS_DIR / "trace.txt"
+        with trace_output_path.open("w") as f:
             for r in logs:
                 f.write(f"Order: {r['order']:04d}\n")
                 f.write(f"Module Type: {r['type']}\n")
@@ -1151,19 +1164,20 @@ if __name__ == "__main__":
         vision = [r for r in logs if r["name"].startswith("visual.")]
         lang   = [r for r in logs if r["name"].startswith("language_model.")]
         print(f"Hook trace: {len(logs)} total  (vision={len(vision)}, lang={len(lang)})")
-        print("Saved to ./outputs/trace.txt")
+        print(f"Saved to {trace_output_path}")
 
     elif TEST_MODE == "fx":
         # FX trace of the text decoder only — no real inputs needed.
         # Residual elementwise_add ops ARE visible; actual tensor shapes are None.
         # Uses per-layer replication to avoid Proxy.__setitem__ in Qwen3VLTextModel.
         lang_fx = _qwen3_text_decoder_fx(parser)
-        with open("./outputs/fx_trace.txt", "w") as f:
+        fx_trace_output_path = OUTPUTS_DIR / "fx_trace.txt"
+        with fx_trace_output_path.open("w") as f:
             for i, r in enumerate(lang_fx):
                 _log_print(f, f"{i:04d} {r['name']} {r['type']}")
         adds = sum(1 for r in lang_fx if r["type"] == "elementwise_add")
         print(f"FX trace: {len(lang_fx)} nodes  ({adds} elementwise_add ops)")
-        print("Saved to ./outputs/fx_trace.txt")
+        print(f"Saved to {fx_trace_output_path}")
 
     elif TEST_MODE == "combined":
         # Step 1 – hook trace the full model to get real I/O shapes (especially
@@ -1188,7 +1202,8 @@ if __name__ == "__main__":
         lang_fx = _qwen3_text_decoder_fx(parser)
         # Step 4 – merge: visual (real shapes) first, then language (residuals visible).
         combined = parser.combine_traces(visual_tree, lang_fx)
-        with open("./outputs/combined_trace.txt", "w") as f:
+        combined_trace_output_path = OUTPUTS_DIR / "combined_trace.txt"
+        with combined_trace_output_path.open("w") as f:
             for i, r in enumerate(combined):
                 _log_print(
                     f,
@@ -1201,7 +1216,7 @@ if __name__ == "__main__":
         print(f"Combined trace: {len(combined)} total")
         print(f"  hook (visual encoder):  {len(hook_nodes)} nodes  (real I/O shapes)")
         print(f"  fx   (text decoder):    {len(fx_nodes_combined)} nodes  ({adds} elementwise_add ops)")
-        print("Saved to ./outputs/combined_trace.txt")
+        print(f"Saved to {combined_trace_output_path}")
 
     elif TEST_MODE == "compile":
         parser.torch_compile_with_plena_backend(parser.model, inputs)
@@ -1211,4 +1226,4 @@ if __name__ == "__main__":
         
     elif TEST_MODE == "export_info":
         model_info = parser.extract_model_info(parser.model, inputs)
-        parser.export_model_info(model_info, "./outputs/model_info.json")
+        parser.export_model_info(model_info, OUTPUTS_DIR / "model_info.json")
