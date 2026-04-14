@@ -10,6 +10,7 @@ from .preload_addr_reg import preload_addr_reg_asm
 from .projection_asm import projection_asm
 from .reset_reg_asm import reset_fpreg_asm, reset_reg_asm
 from .silu_asm import silu_asm
+from .gemv_asm import gemv_asm
 
 __all__ = [
     "batched_matmul_asm",
@@ -20,6 +21,7 @@ __all__ = [
     "ffn_up_silu_asm",
     "flash_attn_asm",
     "gelu_asm",
+    "gemv_asm",
     "layer_norm_asm",
     "preload_act_asm",
     "preload_addr_reg_asm",

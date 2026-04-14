@@ -708,3 +708,14 @@ End of a hardware loop. If the loop counter (in register `rd`) is greater than 0
 
 ---
 
+## Extensions
+
+### V_SHIFT_V
+
+**Format:** `V_SHIFT_V rd, rs1, rs2`
+
+**Operation:** `Vector[gp_reg<rd>] = ElementShift(Vector[gp_reg<rs1>], gp_reg<rs2>)`
+
+**Description:**
+
+Shift the vector elements left by the amount specified by `gp_reg<rs2>`. Elements are shifted left, and zeros are filled in from the right. For example, `[a0, a1, a2, a3]` with shift=2 becomes `[a2, a3, 0, 0]`.
