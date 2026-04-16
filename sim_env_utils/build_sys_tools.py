@@ -138,6 +138,12 @@ def parse_args():
 def init_mem(build_path):
     """Initialize memory files and environment variables for simulation."""
     build_path.mkdir(parents=True, exist_ok=True)
+
+    # Clear HBM binary so each test starts with a fresh HBM (not accumulating stale data).
+    hbm_bin_file = build_path / "hbm_for_behave_sim.bin"
+    if hbm_bin_file.exists():
+        hbm_bin_file.unlink()
+
     hbm_element_file = build_path / "hbm_ele.mem"
     hbm_scale_file = build_path / "hbm_scale.mem"
     hbm_file_for_behave_sim = build_path / "hbm_for_behave_sim.mem"
