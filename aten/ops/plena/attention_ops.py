@@ -174,7 +174,7 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
     alloc.free_addr([k_addr, v_addr])
 
     # Return O as a VRAMMatrixVar the caller can consume
-    from plena_compiler import VRAMMatrixVar
+    from compiler.aten.plena_compiler import VRAMMatrixVar
 
     O = VRAMMatrixVar(prog, o_name, (s_q, hq * h_qkv), display_name="O")
     prog._tensors[o_name] = O
