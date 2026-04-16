@@ -144,7 +144,7 @@ class LLMModelParser:
                 "execution_order": order_counter,
                 "input_shape": [batch_size, seq_len],  # input_ids shape
                 "output_shape": [batch_size, seq_len, hidden_size],  # embedded tokens
-                "dimensions": {"num_embeddings": getattr(text_cfg, "vocab_size", None), "embedding_dim": hidden_size},
+                "dimensions": {"num_embeddings": getattr(text_cfg, "vocab_size", None), "hidden_size": hidden_size},
                 "is_data_placeholder": True,
             }
             symbolic_nodes.append(embed_info)
@@ -342,7 +342,7 @@ class LLMModelParser:
             "output_shape": current_shape,
             "dimensions": {
                 "num_embeddings": num_patches,
-                "embedding_dim": hidden_size,
+                "hidden_size": hidden_size,
                 "patch_size": patch_size,
             },
             "is_data_placeholder": True,
@@ -586,7 +586,7 @@ class LLMModelParser:
                 elif category == "normalization":
                     print(f"     Norm: shape={dims.get('normalized_shape')}, eps={dims.get('eps')}")
                 elif category == "embedding":
-                    print(f"     Embedding: {dims.get('num_embeddings')} x {dims.get('embedding_dim')}")
+                    print(f"     Embedding: {dims.get('num_embeddings')} x {dims.get('hidden_size')}")
                 elif category == "ffn":
                     print(
                         f"     FFN: {dims.get('hidden_size')} -> {dims.get('intermediate_size')} -> {dims.get('hidden_size')}, activation={dims.get('activation')}"
