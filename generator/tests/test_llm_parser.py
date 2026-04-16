@@ -345,7 +345,6 @@ def test_model():
             print(f"❌ Embedding output shape incorrect for ({test_batch_size}, {test_seq_len})")
             all_passed = False
 
-    # Summary
     print("\n" + "=" * 50)
     if all_passed:
         print("🎉 ALL TESTS PASSED! create_symbolic_graph is correct for LlamaForCausalLM architecture")
@@ -353,6 +352,7 @@ def test_model():
         print("❌ SOME TESTS FAILED! create_symbolic_graph needs fixes")
     print("=" * 50)
 
+    assert all_passed, "create_symbolic_graph shape/order checks failed; see printed diff above"
     return all_passed
 
 

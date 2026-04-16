@@ -27,7 +27,6 @@ def _report_flash_attn_utilization(
     overall_operation_amount += operation_amount
     attainable_operation += operation_amount * (m * k * batch_size)
     theoretical_operation += operation_amount * (m * k * n)
-    breakpoint()
     # QKT
     operation_amount = batch_size * num_attn_heads * (head_dim // k) * (input_token_size // n)
     overall_operation_amount += operation_amount
