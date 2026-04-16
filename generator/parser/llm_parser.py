@@ -26,25 +26,6 @@ class LLMModelParser:
             return self.config.text_config
         return self.config
 
-    def _has_embed_tokens(self):
-        """Find embed_tokens in model, supporting nested VLM architectures."""
-        model = self.model
-        candidate_paths = [
-            ["embed_tokens"],
-            ["model", "embed_tokens"],
-            ["model", "language_model", "model", "embed_tokens"],
-            ["language_model", "model", "embed_tokens"],
-        ]
-        for path in candidate_paths:
-            obj = model
-            for attr in path:
-                obj = getattr(obj, attr, None)
-                if obj is None:
-                    break
-            if obj is not None:
-                return True
-        return False
-
     def extract_critical_dimensions(self) -> dict[str, Any]:
         """Extract dimensions for attention, RMSNorm, FFN operations"""
         if self.config is None:

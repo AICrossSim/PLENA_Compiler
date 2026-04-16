@@ -345,7 +345,6 @@ def test_model():
             print(f"❌ Embedding output shape incorrect for ({test_batch_size}, {test_seq_len})")
             all_passed = False
 
-    # Summary
     print("\n" + "=" * 50)
     if all_passed:
         print("🎉 ALL TESTS PASSED! create_symbolic_graph is correct for LlamaForCausalLM architecture")
@@ -353,6 +352,7 @@ def test_model():
         print("❌ SOME TESTS FAILED! create_symbolic_graph needs fixes")
     print("=" * 50)
 
+    assert all_passed, "create_symbolic_graph shape/order checks failed; see printed diff above"
     return all_passed
 
 
@@ -406,109 +406,48 @@ def test_smolvlm2():
     parser.config = config
     parser.model = SimpleNamespace()  # empty model (embed_tokens detection will miss, graph still built)
 
-    all_passed = True
-
     # ── Test 1: extract_critical_dimensions reads from text_config ────────────
-    print("\n--- Test 1: extract_critical_dimensions ---")
     dims = parser.extract_critical_dimensions()
 
-    checks = [
-        ("hidden_size", dims["hidden_size"], 2048),
-        ("num_hidden_layers", dims["num_hidden_layers"], 24),
-        ("vocab_size", dims["vocab_size"], 49280),
-        ("attention.num_attention_heads", dims["attention"]["num_attention_heads"], 32),
-        ("attention.num_key_value_heads", dims["attention"]["num_key_value_heads"], 1),
-        ("attention.head_dim", dims["attention"]["head_dim"], 64),
-        ("ffn.intermediate_size", dims["ffn"]["intermediate_size"], 8192),
-        ("vision.hidden_size", dims.get("vision", {}).get("hidden_size"), 1152),
-        ("vision.num_hidden_layers", dims.get("vision", {}).get("num_hidden_layers"), 27),
-        ("vision.head_dim", dims.get("vision", {}).get("head_dim"), 72),
-    ]
-    for name, actual, expected in checks:
-        if actual == expected:
-            print(f"  ✅ {name}: {actual}")
-        else:
-            print(f"  ❌ {name}: expected={expected}, actual={actual}")
-            all_passed = False
+    assert dims["hidden_size"] == 2048
+    assert dims["num_hidden_layers"] == 24
+    assert dims["vocab_size"] == 49280
+    assert dims["attention"]["num_attention_heads"] == 32
+    assert dims["attention"]["num_key_value_heads"] == 1, "MQA expected (num_kv_heads=1)"
+    assert dims["attention"]["head_dim"] == 64, "SmolVLM2 uses explicit head_dim=64 (not hidden//heads)"
+    assert dims["ffn"]["intermediate_size"] == 8192
+    assert dims.get("vision", {}).get("hidden_size") == 1152
+    assert dims.get("vision", {}).get("num_hidden_layers") == 27
+    assert dims.get("vision", {}).get("head_dim") == 72
 
     # ── Test 2: create_symbolic_graph text decoder topology ──────────────────
-    print("\n--- Test 2: text decoder symbolic graph ---")
     graph = parser.create_symbolic_graph(batch_size=1, seq_len=8192)
 
-    expected_text_nodes = 1 + 24 * 6 + 1  # embed + 24*(norm,attn,res,norm,ffn,res) + final_norm = 146
-    if graph["total_nodes"] == expected_text_nodes:
-        print(f"  ✅ text graph total_nodes: {graph['total_nodes']}")
-    else:
-        print(f"  ❌ text graph total_nodes: expected={expected_text_nodes}, actual={graph['total_nodes']}")
-        all_passed = False
+    expected_text_nodes = 1 + 24 * 6 + 1  # embed + 24*(norm,attn,res,norm,ffn,res) + final_norm
+    assert graph["total_nodes"] == expected_text_nodes
 
-    # Check GQA projection dims on first attn node
     attn_nodes = [n for n in graph["nodes"] if n["operation_type"] == "attention"]
-    if attn_nodes:
-        attn = attn_nodes[0]
-        q_out = attn["dimensions"]["q_proj"]["out_features"]
-        k_out = attn["dimensions"]["k_proj"]["out_features"]
-        v_out = attn["dimensions"]["v_proj"]["out_features"]
-        expected_q = 32 * 64  # num_heads * head_dim = 2048
-        expected_kv = 1 * 64  # num_kv_heads * head_dim = 64 (MQA!)
-
-        for proj_name, actual, expected in [
-            ("q_proj out", q_out, expected_q),
-            ("k_proj out (MQA)", k_out, expected_kv),
-            ("v_proj out (MQA)", v_out, expected_kv),
-        ]:
-            if actual == expected:
-                print(f"  ✅ {proj_name}: {actual}")
-            else:
-                print(f"  ❌ {proj_name}: expected={expected}, actual={actual}")
-                all_passed = False
+    assert attn_nodes, "expected at least one attention node in text decoder graph"
+    attn = attn_nodes[0]
+    assert attn["dimensions"]["q_proj"]["out_features"] == 32 * 64  # num_heads * head_dim
+    assert attn["dimensions"]["k_proj"]["out_features"] == 1 * 64  # num_kv_heads * head_dim (MQA)
+    assert attn["dimensions"]["v_proj"]["out_features"] == 1 * 64
 
     # ── Test 3: create_vision_symbolic_graph ─────────────────────────────────
-    print("\n--- Test 3: vision encoder symbolic graph ---")
     vgraph = parser.create_vision_symbolic_graph(batch_size=1)
+    assert vgraph is not None, "create_vision_symbolic_graph returned None for SmolVLM2"
 
-    if vgraph is None:
-        print("  ❌ create_vision_symbolic_graph returned None")
-        all_passed = False
-    else:
-        expected_vision_nodes = 1 + 27 * 6 + 1  # patch_embed + 27*(norm,attn,res,norm,ffn,res) + final_norm = 164
-        if vgraph["total_nodes"] == expected_vision_nodes:
-            print(f"  ✅ vision graph total_nodes: {vgraph['total_nodes']}")
-        else:
-            print(f"  ❌ vision graph total_nodes: expected={expected_vision_nodes}, actual={vgraph['total_nodes']}")
-            all_passed = False
+    expected_vision_nodes = 1 + 27 * 6 + 1  # patch_embed + 27*(norm,attn,res,norm,ffn,res) + final_norm
+    assert vgraph["total_nodes"] == expected_vision_nodes
+    assert vgraph.get("component") == "vision_encoder"
 
-        if vgraph.get("component") == "vision_encoder":
-            print(f"  ✅ component: vision_encoder")
-        else:
-            print(f"  ❌ component: expected='vision_encoder', actual={vgraph.get('component')}")
-            all_passed = False
+    vattn_nodes = [n for n in vgraph["nodes"] if n["operation_type"] == "attention"]
+    assert vattn_nodes, "expected at least one attention node in vision graph"
+    vattn = vattn_nodes[0]
+    assert vattn["dimensions"]["head_dim"] == 72
+    assert vattn["dimensions"]["num_key_value_heads"] == 16, "no GQA in SigLIP vision encoder"
 
-        # Check vision attn dimensions
-        vattn_nodes = [n for n in vgraph["nodes"] if n["operation_type"] == "attention"]
-        if vattn_nodes:
-            vattn = vattn_nodes[0]
-            vhead_dim = vattn["dimensions"]["head_dim"]
-            vnkv = vattn["dimensions"]["num_key_value_heads"]
-            if vhead_dim == 72:
-                print(f"  ✅ vision head_dim: {vhead_dim}")
-            else:
-                print(f"  ❌ vision head_dim: expected=72, actual={vhead_dim}")
-                all_passed = False
-            if vnkv == 16:
-                print(f"  ✅ vision num_kv_heads (no GQA): {vnkv}")
-            else:
-                print(f"  ❌ vision num_kv_heads: expected=16, actual={vnkv}")
-                all_passed = False
-
-    # Summary
-    print("\n" + "=" * 50)
-    if all_passed:
-        print("🎉 ALL SmolVLM2 TESTS PASSED!")
-    else:
-        print("❌ SOME SmolVLM2 TESTS FAILED!")
-    print("=" * 50)
-    return all_passed
+    return True
 
 
 if __name__ == "__main__":

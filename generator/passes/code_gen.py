@@ -45,6 +45,9 @@ def _generate_embedding_code(
         mlen=hardware_config.get("mlen", 16),
         blen=hardware_config.get("blen", 16),
         batch=model_info.get("batch_size", 1),
+        # FIXME(code-smell): parser emits "embedding_dim" for embed_tokens nodes
+        # (see llm_parser.create_symbolic_graph) but other ops use "hidden_size".
+        # Harmonise the parser side and drop the second getattr/or fallback.
         hidden_size=dim.get("hidden_size") or dim.get("embedding_dim", model_info.get("hidden_size", 64)),
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
         voc_table_row_size=vocab_size,

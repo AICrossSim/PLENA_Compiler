@@ -53,6 +53,9 @@ def run():
         "num_key_value_heads": dimensions.get("attention", {}).get("num_key_value_heads", "Unknown"),
         "num_attention_heads": dimensions.get("attention", {}).get("num_attention_heads", "Unknown"),
         "num_layers": dimensions.get("num_hidden_layers", "Unknown"),
+        # FIXME(code-smell): defaulting head_dim to 0 silently; downstream codegen
+        # divides by this, so a missing value will explode rather than fail here.
+        # Should raise / fall back to hidden_size // num_heads instead.
         "head_dim": dimensions.get("attention", {}).get("head_dim", 0),
         "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6),
     }
