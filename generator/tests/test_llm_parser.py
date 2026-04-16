@@ -356,5 +356,169 @@ def test_model():
     return all_passed
 
 
+def test_smolvlm2():
+    """Test LLMModelParser with SmolVLM2 multimodal config (no HuggingFace download)."""
+    from types import SimpleNamespace
+
+    print("\n" + "=" * 50)
+    print("Testing SmolVLM2 multimodal config...")
+    print("=" * 50)
+
+    # Mock SmolVLM2 text_config (language decoder: Llama-style with MQA)
+    text_cfg = SimpleNamespace(
+        model_type="llama",
+        hidden_size=2048,
+        num_hidden_layers=24,
+        num_attention_heads=32,
+        num_key_value_heads=1,  # MQA!
+        intermediate_size=8192,
+        head_dim=64,
+        vocab_size=49280,
+        rms_norm_eps=1e-5,
+        hidden_act="silu",
+        max_position_embeddings=8192,
+    )
+
+    # Mock SmolVLM2 vision_config (SigLIP encoder)
+    vision_cfg = SimpleNamespace(
+        model_type="siglip_vision_model",
+        hidden_size=1152,
+        num_hidden_layers=27,
+        num_attention_heads=16,
+        intermediate_size=4304,
+        head_dim=72,
+        image_size=384,
+        patch_size=14,
+        norm_eps=1e-6,
+        hidden_act="gelu_pytorch_tanh",
+    )
+
+    # Mock top-level SmolVLM2 config
+    config = SimpleNamespace(
+        model_type="smolvlm",
+        architectures=["SmolVLMForConditionalGeneration"],
+        text_config=text_cfg,
+        vision_config=vision_cfg,
+    )
+
+    # Create parser with mock config (no model loading)
+    parser = LLMModelParser("mock-smolvlm2")
+    parser.config = config
+    parser.model = SimpleNamespace()  # empty model (embed_tokens detection will miss, graph still built)
+
+    all_passed = True
+
+    # ── Test 1: extract_critical_dimensions reads from text_config ────────────
+    print("\n--- Test 1: extract_critical_dimensions ---")
+    dims = parser.extract_critical_dimensions()
+
+    checks = [
+        ("hidden_size", dims["hidden_size"], 2048),
+        ("num_hidden_layers", dims["num_hidden_layers"], 24),
+        ("vocab_size", dims["vocab_size"], 49280),
+        ("attention.num_attention_heads", dims["attention"]["num_attention_heads"], 32),
+        ("attention.num_key_value_heads", dims["attention"]["num_key_value_heads"], 1),
+        ("attention.head_dim", dims["attention"]["head_dim"], 64),
+        ("ffn.intermediate_size", dims["ffn"]["intermediate_size"], 8192),
+        ("vision.hidden_size", dims.get("vision", {}).get("hidden_size"), 1152),
+        ("vision.num_hidden_layers", dims.get("vision", {}).get("num_hidden_layers"), 27),
+        ("vision.head_dim", dims.get("vision", {}).get("head_dim"), 72),
+    ]
+    for name, actual, expected in checks:
+        if actual == expected:
+            print(f"  ✅ {name}: {actual}")
+        else:
+            print(f"  ❌ {name}: expected={expected}, actual={actual}")
+            all_passed = False
+
+    # ── Test 2: create_symbolic_graph text decoder topology ──────────────────
+    print("\n--- Test 2: text decoder symbolic graph ---")
+    graph = parser.create_symbolic_graph(batch_size=1, seq_len=8192)
+
+    expected_text_nodes = 1 + 24 * 6 + 1  # embed + 24*(norm,attn,res,norm,ffn,res) + final_norm = 146
+    if graph["total_nodes"] == expected_text_nodes:
+        print(f"  ✅ text graph total_nodes: {graph['total_nodes']}")
+    else:
+        print(f"  ❌ text graph total_nodes: expected={expected_text_nodes}, actual={graph['total_nodes']}")
+        all_passed = False
+
+    # Check GQA projection dims on first attn node
+    attn_nodes = [n for n in graph["nodes"] if n["operation_type"] == "attention"]
+    if attn_nodes:
+        attn = attn_nodes[0]
+        q_out = attn["dimensions"]["q_proj"]["out_features"]
+        k_out = attn["dimensions"]["k_proj"]["out_features"]
+        v_out = attn["dimensions"]["v_proj"]["out_features"]
+        expected_q = 32 * 64  # num_heads * head_dim = 2048
+        expected_kv = 1 * 64  # num_kv_heads * head_dim = 64 (MQA!)
+
+        for proj_name, actual, expected in [
+            ("q_proj out", q_out, expected_q),
+            ("k_proj out (MQA)", k_out, expected_kv),
+            ("v_proj out (MQA)", v_out, expected_kv),
+        ]:
+            if actual == expected:
+                print(f"  ✅ {proj_name}: {actual}")
+            else:
+                print(f"  ❌ {proj_name}: expected={expected}, actual={actual}")
+                all_passed = False
+
+    # ── Test 3: create_vision_symbolic_graph ─────────────────────────────────
+    print("\n--- Test 3: vision encoder symbolic graph ---")
+    vgraph = parser.create_vision_symbolic_graph(batch_size=1)
+
+    if vgraph is None:
+        print("  ❌ create_vision_symbolic_graph returned None")
+        all_passed = False
+    else:
+        expected_vision_nodes = 1 + 27 * 6 + 1  # patch_embed + 27*(norm,attn,res,norm,ffn,res) + final_norm = 164
+        if vgraph["total_nodes"] == expected_vision_nodes:
+            print(f"  ✅ vision graph total_nodes: {vgraph['total_nodes']}")
+        else:
+            print(f"  ❌ vision graph total_nodes: expected={expected_vision_nodes}, actual={vgraph['total_nodes']}")
+            all_passed = False
+
+        if vgraph.get("component") == "vision_encoder":
+            print(f"  ✅ component: vision_encoder")
+        else:
+            print(f"  ❌ component: expected='vision_encoder', actual={vgraph.get('component')}")
+            all_passed = False
+
+        # Check vision attn dimensions
+        vattn_nodes = [n for n in vgraph["nodes"] if n["operation_type"] == "attention"]
+        if vattn_nodes:
+            vattn = vattn_nodes[0]
+            vhead_dim = vattn["dimensions"]["head_dim"]
+            vnkv = vattn["dimensions"]["num_key_value_heads"]
+            if vhead_dim == 72:
+                print(f"  ✅ vision head_dim: {vhead_dim}")
+            else:
+                print(f"  ❌ vision head_dim: expected=72, actual={vhead_dim}")
+                all_passed = False
+            if vnkv == 16:
+                print(f"  ✅ vision num_kv_heads (no GQA): {vnkv}")
+            else:
+                print(f"  ❌ vision num_kv_heads: expected=16, actual={vnkv}")
+                all_passed = False
+
+    # Summary
+    print("\n" + "=" * 50)
+    if all_passed:
+        print("🎉 ALL SmolVLM2 TESTS PASSED!")
+    else:
+        print("❌ SOME SmolVLM2 TESTS FAILED!")
+    print("=" * 50)
+    return all_passed
+
+
 if __name__ == "__main__":
-    test_model()
+    llama_passed = test_model()
+    smolvlm2_passed = test_smolvlm2()
+
+    print("\n" + "=" * 60)
+    print("OVERALL RESULTS:")
+    print(f"  Llama test:    {'PASSED' if llama_passed else 'FAILED'}")
+    print(f"  SmolVLM2 test: {'PASSED' if smolvlm2_passed else 'FAILED'}")
+    all_ok = llama_passed and smolvlm2_passed
+    print(f"  Overall:       {'ALL PASSED' if all_ok else 'SOME FAILED'}")
+    print("=" * 60)

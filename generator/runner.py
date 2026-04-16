@@ -3,16 +3,16 @@
 import sys
 from pathlib import Path
 
-from parser import LLMModelParser, hardware_parser
-from passes.code_gen import code_gen_pass
-from passes.utilization_report import analyse_overall_utilization
-from scheduler import gen_scheduler
+from generator.parser import LLMModelParser, hardware_parser
+from generator.passes.code_gen import code_gen_pass
+from generator.passes.utilization_report import analyse_overall_utilization
+from generator.scheduler import gen_scheduler
 
 
 def run():
-    if len(sys.argv) < 3:
-        print("Usage: python runner.py <model_name_or_path> <output_file.asm>")
-        print("Example: python runner.py AICrossSim/clm-60m output.asm")
+    if len(sys.argv) < 4:
+        print("Usage: python -m generator.runner <mode> <model_name_or_path> <output_file.asm>")
+        print("Example: python -m generator.runner codegen AICrossSim/clm-60m output.asm")
         return
     mode = sys.argv[1]
     model_path = sys.argv[2]
@@ -53,7 +53,7 @@ def run():
         "num_key_value_heads": dimensions.get("attention", {}).get("num_key_value_heads", "Unknown"),
         "num_attention_heads": dimensions.get("attention", {}).get("num_attention_heads", "Unknown"),
         "num_layers": dimensions.get("num_hidden_layers", "Unknown"),
-        "head_dim": dimensions.get("hidden_size", "Unknown") // dimensions.get("num_attention_heads", 1),
+        "head_dim": dimensions.get("attention", {}).get("head_dim", 0),
         "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6),
     }
 
