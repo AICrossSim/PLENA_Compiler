@@ -6,8 +6,10 @@ and that S_LUI_INT + S_ADDI_INT pair is emitted for large matrix sizes.
 Note: projection_asm._load_large_int returns list[str].
       ffn_asm._load_large_int returns str (tested indirectly via ffn_asm()).
 """
+
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))  # project root
 
 import unittest
@@ -37,8 +39,8 @@ class TestLoadLargeInt(unittest.TestCase):
         """Value = 2^18 = 262144 needs LUI (upper=64, lower=0)."""
         result = _load_large_int(2, 262144)
         asm = "\n".join(result)
-        self.assertIn("S_LUI_INT gp2, 64", asm)   # 262144 >> 12 = 64
-        self.assertNotIn("S_ADDI_INT", asm)         # lower = 262144 & 0xFFF = 0
+        self.assertIn("S_LUI_INT gp2, 64", asm)  # 262144 >> 12 = 64
+        self.assertNotIn("S_ADDI_INT", asm)  # lower = 262144 & 0xFFF = 0
 
     def test_2048x2048(self):
         """2048*2048 = 4194304: upper=1024, lower=0 -> LUI only."""
@@ -46,7 +48,7 @@ class TestLoadLargeInt(unittest.TestCase):
         result = _load_large_int(3, val)
         asm = "\n".join(result)
         self.assertIn("S_LUI_INT gp3, 1024", asm)  # 4194304 >> 12 = 1024
-        self.assertNotIn("S_ADDI_INT", asm)          # lower = 0
+        self.assertNotIn("S_ADDI_INT", asm)  # lower = 0
 
     def test_2048x8192(self):
         """2048*8192 = 16777216: upper=4096, lower=0 -> LUI only."""
@@ -54,11 +56,11 @@ class TestLoadLargeInt(unittest.TestCase):
         result = _load_large_int(4, val)
         asm = "\n".join(result)
         self.assertIn("S_LUI_INT gp4, 4096", asm)  # 16777216 >> 12 = 4096
-        self.assertNotIn("S_ADDI_INT", asm)          # lower = 0
+        self.assertNotIn("S_ADDI_INT", asm)  # lower = 0
 
     def test_value_with_remainder(self):
         """Value with non-zero lower 12 bits emits both LUI and ADDI."""
-        val = (100 << 12) + 500   # upper=100, lower=500
+        val = (100 << 12) + 500  # upper=100, lower=500
         result = _load_large_int(5, val)
         asm = "\n".join(result)
         self.assertIn("S_LUI_INT gp5, 100", asm)
@@ -85,7 +87,9 @@ class TestProjectionAsmLargeMatrix(unittest.TestCase):
     """Test that projection_asm generates valid code for large matrices."""
 
     BASE_ARGS = dict(
-        mlen=64, blen=4, batch=4,
+        mlen=64,
+        blen=4,
+        batch=4,
         alive_registers=[1, 2, 3, 4, 5, 6],
         w_base_hbm_offset_reg=0,
         activation_base_address=0,
@@ -148,7 +152,9 @@ class TestProjectionTAsmLargeMatrix(unittest.TestCase):
     """Test that projection_T_asm also handles large matrices correctly."""
 
     BASE_ARGS = dict(
-        mlen=64, blen=4, batch=4,
+        mlen=64,
+        blen=4,
+        batch=4,
         alive_registers=[1, 2, 3, 4, 5, 6],
         w_base_hbm_offset_reg=0,
         activation_base_address=0,
@@ -177,7 +183,11 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
     """
 
     BASE_ARGS = dict(
-        mlen=64, vlen=64, blen=4, batch=4, seq_len=64,
+        mlen=64,
+        vlen=64,
+        blen=4,
+        batch=4,
+        seq_len=64,
         alive_registers=list(range(12)),
         gate_weight_hbm_offset_reg=0,
         up_weight_hbm_offset_reg=1,
@@ -188,6 +198,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
 
     def _import_ffn_asm(self):
         from compiler.asm_templates.ffn_asm import ffn_asm
+
         return ffn_asm
 
     def test_small_ffn_no_error(self):
@@ -245,8 +256,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         args = dict(self.BASE_ARGS)
         args["alive_registers"] = list(range(10))  # loop version needs 10
         try:
-            asm = ffn_asm(hidden_size=2048, intermediate_size=8192,
-                          use_loop_instructions=True, **args)
+            asm = ffn_asm(hidden_size=2048, intermediate_size=8192, use_loop_instructions=True, **args)
         except AssertionError as e:
             self.fail(f"ffn_asm loop path raised AssertionError for 2048x8192: {e}")
         self.assertIn("S_LUI_INT", asm)
@@ -257,8 +267,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         ffn_asm = self._import_ffn_asm()
         args = dict(self.BASE_ARGS)
         args["alive_registers"] = list(range(10))
-        asm = ffn_asm(hidden_size=128, intermediate_size=256,
-                      use_loop_instructions=True, **args)
+        asm = ffn_asm(hidden_size=128, intermediate_size=256, use_loop_instructions=True, **args)
         _check_all_addi_immediates(self, asm, "ffn_asm(loop,128,256)")
 
 
@@ -274,8 +283,7 @@ def _check_all_addi_immediates(test_case, asm: str, label: str) -> None:
             try:
                 imm = int(parts[-1].strip())
                 test_case.assertLess(
-                    imm, IMM2_BOUND,
-                    f"[{label}] S_ADDI_INT with large immediate {imm} (>= 2^18): {line}"
+                    imm, IMM2_BOUND, f"[{label}] S_ADDI_INT with large immediate {imm} (>= 2^18): {line}"
                 )
             except ValueError:
                 pass  # not a plain integer literal, skip

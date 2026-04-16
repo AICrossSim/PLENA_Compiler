@@ -22,12 +22,32 @@ def test_attention_code_generation():
     }
 
     # Generate the assembly code
-    generated_code = _generate_attention_code(test_node)
+    model_info = {"batch": 1}
+    hardware_config = {"MLEN": 64, "BLEN": 4}
+    scheduler = {
+        "register_assignment": {
+            "hbm_addr_reg": {
+                "q_weight_offset": 0,
+                "k_weight_offset": 0,
+                "v_weight_offset": 0,
+                "rope_params_offset": 0,
+            }
+        },
+        "memory_layout": {
+            "vector_sram_addr": {"block1": 0, "block2": 0, "block3": 0},
+            "fp_sram": {},
+        },
+    }
+
+    generated_code = _generate_attention_code(test_node, model_info=model_info, hardware_config=hardware_config, scheduler=scheduler)
 
     print("Generated Flash Attention Assembly Code:")
     print("=" * 50)
     print(generated_code)
     print("=" * 50)
+
+    assert isinstance(generated_code, str)
+    assert "Self-attention" in generated_code
 
     # Basic validation
     # assert "Flash Attention Implementation" in generated_code

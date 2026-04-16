@@ -42,6 +42,8 @@ def im2col_asm(
     scratch_vram_addr: int,
     output_vram_base: int,
     W_padded: int = None,
+    fp_one_reg: int = 1,  # FP register holding 1.0 (must be in fp_preload[fp_one_reg])
+    fp_sram_precious_slots: list = None,  # fp_sram slots to save before mask construction
 ) -> str:
     """
     Generate PLENA assembly for on-chip im2col.
@@ -78,31 +80,82 @@ def im2col_asm(
         Generated assembly code as a string.
     """
     # ── register allocation ──────────────────────────────────────────
-    acc_reg = alive_registers[0]       # points to current accumulator VRAM row
-    scratch_reg = alive_registers[1]   # points to scratch VRAM area
-    shift_reg = alive_registers[2]     # holds shift amount (GP integer)
-    hbm_off_reg = alive_registers[3]   # holds HBM offset for H_PREFETCH_V
-    mask_reg = alive_registers[4]      # holds mask vector VRAM address
-    temp_reg = alive_registers[5]      # general temp
+    acc_reg = alive_registers[0]  # points to current accumulator VRAM row
+    scratch_reg = alive_registers[1]  # points to scratch VRAM area
+    shift_reg = alive_registers[2]  # holds shift amount (GP integer)
+    hbm_off_reg = alive_registers[3]  # holds HBM offset for H_PREFETCH_V
+    mask_reg = alive_registers[4]  # holds mask vector VRAM address
+    temp_reg = alive_registers[5]  # general temp
 
     K_col = C_in * K * K  # number of columns in im2col output row
-    assert K_col <= vlen, (
-        f"im2col row length {K_col} exceeds VLEN {vlen}; "
-        "tiled im2col not yet supported"
-    )
+    num_tiles = (K_col + vlen - 1) // vlen
+    if num_tiles > 1:
+        assert vlen % K == 0, (
+            f"multi-tile im2col with V_SHFT_V requires K ({K}) | VLEN ({vlen}); "
+            "K-groups would cross tile boundaries and V_SHFT_V cannot left-shift"
+        )
 
     # W_padded: each input row is stored with W_padded elements in HBM so
     # that row starts are 64-element aligned (required by H_PREFETCH_V).
     if W_padded is None:
         W_padded = W
 
+    # Compute save f_regs for precious fp_sram slots (mirrors im2col_asm_no_shift).
+    # Mask construction zeroes fp_sram[0..VLEN-1] then writes mask values, corrupting
+    # any pre-loaded values in those slots. Hardware supports f_regs 0..7 only.
+    _MAX_FREG = 7
+    if fp_sram_precious_slots is None:
+        fp_sram_precious_slots = [1, 2, 3, 4, 5]
+    used_fregs = {0, fp_one_reg}
+    save_fregs = [f for f in range(1, _MAX_FREG + 1) if f not in used_fregs]
+    assert len(save_fregs) >= len(fp_sram_precious_slots), (
+        f"Not enough free f_regs ({len(save_fregs)}) for {len(fp_sram_precious_slots)} precious fp_sram slots"
+    )
+    save_fregs = save_fregs[: len(fp_sram_precious_slots)]
+
     lines: list[str] = []
     lines.append("; ============================================================")
-    lines.append("; im2col: transform NCHW input in HBM -> im2col matrix in VRAM")
+    lines.append("; im2col (with V_SHFT_V): NCHW input in HBM -> im2col matrix in VRAM")
     lines.append(f";   input shape : (1, {C_in}, {H}, {W})  in HBM (W_padded={W_padded})")
     lines.append(f";   kernel      : {K}x{K},  OH={OH}, OW={OW}")
     lines.append(f";   output      : ({M}, {K_col}) in VRAM starting at {output_vram_base}")
+    lines.append(f"; Requires: f0=0.0 (hw const), fp_preload[{fp_one_reg}]=1.0")
     lines.append("; ============================================================")
+
+    # ── save precious fp_sram slots before mask construction overwrites them ─
+    if fp_sram_precious_slots:
+        lines.append("")
+        lines.append("; -- Save precious fp_sram slots before mask construction --")
+        for slot, sv in zip(fp_sram_precious_slots, save_fregs):
+            lines.append(f"S_LD_FP f{sv}, gp0, {slot}")
+
+    # ── build mask vector [1.0]*K + [0.0]*(VLEN-K) into VRAM via FP_SRAM ─────
+    lines.append("")
+    lines.append(f"; -- Setup: load 1.0 from FP_SRAM[{fp_one_reg}] into f{fp_one_reg} --")
+    lines.append(f"S_LD_FP f{fp_one_reg}, gp0, {fp_one_reg}")
+
+    lines.append("")
+    lines.append(f"; -- Setup: write mask FP_SRAM[0..{K - 1}]=1.0, [{K}..{vlen - 1}]=0.0 --")
+    for kc in range(K):
+        lines.append(f"S_ST_FP f{fp_one_reg}, gp0, {kc}")
+    for kc in range(K, vlen):
+        lines.append(f"S_ST_FP f0, gp0, {kc}")
+
+    lines.append("")
+    lines.append(f"; -- Map FP_SRAM -> VRAM mask row at addr {mask_vec_vram_addr} --")
+    lines.append(f"S_ADDI_INT gp{temp_reg}, gp0, {mask_vec_vram_addr}")
+    lines.append(f"S_MAP_V_FP gp{temp_reg}, gp0, 0")
+
+    lines.append("")
+    lines.append("; -- Restore FP_SRAM[0..K-1] to zeros (rest already zero) --")
+    for kc in range(K):
+        lines.append(f"S_ST_FP f0, gp0, {kc}")
+
+    if fp_sram_precious_slots:
+        lines.append("")
+        lines.append("; -- Restore precious fp_sram slots --")
+        for slot, sv in zip(fp_sram_precious_slots, save_fregs):
+            lines.append(f"S_ST_FP f{sv}, gp0, {slot}")
 
     # ── set up stride for H_PREFETCH_V ───────────────────────────────
     # Stride = W_padded so consecutive prefetched rows map to consecutive
@@ -121,73 +174,63 @@ def im2col_asm(
     # ── set mask register address (constant across all rows) ─────────
     lines.append(f"S_ADDI_INT gp{mask_reg}, gp0, {mask_vec_vram_addr}")
 
-    # ── main loop: iterate over M output positions ───────────────────
-    for m in range(M):
-        oh = m // OW
-        ow = m % OW
-        out_vram_addr = output_vram_base + m * vlen
+    # ── main loop: iterate over tiles × M output positions ───────────
+    # VRAM is column-block-major (matches no_shift template):
+    #   vram_addr(m, t) = output_vram_base + t*M*vlen + m*vlen
+    for tile_t in range(num_tiles):
+        tile_start = tile_t * vlen
+        tile_end = min(tile_start + vlen, K_col)
 
         lines.append("")
-        lines.append(f"; ---- output row m={m}  (oh={oh}, ow={ow}) ----")
+        lines.append(f"; ==== TILE t={tile_t}  global cols [{tile_start}..{tile_end - 1}] ====")
 
-        # Point accumulator register at the output VRAM row.
-        lines.append(f"S_ADDI_INT gp{acc_reg}, gp0, {out_vram_addr}")
+        for m in range(M):
+            oh = m // OW
+            ow = m % OW
+            out_vram_addr = output_vram_base + tile_t * M * vlen + m * vlen
 
-        # Zero the accumulator row: multiply the scratch row by f0 (=0.0)
-        # and write to the accumulator address.
-        # First we need *something* in the scratch slot; we can just use
-        # the mask vector as a source and multiply by f0.
-        lines.append(f"V_MUL_VF gp{acc_reg}, gp{mask_reg}, f0, 0")
+            lines.append("")
+            lines.append(f"; ---- tile={tile_t} output row m={m}  (oh={oh}, ow={ow}) ----")
 
-        # Set scratch base address.
-        lines.append(f"S_ADDI_INT gp{scratch_reg}, gp0, {scratch_vram_addr}")
+            # Point accumulator register at the output VRAM row.
+            lines.append(f"S_ADDI_INT gp{acc_reg}, gp0, {out_vram_addr}")
 
-        for c in range(C_in):
-            for kr in range(K):
-                # HBM offset for this (c, kr, ow) combination.
-                # Input is stored with row-stride W_padded so that each row
-                # start is 64-element aligned (H_PREFETCH_V requirement):
-                #   input[0, c, oh+kr, ow]  ->  (c*H + oh+kr)*W_padded + ow
-                hbm_offset = (c * H + (oh + kr)) * W_padded + ow
+            # Zero the accumulator row: multiply mask vector by f0.
+            lines.append(f"V_MUL_VF gp{acc_reg}, gp{mask_reg}, f0, 0")
 
-                # Target position inside the im2col row.
-                shift_amount = c * K * K + kr * K
+            # Set scratch base address.
+            lines.append(f"S_ADDI_INT gp{scratch_reg}, gp0, {scratch_vram_addr}")
 
-                # Load from HBM into scratch VRAM.
-                # H_PREFETCH_V loads PREFETCH_V_AMOUNT rows.  We only use
-                # scratch slot 0 (at scratch_vram_addr).
-                lines.append(
-                    f"S_ADDI_INT gp{hbm_off_reg}, gp0, {hbm_offset}"
-                )
-                lines.append(
-                    f"H_PREFETCH_V gp{scratch_reg}, gp{hbm_off_reg}, "
-                    f"a{input_hbm_base_addr_reg}, 1, 0"
-                )
+            for c in range(C_in):
+                for kr in range(K):
+                    # Global column position of this K-group in the im2col row.
+                    g = c * K * K + kr * K
 
-                # Mask: zero out elements K..VLEN-1
-                # scratch[0] = scratch[0] * mask_vec  (element-wise)
-                lines.append(
-                    f"V_MUL_VV gp{scratch_reg}, gp{scratch_reg}, "
-                    f"gp{mask_reg}, 0"
-                )
+                    # Skip K-groups not contributing to this tile.
+                    # (assertion above guarantees K|vlen for num_tiles>1, so
+                    #  K-groups never straddle tile boundaries.)
+                    if g + K <= tile_start or g >= tile_end:
+                        continue
 
-                # Shift right by shift_amount positions.
-                # V_SHFT_V rd, rs1, rs2  -- rs2 is a GP register holding
-                # the integer shift amount.
-                if shift_amount > 0:
-                    lines.append(
-                        f"S_ADDI_INT gp{shift_reg}, gp0, {shift_amount}"
-                    )
-                    lines.append(
-                        f"V_SHFT_V gp{scratch_reg}, gp{scratch_reg}, "
-                        f"gp{shift_reg}"
-                    )
+                    local_shift = g - tile_start
 
-                # Accumulate: accum += shifted scratch row.
-                lines.append(
-                    f"V_ADD_VV gp{acc_reg}, gp{acc_reg}, "
-                    f"gp{scratch_reg}, 0"
-                )
+                    # HBM offset for this (c, kr, ow) combination.
+                    hbm_offset = (c * H + (oh + kr)) * W_padded + ow
+
+                    # Load K contiguous elements from HBM into scratch row.
+                    lines.append(f"S_ADDI_INT gp{hbm_off_reg}, gp0, {hbm_offset}")
+                    lines.append(f"H_PREFETCH_V gp{scratch_reg}, gp{hbm_off_reg}, a{input_hbm_base_addr_reg}, 1, 0")
+
+                    # Mask: zero out elements K..VLEN-1
+                    lines.append(f"V_MUL_VV gp{scratch_reg}, gp{scratch_reg}, gp{mask_reg}, 0")
+
+                    # Shift right to local position within tile.
+                    if local_shift > 0:
+                        lines.append(f"S_ADDI_INT gp{shift_reg}, gp0, {local_shift}")
+                        lines.append(f"V_SHFT_V gp{scratch_reg}, gp{scratch_reg}, gp{shift_reg}")
+
+                    # Accumulate: accum += shifted scratch row.
+                    lines.append(f"V_ADD_VV gp{acc_reg}, gp{acc_reg}, gp{scratch_reg}, 0")
 
     lines.append("")
     lines.append("; ============================================================")

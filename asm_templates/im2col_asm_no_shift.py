@@ -9,7 +9,7 @@ Algorithm per output row m:
 Requires: f0=0.0 (hw const), fp_preload[fp_one_reg]=1.0.
 """
 
-PREFETCH_V_AMOUNT = 4   # H_PREFETCH_V always loads this many VRAM rows
+PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows
 
 
 def im2col_asm_no_shift(
@@ -29,8 +29,8 @@ def im2col_asm_no_shift(
     temp_vram_addr: int,
     output_vram_base: int,
     W_padded: int = None,
-    fp_one_reg: int = 1,   # FP register holding 1.0 (must be pre-loaded via fp_preload)
-    fp_ex_reg: int = 2,    # FP register used as V_RED_SUM accumulator
+    fp_one_reg: int = 1,  # FP register holding 1.0 (must be pre-loaded via fp_preload)
+    fp_ex_reg: int = 2,  # FP register used as V_RED_SUM accumulator
     fp_sram_precious_slots: list = None,  # fp_sram slots to save before and restore after im2col
 ) -> str:
     """
@@ -74,16 +74,14 @@ def im2col_asm_no_shift(
         Assembly code string.
     """
     scratch_reg = alive_registers[0]
-    temp_reg    = alive_registers[1]
-    off_reg     = alive_registers[2]
-    out_reg     = alive_registers[3]
-    basis_reg   = alive_registers[4]
+    temp_reg = alive_registers[1]
+    off_reg = alive_registers[2]
+    out_reg = alive_registers[3]
+    basis_reg = alive_registers[4]
 
     K_col = C_in * K * K
 
-    assert K <= vlen, (
-        f"K={K} > vlen={vlen}; basis-vector extraction requires K <= vlen"
-    )
+    assert K <= vlen, f"K={K} > vlen={vlen}; basis-vector extraction requires K <= vlen"
     num_tiles = (K_col + vlen - 1) // vlen
 
     if W_padded is None:
@@ -100,10 +98,9 @@ def im2col_asm_no_shift(
     # Collect available f_regs in [1..MAX_FREG] (skip f0 — hw const)
     save_fregs = [f for f in range(1, _MAX_FREG + 1) if f not in used_fregs]
     assert len(save_fregs) >= len(fp_sram_precious_slots), (
-        f"Not enough free f_regs ({len(save_fregs)}) for "
-        f"{len(fp_sram_precious_slots)} precious fp_sram slots"
+        f"Not enough free f_regs ({len(save_fregs)}) for {len(fp_sram_precious_slots)} precious fp_sram slots"
     )
-    save_fregs = save_fregs[:len(fp_sram_precious_slots)]
+    save_fregs = save_fregs[: len(fp_sram_precious_slots)]
 
     lines = []
     lines.append("; ============================================================")
@@ -141,7 +138,7 @@ def im2col_asm_no_shift(
         lines.append(f"S_ST_FP f{fp_one_reg}, gp0, {kc}")
         lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {basis_vram_addr}")
         lines.append(f"S_MAP_V_FP gp{basis_reg}, gp0, 0")  # FP_SRAM[0..63] -> VRAM
-        lines.append(f"S_ST_FP f0, gp0, {kc}")             # restore 0.0
+        lines.append(f"S_ST_FP f0, gp0, {kc}")  # restore 0.0
 
     # Pin scratch and temp VRAM addresses (constant across all rows)
     lines.append("")
@@ -162,13 +159,11 @@ def im2col_asm_no_shift(
     #   vram_addr(m, t) = output_vram_base + t*M*vlen + m*vlen
     for tile_t in range(num_tiles):
         tile_start = tile_t * vlen
-        tile_end   = min(tile_start + vlen, K_col)
-        tile_width = tile_end - tile_start   # < vlen only for the last partial tile
+        tile_end = min(tile_start + vlen, K_col)
+        tile_width = tile_end - tile_start  # < vlen only for the last partial tile
 
         lines.append("")
-        lines.append(
-            f"; ==== TILE t={tile_t}  global cols [{tile_start}..{tile_end - 1}] ===="
-        )
+        lines.append(f"; ==== TILE t={tile_t}  global cols [{tile_start}..{tile_end - 1}] ====")
 
         for m in range(M):
             oh = m // OW
@@ -177,10 +172,7 @@ def im2col_asm_no_shift(
             out_vram_addr = output_vram_base + tile_t * M * vlen + m * vlen
 
             lines.append("")
-            lines.append(
-                f"; ==== tile={tile_t} output row m={m}  oh={oh}  ow={ow}  "
-                f"vram={out_vram_addr} ===="
-            )
+            lines.append(f"; ==== tile={tile_t} output row m={m}  oh={oh}  ow={ow}  vram={out_vram_addr} ====")
             lines.append(f"S_ADDI_INT gp{out_reg}, gp0, {out_vram_addr}")
 
             # Zero unwritten FP_SRAM slots for partial last tile
@@ -191,10 +183,7 @@ def im2col_asm_no_shift(
             for c in range(C_in):
                 for kr in range(K):
                     # kc values whose global column falls in this tile
-                    contributing_kcs = [
-                        kc for kc in range(K)
-                        if tile_start <= c * K * K + kr * K + kc < tile_end
-                    ]
+                    contributing_kcs = [kc for kc in range(K) if tile_start <= c * K * K + kr * K + kc < tile_end]
                     if not contributing_kcs:
                         continue
 
@@ -203,25 +192,16 @@ def im2col_asm_no_shift(
 
                     lines.append(f"; (c={c}, kr={kr})  hbm_off={hbm_offset}")
                     lines.append(f"S_ADDI_INT gp{off_reg}, gp0, {hbm_offset}")
-                    lines.append(
-                        f"H_PREFETCH_V gp{scratch_reg}, gp{off_reg}, "
-                        f"a{input_hbm_base_addr_reg}, 1, 0"
-                    )
+                    lines.append(f"H_PREFETCH_V gp{scratch_reg}, gp{off_reg}, a{input_hbm_base_addr_reg}, 1, 0")
 
                     for kc in contributing_kcs:
-                        local_pos  = c * K * K + kr * K + kc - tile_start
+                        local_pos = c * K * K + kr * K + kc - tile_start
                         basis_addr = basis_vram_base + kc * vlen
 
-                        lines.append(
-                            f"S_ADDI_INT gp{basis_reg}, gp0, {basis_addr}"
-                        )
-                        lines.append(
-                            f"V_MUL_VV gp{temp_reg}, gp{scratch_reg}, gp{basis_reg}, 0"
-                        )
+                        lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {basis_addr}")
+                        lines.append(f"V_MUL_VV gp{temp_reg}, gp{scratch_reg}, gp{basis_reg}, 0")
                         lines.append(f"S_ADD_FP f{fp_ex_reg}, f0, f0")
-                        lines.append(
-                            f"V_RED_SUM f{fp_ex_reg}, gp{temp_reg}, 0, 0"
-                        )
+                        lines.append(f"V_RED_SUM f{fp_ex_reg}, gp{temp_reg}, 0, 0")
                         lines.append(f"S_ST_FP f{fp_ex_reg}, gp0, {local_pos}")
 
             lines.append(f"S_MAP_V_FP gp{out_reg}, gp0, 0")  # flush to VRAM

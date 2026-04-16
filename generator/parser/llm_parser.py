@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from transformers import AutoConfig, AutoModel
@@ -325,7 +325,7 @@ class LLMModelParser:
 
         return self.symbolic_graph
 
-    def create_vision_symbolic_graph(self, batch_size: int = 1) -> dict | None:
+    def create_vision_symbolic_graph(self, batch_size: int = 1) -> Optional[dict]:
         """Create symbolic graph for vision encoder (SigLIP/ViT style).
         Returns None if no vision_config present.
         """

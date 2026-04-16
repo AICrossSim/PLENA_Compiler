@@ -1,6 +1,7 @@
 import math
 from typing import List, Optional
 
+
 def store_act_asm(
     vlen: int,
     batch: int,
@@ -18,11 +19,11 @@ def store_act_asm(
     """
     generated_code = "; Store Activation Generation\n"
 
-    hbm_offset_reg      = alive_registers[0]
-    set_stride_register  = alive_registers[1]
-    vram_reg             = alive_registers[2]
-    outer_loop_register  = alive_registers[3]
-    inner_loop_register  = alive_registers[4]
+    hbm_offset_reg = alive_registers[0]
+    set_stride_register = alive_registers[1]
+    vram_reg = alive_registers[2]
+    outer_loop_register = alive_registers[3]
+    inner_loop_register = alive_registers[4]
 
     stride_len = hidden_size if stride_size is None else stride_size
     store_amount_per_hidden = math.ceil(hidden_size / vlen)

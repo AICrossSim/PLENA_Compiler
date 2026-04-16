@@ -45,11 +45,11 @@ def batched_matmul_asm(
     w_actual_register = alive_registers[1]
     result_actual_register = alive_registers[2]
 
-    k_tiles = k // mlen            # number of k-dimension tiles
-    n_tiles = n // blen             # total n-dimension tiles
-    tiles_per_mlen = mlen // blen   # n-tiles that fit in one matrix SRAM bank width
-    n_groups = n // mlen            # number of mlen-wide column groups
-    stride_len = n // mlen          # VRAM row stride for mm_wo (N/mlen vectors per result row)
+    k_tiles = k // mlen  # number of k-dimension tiles
+    n_tiles = n // blen  # total n-dimension tiles
+    tiles_per_mlen = mlen // blen  # n-tiles that fit in one matrix SRAM bank width
+    n_groups = n // mlen  # number of mlen-wide column groups
+    stride_len = n // mlen  # VRAM row stride for mm_wo (N/mlen vectors per result row)
 
     generated_code += f"S_ADDI_INT gp{result_actual_register}, gp0, {result_base_address} \n"
     for batch in range(1, b + 1):
@@ -68,7 +68,9 @@ def batched_matmul_asm(
                 # HBM column offset for this n-group
                 n_group_col_offset = (i // tiles_per_mlen) * mlen
                 generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
-                generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {(batch - 1) * k * n + n_group_col_offset} \n"
+                generated_code += (
+                    f"S_ADDI_INT gp{a_actual_register}, gp0, {(batch - 1) * k * n + n_group_col_offset} \n"
+                )
                 for g in range(k_tiles):
                     generated_code += (
                         f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{w_base_hbm_offset_reg}, 1, 0 \n"
@@ -108,7 +110,9 @@ def batched_matmul_asm(
                     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n"
                 # Set result address BEFORE M_MM_WO:
                 # v_addr = result_base + batch_offset + j*blen*n + (i//tiles_per_mlen)*mlen + (i%tiles_per_mlen)*blen
-                result_addr = result_base_address + batch_offset + j * blen * n + (i // tiles_per_mlen) * mlen + col_offset
+                result_addr = (
+                    result_base_address + batch_offset + j * blen * n + (i // tiles_per_mlen) * mlen + col_offset
+                )
                 generated_code += f"S_ADDI_INT gp{result_actual_register}, gp0, {result_addr} \n"
                 # Set stride register for mm_wo (N/mlen vectors per result row)
                 generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {stride_len} \n"

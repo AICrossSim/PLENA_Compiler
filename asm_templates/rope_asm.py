@@ -29,14 +29,12 @@ def rope_asm(
         seq_len:  number of sequence positions
         head_dim: head dimension (must be multiple of vlen)
     """
-    assert head_dim % vlen == 0, (
-        f"head_dim ({head_dim}) must be divisible by vlen ({vlen})"
-    )
+    assert head_dim % vlen == 0, f"head_dim ({head_dim}) must be divisible by vlen ({vlen})"
 
-    x_addr      = alive_registers[0]
-    xrot_addr   = alive_registers[1]
-    cos_addr    = alive_registers[2]
-    sin_addr    = alive_registers[3]
+    x_addr = alive_registers[0]
+    xrot_addr = alive_registers[1]
+    cos_addr = alive_registers[2]
+    sin_addr = alive_registers[3]
     scratch_addr = alive_registers[4]
 
     num_chunks = head_dim // vlen
@@ -48,10 +46,10 @@ def rope_asm(
         chunk_base = j * seq_len * vlen
         for i in range(seq_len):
             addr = chunk_base + i * vlen
-            lines.append(f"S_ADDI_INT gp{x_addr},    gp0, {x_base_address    + addr} ")
+            lines.append(f"S_ADDI_INT gp{x_addr},    gp0, {x_base_address + addr} ")
             lines.append(f"S_ADDI_INT gp{xrot_addr}, gp0, {x_rot_base_address + addr} ")
-            lines.append(f"S_ADDI_INT gp{cos_addr},  gp0, {cos_base_address   + addr} ")
-            lines.append(f"S_ADDI_INT gp{sin_addr},  gp0, {sin_base_address   + addr} ")
+            lines.append(f"S_ADDI_INT gp{cos_addr},  gp0, {cos_base_address + addr} ")
+            lines.append(f"S_ADDI_INT gp{sin_addr},  gp0, {sin_base_address + addr} ")
             lines.append(f"V_MUL_VV gp{scratch_addr}, gp{xrot_addr}, gp{sin_addr}, 0 ")
             lines.append(f"V_MUL_VV gp{x_addr}, gp{x_addr}, gp{cos_addr}, 0 ")
             lines.append(f"V_ADD_VV gp{x_addr}, gp{x_addr}, gp{scratch_addr}, 0 ")

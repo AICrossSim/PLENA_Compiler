@@ -109,7 +109,9 @@ def projection_asm(
                     f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
-                lines.extend(_addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register))
+                lines.extend(
+                    _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register)
+                )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
@@ -124,9 +126,7 @@ def projection_asm(
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                 lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
-            lines.append(
-                f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} "
-            )
+            lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")
         if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_features // blen - 1:
             lines.append(f"S_ADDI_INT gp{result_reg}, gp{result_reg}, {mlen * batch} ")
 
@@ -199,14 +199,18 @@ def projection_T_asm(
             lines.extend(_load_large_int(w_hbm_offset_register, weight_row * blen * in_features))
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
             for weight_col in range(hidden_size // mlen):
-                lines.append(f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 ")
+                lines.append(
+                    f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
+                )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
                 # Move to next mlen-wide column block within this row group
                 lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen} ")
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % tiles_per_mlen) * blen} ")
-            lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % tiles_per_mlen) * blen} ")
+            lines.append(
+                f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % tiles_per_mlen) * blen} "
+            )
         for act_col in range(batch // blen):
             lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address + act_col * mlen * blen} ")
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")

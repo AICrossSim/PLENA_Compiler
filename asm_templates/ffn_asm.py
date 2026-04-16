@@ -154,7 +154,9 @@ def _ffn_asm_unrolled(
             for weight_col in range(hidden_size // mlen):
                 generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{up_weight_hbm_offset_reg}, 1, 0 \n"
                 generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n"
-                generated_code += _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * intermediate_size, w_temp_register)
+                generated_code += _addi_large_int(
+                    w_hbm_offset_register, w_hbm_offset_register, mlen * intermediate_size, w_temp_register
+                )
             generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
         else:
             generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n"
@@ -185,7 +187,9 @@ def _ffn_asm_unrolled(
             for weight_col in range(hidden_size // mlen):
                 generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{gate_weight_hbm_offset_reg}, 1, 0 \n"
                 generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n"
-                generated_code += _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * intermediate_size, w_temp_register)
+                generated_code += _addi_large_int(
+                    w_hbm_offset_register, w_hbm_offset_register, mlen * intermediate_size, w_temp_register
+                )
             generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
         else:
             generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n"
@@ -336,7 +340,9 @@ def ffn_up_silu_asm(
             f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
         )
         generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-        generated_code += _addi_large_int(a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register)
+        generated_code += _addi_large_int(
+            a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register
+        )
 
     # Reset for compute phase
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -457,7 +463,9 @@ def ffn_intermediate_asm(
             f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
         )
         generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-        generated_code += _addi_large_int(a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register)
+        generated_code += _addi_large_int(
+            a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register
+        )
 
     # Reset for compute phase
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -526,7 +534,9 @@ def ffn_intermediate_asm(
             f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{gate_weight_hbm_offset_reg}, 1, 0\n"
         )
         generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-        generated_code += _addi_large_int(a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register)
+        generated_code += _addi_large_int(
+            a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register
+        )
 
     # Reset for compute phase
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -672,7 +682,9 @@ def _ffn_asm_with_loops(
             f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
         )
         generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-        generated_code += _addi_large_int(a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register)
+        generated_code += _addi_large_int(
+            a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register
+        )
 
     # Reset for compute phase
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -741,7 +753,9 @@ def _ffn_asm_with_loops(
             f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{gate_weight_hbm_offset_reg}, 1, 0\n"
         )
         generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-        generated_code += _addi_large_int(a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register)
+        generated_code += _addi_large_int(
+            a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register
+        )
 
     # Reset for compute phase
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -980,7 +994,9 @@ def _ffn_asm_fused_up_gate(
             f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
         )
         generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-        generated_code += _addi_large_int(a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register)
+        generated_code += _addi_large_int(
+            a_actual_register, a_actual_register, mlen * intermediate_size, w_temp_register
+        )
 
     # Setup for UP compute and GATE prefetch overlap
     generated_code += f"S_ADDI_INT gp{w_gate_base_register}, gp0, {gate_mram_offset}\n"

@@ -359,6 +359,7 @@ def test_model():
 def test_smolvlm2():
     """Test LLMModelParser with SmolVLM2 multimodal config (no HuggingFace download)."""
     from types import SimpleNamespace
+
     print("\n" + "=" * 50)
     print("Testing SmolVLM2 multimodal config...")
     print("=" * 50)
@@ -369,7 +370,7 @@ def test_smolvlm2():
         hidden_size=2048,
         num_hidden_layers=24,
         num_attention_heads=32,
-        num_key_value_heads=1,   # MQA!
+        num_key_value_heads=1,  # MQA!
         intermediate_size=8192,
         head_dim=64,
         vocab_size=49280,
@@ -403,7 +404,7 @@ def test_smolvlm2():
     # Create parser with mock config (no model loading)
     parser = LLMModelParser("mock-smolvlm2")
     parser.config = config
-    parser.model = SimpleNamespace()   # empty model (embed_tokens detection will miss, graph still built)
+    parser.model = SimpleNamespace()  # empty model (embed_tokens detection will miss, graph still built)
 
     all_passed = True
 
@@ -434,7 +435,7 @@ def test_smolvlm2():
     print("\n--- Test 2: text decoder symbolic graph ---")
     graph = parser.create_symbolic_graph(batch_size=1, seq_len=8192)
 
-    expected_text_nodes = 1 + 24 * 6 + 1   # embed + 24*(norm,attn,res,norm,ffn,res) + final_norm = 146
+    expected_text_nodes = 1 + 24 * 6 + 1  # embed + 24*(norm,attn,res,norm,ffn,res) + final_norm = 146
     if graph["total_nodes"] == expected_text_nodes:
         print(f"  ✅ text graph total_nodes: {graph['total_nodes']}")
     else:
@@ -448,12 +449,14 @@ def test_smolvlm2():
         q_out = attn["dimensions"]["q_proj"]["out_features"]
         k_out = attn["dimensions"]["k_proj"]["out_features"]
         v_out = attn["dimensions"]["v_proj"]["out_features"]
-        expected_q = 32 * 64   # num_heads * head_dim = 2048
-        expected_kv = 1 * 64   # num_kv_heads * head_dim = 64 (MQA!)
+        expected_q = 32 * 64  # num_heads * head_dim = 2048
+        expected_kv = 1 * 64  # num_kv_heads * head_dim = 64 (MQA!)
 
-        for proj_name, actual, expected in [("q_proj out", q_out, expected_q),
-                                             ("k_proj out (MQA)", k_out, expected_kv),
-                                             ("v_proj out (MQA)", v_out, expected_kv)]:
+        for proj_name, actual, expected in [
+            ("q_proj out", q_out, expected_q),
+            ("k_proj out (MQA)", k_out, expected_kv),
+            ("v_proj out (MQA)", v_out, expected_kv),
+        ]:
             if actual == expected:
                 print(f"  ✅ {proj_name}: {actual}")
             else:
@@ -468,7 +471,7 @@ def test_smolvlm2():
         print("  ❌ create_vision_symbolic_graph returned None")
         all_passed = False
     else:
-        expected_vision_nodes = 1 + 27 * 6 + 1   # patch_embed + 27*(norm,attn,res,norm,ffn,res) + final_norm = 164
+        expected_vision_nodes = 1 + 27 * 6 + 1  # patch_embed + 27*(norm,attn,res,norm,ffn,res) + final_norm = 164
         if vgraph["total_nodes"] == expected_vision_nodes:
             print(f"  ✅ vision graph total_nodes: {vgraph['total_nodes']}")
         else:

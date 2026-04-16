@@ -1,6 +1,7 @@
 import math
 from typing import List
 
+
 def _load_large_int(reg: int, value: int) -> str:
     """Generate instructions to load any non-negative integer into a GP register.
     Uses S_LUI_INT (shifts imm left by 12) + S_ADDI_INT. Returns assembly string."""
@@ -14,6 +15,7 @@ def _load_large_int(reg: int, value: int) -> str:
         code = f"S_ADDI_INT gp{reg}, gp0, {lower} \n"
     return code
 
+
 def preload_act_asm(
     vlen: int,
     preload_len: int,
@@ -22,14 +24,14 @@ def preload_act_asm(
     act_vram_offset: int,
     alive_registers: List[int],
     activation_offset_reg: int,
-    stride_size = None,
+    stride_size=None,
     vram_stride_mult: int = 1,
 ) -> str:
     """Preload activation from HBM to VRAM. Layout: (hidden//mlen, batch, mlen)."""
     generated_code = "; Preload Activation Generation \n"
-    a_actual_register   = alive_registers[0]
+    a_actual_register = alive_registers[0]
     set_stride_register = alive_registers[1]
-    result_register     = alive_registers[2]
+    result_register = alive_registers[2]
     outer_loop_register = alive_registers[3]
     inner_loop_register = alive_registers[4]
 
@@ -41,14 +43,16 @@ def preload_act_asm(
     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, 0 \n"
     generated_code += f"S_ADDI_INT gp{result_register}, gp0, {act_vram_offset} \n"
     load_amount_per_hidden = math.ceil(hidden_size / vlen)
-    
+
     if batch == 1:
         # Each H_PREFETCH_V loads preload_len rows (vlen * preload_len elements)
         # HBM offset should increment by the same amount as VSRAM offset
         elements_per_prefetch = vlen * preload_len
         vram_step = elements_per_prefetch * vram_stride_mult
         for i in range(math.ceil(hidden_size / elements_per_prefetch)):
-            generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, a{activation_offset_reg}, 0, 0, 0 \n"
+            generated_code += (
+                f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, a{activation_offset_reg}, 0, 0, 0 \n"
+            )
             generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vram_step} \n"
             generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {elements_per_prefetch} \n"
     else:
@@ -60,8 +64,10 @@ def preload_act_asm(
         if batch > preload_len:
             generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / preload_len)} \n"
         generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, a{activation_offset_reg}, 1, 0 \n"
-        generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len * vram_stride_mult} \n"
-        if batch > preload_len:  
+        generated_code += (
+            f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len * vram_stride_mult} \n"
+        )
+        if batch > preload_len:
             generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {hidden_size * preload_len} \n"
             generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
         generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
