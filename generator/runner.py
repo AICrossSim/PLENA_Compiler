@@ -17,8 +17,8 @@ def run():
     mode = sys.argv[1]
     model_path = sys.argv[2]
     output_file = sys.argv[3]
-    hardware_config_path = Path(__file__).resolve().parents[1] / "src" / "definitions" / "configuration.svh"
-    precision_config_path = Path(__file__).resolve().parents[1] / "src" / "definitions" / "precision.svh"
+    hardware_config_path = Path(__file__).resolve().parents[1] / "doc" / "configuration.svh"
+    precision_config_path = Path(__file__).resolve().parents[1] / "doc" / "precision.svh"
     mem_layout_lib_path = Path(__file__).resolve().parents[0] / "scheduler" / "mem_layout_lib.json"
     reg_assignment_lib_path = Path(__file__).resolve().parents[0] / "scheduler" / "reg_assignment_lib.json"
     # Validate that output file ends with .asm

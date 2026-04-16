@@ -44,7 +44,7 @@ def test_embeddings_code_generation():
 
 if __name__ == "__main__":
     test_embeddings_code_generation()
-    config_path = Path(__file__).resolve().parents[2] / "src" / "definitions" / "configuration.svh"
-    isa_def_path = Path(__file__).resolve().parents[2] / "src" / "definitions" / "operation.svh"
+    config_path = Path(__file__).resolve().parents[2] / "doc" / "configuration.svh"
+    isa_def_path = Path(__file__).resolve().parents[2] / "doc" / "operation.svh"
     assembler = AssemblyToBinary(isa_def_path, config_path)
     assembler.generate_binary("generated_embedding_assembly.asm", "generated_embedding_assembly.mem")
