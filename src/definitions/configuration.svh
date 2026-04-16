@@ -1,0 +1,1 @@
+/home/khl22/new_plena/PLENA_Simulator/compiler/doc/configuration.svh
