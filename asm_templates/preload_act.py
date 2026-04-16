@@ -1,19 +1,7 @@
 import math
 from typing import List
 
-
-def _load_large_int(reg: int, value: int) -> str:
-    """Generate instructions to load any non-negative integer into a GP register.
-    Uses S_LUI_INT (shifts imm left by 12) + S_ADDI_INT. Returns assembly string."""
-    upper = value >> 12
-    lower = value & 0xFFF
-    if upper:
-        code = f"S_LUI_INT gp{reg}, {upper} \n"
-        if lower:
-            code += f"S_ADDI_INT gp{reg}, gp{reg}, {lower} \n"
-    else:
-        code = f"S_ADDI_INT gp{reg}, gp0, {lower} \n"
-    return code
+from ._imm import load_large_int_str as _load_large_int
 
 
 def preload_act_asm(

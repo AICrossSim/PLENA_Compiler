@@ -3,17 +3,14 @@ Unit tests for LUI+ADDI large immediate fix in ASM templates.
 Verifies that S_ADDI_INT is no longer used for values > 2^18,
 and that S_LUI_INT + S_ADDI_INT pair is emitted for large matrix sizes.
 
-Note: projection_asm._load_large_int returns list[str].
-      ffn_asm._load_large_int returns str (tested indirectly via ffn_asm()).
+The list-returning helper lives in `asm_templates._imm`; the str-returning
+helper used inside ffn_asm is exercised indirectly via ffn_asm().
 """
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))  # project root
-
 import unittest
-from compiler.asm_templates.projection_asm import projection_asm, projection_T_asm, _load_large_int
+
+from asm_templates._imm import load_large_int as _load_large_int
+from asm_templates.projection_asm import projection_asm, projection_T_asm
 
 
 class TestLoadLargeInt(unittest.TestCase):
@@ -197,7 +194,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
     )
 
     def _import_ffn_asm(self):
-        from compiler.asm_templates.ffn_asm import ffn_asm
+        from asm_templates.ffn_asm import ffn_asm
 
         return ffn_asm
 

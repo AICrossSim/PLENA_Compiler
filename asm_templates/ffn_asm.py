@@ -1,30 +1,5 @@
-def _load_large_int(reg: int, value: int) -> str:
-    """Generate instructions to load any non-negative integer into a GP register.
-
-    S_ADDI_INT supports 18-bit immediates (values 0..2^18-1).
-    For values < 2^18, emit a single S_ADDI_INT from gp0.
-    For values >= 2^18, use S_LUI_INT (rd = imm << 12) + optional S_ADDI_INT.
-    """
-    IMM2_BOUND = 1 << 18
-    if value < IMM2_BOUND:
-        return f"S_ADDI_INT gp{reg}, gp0, {value}\n"
-    upper = value >> 12
-    lower = value & 0xFFF
-    code = f"S_LUI_INT gp{reg}, {upper}\n"
-    if lower:
-        code += f"S_ADDI_INT gp{reg}, gp{reg}, {lower}\n"
-    return code
-
-
-def _addi_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int) -> str:
-    """Generate rd = rs1 + value, handling values >= 2^18 by loading into temp_reg first."""
-    IMM2_BOUND = 1 << 18
-    if value < IMM2_BOUND:
-        return f"S_ADDI_INT gp{dest_reg}, gp{src_reg}, {value}\n"
-    else:
-        code = _load_large_int(temp_reg, value)
-        code += f"S_ADD_INT gp{dest_reg}, gp{src_reg}, gp{temp_reg}\n"
-        return code
+from ._imm import addi_large_int_str as _addi_large_int
+from ._imm import load_large_int_str as _load_large_int
 
 
 def ffn_asm(

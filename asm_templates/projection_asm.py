@@ -1,33 +1,7 @@
 from __future__ import annotations
 
-
-def _load_large_int(reg: int, value: int) -> list[str]:
-    """Generate instructions to load any non-negative integer into a GP register.
-
-    S_ADDI_INT supports 18-bit immediates (values 0..2^18-1).
-    For values < 2^18, emit a single S_ADDI_INT from gp0.
-    For values >= 2^18, use S_LUI_INT (rd = imm << 12) + optional S_ADDI_INT.
-    """
-    IMM2_BOUND = 1 << 18
-    if value < IMM2_BOUND:
-        return [f"S_ADDI_INT gp{reg}, gp0, {value}"]
-    upper = value >> 12
-    lower = value & 0xFFF
-    lines = [f"S_LUI_INT gp{reg}, {upper}"]
-    if lower:
-        lines.append(f"S_ADDI_INT gp{reg}, gp{reg}, {lower}")
-    return lines
-
-
-def _addi_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int) -> list[str]:
-    """Generate rd = rs1 + value, handling values >= 2^18 by loading into temp_reg first."""
-    IMM2_BOUND = 1 << 18
-    if value < IMM2_BOUND:
-        return [f"S_ADDI_INT gp{dest_reg}, gp{src_reg}, {value}"]
-    else:
-        lines = _load_large_int(temp_reg, value)
-        lines.append(f"S_ADD_INT gp{dest_reg}, gp{src_reg}, gp{temp_reg}")
-        return lines
+from ._imm import addi_large_int as _addi_large_int
+from ._imm import load_large_int as _load_large_int
 
 
 def projection_asm(
