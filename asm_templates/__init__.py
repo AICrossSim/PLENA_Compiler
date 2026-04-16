@@ -7,7 +7,7 @@ from .gelu_asm import gelu_asm
 from .normalization_asm import layer_norm_asm, rms_norm_asm
 from .preload_act import preload_act_asm
 from .preload_addr_reg import preload_addr_reg_asm
-from .projection_asm import projection_asm
+from .projection_asm import projection_asm, projection_T_asm
 from .reset_reg_asm import reset_fpreg_asm, reset_reg_asm
 from .silu_asm import silu_asm
 from .gemv_asm import gemv_asm
@@ -26,6 +26,7 @@ __all__ = [
     "preload_act_asm",
     "preload_addr_reg_asm",
     "projection_asm",
+    "projection_T_asm",
     "reset_fpreg_asm",
     "reset_reg_asm",
     "rms_norm_asm",
