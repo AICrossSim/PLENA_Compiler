@@ -28,6 +28,7 @@ from compiler.asm_templates import (
     layer_norm_asm,
     rope_asm,
 )
+from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl
 
 
 MLEN = 64  # Minimum matrix block size
@@ -1238,76 +1239,22 @@ class TileCompiler:
         Returns:
             ISA code string.
         """
-        if len(gp_regs) < 9:
-            raise ValueError(f"{caller_name} requires at least 9 gp registers, got {len(gp_regs)}")
-
-        gp_act = gp_regs[0]
-        gp_mat = gp_regs[1]
-        gp_result = gp_regs[2]
-        gp_loop_outer = gp_regs[3]
-        gp_loop_middle = gp_regs[4]
-        gp_loop_inner = gp_regs[5]
-        gp_act_row_base = gp_regs[6]
-        gp_mat_col_base = gp_regs[7]
-        gp_result_col_base = gp_regs[8]
-
-        tiles_per_mlen = self.mlen // self.blen
-        vram_hidden_block_stride = full_batch * self.mlen
-        mram_hidden_block_stride = self.mlen * self.mlen
-        output_row_stride = self.blen * self.mlen
-        # Middle loop: for sub-mlen batch only iterate the real row groups.
-        row_loop_count = min(tiles_per_mlen, math.ceil(full_batch / self.blen))
-
         do_unroll = self.unroll_loops if unroll is None else unroll
-
-        lines = list(header_lines)
-
-        if do_unroll:
-            # Fully unrolled: bake all addresses at ASM-gen time.
-            # No C_LOOP_START/END or S_ADDI_INT increments.
-            for oc in range(tiles_per_mlen):
-                mat_col_addr = mram_start_addr + oc * mat_col_stride
-                result_col_addr = result_vram_addr + oc * self.blen
-                for or_ in range(row_loop_count):
-                    act_row_addr = vram_row_start_addr + or_ * output_row_stride
-                    result_addr = result_col_addr + or_ * output_row_stride
-                    for ih in range(num_hidden_blocks):
-                        act_addr = act_row_addr + ih * vram_hidden_block_stride
-                        mat_addr = mat_col_addr + ih * mram_hidden_block_stride
-                        lines.append(f"S_ADDI_INT gp{gp_act}, gp0, {act_addr}")
-                        lines.append(f"S_ADDI_INT gp{gp_mat}, gp0, {mat_addr}")
-                        if transposed:
-                            lines.append(f"M_TMM 0, gp{gp_act}, gp{gp_mat}")
-                        else:
-                            lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
-                    lines.append(f"S_ADDI_INT gp{gp_result}, gp0, {result_addr}")
-                    lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
-        else:
-            lines.append(f"S_ADDI_INT gp{gp_mat_col_base}, gp0, {mram_start_addr}")
-            lines.append(f"S_ADDI_INT gp{gp_result_col_base}, gp0, {result_vram_addr}")
-            lines.append(f"C_LOOP_START gp{gp_loop_outer}, {tiles_per_mlen}")
-            lines.append(f"S_ADDI_INT gp{gp_act_row_base}, gp0, {vram_row_start_addr}")
-            lines.append(f"S_ADDI_INT gp{gp_result}, gp{gp_result_col_base}, 0")
-            lines.append(f"C_LOOP_START gp{gp_loop_middle}, {row_loop_count}")
-            lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act_row_base}, 0")
-            lines.append(f"S_ADDI_INT gp{gp_mat}, gp{gp_mat_col_base}, 0")
-            lines.append(f"C_LOOP_START gp{gp_loop_inner}, {num_hidden_blocks}")
-            if transposed:
-                lines.append(f"M_TMM 0, gp{gp_act}, gp{gp_mat}")
-            else:
-                lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
-            lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {vram_hidden_block_stride}")
-            lines.append(f"S_ADDI_INT gp{gp_mat}, gp{gp_mat}, {mram_hidden_block_stride}")
-            lines.append(f"C_LOOP_END gp{gp_loop_inner}")
-            lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
-            lines.append(f"S_ADDI_INT gp{gp_act_row_base}, gp{gp_act_row_base}, {output_row_stride}")
-            lines.append(f"S_ADDI_INT gp{gp_result}, gp{gp_result}, {output_row_stride}")
-            lines.append(f"C_LOOP_END gp{gp_loop_middle}")
-            lines.append(f"S_ADDI_INT gp{gp_mat_col_base}, gp{gp_mat_col_base}, {mat_col_stride}")
-            lines.append(f"S_ADDI_INT gp{gp_result_col_base}, gp{gp_result_col_base}, {self.blen}")
-            lines.append(f"C_LOOP_END gp{gp_loop_outer}")
-
-        return "\n".join(lines) + "\n"
+        return vram_sub_projection_asm_impl(
+            mlen=self.mlen,
+            blen=self.blen,
+            unroll_loops=do_unroll,
+            header_lines=header_lines,
+            vram_row_start_addr=vram_row_start_addr,
+            mram_start_addr=mram_start_addr,
+            result_vram_addr=result_vram_addr,
+            full_batch=full_batch,
+            num_hidden_blocks=num_hidden_blocks,
+            mat_col_stride=mat_col_stride,
+            transposed=transposed,
+            gp_regs=gp_regs,
+            caller_name=caller_name,
+        )
 
     def vram_sub_projection_asm(
         self,
