@@ -1,6 +1,6 @@
 from utils.load_config import load_svh_settings
 
-from compiler.assembler.parser import load_isa_definitions, parse_asm_file
+from assembler.parser import load_isa_definitions, parse_asm_file
 
 
 class AssemblyToBinary:
