@@ -4,7 +4,6 @@ from .embedding_asm import embedding_asm
 from .ffn_asm import ffn_asm, ffn_intermediate_asm, ffn_up_silu_asm
 from .flash_attn_asm import flash_attn_asm
 from .gelu_asm import gelu_asm
-from .im2col_asm import im2col_asm
 from .im2col_asm_no_shift import im2col_asm_no_shift
 from .normalization_asm import layer_norm_asm, rms_norm_asm
 from .preload_act import preload_act_asm
@@ -26,7 +25,6 @@ __all__ = [
     "flash_attn_asm",
     "gelu_asm",
     "gemv_asm",
-    "im2col_asm",
     "im2col_asm_no_shift",
     "layer_norm_asm",
     "preload_act_asm",
