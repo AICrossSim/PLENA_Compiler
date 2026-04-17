@@ -1,8 +1,7 @@
 """compiler.aten — ATen-style PLENA compiler path.
 
-PlenaCompiler DSL + compile_module (torch.export → ISA) + op backend
-registry. Pairs with compiler.generator for the two-path compiler
-(template vs. aten).
+PlenaCompiler DSL + op backend registry. Pairs with compiler.generator
+for the two-path compiler (template vs. aten).
 """
 
 from pathlib import Path
@@ -37,4 +36,3 @@ from compiler.aten.plena_compiler import (  # noqa: E402, F401
     FPRAMObjectLayout,
 )
 from compiler.aten.ops.registry import OpRegistry, Backend  # noqa: E402, F401
-from compiler.aten.compile_module import compile_module, quantize_to_mxfp  # noqa: E402, F401
