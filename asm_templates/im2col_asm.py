@@ -91,8 +91,8 @@ def im2col_asm(
     num_tiles = (K_col + vlen - 1) // vlen
     if num_tiles > 1:
         assert vlen % K == 0, (
-            f"multi-tile im2col with V_SHFTL_V requires K ({K}) | VLEN ({vlen}); "
-            "K-groups would cross tile boundaries and V_SHFTL_V cannot left-shift"
+            f"multi-tile im2col with V_SHIFT_V requires K ({K}) | VLEN ({vlen}); "
+            "K-groups would cross tile boundaries and V_SHIFT_V cannot right-shift across tile"
         )
 
     # W_padded: each input row is stored with W_padded elements in HBM so
@@ -115,7 +115,7 @@ def im2col_asm(
 
     lines: list[str] = []
     lines.append("; ============================================================")
-    lines.append("; im2col (with V_SHFTL_V): NCHW input in HBM -> im2col matrix in VRAM")
+    lines.append("; im2col (with V_SHIFT_V): NCHW input in HBM -> im2col matrix in VRAM")
     lines.append(f";   input shape : (1, {C_in}, {H}, {W})  in HBM (W_padded={W_padded})")
     lines.append(f";   kernel      : {K}x{K},  OH={OH}, OW={OW}")
     lines.append(f";   output      : ({M}, {K_col}) in VRAM starting at {output_vram_base}")
@@ -227,7 +227,7 @@ def im2col_asm(
                     # Shift right to local position within tile.
                     if local_shift > 0:
                         lines.append(f"S_ADDI_INT gp{shift_reg}, gp0, {local_shift}")
-                        lines.append(f"V_SHFTL_V gp{scratch_reg}, gp{scratch_reg}, gp{shift_reg}")
+                        lines.append(f"V_SHIFT_V gp{scratch_reg}, gp{scratch_reg}, gp{shift_reg}")
 
                     # Accumulate: accum += shifted scratch row.
                     lines.append(f"V_ADD_VV gp{acc_reg}, gp{acc_reg}, gp{scratch_reg}, 0")
