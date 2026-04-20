@@ -39,7 +39,9 @@ def test_attention_code_generation():
         },
     }
 
-    generated_code = _generate_attention_code(test_node, model_info=model_info, hardware_config=hardware_config, scheduler=scheduler)
+    generated_code = _generate_attention_code(
+        test_node, model_info=model_info, hardware_config=hardware_config, scheduler=scheduler
+    )
 
     print("Generated Flash Attention Assembly Code:")
     print("=" * 50)

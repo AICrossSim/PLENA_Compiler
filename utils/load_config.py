@@ -33,4 +33,3 @@ def load_svh_settings(file_path: Union[str, Path]) -> dict[str, int]:
             hardware_settings[name] = value
 
     return hardware_settings
-
