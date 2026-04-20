@@ -43,7 +43,7 @@ def conv2d_plena(
 ):
     """
     PLENA backend: hardware im2col + systolic matmul.
-    Default path avoids V_SHFTL_V; use_shift=True opts into the vector-shift path.
+    Default path avoids V_SHIFT_V; use_shift=True opts into the vector-shift path.
 
     Args:
         prog:           PlenaCompiler instance.

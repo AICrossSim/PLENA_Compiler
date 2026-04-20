@@ -171,10 +171,9 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
 
     // Extensions
     V_SHIFT_V              = 6'h31,
-    V_SHFTL_V              = 6'h32,  // temp, see note below
+    C_BREAK                = 6'h32,  // Rust emulator: 0x32 (V_SHFTL_V retired)
     V_PS_V                 = 6'h32,  // spec-only, not implemented in Rust emulator
-    C_HADAMARD_TRANSFORM   = 6'h33,  // spec-only, not implemented in Rust emulator
-    C_BREAK                = 6'h34   // not implemented in Rust emulator (Rust uses 0x33 for C_BREAK)
+    C_HADAMARD_TRANSFORM   = 6'h33   // spec-only, not implemented in Rust emulator
 } CUSTOM_ISA_OPCODE;
 
 
