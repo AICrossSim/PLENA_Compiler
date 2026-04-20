@@ -1,12 +1,11 @@
 import re
 from pathlib import Path
-from typing import Union
 
 
 _PARAM_PATTERN = re.compile(r"\s*(?:localparam|parameter)\s+(?:\w+\s+)?(\w+)\s*=\s*([^;]+);")
 
 
-def load_svh_settings(file_path: Union[str, Path]) -> dict[str, int]:
+def load_svh_settings(file_path: str | Path) -> dict[str, int]:
     """Parse integer `parameter`/`localparam` definitions from a SystemVerilog .svh/.sv file.
 
     This is intentionally tiny and self-contained so the `compiler/` repo can run

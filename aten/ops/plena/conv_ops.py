@@ -37,7 +37,7 @@ def conv2d_plena(
     OH: int,
     OW: int,
     M: int,
-    W_padded: int = None,
+    W_padded: int | None = None,
     fp_one_reg: int = 1,
     use_shift: bool = False,
 ):

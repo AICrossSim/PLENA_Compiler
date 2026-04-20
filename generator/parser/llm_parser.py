@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from transformers import AutoConfig, AutoModel
@@ -306,7 +306,7 @@ class LLMModelParser:
 
         return self.symbolic_graph
 
-    def create_vision_symbolic_graph(self, batch_size: int = 1) -> Optional[dict]:
+    def create_vision_symbolic_graph(self, batch_size: int = 1) -> dict | None:
         """Create symbolic graph for vision encoder (SigLIP/ViT style).
         Returns None if no vision_config present.
         """
@@ -495,7 +495,7 @@ class LLMModelParser:
     def print_summary(self):
         """Print a summary of the model dimensions and structure"""
         dims = self.extract_critical_dimensions()
-        text_cfg = self._resolve_text_config()
+        self._resolve_text_config()
 
         print(f"Model: {self.model_name_or_path}")
         print(f"Architecture: {getattr(self.config, 'architectures', ['Unknown'])[0]}")

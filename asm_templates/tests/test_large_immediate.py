@@ -8,6 +8,7 @@ helper used inside ffn_asm is exercised indirectly via ffn_asm().
 """
 
 import unittest
+from typing import ClassVar
 
 from asm_templates._imm import load_large_int as _load_large_int
 from asm_templates.projection_asm import projection_asm, projection_T_asm
@@ -83,7 +84,7 @@ class TestLoadLargeInt(unittest.TestCase):
 class TestProjectionAsmLargeMatrix(unittest.TestCase):
     """Test that projection_asm generates valid code for large matrices."""
 
-    BASE_ARGS = dict(
+    BASE_ARGS: ClassVar[dict] = dict(
         mlen=64,
         blen=4,
         batch=4,
@@ -148,7 +149,7 @@ class TestProjectionAsmLargeMatrix(unittest.TestCase):
 class TestProjectionTAsmLargeMatrix(unittest.TestCase):
     """Test that projection_T_asm also handles large matrices correctly."""
 
-    BASE_ARGS = dict(
+    BASE_ARGS: ClassVar[dict] = dict(
         mlen=64,
         blen=4,
         batch=4,
@@ -179,7 +180,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
     ffn_asm has its own _load_large_int (returns str), tested indirectly.
     """
 
-    BASE_ARGS = dict(
+    BASE_ARGS: ClassVar[dict] = dict(
         mlen=64,
         vlen=64,
         blen=4,

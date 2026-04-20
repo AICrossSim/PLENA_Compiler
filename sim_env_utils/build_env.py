@@ -9,12 +9,12 @@ _TOOLS_PATH = str(Path(__file__).parent.parent.parent / "tools")
 if _TOOLS_PATH not in sys.path:
     sys.path.insert(0, _TOOLS_PATH)
 
-import torch
-from memory_mapping.rand_gen import RandomMxfpTensorGenerator
-from utils.load_config import load_toml_config
-from utils.logger import get_logger
+import torch  # noqa: E402
+from memory_mapping.rand_gen import RandomMxfpTensorGenerator  # noqa: E402
+from utils.load_config import load_toml_config  # noqa: E402
+from utils.logger import get_logger  # noqa: E402
 
-from .build_sys_tools import env_setup, init_mem
+from .build_sys_tools import env_setup, init_mem  # noqa: E402
 
 # Project root is 3 levels up from compiler/sim_env_utils/
 _PROJECT_ROOT = Path(__file__).parent.parent.parent

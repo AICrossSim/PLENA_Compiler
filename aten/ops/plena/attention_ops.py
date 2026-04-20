@@ -20,7 +20,6 @@ def flash_attention_plena(prog, Q, K, V, scale=None, hq=1, hkv=1, h_qkv=None):
     Returns:
         VRAMMatrixVar for O, shape matching Q.
     """
-    import math
 
     # Detect MHA vs GQA
     if hq == 1 and hkv == 1:
@@ -81,7 +80,7 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
     """
     import math
     from compiler.asm_templates.flashattn import flash_attn_asm
-    from compiler.asm_templates import preload_addr_reg_asm, reset_reg_asm
+    from compiler.asm_templates import preload_addr_reg_asm
 
     ratio = hq // hkv
     mlen = prog.mlen
@@ -99,8 +98,8 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
             f"mlen={mlen}.  E.g. hq=4, hkv=1, h_qkv=16 with mlen=64."
         )
 
-    s_q, q_total_dim = Q.shape
-    s_kv, k_total_dim = K.shape
+    s_q, _q_total_dim = Q.shape
+    s_kv, _k_total_dim = K.shape
 
     if scale is None:
         scale = 1.0 / math.sqrt(h_qkv)

@@ -1041,7 +1041,7 @@ class TileCompiler:
         col_idx: int,
         mram_dest_addr: int,
         hbm_addr_reg: int = 1,
-        gp_regs: list[int] = None,
+        gp_regs: list[int] | None = None,
     ) -> str:
         """
         Generate ISA code for loading sub-matrix from HBM to MRAM.
@@ -1090,7 +1090,7 @@ class TileCompiler:
         row_idx: int,
         mram_start_addr: int,
         hbm_addr_reg: int = 1,
-        gp_regs: list[int] = None,
+        gp_regs: list[int] | None = None,
     ) -> str:
         """
         Generate ISA code for loading all sub-blocks in a row: matrix[row_idx][:]
@@ -1146,9 +1146,9 @@ class TileCompiler:
         col_idx: int,
         mram_start_addr: int,
         hbm_addr_reg: int = 1,
-        gp_regs: list[int] = None,
+        gp_regs: list[int] | None = None,
         k_block_start: int = 0,
-        k_block_count: int = None,
+        k_block_count: int | None = None,
     ) -> str:
         """
         Generate ISA code for loading all sub-blocks in a column: matrix[:][col_idx].
@@ -1216,7 +1216,7 @@ class TileCompiler:
         transposed: bool,
         gp_regs: list[int],
         caller_name: str,
-        unroll: bool = None,
+        unroll: bool | None = None,
     ) -> str:
         """
         Shared implementation kernel for vram_sub_projection_asm and
@@ -1263,10 +1263,10 @@ class TileCompiler:
         mram_mat_name: str,
         mram_col_idx: int,
         result_vram_addr: int,
-        gp_regs: list[int] = None,
+        gp_regs: list[int] | None = None,
         k_block_start: int = 0,
-        k_block_count: int = None,
-        unroll: bool = None,
+        k_block_count: int | None = None,
+        unroll: bool | None = None,
     ) -> str:
         """
         Generate ISA for VRAM sub-block × MRAM sub-matrix multiply.
@@ -1338,8 +1338,8 @@ class TileCompiler:
         mram_mat_name: str,
         mram_row_idx: int,
         result_vram_addr: int,
-        gp_regs: list[int] = None,
-        unroll: bool = None,
+        gp_regs: list[int] | None = None,
+        unroll: bool | None = None,
     ) -> str:
         """
         Generate ISA for VRAM sub-block × MRAM sub-matrix transposed multiply.
@@ -1416,7 +1416,7 @@ class TileCompiler:
         target_name: str,
         target_row_idx: int,
         target_col_idx: int,
-        gp_regs: list[int] = None,
+        gp_regs: list[int] | None = None,
     ) -> str:
         """
         Add two mlen x mlen blocks and write to any target block:
@@ -1496,7 +1496,7 @@ class TileCompiler:
         hidden_size: int,
         vram_dest_addr: int,
         hbm_addr_reg: int = 0,
-        gp_regs: list[int] = None,
+        gp_regs: list[int] | None = None,
     ) -> str:
         """
         Load activation from HBM to VRAM with format conversion.
@@ -1518,8 +1518,8 @@ class TileCompiler:
         gp_hbm_offset = gp_regs[0]
         gp_stride = gp_regs[1]
         gp_vram = gp_regs[2]
-        gp_outer = gp_regs[3]
-        gp_inner = gp_regs[4]
+        _gp_outer = gp_regs[3]
+        _gp_inner = gp_regs[4]
 
         num_col_blocks = hidden_size // self.mlen
         preload_len = 4  # load 4 rows per H_PREFETCH_V call
@@ -1558,7 +1558,7 @@ class TileCompiler:
         hidden_size: int,
         hbm_dest_addr: int,
         hbm_addr_reg: int = 0,
-        gp_regs: list[int] = None,
+        gp_regs: list[int] | None = None,
     ) -> str:
         """
         Store activation from VRAM to HBM with format conversion.
@@ -1579,8 +1579,8 @@ class TileCompiler:
         gp_hbm_offset = gp_regs[0]
         gp_stride = gp_regs[1]
         gp_vram = gp_regs[2]
-        gp_outer = gp_regs[3]
-        gp_inner = gp_regs[4]
+        _gp_outer = gp_regs[3]
+        _gp_inner = gp_regs[4]
 
         num_col_blocks = hidden_size // self.mlen
         store_amount = 4  # store 4 rows per H_STORE_V call
@@ -1786,7 +1786,7 @@ class DeveloperCompiler(TileCompiler):
         ``_handle_k_prefetch_done``, ``_handle_s_tile_done``, ``_handle_k_end``.
         """
 
-        def __init__(self, compiler: "DeveloperCompiler"):
+        def __init__(self, compiler: DeveloperCompiler):
             self.compiler = compiler
             self.enabled = False
 
@@ -1905,7 +1905,7 @@ class DeveloperCompiler(TileCompiler):
     # DeveloperCompiler *is* the TileCompiler, so the property just returns
     # ``self``.
     @property
-    def tile_compiler(self) -> "DeveloperCompiler":
+    def tile_compiler(self) -> DeveloperCompiler:
         return self
 
     # Interrupt handler placeholders (overridden by flash-attention passes).
@@ -3612,7 +3612,7 @@ class DeveloperCompiler(TileCompiler):
         col_idx: int,
         mram_start_addr: int | None = None,
         k_block_start: int = 0,
-        k_block_count: int = None,
+        k_block_count: int | None = None,
     ) -> str:
         """
         Load entire column sub-blocks from HBM to MRAM: matrix[:][col_idx].
@@ -3742,7 +3742,7 @@ class DeveloperCompiler(TileCompiler):
         src_matrix: str,
         dst_row_offset: int = 0,
         src_row_offset: int = 0,
-        num_rows: int = None,
+        num_rows: int | None = None,
     ) -> str:
         """
         General VRAM Matrix Addition: dst[row_offset:] += src.
@@ -3851,7 +3851,7 @@ class DeveloperCompiler(TileCompiler):
         target_row_idx: int,
         target_col_idx: int,
         k_block_start: int = 0,
-        k_block_count: int = None,
+        k_block_count: int | None = None,
     ) -> str:
         """
         Sub-block multiplication:
@@ -3862,7 +3862,7 @@ class DeveloperCompiler(TileCompiler):
             raise KeyError(f"Target matrix '{target_matrix}' not found. Use allocate_vram_matrix first.")
 
         target_info = self[target_matrix]
-        target_rows, target_cols = target_info.shape
+        target_rows, _target_cols = target_info.shape
         target_base_addr = target_info.vram_addr
 
         # VRAM layout: [batch, mlen, hidden/mlen], column-block major.
@@ -3914,7 +3914,7 @@ class DeveloperCompiler(TileCompiler):
             raise KeyError(f"Target matrix '{target_matrix}' not found. Use allocate_vram_matrix first.")
 
         target_info = self[target_matrix]
-        target_rows, target_cols = target_info.shape
+        target_rows, _target_cols = target_info.shape
         target_base_addr = target_info.vram_addr
 
         # VRAM layout: [batch, mlen, hidden/mlen], column-block major.
@@ -4134,7 +4134,7 @@ class _DeveloperView:
 
     __slots__ = ("_inst",)
 
-    def __init__(self, inst: "PlenaCompiler"):
+    def __init__(self, inst: PlenaCompiler):
         object.__setattr__(self, "_inst", inst)
 
     def __getattr__(self, name: str):
@@ -4166,7 +4166,7 @@ class TensorVar:
 
     def __init__(
         self,
-        program: "PlenaCompiler",
+        program: PlenaCompiler,
         internal_name: str,
         kind: str,
         shape: tuple[int, int],
@@ -4209,7 +4209,7 @@ class InputVar(TensorVar):
 
     def __init__(
         self,
-        program: "PlenaCompiler",
+        program: PlenaCompiler,
         name: str,
         shape: tuple[int, int],
         hbm_addr: int,
@@ -4240,7 +4240,7 @@ class FPVar:
     """
 
     def __init__(
-        self, program: "PlenaCompiler", internal_name: str, address: int, size: int, display_name: str | None = None
+        self, program: PlenaCompiler, internal_name: str, address: int, size: int, display_name: str | None = None
     ):
         self._program = program
         self.internal_name = internal_name
@@ -4270,7 +4270,7 @@ class VRAMMatrixVar(TensorVar):
     Supports sub-block indexed writes: `O[r][c] = ...`
     """
 
-    def __init__(self, program: "PlenaCompiler", name: str, shape: tuple[int, int], display_name: str | None = None):
+    def __init__(self, program: PlenaCompiler, name: str, shape: tuple[int, int], display_name: str | None = None):
         super().__init__(program, name, "vram_matrix", shape, display_name=display_name)
 
 
@@ -4335,12 +4335,12 @@ class PlenaCompiler(DeveloperCompiler):
     # mlen / blen are instance attributes inherited from TileCompiler.__init__.
 
     @property
-    def compiler(self) -> "PlenaCompiler":
+    def compiler(self) -> PlenaCompiler:
         """Legacy accessor — returns self now that PlenaCompiler is the compiler."""
         return self
 
     @property
-    def _compiler(self) -> "_DeveloperView":
+    def _compiler(self) -> _DeveloperView:
         """Back-compat shim for legacy ``prog._compiler.X(...)`` call sites.
         Returns a proxy that resolves callables against DeveloperCompiler
         directly so callers reach the low-level API regardless of any
@@ -5217,7 +5217,7 @@ class PlenaCompiler(DeveloperCompiler):
         target_col_idx: int,
         auto_reset_mram: bool = True,
         k_block_start: int = 0,
-        k_block_count: int = None,
+        k_block_count: int | None = None,
     ):
         """
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[:][mram_col_idx]

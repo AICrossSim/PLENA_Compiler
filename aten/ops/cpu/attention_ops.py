@@ -8,7 +8,7 @@ def flash_attention_cpu(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
-    scale: float = None,
+    scale: float | None = None,
 ) -> torch.Tensor:
     """CPU reference: Flash Attention = softmax(Q @ K.T * scale) @ V."""
     if scale is None:

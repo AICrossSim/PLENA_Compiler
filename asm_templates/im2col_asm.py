@@ -41,9 +41,9 @@ def im2col_asm(
     mask_vec_vram_addr: int,
     scratch_vram_addr: int,
     output_vram_base: int,
-    W_padded: int = None,
+    W_padded: int | None = None,
     fp_one_reg: int = 1,  # FP register holding 1.0 (must be in fp_preload[fp_one_reg])
-    fp_sram_precious_slots: list = None,  # fp_sram slots to save before mask construction
+    fp_sram_precious_slots: list | None = None,  # fp_sram slots to save before mask construction
 ) -> str:
     """
     Generate PLENA assembly for on-chip im2col.

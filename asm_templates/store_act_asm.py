@@ -1,15 +1,14 @@
 import math
-from typing import List, Optional
 
 
 def store_act_asm(
     vlen: int,
     batch: int,
     hidden_size: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     act_vram_offset: int,
     hbm_addr_reg: int,
-    stride_size: Optional[int] = None,
+    stride_size: int | None = None,
     store_amount: int = 4,
 ) -> str:
     """Store activation from VRAM back to HBM (reverse of preload_act_asm).

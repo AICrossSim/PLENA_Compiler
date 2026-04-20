@@ -1,5 +1,4 @@
 import math
-from typing import List
 
 from ._imm import load_large_int_str as _load_large_int
 
@@ -10,7 +9,7 @@ def preload_act_asm(
     batch: int,
     hidden_size: int,
     act_vram_offset: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     activation_offset_reg: int,
     stride_size=None,
     vram_stride_mult: int = 1,

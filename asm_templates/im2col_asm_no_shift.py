@@ -28,10 +28,10 @@ def im2col_asm_no_shift(
     scratch_vram_addr: int,
     temp_vram_addr: int,
     output_vram_base: int,
-    W_padded: int = None,
+    W_padded: int | None = None,
     fp_one_reg: int = 1,  # FP register holding 1.0 (must be pre-loaded via fp_preload)
     fp_ex_reg: int = 2,  # FP register used as V_RED_SUM accumulator
-    fp_sram_precious_slots: list = None,  # fp_sram slots to save before and restore after im2col
+    fp_sram_precious_slots: list | None = None,  # fp_sram slots to save before and restore after im2col
 ) -> str:
     """
     Generate PLENA assembly for on-chip im2col without V_SHFT_V.
