@@ -1,6 +1,3 @@
-import math
-
-
 def batched_matmul_asm(
     mlen: int,
     blen: int,
@@ -48,7 +45,6 @@ def batched_matmul_asm(
     k_tiles = k // mlen  # number of k-dimension tiles
     n_tiles = n // blen  # total n-dimension tiles
     tiles_per_mlen = mlen // blen  # n-tiles that fit in one matrix SRAM bank width
-    n_groups = n // mlen  # number of mlen-wide column groups
     stride_len = n // mlen  # VRAM row stride for mm_wo (N/mlen vectors per result row)
 
     generated_code += f"S_ADDI_INT gp{result_actual_register}, gp0, {result_base_address} \n"
@@ -100,14 +96,13 @@ def batched_matmul_asm(
                     generated_code += f"S_ADDI_INT gp{result_actual_register}, gp0, {vram_dest} \n"
                     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {hbm_g_off} \n"
                     generated_code += f"H_PREFETCH_V gp{result_actual_register}, gp{a_actual_register}, a{a_base_hbm_offset_reg}, 1, 0 \n"
-                # Set weight register to column offset within the first bank
-                generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {col_offset} \n"
-                # M_MM for each k-tile; a_reg explicitly set to k-tile's VRAM address
+                # M_MM for each k-tile; set absolute MSRAM bank offset before each M_MM
                 for g in range(k_tiles):
                     a_vram = g * blen * mlen
+                    msram_bank_offset = g * mlen * mlen  # absolute, not cumulative
                     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {a_vram} \n"
+                    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {msram_bank_offset + col_offset} \n"
                     generated_code += f"M_MM 0, gp{w_actual_register}, gp{a_actual_register} \n"
-                    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n"
                 # Set result address BEFORE M_MM_WO:
                 # v_addr = result_base + batch_offset + j*blen*n + (i//tiles_per_mlen)*mlen + (i%tiles_per_mlen)*blen
                 result_addr = (
