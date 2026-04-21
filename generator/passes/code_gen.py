@@ -136,17 +136,21 @@ def _generate_ffn_code(
     ; Gate and Up projections
     """
 
+    ffn_weight_reg = scheduler["register_assignment"].get("hbm_addr_reg", {}).get("ffn_weight_offset", 0)
     code += ffn_asm(
         mlen=hardware_config.get("MLEN", 16),
+        vlen=hardware_config.get("VLEN", 16),
         blen=hardware_config.get("BLEN", 16),
         batch=model_info.get("batch", 1),
+        seq_len=model_info.get("seq_len", 1),
         hidden_size=hidden_size,
-        alive_registers=[1, 2, 3, 4, 5, 6],
-        weight_hbm_offset_reg=scheduler["register_assignment"].get("hbm_addr_reg", {}).get("ffn_weight_offset", 0),
-        intermediate_size=model_info.get("intermediate_size", 4096),
+        intermediate_size=intermediate_size,
+        alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        gate_weight_hbm_offset_reg=ffn_weight_reg,
+        up_weight_hbm_offset_reg=ffn_weight_reg,
+        down_weight_hbm_offset_reg=ffn_weight_reg,
+        const_one_fp_address=scheduler["memory_layout"].get("fp_sram", {}).get("silu_e", 0),
         activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
-        const_address=scheduler["memory_layout"].get("fp_sram", {}).get("silu_e", 0),
-        result_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block5", 0),
     )
     return code.strip()
 
@@ -171,6 +175,7 @@ def _generate_normalization_code(
         activation_base_address=scheduler.get("vector_sram_addr", {}).get("block1", 0),
         scratchpad_base_address=scheduler.get("vector_sram_addr", {}).get("block2", 0),
         vlen=hardware_config.get("vlen", 16),
+        batch_size=model_info.get("batch_size", 1),
         hidden_dim=hidden_size,
     )
 

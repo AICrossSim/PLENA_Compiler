@@ -28,7 +28,7 @@ def embedding_asm(
     # Need to perform dot product with dim (hidden_size, hidden_size) @ (hidden_size, batch_size)
     for m in range(hidden_size // blen):
         for j in range(hidden_size // mlen):
-            for i in range(blen):
+            for i in range(batch):
                 if m == 0:
                     # Load to on-chip memory
                     input_id = input_ids[i]
@@ -43,5 +43,5 @@ def embedding_asm(
                 )
                 generated_code += f"S_ADDI_INT gp{load_m_on_chip_addr}, gp{load_m_on_chip_addr}, {mlen} \n"
             generated_code += f"M_MM gp{load_m_on_chip_addr}, gp{load_m_on_chip_addr}, gp{load_v_on_chip_addr} \n"
-        generated_code += f"M_MM_WO gp{load_v_on_chip_addr}, {0} \n"
+        generated_code += f"M_MM_WO gp{load_v_on_chip_addr}, gp0, 0 \n"
     return generated_code
