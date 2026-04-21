@@ -41,7 +41,7 @@ def embedding_asm(
                 generated_code += (
                     f"H_PREFETCH_M gp{load_m_on_chip_addr}, gp{indx_reg}, a{voc_table_base_addr_reg_index}, 0, 0 \n"
                 )
-                generated_code += f"S_ADDI_INT gp{load_m_on_chip_addr}, gp{load_m_on_chip_addr}, {mlen} \n"
+                generated_code += f"S_ADDI_INT gp{load_m_on_chip_addr}, gp{load_m_on_chip_addr}, {mlen * mlen} \n"
             generated_code += f"M_MM gp{load_m_on_chip_addr}, gp{load_m_on_chip_addr}, gp{load_v_on_chip_addr} \n"
         generated_code += f"M_MM_WO gp{load_v_on_chip_addr}, gp0, 0 \n"
     return generated_code
