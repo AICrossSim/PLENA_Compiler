@@ -45,6 +45,21 @@ def run():
 
     dimensions = parser.extract_critical_dimensions()
 
+    # For multimodal models, prepend the vision encoder graph so the emitted ASM
+    # actually exercises the SigLIP / ViT layers + connector before the text decoder.
+    vision_graph = parser.create_vision_symbolic_graph(batch_size=1)
+    if vision_graph is not None:
+        vision_nodes = vision_graph["nodes"]
+        vision_order = vision_graph["execution_order"]
+        # Renumber text nodes so execution_order remains globally monotonic.
+        offset = len(vision_nodes)
+        for node in symbolic_graph["nodes"]:
+            node["execution_order"] = node["execution_order"] + offset
+        symbolic_graph["nodes"] = vision_nodes + symbolic_graph["nodes"]
+        symbolic_graph["execution_order"] = vision_order + symbolic_graph["execution_order"]
+        symbolic_graph["total_nodes"] = len(symbolic_graph["nodes"])
+        print(f"\n[vision] Prepended {len(vision_nodes)} vision encoder nodes to symbolic graph")
+
     # Print detailed symbolic graph
     parser.print_symbolic_graph_details()
 
@@ -67,6 +82,14 @@ def run():
         "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6),
         "seq_len": seq_len,
     }
+
+    # Expose vision encoder dims when present (so code_gen can parameterise
+    # conv2d, bidirectional attention and the connector projection).
+    if "vision" in dimensions:
+        model_info["vision"] = dimensions["vision"]
+        model_info["has_vision"] = True
+    else:
+        model_info["has_vision"] = False
 
     # Run code generation pass
     if mode == "utilization":

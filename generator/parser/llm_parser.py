@@ -339,6 +339,7 @@ class LLMModelParser:
         image_size = getattr(vcfg, "image_size", 224)
         patch_size = getattr(vcfg, "patch_size", 16)
         num_patches = (image_size // patch_size) ** 2
+        num_channels = getattr(vcfg, "num_channels", 3)
         hidden_size = getattr(vcfg, "hidden_size", 768)
         num_layers = getattr(vcfg, "num_hidden_layers", 12)
         num_heads = getattr(vcfg, "num_attention_heads", 12)
@@ -352,18 +353,25 @@ class LLMModelParser:
         order_counter = 0
         current_shape = [batch_size, num_patches, hidden_size]
 
-        # Patch embedding node
+        # Patch embedding: Conv2d(num_channels, hidden_size, kernel=patch_size, stride=patch_size)
+        # Implemented as im2col -> matmul on PLENA.  Emits a dedicated conv2d node so
+        # code_gen can wrap the im2col + projection template pair.
         patch_embed = {
             "name": "vision_patch_embed",
-            "operation_type": "embedding",
-            "operation_category": "embedding",
+            "operation_type": "conv2d",
+            "operation_category": "conv2d",
             "execution_order": order_counter,
-            "input_shape": [batch_size, 3, image_size, image_size],
+            "input_shape": [batch_size, num_channels, image_size, image_size],
             "output_shape": current_shape,
             "dimensions": {
-                "num_embeddings": num_patches,
-                "hidden_size": hidden_size,
+                "in_channels": num_channels,
+                "out_channels": hidden_size,
+                "image_size": image_size,
                 "patch_size": patch_size,
+                "kernel_size": patch_size,
+                "stride": patch_size,
+                "num_patches": num_patches,
+                "hidden_size": hidden_size,
             },
             "is_data_placeholder": True,
         }
@@ -392,7 +400,7 @@ class LLMModelParser:
             execution_order.append(f"vision_layer_{layer_idx}_pre_attn_norm")
             order_counter += 1
 
-            # Self-attention (ViT has no GQA: num_kv_heads == num_heads)
+            # Self-attention (ViT has no GQA: num_kv_heads == num_heads, and SigLIP is bidirectional)
             attn_info = {
                 "name": f"vision_layer_{layer_idx}_self_attn",
                 "operation_type": "attention",
@@ -405,6 +413,7 @@ class LLMModelParser:
                     "num_attention_heads": num_heads,
                     "num_key_value_heads": num_heads,
                     "head_dim": head_dim,
+                    "causal_mask": False,  # SigLIP / ViT uses bidirectional attention
                     "q_proj": {"in_features": hidden_size, "out_features": num_heads * head_dim},
                     "k_proj": {"in_features": hidden_size, "out_features": num_heads * head_dim},
                     "v_proj": {"in_features": hidden_size, "out_features": num_heads * head_dim},
@@ -450,7 +459,7 @@ class LLMModelParser:
             execution_order.append(f"vision_layer_{layer_idx}_pre_ffn_norm")
             order_counter += 1
 
-            # FFN
+            # FFN (ViT-style: fc1 -> activation -> fc2, no gate projection)
             mlp_info = {
                 "name": f"vision_layer_{layer_idx}_mlp",
                 "operation_type": "ffn",
@@ -462,6 +471,7 @@ class LLMModelParser:
                     "hidden_size": hidden_size,
                     "intermediate_size": intermediate_size,
                     "activation": hidden_act,
+                    "arch": "vit",  # no gate projection — two-linear FFN
                     "fc1": {"in_features": hidden_size, "out_features": intermediate_size},
                     "fc2": {"in_features": intermediate_size, "out_features": hidden_size},
                 },
@@ -503,6 +513,39 @@ class LLMModelParser:
         }
         symbolic_nodes.append(final_norm)
         execution_order.append("vision_final_norm")
+        order_counter += 1
+
+        # Vision -> text connector (pixel-shuffle + linear projection).
+        # SmolVLM uses a "scale_factor" pixel-shuffle that reshapes
+        # (num_patches, hidden_vision) -> (num_patches // scale_factor**2,
+        #                                  hidden_vision * scale_factor**2)
+        # then a Linear(hidden_vision * scale_factor**2 -> hidden_text).
+        text_cfg = self._resolve_text_config()
+        hidden_text = getattr(text_cfg, "hidden_size", hidden_size)
+        scale_factor = getattr(self.config, "scale_factor", 1) or 1
+        pixel_shuffle_dim = hidden_size * (scale_factor * scale_factor)
+        shuffled_patches = max(num_patches // (scale_factor * scale_factor), 1)
+
+        connector_info = {
+            "name": "vision_connector",
+            "operation_type": "vision_projection",
+            "operation_category": "vision_projection",
+            "execution_order": order_counter,
+            "input_shape": current_shape,
+            "output_shape": [batch_size, shuffled_patches, hidden_text],
+            "dimensions": {
+                "in_features": pixel_shuffle_dim,
+                "out_features": hidden_text,
+                "hidden_size": hidden_text,
+                "vision_hidden_size": hidden_size,
+                "scale_factor": scale_factor,
+                "num_patches_in": num_patches,
+                "num_patches_out": shuffled_patches,
+            },
+            "is_data_placeholder": False,
+        }
+        symbolic_nodes.append(connector_info)
+        execution_order.append("vision_connector")
         order_counter += 1
 
         return {
