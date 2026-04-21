@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -11,12 +12,18 @@ from generator.scheduler import gen_scheduler
 
 def run():
     if len(sys.argv) < 4:
-        print("Usage: python -m generator.runner <mode> <model_name_or_path> <output_file.asm>")
-        print("Example: python -m generator.runner codegen AICrossSim/clm-60m output.asm")
+        print("Usage: python -m generator.runner <mode> <model_name_or_path> <output_file.asm> [--seq-len N]")
+        print("Example: python -m generator.runner codegen AICrossSim/clm-60m output.asm --seq-len 512")
         return
     mode = sys.argv[1]
     model_path = sys.argv[2]
     output_file = sys.argv[3]
+
+    # Parse optional arguments after the positional ones
+    arg_parser = argparse.ArgumentParser(add_help=False)
+    arg_parser.add_argument("--seq-len", type=int, default=512)
+    extra_args, _ = arg_parser.parse_known_args(sys.argv[4:])
+    seq_len = extra_args.seq_len
     hardware_config_path = Path(__file__).resolve().parents[1] / "doc" / "configuration.svh"
     precision_config_path = Path(__file__).resolve().parents[1] / "doc" / "precision.svh"
     mem_layout_lib_path = Path(__file__).resolve().parents[0] / "scheduler" / "mem_layout_lib.json"
@@ -34,7 +41,7 @@ def run():
     parser.print_summary()
 
     # Create symbolic graph
-    symbolic_graph = parser.create_symbolic_graph()
+    symbolic_graph = parser.create_symbolic_graph(seq_len=seq_len)
 
     dimensions = parser.extract_critical_dimensions()
 
@@ -58,6 +65,7 @@ def run():
         # Should raise / fall back to hidden_size // num_heads instead.
         "head_dim": dimensions.get("attention", {}).get("head_dim", 0),
         "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6),
+        "seq_len": seq_len,
     }
 
     # Run code generation pass
@@ -80,6 +88,7 @@ def run():
         f.write(generated_asm)
 
     print(f"Generated assembly code saved to: {output_file}")
+    print(f"seq_len used: {seq_len}")
 
     # Print a preview of the generated code
     print("\nGenerated code preview (first 20 lines):")
