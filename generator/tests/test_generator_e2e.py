@@ -281,20 +281,8 @@ def _build_vram_preload(
     config = load_toml_config(str(plena_toml), "CONFIG")
 
     scratch_dir.mkdir(parents=True, exist_ok=True)
-    gen = RandomMxfpTensorGenerator(
-        shape=tuple(embed_flat.shape),
-        quant_config=quant_config,
-        config_settings=config,
-        directory=str(scratch_dir),
-        filename="embed_preload.pt",
-    )
-    # Note: quantize_tensor returns (blocks, bias) in the block-wise
-    # MXFP8 layout used by HBM. For VRAM preload the emulator expects
-    # raw fp16 values via load_from_bytes; so we dequantize back to
-    # float32, cast to fp16, and write the bytes. This matches ATen
-    # tests (e.g. flash_attention_gqa_test.py) which stage VRAM as
-    # fp16 directly.
-    _ = gen.quantize_tensor(embed_flat)
+    # VRAM preload expects raw fp16 bytes, matching ATen test convention
+    # (e.g. flash_attention_gqa_test.py stages VRAM as fp16 directly).
     embed_fp16 = embed_flat.to(torch.float16).numpy()
 
     # Byte offsets.
