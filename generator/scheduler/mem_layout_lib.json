@@ -12,11 +12,11 @@
     },
 
     "vector_sram_addr": {
-        "block1" : "batch_size * (hidden_size // MLEN)",
-        "block2" : "hidden_size // MLEN",
-        "block3" : "batch_size * (hidden_size // MLEN)",
-        "block4" : "batch_size * (hidden_size // MLEN)",
-        "block5" : "batch_size * (intermediate_size // MLEN)"
+        "block1" : "batch_size * hidden_size",
+        "block2" : "hidden_size",
+        "block3" : "batch_size * hidden_size",
+        "block4" : "batch_size * hidden_size",
+        "block5" : "batch_size * intermediate_size"
     },
 
     "hbm_addr": {
