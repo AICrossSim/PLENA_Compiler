@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -11,12 +12,18 @@ from generator.scheduler import gen_scheduler
 
 def run():
     if len(sys.argv) < 4:
-        print("Usage: python -m generator.runner <mode> <model_name_or_path> <output_file.asm>")
-        print("Example: python -m generator.runner codegen AICrossSim/clm-60m output.asm")
+        print("Usage: python -m generator.runner <mode> <model_name_or_path> <output_file.asm> [--seq-len N]")
+        print("Example: python -m generator.runner codegen AICrossSim/clm-60m output.asm --seq-len 512")
         return
     mode = sys.argv[1]
     model_path = sys.argv[2]
     output_file = sys.argv[3]
+
+    # Parse optional arguments after the positional ones
+    arg_parser = argparse.ArgumentParser(add_help=False)
+    arg_parser.add_argument("--seq-len", type=int, default=512)
+    extra_args, _ = arg_parser.parse_known_args(sys.argv[4:])
+    seq_len = extra_args.seq_len
     hardware_config_path = Path(__file__).resolve().parents[1] / "doc" / "configuration.svh"
     precision_config_path = Path(__file__).resolve().parents[1] / "doc" / "precision.svh"
     mem_layout_lib_path = Path(__file__).resolve().parents[0] / "scheduler" / "mem_layout_lib.json"
@@ -34,9 +41,24 @@ def run():
     parser.print_summary()
 
     # Create symbolic graph
-    symbolic_graph = parser.create_symbolic_graph()
+    symbolic_graph = parser.create_symbolic_graph(seq_len=seq_len)
 
     dimensions = parser.extract_critical_dimensions()
+
+    # For multimodal models, prepend the vision encoder graph so the emitted ASM
+    # actually exercises the SigLIP / ViT layers + connector before the text decoder.
+    vision_graph = parser.create_vision_symbolic_graph(batch_size=1)
+    if vision_graph is not None:
+        vision_nodes = vision_graph["nodes"]
+        vision_order = vision_graph["execution_order"]
+        # Renumber text nodes so execution_order remains globally monotonic.
+        offset = len(vision_nodes)
+        for node in symbolic_graph["nodes"]:
+            node["execution_order"] = node["execution_order"] + offset
+        symbolic_graph["nodes"] = vision_nodes + symbolic_graph["nodes"]
+        symbolic_graph["execution_order"] = vision_order + symbolic_graph["execution_order"]
+        symbolic_graph["total_nodes"] = len(symbolic_graph["nodes"])
+        print(f"\n[vision] Prepended {len(vision_nodes)} vision encoder nodes to symbolic graph")
 
     # Print detailed symbolic graph
     parser.print_symbolic_graph_details()
@@ -58,7 +80,16 @@ def run():
         # Should raise / fall back to hidden_size // num_heads instead.
         "head_dim": dimensions.get("attention", {}).get("head_dim", 0),
         "eps": dimensions.get("rms_norm", {}).get("eps", 1e-6),
+        "seq_len": seq_len,
     }
+
+    # Expose vision encoder dims when present (so code_gen can parameterise
+    # conv2d, bidirectional attention and the connector projection).
+    if "vision" in dimensions:
+        model_info["vision"] = dimensions["vision"]
+        model_info["has_vision"] = True
+    else:
+        model_info["has_vision"] = False
 
     # Run code generation pass
     if mode == "utilization":
@@ -80,6 +111,7 @@ def run():
         f.write(generated_asm)
 
     print(f"Generated assembly code saved to: {output_file}")
+    print(f"seq_len used: {seq_len}")
 
     # Print a preview of the generated code
     print("\nGenerated code preview (first 20 lines):")

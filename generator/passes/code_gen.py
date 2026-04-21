@@ -13,6 +13,9 @@ from asm_templates import (
     embedding_asm,
     # flash_attn_asm,
     ffn_asm,
+    im2col_asm,
+    layer_norm_asm,
+    lm_head_asm,
     projection_asm,
     rms_norm_asm,
 )
@@ -61,59 +64,84 @@ def _generate_embedding_code(
 def _generate_attention_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
-    """Generate assembly code for attention operations."""
+    """Generate assembly code for attention operations.
+
+    Handles both causal (Llama-style decoder) and bidirectional (SigLIP/ViT)
+    attention.  When ``dims["causal_mask"]`` is False we skip RoPE on Q/K and
+    annotate the block as bidirectional — the monolithic flash_attn template
+    does not accept a causal flag today, so the softmax step is emitted without
+    masking by design (matching SigLIP's full-visibility attention pattern).
+    """
 
     dims = node["dimensions"]
     hidden_size = dims["hidden_size"]
     num_heads = dims["num_attention_heads"]
     head_dim = dims["head_dim"]
+    causal_mask = dims.get("causal_mask", True)
 
-    # # TODO: break flash attention down into multiple smaller templates for loop
-    # # TODO: Templates in asm_templates/flash_attention_tr_loop.asm + asm_templates/flash_attention_tc_loop.asm
+    # Honor per-node out_features so SigLIP (num_heads * head_dim != hidden_size
+    # is unusual but possible) and GQA/MQA stay correct.
+    q_out = dims.get("q_proj", {}).get("out_features", num_heads * head_dim)
+    k_out = dims.get("k_proj", {}).get("out_features", num_heads * head_dim)
+    v_out = dims.get("v_proj", {}).get("out_features", num_heads * head_dim)
+
+    attn_kind = "bidirectional (SigLIP/ViT)" if not causal_mask else "causal (decoder)"
     code = f"""
-    # ; Self-attention: hidden_size={hidden_size}, num_heads={num_heads}, head_dim={head_dim}
-    # ; Q, K, V projections and attention computation
-    # """
+; Self-attention ({attn_kind}): hidden_size={hidden_size}, heads={num_heads}, head_dim={head_dim}
+; Q, K, V projections + attention.  RoPE={'off' if not causal_mask else 'on Q/K'}.
+"""
+    mlen = hardware_config.get("MLEN", 16)
+    blen = hardware_config.get("BLEN", 16)
+    batch = model_info.get("batch", 1)
+    hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
+    vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
+
+    # Q projection
     code += projection_asm(
-        mlen=hardware_config.get("MLEN", 16),
-        blen=hardware_config.get("BLEN", 16),
-        batch=model_info.get("batch", 1),
+        mlen=mlen,
+        blen=blen,
+        batch=batch,
         hidden_size=hidden_size,
         alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
-        w_base_hbm_offset_reg=scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 0),
-        rope_hbm_offset_reg=scheduler["register_assignment"].get("hbm_addr_reg", {}).get("rope_params_offset", 0),
-        rope_on_chip_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block3", 0),
-        activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
-        result_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block2", 0),
-        rope_enabled=True,
+        w_base_hbm_offset_reg=hbm_addr_reg.get("q_weight_offset", 0),
+        rope_hbm_offset_reg=hbm_addr_reg.get("rope_params_offset", 0),
+        rope_on_chip_address=vsram.get("block3", 0),
+        activation_base_address=vsram.get("block1", 0),
+        result_base_address=vsram.get("block2", 0),
+        rope_enabled=causal_mask,
+        out_features=q_out,
     )
 
+    # K projection
     code += projection_asm(
-        mlen=hardware_config.get("MLEN", 16),
-        blen=hardware_config.get("BLEN", 16),
-        batch=model_info.get("batch", 1),
+        mlen=mlen,
+        blen=blen,
+        batch=batch,
         hidden_size=hidden_size,
         alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
-        w_base_hbm_offset_reg=scheduler["register_assignment"].get("hbm_addr_reg", {}).get("k_weight_offset", 0),
-        rope_hbm_offset_reg=scheduler["register_assignment"].get("hbm_addr_reg", {}).get("rope_params_offset", 0),
-        rope_on_chip_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block3", 0),
-        activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
-        result_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block2", 0),
-        rope_enabled=True,
+        w_base_hbm_offset_reg=hbm_addr_reg.get("k_weight_offset", 0),
+        rope_hbm_offset_reg=hbm_addr_reg.get("rope_params_offset", 0),
+        rope_on_chip_address=vsram.get("block3", 0),
+        activation_base_address=vsram.get("block1", 0),
+        result_base_address=vsram.get("block2", 0),
+        rope_enabled=causal_mask,
+        out_features=k_out,
     )
 
+    # V projection (no RoPE ever)
     code += projection_asm(
-        mlen=hardware_config.get("MLEN", 16),
-        blen=hardware_config.get("BLEN", 16),
-        batch=model_info.get("batch", 1),
+        mlen=mlen,
+        blen=blen,
+        batch=batch,
         hidden_size=hidden_size,
         alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
-        w_base_hbm_offset_reg=scheduler["register_assignment"].get("hbm_addr_reg", {}).get("v_weight_offset", 0),
-        rope_hbm_offset_reg=scheduler["register_assignment"].get("hbm_addr_reg", {}).get("rope_params_offset", 0),
-        rope_on_chip_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block3", 0),
-        activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
-        result_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block2", 0),
+        w_base_hbm_offset_reg=hbm_addr_reg.get("v_weight_offset", 0),
+        rope_hbm_offset_reg=hbm_addr_reg.get("rope_params_offset", 0),
+        rope_on_chip_address=vsram.get("block3", 0),
+        activation_base_address=vsram.get("block1", 0),
+        result_base_address=vsram.get("block2", 0),
         rope_enabled=False,
+        out_features=v_out,
     )
 
     # code += flash_attn_asm()
@@ -124,33 +152,81 @@ def _generate_attention_code(
 def _generate_ffn_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
-    """Generate assembly code for FFN/MLP operations."""
+    """Generate assembly code for FFN/MLP operations.
+
+    Dispatches on ``dims["arch"]``:
+      - ``"vit"`` — SigLIP/ViT two-linear FFN (fc1 -> activation -> fc2),
+        emitted as two ``projection_asm`` calls.
+      - default — Llama-style gated FFN (gate/up/down) via ``ffn_asm``.
+    """
 
     dims = node["dimensions"]
     hidden_size = dims["hidden_size"]
     intermediate_size = dims["intermediate_size"]
     activation = dims["activation"]
+    arch = dims.get("arch", "gated")
+
+    mlen = hardware_config.get("MLEN", 16)
+    blen = hardware_config.get("BLEN", 16)
+    vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
+    hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
+
+    if arch == "vit":
+        code = f"""
+; Vision FFN (ViT-style): hidden={hidden_size} -> {intermediate_size} -> {hidden_size}, act={activation}
+; Emitted as fc1 (projection) + GELU-activation (implicit) + fc2 (projection).
+"""
+        # fc1: hidden -> intermediate
+        code += projection_asm(
+            mlen=mlen,
+            blen=blen,
+            batch=model_info.get("batch", 1),
+            hidden_size=hidden_size,
+            alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+            w_base_hbm_offset_reg=hbm_addr_reg.get("ffn_up_offset", 0),
+            activation_base_address=vsram.get("block1", 0),
+            result_base_address=vsram.get("block5", vsram.get("block2", 0)),
+            rope_enabled=False,
+            out_features=intermediate_size,
+        )
+        code += f"\n; -- {activation} activation (placeholder; GELU not yet wired into codegen) --\n"
+        # fc2: intermediate -> hidden
+        code += projection_asm(
+            mlen=mlen,
+            blen=blen,
+            batch=model_info.get("batch", 1),
+            hidden_size=intermediate_size,
+            alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+            w_base_hbm_offset_reg=hbm_addr_reg.get("ffn_down_offset", 0),
+            activation_base_address=vsram.get("block5", vsram.get("block2", 0)),
+            result_base_address=vsram.get("block1", 0),
+            rope_enabled=False,
+            out_features=hidden_size,
+        )
+        return code.strip()
 
     code = f"""
-    ; FFN/MLP: hidden_size={hidden_size}, intermediate_size={intermediate_size}, activation={activation}
-    ; Gate and Up projections
-    """
+; FFN/MLP (gated): hidden={hidden_size}, inter={intermediate_size}, activation={activation}
+; Gate and Up projections
+"""
 
-    ffn_weight_reg = scheduler["register_assignment"].get("hbm_addr_reg", {}).get("ffn_weight_offset", 0)
+    ffn_gate_reg = hbm_addr_reg.get("ffn_gate_offset", 0)
+    ffn_up_reg = hbm_addr_reg.get("ffn_up_offset", 0)
+    ffn_down_reg = hbm_addr_reg.get("ffn_down_offset", 0)
     code += ffn_asm(
-        mlen=hardware_config.get("MLEN", 16),
+        mlen=mlen,
         vlen=hardware_config.get("VLEN", 16),
-        blen=hardware_config.get("BLEN", 16),
+        blen=blen,
         batch=model_info.get("batch", 1),
         seq_len=model_info.get("seq_len", 1),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-        gate_weight_hbm_offset_reg=ffn_weight_reg,
-        up_weight_hbm_offset_reg=ffn_weight_reg,
-        down_weight_hbm_offset_reg=ffn_weight_reg,
+        gate_weight_hbm_offset_reg=ffn_gate_reg,
+        up_weight_hbm_offset_reg=ffn_up_reg,
+        down_weight_hbm_offset_reg=ffn_down_reg,
         const_one_fp_address=scheduler["memory_layout"].get("fp_sram", {}).get("silu_e", 0),
-        activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
+        activation_base_address=vsram.get("block1", 0),
     )
     return code.strip()
 
@@ -158,25 +234,185 @@ def _generate_ffn_code(
 def _generate_normalization_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
-    """Generate assembly code for normalization operations."""
+    """Generate assembly code for normalization operations.
+
+    Dispatches to layer_norm_asm when the node requests layer_norm (ViT / SigLIP);
+    otherwise defaults to rms_norm_asm (Llama-style text decoder).
+    """
 
     dims = node["dimensions"]
     hidden_size = dims["normalized_shape"]
+    norm_type = dims.get("norm_type", "rms_norm")
     eps_offset = scheduler.get("fp_sram", {}).get("eps", 0)
     reci_hid_offset = scheduler.get("fp_sram", {}).get("hid_reciprocal", 0)
+    vlen = hardware_config.get("vlen", 16)
+    batch_size = model_info.get("batch_size", 1)
+    activation_base = scheduler.get("vector_sram_addr", {}).get("block1", 0)
+    scratchpad_base = scheduler.get("vector_sram_addr", {}).get("block2", 0)
+
+    if norm_type == "layer_norm":
+        code = f"""
+; LayerNorm: hidden_size={hidden_size}  (vision encoder)
+"""
+        code += layer_norm_asm(
+            _eps_offset=eps_offset,
+            reci_hid_offset=reci_hid_offset,
+            alive_registers=[1, 2, 3],
+            activation_base_address=activation_base,
+            scratchpad_base_address=scratchpad_base,
+            vlen=vlen,
+            batch_size=batch_size,
+            hidden_dim=hidden_size,
+        )
+        return code.strip()
+
     code = f"""
-; Normalization: hidden_size={hidden_size}`
-; Layer normalization
+; RMSNorm: hidden_size={hidden_size}
 """
     code += rms_norm_asm(
         _eps_offset=eps_offset,
         reci_hid_offset=reci_hid_offset,
         alive_registers=[1, 2, 3],
-        activation_base_address=scheduler.get("vector_sram_addr", {}).get("block1", 0),
-        scratchpad_base_address=scheduler.get("vector_sram_addr", {}).get("block2", 0),
-        vlen=hardware_config.get("vlen", 16),
-        batch_size=model_info.get("batch_size", 1),
+        activation_base_address=activation_base,
+        scratchpad_base_address=scratchpad_base,
+        vlen=vlen,
+        batch_size=batch_size,
         hidden_dim=hidden_size,
+    )
+
+    return code.strip()
+
+
+def _generate_conv2d_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly code for a Conv2d patch-embedding operation.
+
+    The PLENA ISA has no native Conv2d, so we lower it to:
+        1. im2col_asm   — reshape NCHW patches into a (M, C_in*K*K) matrix in VRAM
+        2. projection_asm — matmul by the Conv2d weight matrix (C_out, C_in*K*K).
+
+    For SigLIP: C_in=3, K=patch_size, stride=patch_size.  The kernel is emitted
+    as a single ASM block so we're honest about what the HW would run, even
+    though the orchestration over multiple patch tiles is left to the compiler
+    integration.
+    """
+
+    dims = node["dimensions"]
+    in_channels = dims["in_channels"]
+    out_channels = dims["out_channels"]
+    image_size = dims["image_size"]
+    patch_size = dims["patch_size"]
+    num_patches = dims["num_patches"]
+    K_col = in_channels * patch_size * patch_size  # im2col row width
+
+    mlen = hardware_config.get("MLEN", hardware_config.get("mlen", 16))
+    vlen = hardware_config.get("VLEN", hardware_config.get("vlen", 16))
+    blen = hardware_config.get("BLEN", hardware_config.get("blen", 16))
+
+    # im2col produces one VRAM row per patch; stride == patch_size so OH=OW=image/patch.
+    OH = OW = image_size // patch_size
+    M = num_patches
+
+    # Pick safe default registers / VRAM addresses (kept disjoint from rest of pipeline).
+    alive_registers = [10, 11, 12, 13, 14, 15]
+    mask_vec_vram_addr = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block3", 0)
+    scratch_vram_addr = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block4", 0)
+    output_vram_base = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0)
+    input_hbm_base_addr_reg = (
+        scheduler["register_assignment"].get("hbm_addr_reg", {}).get("token_table_offset", 1)
+    )
+
+    code = f"""
+; === Conv2d patch embedding (lowered to im2col + matmul) ===
+; in_channels={in_channels}, out_channels={out_channels}
+; image={image_size}x{image_size}, patch={patch_size}x{patch_size}, num_patches={num_patches}
+; im2col output shape: ({M}, {K_col})
+"""
+
+    # Step 1: im2col  (requires K | vlen for multi-tile; patch_size=16, vlen=64 satisfies this)
+    code += im2col_asm(
+        mlen=mlen,
+        vlen=vlen,
+        C_in=in_channels,
+        H=image_size,
+        W=image_size,
+        K=patch_size,
+        OH=OH,
+        OW=OW,
+        M=M,
+        alive_registers=alive_registers,
+        input_hbm_base_addr_reg=input_hbm_base_addr_reg,
+        mask_vec_vram_addr=mask_vec_vram_addr,
+        scratch_vram_addr=scratch_vram_addr,
+        output_vram_base=output_vram_base,
+    )
+
+    # Step 2: matmul against the Conv2d weight (C_out, K_col).
+    # Reuse projection_asm with out_features=C_out.
+    w_base_hbm_offset_reg = (
+        scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
+    )
+    result_base_address = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block2", 0)
+    code += "\n; -- Conv2d weight matmul: (num_patches, K_col) @ (K_col, out_channels) --\n"
+    code += projection_asm(
+        mlen=mlen,
+        blen=blen,
+        batch=model_info.get("batch_size", 1),
+        hidden_size=K_col,
+        alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+        w_base_hbm_offset_reg=w_base_hbm_offset_reg,
+        activation_base_address=output_vram_base,
+        result_base_address=result_base_address,
+        rope_enabled=False,
+        out_features=out_channels,
+    )
+
+    return code.strip()
+
+
+def _generate_vision_projection_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly for the vision -> text connector (pixel-shuffle + linear).
+
+    The pixel-shuffle is a pure reshape and has no ASM cost; we annotate it and
+    emit the linear projection via projection_asm.
+    """
+
+    dims = node["dimensions"]
+    in_features = dims["in_features"]
+    out_features = dims["out_features"]
+    scale_factor = dims.get("scale_factor", 1)
+    num_patches_in = dims.get("num_patches_in", 0)
+    num_patches_out = dims.get("num_patches_out", 0)
+
+    mlen = hardware_config.get("MLEN", hardware_config.get("mlen", 16))
+    blen = hardware_config.get("BLEN", hardware_config.get("blen", 16))
+
+    w_base_hbm_offset_reg = (
+        scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
+    )
+    activation_base_address = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0)
+    result_base_address = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block2", 0)
+
+    code = f"""
+; === Vision -> text connector ===
+; pixel_shuffle: scale_factor={scale_factor},  patches {num_patches_in} -> {num_patches_out}
+; linear: in_features={in_features} -> out_features={out_features}
+; (reshape has no ASM cost; emit linear projection only.)
+"""
+    code += projection_asm(
+        mlen=mlen,
+        blen=blen,
+        batch=model_info.get("batch_size", 1),
+        hidden_size=in_features,
+        alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+        w_base_hbm_offset_reg=w_base_hbm_offset_reg,
+        activation_base_address=activation_base_address,
+        result_base_address=result_base_address,
+        rope_enabled=False,
+        out_features=out_features,
     )
 
     return code.strip()
@@ -206,6 +442,34 @@ def _generate_elementwise_add_code(
     return code.strip()
 
 
+def _generate_lm_head_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly code for the LM head (hidden→vocab_size projection)."""
+    dims = node["dimensions"]
+    hidden_size = dims["hidden_size"]
+    vocab_size = dims["vocab_size"]
+
+    code = f"""
+; LM head projection: hidden_size={hidden_size}, vocab_size={vocab_size}
+; logits = hidden_states @ lm_head.weight.T
+"""
+    code += lm_head_asm(
+        mlen=hardware_config.get("MLEN", 16),
+        blen=hardware_config.get("BLEN", 16),
+        batch=model_info.get("batch_size", 1),
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
+        lm_head_weight_hbm_offset_reg=scheduler["register_assignment"]
+        .get("hbm_addr_reg", {})
+        .get("lm_head_weight_offset", 0),
+        activation_base_address=scheduler.get("vector_sram_addr", {}).get("block1", 0),
+        result_base_address=scheduler.get("vector_sram_addr", {}).get("block2", 0),
+    )
+    return code.strip()
+
+
 def _generate_node_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
@@ -225,6 +489,12 @@ def _generate_node_code(
         return header + _generate_normalization_code(node, model_info, hardware_config, scheduler)
     elif operation_type == "elementwise_add":
         return header + _generate_elementwise_add_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "lm_head":
+        return header + _generate_lm_head_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "conv2d":
+        return header + _generate_conv2d_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "vision_projection":
+        return header + _generate_vision_projection_code(node, model_info, hardware_config, scheduler)
     else:
         raise ValueError(f"Unknown operation type: {operation_type}")
 

@@ -59,6 +59,8 @@ class AssemblyToBinary:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in ["S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"]:
             binary_instruction = (rs1 << (opw + ow)) + (rd << opw) + opcode
+        elif instruction.opcode in ["C_BREAK"]:
+            binary_instruction = opcode
         elif instruction.opcode in ["C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"]:
             binary_instruction = (rd << opw) + opcode
         elif instruction.opcode in ["C_LOOP_START"]:
@@ -87,6 +89,28 @@ class AssemblyToBinary:
             binary_instruction = (
                 (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
             )
+        elif instruction.opcode in [
+            # Scalar arithmetic (rd, rs1, rs2) — no rmask
+            "S_ADD_INT",
+            "S_ADD_FP",
+            "S_SUB_INT",
+            "S_SUB_FP",
+            "S_MUL_INT",
+            "S_MUL_FP",
+            "S_MAX_FP",
+            # Matrix ops without write-out (rd, rs1, rs2)
+            "M_MM",
+            "M_MV",
+            "M_BMM",
+            "M_BMV",
+            "M_TMM",
+            "M_TMV",
+            "M_BTMM",
+            "M_BTMV",
+            # CSR: addr reg destination + 2 GP sources (a{N}, gp{X}, gp{Y} → rd, rs1, rs2)
+            "C_SET_ADDR_REG",
+        ]:
+            binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         else:
             binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
 

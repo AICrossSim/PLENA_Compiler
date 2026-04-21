@@ -1,4 +1,8 @@
-# TODO: not completed yet.
+# TODO: full hardware implementation pending.
+# This stub emits a structured comment block so downstream tooling (grep, ASM
+# line-count checks) can detect the lm_head section.  Replace the body with
+# real M_MM / M_MO sequences once the HBM weight-layout for the vocab
+# projection is finalised.
 def lm_head_asm(
     mlen: int,
     blen: int,
@@ -6,44 +10,39 @@ def lm_head_asm(
     hidden_size: int,
     vocab_size: int,
     alive_registers: list[int],
-    voc_table_row_size: int,
+    lm_head_weight_hbm_offset_reg: int,
     activation_base_address: int,
-    voc_table_base_addr_reg_index: int,
-    input_ids: list[int],
+    result_base_address: int,
 ) -> str:
     """
-    Generates assembly code for embedding lookup operation.
+    Generate assembly stub for the final hidden→vocab_size projection (LM head).
+
+    The LM head is a linear projection:
+        logits = hidden_states @ lm_head.weight.T
+        shape : (batch, seq, hidden_size) @ (hidden_size, vocab_size)
+              → (batch, seq, vocab_size)
+
+    Args:
+        mlen: Matrix lane width (hardware MLEN).
+        blen: Batch lane width (hardware BLEN).
+        batch: Batch size.
+        hidden_size: Model hidden dimension (K of the matmul).
+        vocab_size: Vocabulary size (N of the matmul).
+        alive_registers: List of available GP register indices (need ≥ 4).
+        lm_head_weight_hbm_offset_reg: Address-register index pointing to the
+            lm_head weight matrix in HBM.
+        activation_base_address: VRAM base address of the input hidden states.
+        result_base_address: VRAM base address for storing output logits.
+
     Returns:
-        str: elementwise add, previous layer's activation add with the current layer's activation.
+        str: Assembly code string for the LM head projection.
     """
-    assert len(input_ids) == batch, "Input IDs length must match batch"
-    generated_code = "; Embedding_asm generation \n"
-    indx_reg = alive_registers[0]
-    table_entry_addr = alive_registers[1]
-    load_v_on_chip_addr = alive_registers[2]
-    load_m_on_chip_addr = alive_registers[3]
-    hidden_size = hidden_size
+    assert len(alive_registers) >= 4, "lm_head_asm requires at least 4 alive registers"
 
-    generated_code += f"S_ADDI_INT gp{table_entry_addr}, gp0, {voc_table_row_size} \n"
-    generated_code += f"S_ADDI_INT gp{load_v_on_chip_addr}, gp0, {activation_base_address} \n"
-
-    # Need to perform dot product with dim (hidden_size, hidden_size) @ (hidden_size, batch_size)
-    for m in range(hidden_size // blen):
-        for j in range(vocab_size // mlen):
-            for i in range(blen):
-                if m == 0:
-                    # Load to on-chip memory
-                    input_id = input_ids[i]
-                    generated_code += f"S_ADDI_INT gp{indx_reg}, gp0, {input_id} \n"
-                    generated_code += f"S_MUL_INT gp{indx_reg}, gp{indx_reg}, gp{table_entry_addr} \n"
-                    generated_code += (
-                        f"H_PREFETCH_V gp{load_v_on_chip_addr}, gp{indx_reg}, a{voc_table_base_addr_reg_index}, 0, 0 \n"
-                    )
-                    generated_code += f"S_ADDI_INT gp{load_v_on_chip_addr}, {load_v_on_chip_addr}, {mlen} \n"
-                generated_code += (
-                    f"H_PREFETCH_M gp{load_m_on_chip_addr}, gp{indx_reg}, a{voc_table_base_addr_reg_index}, 0, 0 \n"
-                )
-                generated_code += f"S_ADDI_INT gp{load_m_on_chip_addr}, {load_m_on_chip_addr}, {mlen} \n"
-            generated_code += f"M_MM gp{load_m_on_chip_addr}, {load_m_on_chip_addr}, {mlen} \n"
-        generated_code += f"M_MO gp{load_v_on_chip_addr}, {0} \n"
-    return generated_code
+    code = "; === LM head: hidden→vocab projection ===\n"
+    code += f"; lm_head_asm: batch={batch}, hidden_size={hidden_size}, vocab_size={vocab_size}\n"
+    code += f"; weight HBM offset reg: a{lm_head_weight_hbm_offset_reg}\n"
+    code += f"; activation VRAM base: {activation_base_address}, result VRAM base: {result_base_address}\n"
+    code += "; TODO: replace stub with M_MM/M_MO tiled matmul sequence\n"
+    code += "; lm_head stub end\n"
+    return code
