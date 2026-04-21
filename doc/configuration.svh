@@ -9,9 +9,9 @@ package configuration_pkg;
     // Compute Unit Related 
     parameter   BLEN = 4;
     parameter   HLEN = 8
-    parameter   MLEN = 16;
+    parameter   MLEN = 64;
     parameter   Matrix_Parallel_Rd_Dim = 1;
-    parameter   VLEN = 16;
+    parameter   VLEN = 64;
     parameter   INST_BUFF_DEPTH = 16;
     parameter   ON_CHIP_ADDR_WIDTH = precision_pkg::INT_DATA_WIDTH;
     parameter   SourceWidth = 1;

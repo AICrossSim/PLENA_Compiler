@@ -45,8 +45,8 @@ def _generate_embedding_code(
 ; Input: token_ids, Output: embedded_vectors
 """
     code += embedding_asm(
-        mlen=hardware_config.get("mlen", 16),
-        blen=hardware_config.get("blen", 16),
+        mlen=hardware_config.get("MLEN", 64),
+        blen=hardware_config.get("BLEN", 4),
         batch=model_info.get("batch_size", 1),
         hidden_size=dim["hidden_size"],
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
@@ -90,8 +90,8 @@ def _generate_attention_code(
 ; Self-attention ({attn_kind}): hidden_size={hidden_size}, heads={num_heads}, head_dim={head_dim}
 ; Q, K, V projections + attention.  RoPE={'off' if not causal_mask else 'on Q/K'}.
 """
-    mlen = hardware_config.get("MLEN", 16)
-    blen = hardware_config.get("BLEN", 16)
+    mlen = hardware_config.get("MLEN", 64)
+    blen = hardware_config.get("BLEN", 4)
     batch = model_info.get("batch", 1)
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
     vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
@@ -166,8 +166,8 @@ def _generate_ffn_code(
     activation = dims["activation"]
     arch = dims.get("arch", "gated")
 
-    mlen = hardware_config.get("MLEN", 16)
-    blen = hardware_config.get("BLEN", 16)
+    mlen = hardware_config.get("MLEN", 64)
+    blen = hardware_config.get("BLEN", 4)
     vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
 
@@ -215,7 +215,7 @@ def _generate_ffn_code(
     ffn_down_reg = hbm_addr_reg.get("ffn_down_offset", 0)
     code += ffn_asm(
         mlen=mlen,
-        vlen=hardware_config.get("VLEN", 16),
+        vlen=hardware_config.get("VLEN", 64),
         blen=blen,
         batch=model_info.get("batch", 1),
         seq_len=model_info.get("seq_len", 1),
@@ -245,7 +245,7 @@ def _generate_normalization_code(
     norm_type = dims.get("norm_type", "rms_norm")
     eps_offset = scheduler.get("fp_sram", {}).get("eps", 0)
     reci_hid_offset = scheduler.get("fp_sram", {}).get("hid_reciprocal", 0)
-    vlen = hardware_config.get("vlen", 16)
+    vlen = hardware_config.get("VLEN", 64)
     batch_size = model_info.get("batch_size", 1)
     activation_base = scheduler.get("vector_sram_addr", {}).get("block1", 0)
     scratchpad_base = scheduler.get("vector_sram_addr", {}).get("block2", 0)
@@ -306,9 +306,9 @@ def _generate_conv2d_code(
     num_patches = dims["num_patches"]
     K_col = in_channels * patch_size * patch_size  # im2col row width
 
-    mlen = hardware_config.get("MLEN", hardware_config.get("mlen", 16))
-    vlen = hardware_config.get("VLEN", hardware_config.get("vlen", 16))
-    blen = hardware_config.get("BLEN", hardware_config.get("blen", 16))
+    mlen = hardware_config.get("MLEN", 64)
+    vlen = hardware_config.get("VLEN", 64)
+    blen = hardware_config.get("BLEN", 4)
 
     # im2col produces one VRAM row per patch; stride == patch_size so OH=OW=image/patch.
     OH = OW = image_size // patch_size
@@ -387,8 +387,8 @@ def _generate_vision_projection_code(
     num_patches_in = dims.get("num_patches_in", 0)
     num_patches_out = dims.get("num_patches_out", 0)
 
-    mlen = hardware_config.get("MLEN", hardware_config.get("mlen", 16))
-    blen = hardware_config.get("BLEN", hardware_config.get("blen", 16))
+    mlen = hardware_config.get("MLEN", 64)
+    blen = hardware_config.get("BLEN", 4)
 
     w_base_hbm_offset_reg = (
         scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
@@ -429,7 +429,7 @@ def _generate_elementwise_add_code(
     ; Elementwise addition (residual connection): shape={shape}
     """
     code += elementwise_add_asm(
-        vlen=hardware_config.get("VLEN", 16),
+        vlen=hardware_config.get("VLEN", 64),
         hidden_size=model_info["hidden_size"],
         batch=model_info.get("batch", 1),
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3]),
@@ -455,8 +455,8 @@ def _generate_lm_head_code(
 ; logits = hidden_states @ lm_head.weight.T
 """
     code += lm_head_asm(
-        mlen=hardware_config.get("MLEN", 16),
-        blen=hardware_config.get("BLEN", 16),
+        mlen=hardware_config.get("MLEN", 64),
+        blen=hardware_config.get("BLEN", 4),
         batch=model_info.get("batch_size", 1),
         hidden_size=hidden_size,
         vocab_size=vocab_size,
