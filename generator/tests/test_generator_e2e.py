@@ -453,9 +453,9 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
         "skip_first_dim": False,
     }
 
-    # VRAM file size: VECTOR_SRAM_DEPTH * VLEN * 2 bytes (fp16).
-    # Falls back to a generous default if the config doesn't report depth.
-    vram_depth = _hw_cfg.get("VECTOR_SRAM_DEPTH", 1024)
+    # VRAM file size: VECTOR_SRAM_SIZE * VLEN * 2 bytes (fp16).
+    # Falls back to a generous default if the config doesn't report size.
+    vram_depth = _hw_cfg.get("VECTOR_SRAM_SIZE", 65536)
     vram_size_bytes = vram_depth * vlen * 2
 
     # Dummy token_ids (sequential). The generator ASM's numerical check is
