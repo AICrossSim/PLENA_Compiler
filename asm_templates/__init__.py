@@ -6,6 +6,7 @@ from .flash_attn_asm import flash_attn_asm
 from .gelu_asm import gelu_asm
 from .im2col_asm import im2col_asm
 from .im2col_asm_no_shift import im2col_asm_no_shift
+from .lm_head import lm_head_asm
 from .normalization_asm import layer_norm_asm, rms_norm_asm
 from .preload_act import preload_act_asm
 from .preload_addr_reg import preload_addr_reg_asm
@@ -29,6 +30,7 @@ __all__ = [
     "im2col_asm",
     "im2col_asm_no_shift",
     "layer_norm_asm",
+    "lm_head_asm",
     "preload_act_asm",
     "preload_addr_reg_asm",
     "projection_T_asm",

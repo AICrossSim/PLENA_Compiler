@@ -84,8 +84,8 @@ def test_smolvlm2_text_decoder_graph():
     parser = _make_smolvlm2_parser()
     graph = parser.create_symbolic_graph(batch_size=1, seq_len=8192)
 
-    # embed + 24*(norm,attn,res,norm,ffn,res) + final_norm
-    expected_text_nodes = 1 + 24 * 6 + 1
+    # embed + 24*(norm,attn,res,norm,ffn,res) + final_norm + lm_head
+    expected_text_nodes = 1 + 24 * 6 + 1 + 1
     assert graph["total_nodes"] == expected_text_nodes
 
     attn_nodes = [n for n in graph["nodes"] if n["operation_type"] == "attention"]

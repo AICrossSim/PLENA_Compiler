@@ -298,6 +298,26 @@ class LLMModelParser:
         execution_order.append("final_layernorm")
         order_counter += 1
 
+        # LM head: final hidden→vocab_size projection
+        vocab_size = getattr(text_cfg, "vocab_size", None)
+        if vocab_size is not None:
+            lm_head_info = {
+                "name": "lm_head",
+                "operation_type": "lm_head",
+                "operation_category": "lm_head",
+                "execution_order": order_counter,
+                "input_shape": [batch_size, seq_len, hidden_size],
+                "output_shape": [batch_size, seq_len, vocab_size],
+                "dimensions": {
+                    "hidden_size": hidden_size,
+                    "vocab_size": vocab_size,
+                },
+                "is_data_placeholder": False,
+            }
+            symbolic_nodes.append(lm_head_info)
+            execution_order.append("lm_head")
+            order_counter += 1
+
         self.symbolic_graph = {
             "nodes": symbolic_nodes,
             "execution_order": execution_order,

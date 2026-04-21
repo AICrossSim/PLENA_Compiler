@@ -13,6 +13,7 @@ from asm_templates import (
     embedding_asm,
     # flash_attn_asm,
     ffn_asm,
+    lm_head_asm,
     projection_asm,
     rms_norm_asm,
 )
@@ -136,7 +137,10 @@ def _generate_ffn_code(
     ; Gate and Up projections
     """
 
-    ffn_weight_reg = scheduler["register_assignment"].get("hbm_addr_reg", {}).get("ffn_weight_offset", 0)
+    hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
+    ffn_gate_reg = hbm_addr_reg.get("ffn_gate_offset", 0)
+    ffn_up_reg = hbm_addr_reg.get("ffn_up_offset", 0)
+    ffn_down_reg = hbm_addr_reg.get("ffn_down_offset", 0)
     code += ffn_asm(
         mlen=hardware_config.get("MLEN", 16),
         vlen=hardware_config.get("VLEN", 16),
@@ -146,9 +150,9 @@ def _generate_ffn_code(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-        gate_weight_hbm_offset_reg=ffn_weight_reg,
-        up_weight_hbm_offset_reg=ffn_weight_reg,
-        down_weight_hbm_offset_reg=ffn_weight_reg,
+        gate_weight_hbm_offset_reg=ffn_gate_reg,
+        up_weight_hbm_offset_reg=ffn_up_reg,
+        down_weight_hbm_offset_reg=ffn_down_reg,
         const_one_fp_address=scheduler["memory_layout"].get("fp_sram", {}).get("silu_e", 0),
         activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
     )
@@ -206,6 +210,34 @@ def _generate_elementwise_add_code(
     return code.strip()
 
 
+def _generate_lm_head_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly code for the LM head (hidden→vocab_size projection)."""
+    dims = node["dimensions"]
+    hidden_size = dims["hidden_size"]
+    vocab_size = dims["vocab_size"]
+
+    code = f"""
+; LM head projection: hidden_size={hidden_size}, vocab_size={vocab_size}
+; logits = hidden_states @ lm_head.weight.T
+"""
+    code += lm_head_asm(
+        mlen=hardware_config.get("MLEN", 16),
+        blen=hardware_config.get("BLEN", 16),
+        batch=model_info.get("batch_size", 1),
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
+        lm_head_weight_hbm_offset_reg=scheduler["register_assignment"]
+        .get("hbm_addr_reg", {})
+        .get("lm_head_weight_offset", 0),
+        activation_base_address=scheduler.get("vector_sram_addr", {}).get("block1", 0),
+        result_base_address=scheduler.get("vector_sram_addr", {}).get("block2", 0),
+    )
+    return code.strip()
+
+
 def _generate_node_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
@@ -225,6 +257,8 @@ def _generate_node_code(
         return header + _generate_normalization_code(node, model_info, hardware_config, scheduler)
     elif operation_type == "elementwise_add":
         return header + _generate_elementwise_add_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "lm_head":
+        return header + _generate_lm_head_code(node, model_info, hardware_config, scheduler)
     else:
         raise ValueError(f"Unknown operation type: {operation_type}")
 
