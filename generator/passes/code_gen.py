@@ -10,7 +10,6 @@ from typing import Any
 
 from asm_templates import (
     elementwise_add_asm,
-    embedding_asm,
     # flash_attn_asm,
     ffn_asm,
     im2col_asm,
@@ -36,29 +35,21 @@ def _load_template(template_name: str) -> str:
 def _generate_embedding_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
-    """Generate assembly code for embedding operations."""
-    vocab_size = model_info["vocab_size"]
-    dim = node["dimensions"]
-    # TODO need to add a dot product at the end.
-    code = f"""
-; Embedding lookup: vocab_size={vocab_size}
-; Input: token_ids, Output: embedded_vectors
-"""
-    code += embedding_asm(
-        mlen=hardware_config.get("MLEN", 64),
-        blen=hardware_config.get("BLEN", 4),
-        batch=model_info.get("batch_size", 1),
-        hidden_size=dim["hidden_size"],
-        alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
-        voc_table_row_size=vocab_size,
-        activation_base_address=scheduler.get("activation_base_address", 0),
-        voc_table_base_addr_reg_index=scheduler.get("register_assignment", {})
-        .get("hbm_addr_reg", {})
-        .get("token_table_offset", 0),
-        input_ids=[1 for _ in range(model_info.get("batch_size", 1))],
-    )
+    """Embedding lookup is performed CPU-side and pre-loaded into VRAM.
 
-    return code.strip()
+    The parser marks embed_tokens with ``is_data_placeholder=True`` (see
+    llm_parser.py); honoring that, we emit no instructions here. The
+    e2e harness is responsible for computing ``embed_table[token_ids]``
+    and writing it to ``vram_preload.bin`` before invoking the emulator
+    with ``--vram``. This matches the ATen path convention.
+    """
+    vocab_size = model_info.get("vocab_size")
+    dim = node["dimensions"]
+    return (
+        "; === embed_tokens: CPU-side lookup, pre-loaded into VRAM ===\n"
+        f"; vocab_size={vocab_size}, hidden_size={dim['hidden_size']}\n"
+        "; (no instructions emitted; activation staged via vram_preload.bin)\n"
+    )
 
 
 def _generate_attention_code(
