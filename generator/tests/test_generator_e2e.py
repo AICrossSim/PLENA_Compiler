@@ -22,6 +22,7 @@ Exit codes:
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,49 @@ from assembler import AssemblyToBinary  # noqa: E402
 sys.path.insert(0, str(_REPO_ROOT / "transactional_emulator" / "testbench"))
 from emulator_runner import run_emulator  # noqa: E402
 from transactional_emulator.tools.check_mem import read_bin_file_as_array  # noqa: E402
+
+
+_SECTION_HEADER_RE = re.compile(r"^\s*;\s*===\s+.+\s+===\s*$")
+_EMBEDDING_HEADER_RE = re.compile(r"^\s*;\s*===\s+embed_tokens\s+\(embedding\)\s+===\s*$")
+
+
+def _strip_embedding_section(asm_path: Path) -> dict | None:
+    """Remove the embed_tokens section from the generated ASM, in-place.
+
+    The section is identified by its `; === embed_tokens (embedding) ===`
+    header and ends at the next `; === <anything> ===` header. Returns a
+    dict with {lines_removed, bytes_before} on success, or None if no
+    embedding section was found.
+
+    This is a WORKAROUND for the pre-existing embedding_asm.py MRAM-OOB
+    bug; see the TODO in run_pipeline().
+    """
+    original = asm_path.read_text()
+    bytes_before = len(original.encode())
+    lines = original.splitlines(keepends=True)
+    new_lines: list[str] = []
+    i = 0
+    removed = 0
+    stripped = False
+    while i < len(lines):
+        if not stripped and _EMBEDDING_HEADER_RE.match(lines[i]):
+            # Skip until the next section header (but keep THAT header).
+            stripped = True
+            # Also consume the header line itself.
+            i += 1
+            removed += 1
+            while i < len(lines) and not _SECTION_HEADER_RE.match(lines[i]):
+                i += 1
+                removed += 1
+            # Loop continues with `i` pointing at the next section header
+            # (or EOF) — that line is not consumed here.
+        else:
+            new_lines.append(lines[i])
+            i += 1
+    if not stripped:
+        return None
+    asm_path.write_text("".join(new_lines))
+    return {"lines_removed": removed, "bytes_before": bytes_before}
 
 
 def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
@@ -77,6 +121,32 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
         print(result.stderr[-2000:], file=sys.stderr)
         raise RuntimeError(f"generator.runner codegen failed: exit {result.returncode}")
     print(f"      ASM written: {asm_path} ({asm_path.stat().st_size} bytes)")
+
+    # Step 1.5: WORKAROUND — strip embed_tokens section.
+    # `compiler/asm_templates/embedding_asm.py` emits H_PREFETCH_M in a loop
+    # that monotonically increments the MRAM destination address by MLEN*MLEN
+    # per iteration. For clm-60m (hidden=384, vocab=49152) this produces
+    # ~576 prefetches, but MRAM depth = MATRIX_SRAM_SIZE/MLEN = 4 tiles, so
+    # the emulator panics with MRAM OOB after the first 4 iterations.
+    #
+    # This is a pre-existing template bug — the M_MM-based embedding lookup
+    # is not HW-realistic and needs a dedicated rewrite (out of scope here).
+    # Workaround: strip the entire `; === embed_tokens (embedding) ===`
+    # section from the generated ASM before assembly. Downstream layers
+    # default to reading VRAM at the embedding's output address (0), which
+    # either matches any `--vram` preload or reads the zero-initialized VRAM.
+    #
+    # TODO: remove this workaround once embedding_asm.py is rewritten.
+    removed_section = _strip_embedding_section(asm_path)
+    if removed_section is not None:
+        print(
+            f"      WORKAROUND: stripped embedding section "
+            f"({removed_section['lines_removed']} lines, "
+            f"{removed_section['bytes_before'] - asm_path.stat().st_size} bytes freed); "
+            f"see TODO in harness."
+        )
+    else:
+        print("      WORKAROUND: no embedding section found (already filtered?)")
 
     # Step 2: assemble
     print("[2/5] AssemblyToBinary")
