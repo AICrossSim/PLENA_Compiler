@@ -319,7 +319,7 @@ def _build_vram_preload(
     }
 
 
-def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
+def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int | None = None) -> dict:
     """Run codegen → assemble → emulator; return paths + metadata.
 
     Raises subprocess.CalledProcessError / RuntimeError on any step failure.
@@ -329,9 +329,9 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
     mem_path = build_dir / "generated_machine_code.mem"
 
     # Step 1: codegen
-    print(f"[1/5] generator.runner codegen {model_id} (seq_len={seq_len})")
-    result = subprocess.run(
-        [
+    layers_note = f", num_layers={num_layers}" if num_layers is not None else ""
+    print(f"[1/5] generator.runner codegen {model_id} (seq_len={seq_len}{layers_note})")
+    codegen_cmd = [
             "python3",
             "-m",
             "generator.runner",
@@ -340,7 +340,11 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
             str(asm_path),
             "--seq-len",
             str(seq_len),
-        ],
+        ]
+    if num_layers is not None:
+        codegen_cmd += ["--num-layers", str(num_layers)]
+    result = subprocess.run(
+        codegen_cmd,
         cwd=str(_COMPILER_ROOT),
         env={**os.environ, "PYTHONPATH": f"{_COMPILER_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"},
         stdin=subprocess.DEVNULL,
@@ -496,14 +500,15 @@ def pytorch_reference(model_id: str, input_ids: torch.Tensor) -> np.ndarray:
     return out.detach().numpy().astype(np.float32).flatten()
 
 
-def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128) -> int:
+def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128, num_layers: int | None = None) -> int:
     build_dir = Path("/tmp") / f"gen_e2e_{model_id.replace('/', '_')}_sl{seq_len}"
     print("=" * 80)
-    print(f"Generator e2e harness — {model_id} — seq_len={seq_len}")
+    layers_note = f", num_layers={num_layers}" if num_layers is not None else ""
+    print(f"Generator e2e harness — {model_id} — seq_len={seq_len}{layers_note}")
     print("=" * 80)
 
     try:
-        artifacts = run_pipeline(model_id, seq_len, build_dir)
+        artifacts = run_pipeline(model_id, seq_len, build_dir, num_layers=num_layers)
     except Exception as e:
         print(f"\nPIPELINE FAILED: {e}", file=sys.stderr)
         return 1
@@ -533,6 +538,11 @@ def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128) -> int:
 
 
 if __name__ == "__main__":
-    model = sys.argv[1] if len(sys.argv) > 1 else "AICrossSim/clm-60m"
-    sl = int(sys.argv[2]) if len(sys.argv) > 2 else 128
-    sys.exit(run_test(model, sl))
+    import argparse as _argparse
+    _ap = _argparse.ArgumentParser(description="Generator e2e harness")
+    _ap.add_argument("model_id", nargs="?", default="AICrossSim/clm-60m")
+    _ap.add_argument("seq_len", nargs="?", type=int, default=128)
+    _ap.add_argument("--num-layers", type=int, default=None,
+                     help="Override num_hidden_layers (e.g. 1 for fast e2e runs, ~22x less ASM)")
+    _args = _ap.parse_args()
+    sys.exit(run_test(_args.model_id, _args.seq_len, num_layers=_args.num_layers))
