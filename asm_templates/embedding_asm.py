@@ -15,17 +15,26 @@ def embedding_asm(
     token_idx * hidden_size``. The row is transferred in chunks of ``vlen``
     elements via ``H_PREFETCH_V``.
 
-    The HBM vocab table is MXFP8-packed: each row occupies
-    ``voc_table_row_bytes`` bytes (= ``(hidden_size // block_dim) *
-    (act_block_width // 8 + scale_width // 8)``). The caller supplies that
-    stride so this template stays quantization-format-agnostic.
+    Stride convention (IMPORTANT): the ``offset`` GP register that advances
+    between VLEN chunks is counted in *data bytes only*, not data+scale.  The
+    Rust emulator's H_PREFETCH_V implementation
+    (``transactional_emulator/src/main.rs:2031-2037``) auto-derives the scale
+    byte offset from the data byte offset via
+    ``scale_offset = data_offset / (elem_bits * block / scale_bits)``,
+    which means the scale pointer is internal to the emulator.  Advancing
+    ``offset`` by data+scale bytes would cause the derived scale offset to
+    double-count.  Caller must therefore pass ``voc_table_row_bytes =
+    hidden_size * elem_bytes`` (the on-disk *data*-only stride, irrespective of
+    how much scale metadata is interleaved in HBM).
 
     Cost: ``hidden_size // vlen`` H_PREFETCH_V + a handful of S_ADDI_INT per
     token. No MRAM usage, no M_MM.
 
     Args:
         vlen: Vector lane width in elements (matches VLEN).
-        batch: Number of tokens in this batch; must equal ``len(input_ids)``.
+        batch: Number of tokens to embed; must equal ``len(input_ids)``.  For a
+            decoder LLM this is ``batch_size * seq_len`` so the VRAM output
+            spans every token in the sequence.
         hidden_size: Embedding dimension. Must be a multiple of ``vlen``.
         alive_registers: Free general-purpose registers. We consume the first
             two (vram-dest pointer, hbm-byte-offset pointer).
@@ -35,7 +44,9 @@ def embedding_asm(
             register holding the vocab-table base pointer.
         input_ids: Token ids emitted at codegen time (runtime token ids would
             need a scalar-indexed HBM load primitive we don't have).
-        voc_table_row_bytes: Bytes per vocab row in HBM (MXFP8-packed).
+        voc_table_row_bytes: Data bytes per vocab row in HBM.  Must be
+            ``hidden_size * elem_bytes`` (NOT include scale bytes — the
+            emulator auto-derives the scale offset from the data offset).
 
     Returns:
         str: Generated assembly.
