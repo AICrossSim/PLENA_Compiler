@@ -87,6 +87,10 @@ def _generate_attention_code(
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
     vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
 
+    _proj_matrix_sram = hardware_config.get("MATRIX_SRAM_SIZE", 1024)
+    _proj_vlen = hardware_config.get("VLEN", 64)
+    _proj_scratch = vsram.get("block4", 0)
+
     # Q projection
     code += projection_asm(
         mlen=mlen,
@@ -101,6 +105,9 @@ def _generate_attention_code(
         result_base_address=vsram.get("block2", 0),
         rope_enabled=causal_mask,
         out_features=q_out,
+        matrix_sram_size=_proj_matrix_sram,
+        scratch_base_address=_proj_scratch,
+        vlen=_proj_vlen,
     )
 
     # K projection
@@ -117,6 +124,9 @@ def _generate_attention_code(
         result_base_address=vsram.get("block2", 0),
         rope_enabled=causal_mask,
         out_features=k_out,
+        matrix_sram_size=_proj_matrix_sram,
+        scratch_base_address=_proj_scratch,
+        vlen=_proj_vlen,
     )
 
     # V projection (no RoPE ever)
@@ -133,6 +143,9 @@ def _generate_attention_code(
         result_base_address=vsram.get("block2", 0),
         rope_enabled=False,
         out_features=v_out,
+        matrix_sram_size=_proj_matrix_sram,
+        scratch_base_address=_proj_scratch,
+        vlen=_proj_vlen,
     )
 
     # code += flash_attn_asm()
@@ -162,6 +175,10 @@ def _generate_ffn_code(
     vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
 
+    _vit_matrix_sram = hardware_config.get("MATRIX_SRAM_SIZE", 1024)
+    _vit_vlen = hardware_config.get("VLEN", 64)
+    _vit_scratch = vsram.get("block4", 0)
+
     if arch == "vit":
         code = f"""
 ; Vision FFN (ViT-style): hidden={hidden_size} -> {intermediate_size} -> {hidden_size}, act={activation}
@@ -179,6 +196,9 @@ def _generate_ffn_code(
             result_base_address=vsram.get("block5", vsram.get("block2", 0)),
             rope_enabled=False,
             out_features=intermediate_size,
+            matrix_sram_size=_vit_matrix_sram,
+            scratch_base_address=_vit_scratch,
+            vlen=_vit_vlen,
         )
         code += f"\n; -- {activation} activation (placeholder; GELU not yet wired into codegen) --\n"
         # fc2: intermediate -> hidden
@@ -193,6 +213,9 @@ def _generate_ffn_code(
             result_base_address=vsram.get("block1", 0),
             rope_enabled=False,
             out_features=hidden_size,
+            matrix_sram_size=_vit_matrix_sram,
+            scratch_base_address=_vit_scratch,
+            vlen=_vit_vlen,
         )
         return code.strip()
 
@@ -218,6 +241,7 @@ def _generate_ffn_code(
         down_weight_hbm_offset_reg=ffn_down_reg,
         const_one_fp_address=scheduler["memory_layout"].get("fp_sram", {}).get("silu_e", 0),
         activation_base_address=vsram.get("block1", 0),
+        matrix_sram_size=hardware_config.get("MATRIX_SRAM_SIZE", 1024),
     )
     return code.strip()
 
