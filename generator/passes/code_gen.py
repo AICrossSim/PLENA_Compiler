@@ -10,7 +10,6 @@ from typing import Any
 
 from asm_templates import (
     elementwise_add_asm,
-    embedding_asm,
     # flash_attn_asm,
     ffn_asm,
     im2col_asm,
@@ -36,29 +35,21 @@ def _load_template(template_name: str) -> str:
 def _generate_embedding_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
-    """Generate assembly code for embedding operations."""
-    vocab_size = model_info["vocab_size"]
-    dim = node["dimensions"]
-    # TODO need to add a dot product at the end.
-    code = f"""
-; Embedding lookup: vocab_size={vocab_size}
-; Input: token_ids, Output: embedded_vectors
-"""
-    code += embedding_asm(
-        mlen=hardware_config.get("MLEN", 64),
-        blen=hardware_config.get("BLEN", 4),
-        batch=model_info.get("batch_size", 1),
-        hidden_size=dim["hidden_size"],
-        alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
-        voc_table_row_size=vocab_size,
-        activation_base_address=scheduler.get("activation_base_address", 0),
-        voc_table_base_addr_reg_index=scheduler.get("register_assignment", {})
-        .get("hbm_addr_reg", {})
-        .get("token_table_offset", 0),
-        input_ids=[1 for _ in range(model_info.get("batch_size", 1))],
-    )
+    """Embedding lookup is performed CPU-side and pre-loaded into VRAM.
 
-    return code.strip()
+    The parser marks embed_tokens with ``is_data_placeholder=True`` (see
+    llm_parser.py); honoring that, we emit no instructions here. The
+    e2e harness is responsible for computing ``embed_table[token_ids]``
+    and writing it to ``vram_preload.bin`` before invoking the emulator
+    with ``--vram``. This matches the ATen path convention.
+    """
+    vocab_size = model_info.get("vocab_size")
+    dim = node["dimensions"]
+    return (
+        "; === embed_tokens: CPU-side lookup, pre-loaded into VRAM ===\n"
+        f"; vocab_size={vocab_size}, hidden_size={dim['hidden_size']}\n"
+        "; (no instructions emitted; activation staged via vram_preload.bin)\n"
+    )
 
 
 def _generate_attention_code(
@@ -96,6 +87,13 @@ def _generate_attention_code(
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
     vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
 
+    _proj_matrix_sram = hardware_config.get("MATRIX_SRAM_SIZE", 1024)
+    _proj_vlen = hardware_config.get("VLEN", 64)
+    # Use dedicated k_split_scratch (placed after all activation/intermediate regions)
+    # to prevent scratch/activation aliasing at batch_size=1 where block4 == block1.
+    # Fall back to block4 for scheduler dicts pre-dating the new key.
+    _proj_scratch = vsram.get("k_split_scratch", vsram.get("block4", 0))
+
     # Q projection
     code += projection_asm(
         mlen=mlen,
@@ -110,6 +108,9 @@ def _generate_attention_code(
         result_base_address=vsram.get("block2", 0),
         rope_enabled=causal_mask,
         out_features=q_out,
+        matrix_sram_size=_proj_matrix_sram,
+        scratch_base_address=_proj_scratch,
+        vlen=_proj_vlen,
     )
 
     # K projection
@@ -126,6 +127,9 @@ def _generate_attention_code(
         result_base_address=vsram.get("block2", 0),
         rope_enabled=causal_mask,
         out_features=k_out,
+        matrix_sram_size=_proj_matrix_sram,
+        scratch_base_address=_proj_scratch,
+        vlen=_proj_vlen,
     )
 
     # V projection (no RoPE ever)
@@ -142,6 +146,9 @@ def _generate_attention_code(
         result_base_address=vsram.get("block2", 0),
         rope_enabled=False,
         out_features=v_out,
+        matrix_sram_size=_proj_matrix_sram,
+        scratch_base_address=_proj_scratch,
+        vlen=_proj_vlen,
     )
 
     # code += flash_attn_asm()
@@ -171,6 +178,12 @@ def _generate_ffn_code(
     vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
 
+    _vit_matrix_sram = hardware_config.get("MATRIX_SRAM_SIZE", 1024)
+    _vit_vlen = hardware_config.get("VLEN", 64)
+    # Use dedicated k_split_scratch to prevent scratch/activation aliasing
+    # at batch_size=1. Fall back to block4 for legacy scheduler dicts.
+    _vit_scratch = vsram.get("k_split_scratch", vsram.get("block4", 0))
+
     if arch == "vit":
         code = f"""
 ; Vision FFN (ViT-style): hidden={hidden_size} -> {intermediate_size} -> {hidden_size}, act={activation}
@@ -188,6 +201,9 @@ def _generate_ffn_code(
             result_base_address=vsram.get("block5", vsram.get("block2", 0)),
             rope_enabled=False,
             out_features=intermediate_size,
+            matrix_sram_size=_vit_matrix_sram,
+            scratch_base_address=_vit_scratch,
+            vlen=_vit_vlen,
         )
         code += f"\n; -- {activation} activation (placeholder; GELU not yet wired into codegen) --\n"
         # fc2: intermediate -> hidden
@@ -202,6 +218,9 @@ def _generate_ffn_code(
             result_base_address=vsram.get("block1", 0),
             rope_enabled=False,
             out_features=hidden_size,
+            matrix_sram_size=_vit_matrix_sram,
+            scratch_base_address=_vit_scratch,
+            vlen=_vit_vlen,
         )
         return code.strip()
 
@@ -227,6 +246,7 @@ def _generate_ffn_code(
         down_weight_hbm_offset_reg=ffn_down_reg,
         const_one_fp_address=scheduler["memory_layout"].get("fp_sram", {}).get("silu_e", 0),
         activation_base_address=vsram.get("block1", 0),
+        matrix_sram_size=hardware_config.get("MATRIX_SRAM_SIZE", 1024),
     )
     return code.strip()
 

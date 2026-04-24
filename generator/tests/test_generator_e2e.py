@@ -22,7 +22,6 @@ Exit codes:
 """
 
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -49,49 +48,6 @@ from utils.load_config import load_toml_config  # noqa: E402
 sys.path.insert(0, str(_REPO_ROOT / "transactional_emulator" / "testbench"))
 from emulator_runner import run_emulator  # noqa: E402
 from transactional_emulator.tools.check_mem import read_bin_file_as_array  # noqa: E402
-
-
-_SECTION_HEADER_RE = re.compile(r"^\s*;\s*===\s+.+\s+===\s*$")
-_EMBEDDING_HEADER_RE = re.compile(r"^\s*;\s*===\s+embed_tokens\s+\(embedding\)\s+===\s*$")
-
-
-def _strip_embedding_section(asm_path: Path) -> dict | None:
-    """Remove the embed_tokens section from the generated ASM, in-place.
-
-    The section is identified by its `; === embed_tokens (embedding) ===`
-    header and ends at the next `; === <anything> ===` header. Returns a
-    dict with {lines_removed, bytes_before} on success, or None if no
-    embedding section was found.
-
-    This is a WORKAROUND for the pre-existing embedding_asm.py MRAM-OOB
-    bug; see the TODO in run_pipeline().
-    """
-    original = asm_path.read_text()
-    bytes_before = len(original.encode())
-    lines = original.splitlines(keepends=True)
-    new_lines: list[str] = []
-    i = 0
-    removed = 0
-    stripped = False
-    while i < len(lines):
-        if not stripped and _EMBEDDING_HEADER_RE.match(lines[i]):
-            # Skip until the next section header (but keep THAT header).
-            stripped = True
-            # Also consume the header line itself.
-            i += 1
-            removed += 1
-            while i < len(lines) and not _SECTION_HEADER_RE.match(lines[i]):
-                i += 1
-                removed += 1
-            # Loop continues with `i` pointing at the next section header
-            # (or EOF) — that line is not consumed here.
-        else:
-            new_lines.append(lines[i])
-            i += 1
-    if not stripped:
-        return None
-    asm_path.write_text("".join(new_lines))
-    return {"lines_removed": removed, "bytes_before": bytes_before}
 
 
 def _build_hbm_from_hf_weights(
@@ -261,10 +217,109 @@ def _build_hbm_from_hf_weights(
         # Expand HBM size in that case; never truncate real weight data.
         pass
 
-    return summary
+    # Return both the summary and the loaded HF model so the caller can
+    # reuse it (e.g. for CPU-side embedding lookup when building
+    # vram_preload.bin) without paying the from_pretrained() cost twice.
+    return summary, model
 
 
-def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
+def _build_vram_preload(
+    model,
+    token_ids: torch.Tensor,
+    vram_path: Path,
+    vram_size_bytes: int,
+    vlen: int,
+    activation_base_elements: int,
+    quant_config: dict,
+    scratch_dir: Path,
+) -> dict:
+    """CPU-side embedding lookup -> MXFP8-quantize -> write to vram_preload.bin.
+
+    Matches the ``embed_table[token_ids]`` semantic the generator's
+    ``_generate_embedding_code`` now delegates to. The result is staged at
+    the VRAM offset the first decoder layer's attention expects to read
+    from (``scheduler.memory_layout.vector_sram_addr.block1`` — which
+    returns element units per PR #10's fix).
+
+    Layout of ``vram_preload.bin`` (raw fp16 bytes, loaded linearly by the
+    emulator via ``vector_sram::load_from_bytes``):
+
+        [0 .. activation_base_elements)                 — zero padding
+        [activation_base_elements .. + B*S*H elements)  — flattened embedding
+        [tail .. vram_size_bytes)                       — zero padding
+
+    The emulator packs VLEN elements per row; any trailing partial row is
+    zero-padded by ``load_from_bytes`` itself.
+
+    Args:
+        model: HF model (from AutoModelForCausalLM.from_pretrained) that
+            already lives in memory from ``_build_hbm_from_hf_weights``.
+        token_ids: int tensor of shape (batch, seq_len).
+        vram_path: output file; overwritten.
+        vram_size_bytes: total VRAM file size (zero-padded tail).
+        vlen: hardware VLEN (e.g. 64) — only used for logging / sanity.
+        activation_base_elements: element offset where embed result should
+            land (``block1`` from the scheduler, already in elements).
+        quant_config: MXFP8 quantization config; same as HBM weight path.
+        scratch_dir: directory for intermediate RandomMxfpTensorGenerator
+            files.
+
+    Returns: {"offset_elements", "offset_bytes", "bytes_written", "shape"}
+    """
+    batch, seq_len = token_ids.shape
+    with torch.no_grad():
+        embed = model.get_input_embeddings()(token_ids).to(torch.float32)
+    # shape: (batch, seq_len, hidden) -> flatten row-major (batch-major)
+    # for the VRAM layout. Emulator's load_from_bytes packs VLEN elements
+    # per row, so this gives consecutive tokens' hidden vectors in row order.
+    hidden_size = embed.shape[-1]
+    embed_flat = embed.reshape(batch * seq_len, hidden_size).contiguous()
+
+    # MXFP8-quantize the same way HBM activations are quantized, so the
+    # emulator's dequant path matches what downstream layers expect.
+    plena_toml = _REPO_ROOT / "plena_settings.toml"
+    config = load_toml_config(str(plena_toml), "CONFIG")
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    # VRAM preload expects raw fp16 bytes, matching ATen test convention
+    # (e.g. flash_attention_gqa_test.py stages VRAM as fp16 directly).
+    embed_fp16 = embed_flat.to(torch.float16).numpy()
+
+    # Byte offsets.
+    element_size = 2  # fp16
+    offset_bytes = activation_base_elements * element_size
+    payload_bytes = embed_fp16.nbytes
+
+    if offset_bytes + payload_bytes > vram_size_bytes:
+        raise RuntimeError(
+            f"VRAM preload overflows: offset={offset_bytes} + payload={payload_bytes} "
+            f"> VRAM size {vram_size_bytes}. Either reduce batch*seq_len or raise VECTOR_SRAM_SIZE."
+        )
+
+    with open(vram_path, "wb") as f:
+        if offset_bytes > 0:
+            f.write(b"\x00" * offset_bytes)
+        f.write(embed_fp16.tobytes(order="C"))
+        tail = vram_size_bytes - offset_bytes - payload_bytes
+        if tail > 0:
+            f.write(b"\x00" * tail)
+
+    print(
+        f"      wrote vram_preload  shape={tuple(embed_flat.shape)} "
+        f"offset_elements={activation_base_elements} "
+        f"offset_bytes={offset_bytes} bytes={payload_bytes} "
+        f"(vlen={vlen}, total_file={vram_size_bytes})"
+    )
+
+    return {
+        "offset_elements": activation_base_elements,
+        "offset_bytes": offset_bytes,
+        "bytes_written": payload_bytes,
+        "shape": tuple(embed_flat.shape),
+    }
+
+
+def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int | None = None) -> dict:
     """Run codegen → assemble → emulator; return paths + metadata.
 
     Raises subprocess.CalledProcessError / RuntimeError on any step failure.
@@ -274,9 +329,9 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
     mem_path = build_dir / "generated_machine_code.mem"
 
     # Step 1: codegen
-    print(f"[1/5] generator.runner codegen {model_id} (seq_len={seq_len})")
-    result = subprocess.run(
-        [
+    layers_note = f", num_layers={num_layers}" if num_layers is not None else ""
+    print(f"[1/5] generator.runner codegen {model_id} (seq_len={seq_len}{layers_note})")
+    codegen_cmd = [
             "python3",
             "-m",
             "generator.runner",
@@ -285,7 +340,11 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
             str(asm_path),
             "--seq-len",
             str(seq_len),
-        ],
+        ]
+    if num_layers is not None:
+        codegen_cmd += ["--num-layers", str(num_layers)]
+    result = subprocess.run(
+        codegen_cmd,
         cwd=str(_COMPILER_ROOT),
         env={**os.environ, "PYTHONPATH": f"{_COMPILER_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"},
         stdin=subprocess.DEVNULL,
@@ -297,32 +356,6 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
         print(result.stderr[-2000:], file=sys.stderr)
         raise RuntimeError(f"generator.runner codegen failed: exit {result.returncode}")
     print(f"      ASM written: {asm_path} ({asm_path.stat().st_size} bytes)")
-
-    # Step 1.5: WORKAROUND — strip embed_tokens section.
-    # `compiler/asm_templates/embedding_asm.py` emits H_PREFETCH_M in a loop
-    # that monotonically increments the MRAM destination address by MLEN*MLEN
-    # per iteration. For clm-60m (hidden=384, vocab=49152) this produces
-    # ~576 prefetches, but MRAM depth = MATRIX_SRAM_SIZE/MLEN = 4 tiles, so
-    # the emulator panics with MRAM OOB after the first 4 iterations.
-    #
-    # This is a pre-existing template bug — the M_MM-based embedding lookup
-    # is not HW-realistic and needs a dedicated rewrite (out of scope here).
-    # Workaround: strip the entire `; === embed_tokens (embedding) ===`
-    # section from the generated ASM before assembly. Downstream layers
-    # default to reading VRAM at the embedding's output address (0), which
-    # either matches any `--vram` preload or reads the zero-initialized VRAM.
-    #
-    # TODO: remove this workaround once embedding_asm.py is rewritten.
-    removed_section = _strip_embedding_section(asm_path)
-    if removed_section is not None:
-        print(
-            f"      WORKAROUND: stripped embedding section "
-            f"({removed_section['lines_removed']} lines, "
-            f"{removed_section['bytes_before'] - asm_path.stat().st_size} bytes freed); "
-            f"see TODO in harness."
-        )
-    else:
-        print("      WORKAROUND: no embedding section found (already filtered?)")
 
     # Step 2: assemble
     print("[2/5] AssemblyToBinary")
@@ -353,10 +386,88 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path) -> dict:
     HBM_SIZE = 256 << 20  # 256 MiB (same as prior stub).
     FPSRAM_BYTES = 1024 * 2
     INTSRAM_BYTES = 1024 * 4
-    _build_hbm_from_hf_weights(model_id, seq_len, hbm_path, HBM_SIZE)
+    _hbm_summary, hf_model = _build_hbm_from_hf_weights(model_id, seq_len, hbm_path, HBM_SIZE)
     for p, size in [(fpsram_path, FPSRAM_BYTES), (intsram_path, INTSRAM_BYTES)]:
         if not p.exists() or p.stat().st_size != size:
             p.write_bytes(b"\x00" * size)
+
+    # Step 3.5: VRAM preload — CPU-side embedding lookup.
+    # Matches the convention introduced by the generator's
+    # ``_generate_embedding_code``: no ASM is emitted for the embed_tokens
+    # node; instead the harness stages ``embed_table[token_ids]`` in VRAM
+    # at the offset the first decoder layer expects to read from
+    # (``scheduler.memory_layout.vector_sram_addr.block1`` — elements).
+    print("[3.5/5] VRAM preload: CPU embedding lookup (batch × seq × hidden)")
+    # Resolve scheduler-computed block1 by invoking the same gen_scheduler
+    # path the generator uses. Doing it here (instead of passing through
+    # subprocess stdout) keeps the source of truth in one place.
+    import sys as _sys  # avoid shadowing outer name
+    _sys.path.insert(0, str(_COMPILER_ROOT))
+    from generator.parser import LLMModelParser, hardware_parser  # noqa: E402
+    from generator.scheduler import gen_scheduler  # noqa: E402
+
+    _hw_cfg = hardware_parser(
+        _COMPILER_ROOT / "doc" / "configuration.svh",
+        _COMPILER_ROOT / "doc" / "precision.svh",
+    )
+    _parser = LLMModelParser(model_id)
+    _parser.load_model()
+    _dims = _parser.extract_critical_dimensions()
+    batch_size = 4  # matches runner.py model_info["batch_size"]
+    hidden_size = _dims.get("hidden_size")
+    vocab_size = _dims.get("vocab_size")
+    _model_info = {
+        "batch_size": batch_size,
+        "hidden_size": hidden_size,
+        "intermediate_size": _dims.get("ffn", {}).get("intermediate_size", 4096),
+        "vocab_size": vocab_size,
+        "seq_len": seq_len,
+        "context_length": _dims.get("max_position_embeddings", seq_len),
+    }
+    _sched = gen_scheduler(
+        _hw_cfg,
+        _model_info,
+        _COMPILER_ROOT / "generator" / "scheduler" / "mem_layout_lib.json",
+        _COMPILER_ROOT / "generator" / "scheduler" / "reg_assignment_lib.json",
+    )
+    block1_elements = _sched["memory_layout"]["vector_sram_addr"].get("block1", 0)
+    vlen = _hw_cfg.get("VLEN", 64)
+
+    # Quant config mirrors _build_hbm_from_hf_weights.
+    plena_toml = _REPO_ROOT / "plena_settings.toml"
+    precision = load_toml_config(str(plena_toml), "PRECISION")
+    quant_config = {
+        "exp_width": precision["HBM_V_ACT_TYPE"]["ELEM"]["exponent"],
+        "man_width": precision["HBM_V_ACT_TYPE"]["ELEM"]["mantissa"],
+        "exp_bias_width": precision["HBM_V_ACT_TYPE"]["SCALE"]["exponent"],
+        "block_size": [1, precision["HBM_M_WEIGHT_TYPE"]["block"]],
+        "int_width": precision["HBM_V_INT_TYPE"]["DATA_TYPE"]["width"],
+        "skip_first_dim": False,
+    }
+
+    # VRAM file size: VECTOR_SRAM_SIZE * VLEN * 2 bytes (fp16).
+    # Falls back to a generous default if the config doesn't report size.
+    vram_depth = _hw_cfg.get("VECTOR_SRAM_SIZE", 65536)
+    vram_size_bytes = vram_depth * vlen * 2
+
+    # Dummy token_ids (sequential). The generator ASM's numerical check is
+    # separate; the preload's job is to stage a realistic activation shape.
+    token_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).repeat(batch_size, 1)
+    # Clamp to vocab_size in case vocab < seq_len.
+    if vocab_size is not None and isinstance(vocab_size, int) and vocab_size > 0:
+        token_ids = token_ids % vocab_size
+
+    vram_preload_path = build_dir / "vram_preload.bin"
+    _build_vram_preload(
+        model=hf_model,
+        token_ids=token_ids,
+        vram_path=vram_preload_path,
+        vram_size_bytes=vram_size_bytes,
+        vlen=vlen,
+        activation_base_elements=int(block1_elements),
+        quant_config=quant_config,
+        scratch_dir=build_dir / "_vram_scratch",
+    )
 
     # Step 4: run emulator
     print("[4/5] Rust transactional emulator")
@@ -389,14 +500,15 @@ def pytorch_reference(model_id: str, input_ids: torch.Tensor) -> np.ndarray:
     return out.detach().numpy().astype(np.float32).flatten()
 
 
-def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128) -> int:
+def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128, num_layers: int | None = None) -> int:
     build_dir = Path("/tmp") / f"gen_e2e_{model_id.replace('/', '_')}_sl{seq_len}"
     print("=" * 80)
-    print(f"Generator e2e harness — {model_id} — seq_len={seq_len}")
+    layers_note = f", num_layers={num_layers}" if num_layers is not None else ""
+    print(f"Generator e2e harness — {model_id} — seq_len={seq_len}{layers_note}")
     print("=" * 80)
 
     try:
-        artifacts = run_pipeline(model_id, seq_len, build_dir)
+        artifacts = run_pipeline(model_id, seq_len, build_dir, num_layers=num_layers)
     except Exception as e:
         print(f"\nPIPELINE FAILED: {e}", file=sys.stderr)
         return 1
@@ -426,6 +538,11 @@ def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128) -> int:
 
 
 if __name__ == "__main__":
-    model = sys.argv[1] if len(sys.argv) > 1 else "AICrossSim/clm-60m"
-    sl = int(sys.argv[2]) if len(sys.argv) > 2 else 128
-    sys.exit(run_test(model, sl))
+    import argparse as _argparse
+    _ap = _argparse.ArgumentParser(description="Generator e2e harness")
+    _ap.add_argument("model_id", nargs="?", default="AICrossSim/clm-60m")
+    _ap.add_argument("seq_len", nargs="?", type=int, default=128)
+    _ap.add_argument("--num-layers", type=int, default=None,
+                     help="Override num_hidden_layers (e.g. 1 for fast e2e runs, ~22x less ASM)")
+    _args = _ap.parse_args()
+    sys.exit(run_test(_args.model_id, _args.seq_len, num_layers=_args.num_layers))

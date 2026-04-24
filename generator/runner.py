@@ -22,8 +22,11 @@ def run():
     # Parse optional arguments after the positional ones
     arg_parser = argparse.ArgumentParser(add_help=False)
     arg_parser.add_argument("--seq-len", type=int, default=512)
+    arg_parser.add_argument("--num-layers", type=int, default=None,
+                            help="Override num_hidden_layers in model config (e.g. 1 for fast e2e runs)")
     extra_args, _ = arg_parser.parse_known_args(sys.argv[4:])
     seq_len = extra_args.seq_len
+    num_layers_override = extra_args.num_layers
     hardware_config_path = Path(__file__).resolve().parents[1] / "doc" / "configuration.svh"
     precision_config_path = Path(__file__).resolve().parents[1] / "doc" / "precision.svh"
     mem_layout_lib_path = Path(__file__).resolve().parents[0] / "scheduler" / "mem_layout_lib.json"
@@ -38,6 +41,14 @@ def run():
     parser = LLMModelParser(model_path)
 
     parser.load_model()
+
+    # Apply num_hidden_layers override before the symbolic graph is built.
+    if num_layers_override is not None:
+        text_cfg = parser._resolve_text_config()
+        original = getattr(text_cfg, "num_hidden_layers", None)
+        text_cfg.num_hidden_layers = num_layers_override
+        print(f"[override] num_hidden_layers: {original} -> {num_layers_override} (via --num-layers)")
+
     parser.print_summary()
 
     # Create symbolic graph

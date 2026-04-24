@@ -16,7 +16,8 @@
         "block2" : "hidden_size",
         "block3" : "batch_size * hidden_size",
         "block4" : "batch_size * hidden_size",
-        "block5" : "batch_size * intermediate_size"
+        "block5" : "batch_size * intermediate_size",
+        "k_split_scratch" : "batch_size * hidden_size + batch_size * intermediate_size"
     },
 
     "hbm_addr": {
