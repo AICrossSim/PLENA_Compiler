@@ -8,7 +8,9 @@
         "infinity" : { "content": "", "addr": "0" },
         "eps"      : { "content": "", "addr": "1" },
         "hid_reciprocal" : { "content": "", "addr": "2" },
-        "silu_e" : { "content": "", "addr": "3" }
+        "silu_e" : { "content": "", "addr": "3" },
+        "gelu_1702" : { "content": "1.702", "addr": "4" },
+        "attn_scale" : { "content": "1/sqrt(head_dim)", "addr": "5" }
     },
 
     "vector_sram_addr": {
@@ -17,7 +19,11 @@
         "block3" : "batch_size * hidden_size",
         "block4" : "batch_size * hidden_size",
         "block5" : "batch_size * intermediate_size",
-        "k_split_scratch" : "batch_size * hidden_size + batch_size * intermediate_size"
+        "k_split_scratch" : "batch_size * hidden_size + batch_size * intermediate_size",
+        "q_scratch" : "batch_size * hidden_size + batch_size * intermediate_size + batch_size * hidden_size",
+        "k_scratch" : "batch_size * hidden_size + batch_size * intermediate_size + 2 * batch_size * hidden_size",
+        "v_scratch" : "batch_size * hidden_size + batch_size * intermediate_size + 3 * batch_size * hidden_size",
+        "attn_out_scratch" : "batch_size * hidden_size + batch_size * intermediate_size + 4 * batch_size * hidden_size"
     },
 
     "hbm_addr": {

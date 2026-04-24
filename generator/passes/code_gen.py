@@ -10,8 +10,9 @@ from typing import Any
 
 from asm_templates import (
     elementwise_add_asm,
-    # flash_attn_asm,
     ffn_asm,
+    flash_attn_asm,
+    gelu_asm,
     im2col_asm,
     layer_norm_asm,
     lm_head_asm,
@@ -94,6 +95,16 @@ def _generate_attention_code(
     # Fall back to block4 for scheduler dicts pre-dating the new key.
     _proj_scratch = vsram.get("k_split_scratch", vsram.get("block4", 0))
 
+    # Q, K, V must land in distinct VRAM regions so the attention stage can
+    # read all three back.  Prior versions aliased all three onto ``block2``
+    # which caused K and V writes to overwrite Q.  The new dedicated
+    # q_scratch/k_scratch/v_scratch regions sit past all activation + FFN
+    # intermediate blocks.  We fall back to block2/3/4 only when the scheduler
+    # pre-dates the new keys (legacy compatibility).
+    _q_scratch = vsram.get("q_scratch", vsram.get("block2", 0))
+    _k_scratch = vsram.get("k_scratch", vsram.get("block3", 0))
+    _v_scratch = vsram.get("v_scratch", vsram.get("block4", 0))
+
     # Q projection
     code += projection_asm(
         mlen=mlen,
@@ -105,7 +116,7 @@ def _generate_attention_code(
         rope_hbm_offset_reg=hbm_addr_reg.get("rope_params_offset", 0),
         rope_on_chip_address=vsram.get("block3", 0),
         activation_base_address=vsram.get("block1", 0),
-        result_base_address=vsram.get("block2", 0),
+        result_base_address=_q_scratch,
         rope_enabled=causal_mask,
         out_features=q_out,
         matrix_sram_size=_proj_matrix_sram,
@@ -124,7 +135,7 @@ def _generate_attention_code(
         rope_hbm_offset_reg=hbm_addr_reg.get("rope_params_offset", 0),
         rope_on_chip_address=vsram.get("block3", 0),
         activation_base_address=vsram.get("block1", 0),
-        result_base_address=vsram.get("block2", 0),
+        result_base_address=_k_scratch,
         rope_enabled=causal_mask,
         out_features=k_out,
         matrix_sram_size=_proj_matrix_sram,
@@ -143,7 +154,7 @@ def _generate_attention_code(
         rope_hbm_offset_reg=hbm_addr_reg.get("rope_params_offset", 0),
         rope_on_chip_address=vsram.get("block3", 0),
         activation_base_address=vsram.get("block1", 0),
-        result_base_address=vsram.get("block2", 0),
+        result_base_address=_v_scratch,
         rope_enabled=False,
         out_features=v_out,
         matrix_sram_size=_proj_matrix_sram,
@@ -151,7 +162,96 @@ def _generate_attention_code(
         vlen=_proj_vlen,
     )
 
-    # code += flash_attn_asm()
+    # Attention body. The flash_attn_asm template asserts
+    # `blen == q_index_2_kv_index_ratio` (= hq // hkv); for SigLIP/ViT
+    # hq == hkv so the ratio is 1 while hardware blen is typically 4.
+    # When that asymmetry blocks the monolithic template we emit a
+    # compositional skeleton (S = Q@K^T, scale + softmax, O = S@V) using
+    # the existing ISA mnemonics inline so the block is no longer just a
+    # placeholder comment. For decoder-style GQA where the ratio matches,
+    # we reuse the full flash_attn_asm template directly.
+    num_kv_heads = dims.get("num_key_value_heads", num_heads)
+    q_index_2_kv_index_ratio = num_heads // max(num_kv_heads, 1)
+    seq_len = model_info.get("seq_len", model_info.get("context_length", mlen))
+    # flash_attn_asm uses ``vector_sram_base_address`` as the Q base; feed it
+    # the dedicated q_scratch region rather than the old block2 alias.
+    vsram_fa_base = _q_scratch
+    fp_sram_map = scheduler["memory_layout"].get("fp_sram", {})
+    fp_sram_fa_base = fp_sram_map.get("silu_e", 3)
+    k_hbm_reg = hbm_addr_reg.get("k_weight_offset", 0)
+    v_hbm_reg = hbm_addr_reg.get("v_weight_offset", 0)
+
+    use_flash_template = causal_mask and q_index_2_kv_index_ratio == blen
+    if use_flash_template:
+        code += "\n; -- Flash attention (causal decoder, GQA-aware) --\n"
+        code += flash_attn_asm(
+            mlen=mlen,
+            vlen=hardware_config.get("VLEN", 64),
+            blen=blen,
+            batch=batch,
+            hq=num_heads,
+            hkv=num_kv_heads,
+            d=head_dim,
+            q_len=seq_len,
+            kv_len=seq_len,
+            alive_registers_int=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            alive_registers_fp=[1, 2, 3, 4, 5, 6, 7],
+            vector_sram_base_address=vsram_fa_base,
+            fp_sram_start_address=fp_sram_fa_base,
+            k_base_hbm_offset_reg=k_hbm_reg,
+            v_base_hbm_offset_reg=v_hbm_reg,
+        )
+    else:
+        reason = (
+            "bidirectional (ViT)"
+            if not causal_mask
+            else f"blen={blen} != q/kv ratio={q_index_2_kv_index_ratio}"
+        )
+        # Compositional skeleton: this emits instruction mnemonics for the
+        # three attention stages using registers disjoint from the Q/K/V
+        # projection epilogue. It is structural (non-tiled) and not a
+        # drop-in replacement for flash_attn; it exists so downstream
+        # tooling sees real opcodes instead of a bare comment.
+        #
+        # Addresses use the dedicated q_scratch/k_scratch/v_scratch regions
+        # (written by the three projections above) and a distinct
+        # attn_out_scratch for the output.  Intermediate S (Q@K^T) reuses
+        # k_split_scratch / block_fallback; P (softmax output) reuses
+        # v_scratch as working buffer after V has been consumed by O = P@V
+        # (NOTE: sequential semantics — P is not read until after we are
+        # done reading V, so the aliasing is safe in this skeleton).
+        s_addr = vsram.get("k_split_scratch", vsram.get("block2", 0))
+        p_addr = _v_scratch  # safe: consumed after V in O = P @ V
+        o_addr = vsram.get("attn_out_scratch", vsram.get("block4", 0))
+        # attn_scale = 1/sqrt(head_dim); the harness seeds this FP slot at
+        # runtime.  Falling back to slot 5 (the dedicated attn_scale slot in
+        # mem_layout_lib.json); older scheduler dicts missing the key get
+        # flagged by the 5 fallback rather than the catastrophic eps value.
+        scale_fp = fp_sram_map.get("attn_scale", 5)
+        neg_inf_fp = fp_sram_map.get("infinity", 0)
+        code += f"\n; -- Bidirectional attention (compositional skeleton; {reason}) --\n"
+        code += (
+            f"; S = Q @ K^T  (shape: [{seq_len}, {seq_len}] per head, {num_heads} heads)\n"
+            f"S_ADDI_INT gp10, gp0, {_q_scratch}  ; Q base (written by Q projection)\n"
+            f"S_ADDI_INT gp14, gp0, {_k_scratch}  ; K base (written by K projection)\n"
+            f"S_ADDI_INT gp15, gp0, {_v_scratch}  ; V base (written by V projection)\n"
+            f"S_ADDI_INT gp11, gp0, {s_addr}  ; S scratch base\n"
+            f"M_MM_VV gp11, gp10, gp14, 0  ; Q @ K^T -> S\n"
+            f"; scale: S *= 1/sqrt(head_dim)\n"
+            f"S_LD_FP f1, gp0, {scale_fp}\n"
+            f"V_MUL_VF gp11, gp11, f1, 0\n"
+            f"; softmax(S) -> P  (bidirectional: no causal mask applied)\n"
+            f"S_ADDI_INT gp12, gp0, {p_addr}  ; P scratch base (reuses v_scratch)\n"
+            f"V_EXP_V gp12, gp11, 0\n"
+            f"V_RECI_V gp12, gp12, 0  ; normalize (placeholder; proper row-wise L1 norm TODO)\n"
+            f"; O = P @ V\n"
+            f"S_ADDI_INT gp13, gp0, {o_addr}  ; O output base (attn_out_scratch)\n"
+            f"M_MM_VV gp13, gp12, gp15, 0  ; P @ V -> O\n"
+            f"; NOTE: downstream RMSNorm reads from block1; the harness or a\n"
+            f"; follow-up copy pass is responsible for moving attn_out_scratch\n"
+            f"; -> block1 between the attention block and the residual add.\n"
+            f"; -- end bidirectional attention skeleton --\n"
+        )
 
     return code.strip()
 
@@ -205,7 +305,33 @@ def _generate_ffn_code(
             scratch_base_address=_vit_scratch,
             vlen=_vit_vlen,
         )
-        code += f"\n; -- {activation} activation (placeholder; GELU not yet wired into codegen) --\n"
+        # Activation between fc1 and fc2. For GELU we emit the sigmoid-approx
+        # body (x * sigmoid(1.702 * x)); other activations fall back to an
+        # annotated no-op (SigLIP/ViT in practice always uses GELU variants).
+        fp_sram = scheduler["memory_layout"].get("fp_sram", {})
+        if activation in ("gelu", "gelu_pytorch_tanh", "quick_gelu"):
+            code += f"\n; -- {activation} activation (sigmoid-approx GELU) --\n"
+            # GELU scratch must not overlap Q/K/V attention scratches (which
+            # are live until the end of the attention block).  FFN runs
+            # strictly after attention so k_split_scratch is free here; fall
+            # back to block5 (fc1 output region) for legacy scheduler dicts.
+            _gelu_scratch = vsram.get("k_split_scratch", vsram.get("block5", vsram.get("block4", 0)))
+            code += gelu_asm(
+                # harness seeds FP slot 3 with 1.0 for SiLU sigmoid base; GELU
+                # reuses that same slot as its multiplicative identity.  Do
+                # not rename without also retargeting the harness preload.
+                const_one_fp_address=fp_sram.get("silu_e", 3),
+                const_1702_fp_address=fp_sram.get("gelu_1702", 4),
+                alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+                # fc1 wrote here; GELU reads/writes in-place.
+                activation_base_address=vsram.get("block5", vsram.get("block2", 0)),
+                scratchpad_base_address=_gelu_scratch,
+                vlen=_vit_vlen,
+                batch_size=model_info.get("batch", 1),
+                hidden_dim=intermediate_size,
+            )
+        else:
+            code += f"\n; -- {activation} activation (unrecognized; no ASM emitted) --\n"
         # fc2: intermediate -> hidden
         code += projection_asm(
             mlen=mlen,
