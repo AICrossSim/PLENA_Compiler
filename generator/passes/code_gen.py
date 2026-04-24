@@ -89,7 +89,10 @@ def _generate_attention_code(
 
     _proj_matrix_sram = hardware_config.get("MATRIX_SRAM_SIZE", 1024)
     _proj_vlen = hardware_config.get("VLEN", 64)
-    _proj_scratch = vsram.get("block4", 0)
+    # Use dedicated k_split_scratch (placed after all activation/intermediate regions)
+    # to prevent scratch/activation aliasing at batch_size=1 where block4 == block1.
+    # Fall back to block4 for scheduler dicts pre-dating the new key.
+    _proj_scratch = vsram.get("k_split_scratch", vsram.get("block4", 0))
 
     # Q projection
     code += projection_asm(
@@ -177,7 +180,9 @@ def _generate_ffn_code(
 
     _vit_matrix_sram = hardware_config.get("MATRIX_SRAM_SIZE", 1024)
     _vit_vlen = hardware_config.get("VLEN", 64)
-    _vit_scratch = vsram.get("block4", 0)
+    # Use dedicated k_split_scratch to prevent scratch/activation aliasing
+    # at batch_size=1. Fall back to block4 for legacy scheduler dicts.
+    _vit_scratch = vsram.get("k_split_scratch", vsram.get("block4", 0))
 
     if arch == "vit":
         code = f"""

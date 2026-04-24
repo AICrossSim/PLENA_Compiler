@@ -4,19 +4,7 @@ import math
 
 from ._imm import addi_large_int as _addi_large_int
 from ._imm import load_large_int as _load_large_int
-
-
-def _proj_k_chunks(num_k_tiles: int, max_k_tiles: int) -> list[tuple[int, int]]:
-    """Split ``num_k_tiles`` into chunks of at most ``max_k_tiles``.
-    Returns list of (k_start_tile, k_count) pairs."""
-    assert max_k_tiles >= 1, f"MAX_K_TILES must be >= 1, got {max_k_tiles}"
-    chunks: list[tuple[int, int]] = []
-    k_pos = 0
-    while k_pos < num_k_tiles:
-        count = min(max_k_tiles, num_k_tiles - k_pos)
-        chunks.append((k_pos, count))
-        k_pos += count
-    return chunks
+from ._k_split import k_chunks as _proj_k_chunks
 
 
 def _emit_projection_chunk(
@@ -164,6 +152,7 @@ def projection_asm(
     if out_features is None:
         out_features = hidden_size  # Backward compatible: square matrix
 
+    assert in_features % mlen == 0, f"K ({in_features}) must be a multiple of MLEN ({mlen})"
     MAX_K_TILES = max(1, matrix_sram_size // mlen)
     num_k_tiles = in_features // mlen
 

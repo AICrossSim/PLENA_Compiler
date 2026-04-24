@@ -1,5 +1,6 @@
 from ._imm import addi_large_int_str as _addi_large_int
 from ._imm import load_large_int_str as _load_large_int
+from ._k_split import k_chunks as _k_chunks
 
 
 def ffn_asm(
@@ -82,19 +83,6 @@ def ffn_asm(
             activation_base_address,
             matrix_sram_size=matrix_sram_size,
         )
-
-
-def _k_chunks(num_k_tiles: int, max_k_tiles: int) -> list[tuple[int, int]]:
-    """Split ``num_k_tiles`` K dimension tiles into chunks of at most
-    ``max_k_tiles``. Returns list of (k_start_tile, k_count) pairs."""
-    assert max_k_tiles >= 1, f"MAX_K_TILES must be >= 1, got {max_k_tiles}"
-    chunks: list[tuple[int, int]] = []
-    k_pos = 0
-    while k_pos < num_k_tiles:
-        count = min(max_k_tiles, num_k_tiles - k_pos)
-        chunks.append((k_pos, count))
-        k_pos += count
-    return chunks
 
 
 def _ffn_asm_unrolled(
@@ -316,9 +304,9 @@ def _emit_ffn_projection_unrolled(
     read from ``act_base + k*mlen*batch*seq_len`` + per-tile column offsets.
     """
 
+    assert k_size % mlen == 0, f"K ({k_size}) must be a multiple of MLEN ({mlen})"
+    assert out_size % mlen == 0, f"out_size ({out_size}) must be a multiple of MLEN ({mlen})"
     num_k_tiles = k_size // mlen
-    num_m_blocks = out_size // mlen  # output row-blocks (MLEN wide)
-    tiles_per_mlen = mlen // blen
     num_act_cols = (batch * seq_len) // blen
 
     lines: list[str] = [f" ; {section_comment} (k_size={k_size}, out_size={out_size})\n"]
@@ -453,28 +441,32 @@ def _emit_ffn_projection_chunk(
     - Activation offset for a chunk is advanced by ``k_start_tile * mlen * batch*seq_len``
     - MRAM prefetch destination always resets to 0 per MLEN block (we only
       prefetch this chunk's ``k_tile_count`` tiles)
+
+    M_MM_WO semantics (confirmed from transactional_emulator/src/main.rs):
+    ``mm_wo`` OVERWRITEs the VRAM slice with the current m_accum, then zeros
+    m_accum.  It does NOT accumulate into existing VRAM content.  Therefore
+    the first-chunk direct write to the real output region is safe, and the
+    K-split partial-sum accumulation via V_ADD_VV is the correct mechanism.
+
+    Note: previous single-pass code emitted M_MM against w_actual_register
+    (a latent bug when hidden_size > mlen — the MRAM pointer did not advance
+    between inner-loop iterations). This unified path uses w_temp_register
+    throughout, matching K-split semantics, so hidden_size > mlen now
+    correctly advances the MRAM pointer.
     """
 
-    num_m_blocks = out_size // mlen
-    tiles_per_mlen = mlen // blen
+    assert k_size % mlen == 0, f"K ({k_size}) must be a multiple of MLEN ({mlen})"
     num_act_cols = (batch * seq_len) // blen
     chunk_hbm_base_offset = k_start_tile * mlen * weight_stride
     chunk_act_base_offset = k_start_tile * mlen * batch * seq_len
 
-    # Target base (either real output or scratch). If scratch, reset the
-    # result_base_register on entry so MLEN-block advancement steps can reuse it.
-    if target_base_value_override is None:
-        target_base_value = result_base_value
-        need_reset_target = False
-    else:
-        target_base_value = target_base_value_override
-        need_reset_target = True
+    # Target base: first chunk writes to real output, subsequent chunks write to scratch.
+    # Both cases load result_base_register with the appropriate base value so the
+    # MLEN-block advancement steps (S_ADDI_INT result_base_register, ...) work uniformly.
+    target_base_value = result_base_value if target_base_value_override is None else target_base_value_override
 
     lines: list[str] = []
-    if need_reset_target:
-        lines.append(_load_large_int(result_base_register, target_base_value))
-    else:
-        lines.append(_load_large_int(result_base_register, target_base_value))
+    lines.append(_load_large_int(result_base_register, target_base_value))
 
     # If the activation base is a register-held address (e.g. up_result_register
     # for down proj), ensure it holds its canonical value at the start of each
