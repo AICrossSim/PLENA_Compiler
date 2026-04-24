@@ -40,23 +40,31 @@ def _generate_embedding_code(
     """Generate assembly code for embedding operations."""
     vocab_size = model_info["vocab_size"]
     dim = node["dimensions"]
-    # TODO need to add a dot product at the end.
+    hidden_size = dim["hidden_size"]
+
+    # MXFP8-packed vocab table: each row is
+    # (hidden_size // block_dim) * (act_block_width // 8 + scale_width // 8) bytes.
+    # Matches mem_layout_lib.json::hbm_addr.token_table per-row expression.
+    block_dim = hardware_config.get("block_dim", hardware_config.get("BLOCK_DIM", 4))
+    act_block_width = hardware_config.get("act_block_width", 32)
+    scale_width = hardware_config.get("scale_width", 8)
+    voc_table_row_bytes = (hidden_size // block_dim) * (act_block_width // 8 + scale_width // 8)
+
     code = f"""
 ; Embedding lookup: vocab_size={vocab_size}
 ; Input: token_ids, Output: embedded_vectors
 """
     code += embedding_asm(
-        mlen=hardware_config.get("MLEN", 64),
-        blen=hardware_config.get("BLEN", 4),
+        vlen=hardware_config.get("VLEN", 64),
         batch=model_info.get("batch_size", 1),
-        hidden_size=dim["hidden_size"],
+        hidden_size=hidden_size,
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
-        voc_table_row_size=vocab_size,
-        activation_base_address=scheduler.get("activation_base_address", 0),
-        voc_table_base_addr_reg_index=scheduler.get("register_assignment", {})
+        activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
+        voc_table_base_addr_reg_index=scheduler["register_assignment"]
         .get("hbm_addr_reg", {})
         .get("token_table_offset", 0),
         input_ids=[1 for _ in range(model_info.get("batch_size", 1))],
+        voc_table_row_bytes=voc_table_row_bytes,
     )
 
     return code.strip()
