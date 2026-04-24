@@ -44,6 +44,8 @@ def run():
 
     # Apply num_hidden_layers override before the symbolic graph is built.
     if num_layers_override is not None:
+        if num_layers_override < 1:
+            raise ValueError(f"--num-layers must be >= 1, got {num_layers_override}")
         text_cfg = parser._resolve_text_config()
         original = getattr(text_cfg, "num_hidden_layers", None)
         text_cfg.num_hidden_layers = num_layers_override

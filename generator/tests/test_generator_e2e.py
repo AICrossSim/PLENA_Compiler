@@ -81,7 +81,11 @@ def _build_hbm_from_hf_weights(
     nn.Linear stores (out_features, in_features); PLENA expects (in, out),
     so we transpose.
 
-    Returns: dict with per-weight {offset, bytes, shape} for logging.
+    Returns:
+        (summary, model) — CHANGED in PR #11: previously returned only `summary`.
+        The HF model is now returned so the caller can reuse it for VRAM preload
+        without paying the from_pretrained() cost twice. Callers expecting the
+        prior shape will need to unpack.
     """
     plena_toml = _REPO_ROOT / "plena_settings.toml"
     precision = load_toml_config(str(plena_toml), "PRECISION")
@@ -230,10 +234,14 @@ def _build_vram_preload(
     vram_size_bytes: int,
     vlen: int,
     activation_base_elements: int,
-    quant_config: dict,
-    scratch_dir: Path,
 ) -> dict:
-    """CPU-side embedding lookup -> MXFP8-quantize -> write to vram_preload.bin.
+    """CPU-side embedding lookup -> raw fp16 write to vram_preload.bin.
+
+    VRAM activations use raw fp16 (matching ATen-path convention, e.g.
+    flash_attention_gqa_test.py stages Q via fp16 VRAM preload). This is
+    intentionally NOT MXFP8-quantized: only HBM activations carry the
+    MX encoding; VRAM holds decoded fp16 values that the emulator's
+    load_from_bytes reads directly.
 
     Matches the ``embed_table[token_ids]`` semantic the generator's
     ``_generate_embedding_code`` now delegates to. The result is staged at
@@ -260,9 +268,6 @@ def _build_vram_preload(
         vlen: hardware VLEN (e.g. 64) — only used for logging / sanity.
         activation_base_elements: element offset where embed result should
             land (``block1`` from the scheduler, already in elements).
-        quant_config: MXFP8 quantization config; same as HBM weight path.
-        scratch_dir: directory for intermediate RandomMxfpTensorGenerator
-            files.
 
     Returns: {"offset_elements", "offset_bytes", "bytes_written", "shape"}
     """
@@ -275,12 +280,6 @@ def _build_vram_preload(
     hidden_size = embed.shape[-1]
     embed_flat = embed.reshape(batch * seq_len, hidden_size).contiguous()
 
-    # MXFP8-quantize the same way HBM activations are quantized, so the
-    # emulator's dequant path matches what downstream layers expect.
-    plena_toml = _REPO_ROOT / "plena_settings.toml"
-    config = load_toml_config(str(plena_toml), "CONFIG")
-
-    scratch_dir.mkdir(parents=True, exist_ok=True)
     # VRAM preload expects raw fp16 bytes, matching ATen test convention
     # (e.g. flash_attention_gqa_test.py stages VRAM as fp16 directly).
     embed_fp16 = embed_flat.to(torch.float16).numpy()
@@ -401,8 +400,7 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     # Resolve scheduler-computed block1 by invoking the same gen_scheduler
     # path the generator uses. Doing it here (instead of passing through
     # subprocess stdout) keeps the source of truth in one place.
-    import sys as _sys  # avoid shadowing outer name
-    _sys.path.insert(0, str(_COMPILER_ROOT))
+    sys.path.insert(0, str(_COMPILER_ROOT))
     from generator.parser import LLMModelParser, hardware_parser  # noqa: E402
     from generator.scheduler import gen_scheduler  # noqa: E402
 
@@ -412,6 +410,14 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     )
     _parser = LLMModelParser(model_id)
     _parser.load_model()
+    # Mirror runner.py's --num-layers override so in-process scheduler
+    # sees the same layer count as the subprocess codegen.
+    if num_layers is not None:
+        _text_cfg = _parser._resolve_text_config() if hasattr(_parser, "_resolve_text_config") else _parser.config
+        if hasattr(_text_cfg, "num_hidden_layers"):
+            _text_cfg.num_hidden_layers = num_layers
+        elif hasattr(_parser.config, "num_hidden_layers"):
+            _parser.config.num_hidden_layers = num_layers
     _dims = _parser.extract_critical_dimensions()
     batch_size = 4  # matches runner.py model_info["batch_size"]
     hidden_size = _dims.get("hidden_size")
@@ -433,18 +439,6 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     block1_elements = _sched["memory_layout"]["vector_sram_addr"].get("block1", 0)
     vlen = _hw_cfg.get("VLEN", 64)
 
-    # Quant config mirrors _build_hbm_from_hf_weights.
-    plena_toml = _REPO_ROOT / "plena_settings.toml"
-    precision = load_toml_config(str(plena_toml), "PRECISION")
-    quant_config = {
-        "exp_width": precision["HBM_V_ACT_TYPE"]["ELEM"]["exponent"],
-        "man_width": precision["HBM_V_ACT_TYPE"]["ELEM"]["mantissa"],
-        "exp_bias_width": precision["HBM_V_ACT_TYPE"]["SCALE"]["exponent"],
-        "block_size": [1, precision["HBM_M_WEIGHT_TYPE"]["block"]],
-        "int_width": precision["HBM_V_INT_TYPE"]["DATA_TYPE"]["width"],
-        "skip_first_dim": False,
-    }
-
     # VRAM file size: VECTOR_SRAM_SIZE * VLEN * 2 bytes (fp16).
     # Falls back to a generous default if the config doesn't report size.
     vram_depth = _hw_cfg.get("VECTOR_SRAM_SIZE", 65536)
@@ -465,8 +459,6 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
         vram_size_bytes=vram_size_bytes,
         vlen=vlen,
         activation_base_elements=int(block1_elements),
-        quant_config=quant_config,
-        scratch_dir=build_dir / "_vram_scratch",
     )
 
     # Step 4: run emulator
