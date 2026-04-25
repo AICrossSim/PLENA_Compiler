@@ -53,6 +53,9 @@ jobs:
       - name: Run embedding codegen test
         run: |
           PYTHONPATH=. python3 generator/tests/test_embedding_code_gen.py
+      - name: Run VLM codegen tests
+        run: |
+          PYTHONPATH=. python3 generator/tests/test_vlm_code_gen.py
 
   codegen-smoke:
     name: Codegen + assembler smoke
@@ -93,4 +96,15 @@ jobs:
               raise SystemExit(f'{overflows} instruction(s) overflow u32')
           print('No u32 overflows')
           "
-      # TODO: Add SmolVLM2 codegen smoke after VLM model-loading support lands on main
+      - name: Codegen SmolVLM2 (vision-language model)
+        run: |
+          PYTHONPATH=. python3 -m generator.runner codegen HuggingFaceTB/SmolVLM2-256M-Video-Instruct /tmp/smolvlm2.asm --seq-len 32 --num-layers 1
+          echo "SmolVLM2 ASM: $(wc -c < /tmp/smolvlm2.asm) bytes"
+      - name: Assemble SmolVLM2
+        run: |
+          PYTHONPATH=. python3 -c "
+          from assembler import AssemblyToBinary
+          asm = AssemblyToBinary('doc/operation.svh', 'doc/precision.svh')
+          asm.generate_binary('/tmp/smolvlm2.asm', '/tmp/smolvlm2.mem')
+          print('SmolVLM2 assembled OK')
+          "
