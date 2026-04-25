@@ -17,7 +17,7 @@ def online_softmax_code(
     alive_registers_fp: list[int],
     s_address: int,
     m_start_address: int,
-    qk_scale_address: int = 1,
+    qk_scale_address: int = 5,  # was 1; canonical slot is now 5 (attn_scale)
 ) -> str:
     """
     Args:
@@ -25,7 +25,7 @@ def online_softmax_code(
     alive_registers_int: the list of alive registers for fix point operations
     alive_registers_fp: the list of alive registers for floating point operations
     mlen: also Br: the number of row of the QKT result
-    qk_scale_address: the FP SRAM address containing qk_scale (default 1)
+    qk_scale_address: the FP SRAM address containing qk_scale (default 5)
     Description:
         This part of asm is for the inner loop of the flash attention, mapping to line 9 to line 10 process,
         which requires per row level computation, hence with the loop mlen times.
@@ -55,7 +55,7 @@ def online_softmax_code(
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {mlen} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {mlen} \n"
 
-        # Load qk_scale from FP SRAM (preloaded at address 1)
+        # Load qk_scale from FP SRAM (preloaded at FP SRAM address 5)
         generated_code += f"S_LD_FP f{qk_scale_register}, gp0, {qk_scale_address} \n"
 
         # Hardware loop over mlen rows
@@ -127,7 +127,7 @@ def online_softmax_code(
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {1} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {1} \n"
 
-        # Load qk_scale from FP SRAM (preloaded at address 1)
+        # Load qk_scale from FP SRAM (preloaded at FP SRAM address 5)
         generated_code += f"S_LD_FP f{qk_scale_register}, gp0, {qk_scale_address} \n"
 
         # Scale S row by qk_scale: S = S * qk_scale
