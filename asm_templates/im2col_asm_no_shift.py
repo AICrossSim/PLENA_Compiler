@@ -1,5 +1,5 @@
 """
-im2col ASM template — uses V_MUL_VV + V_RED_SUM basis-vector extraction
+im2col ASM template -- uses V_MUL_VV + V_RED_SUM basis-vector extraction
 instead of undocumented V_SHFT_V.
 
 Algorithm per output row m:
@@ -8,6 +8,8 @@ Algorithm per output row m:
 
 Requires: f0=0.0 (hw const), fp_preload[fp_one_reg]=1.0.
 """
+
+from ._imm import load_large_int as _load_large_int_list
 
 PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows
 
@@ -136,23 +138,23 @@ def im2col_asm_no_shift(
         basis_vram_addr = basis_vram_base + kc * vlen
         lines.append(f"; e_{kc}: 1.0 at pos {kc}")
         lines.append(f"S_ST_FP f{fp_one_reg}, gp0, {kc}")
-        lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {basis_vram_addr}")
+        lines.extend(_load_large_int_list(basis_reg, basis_vram_addr))
         lines.append(f"S_MAP_V_FP gp{basis_reg}, gp0, 0")  # FP_SRAM[0..63] -> VRAM
         lines.append(f"S_ST_FP f0, gp0, {kc}")  # restore 0.0
 
     # Pin scratch and temp VRAM addresses (constant across all rows)
     lines.append("")
     lines.append("; -- Setup: pin scratch/temp VRAM pointers --")
-    lines.append(f"S_ADDI_INT gp{scratch_reg}, gp0, {scratch_vram_addr}")
-    lines.append(f"S_ADDI_INT gp{temp_reg}, gp0, {temp_vram_addr}")
+    lines.extend(_load_large_int_list(scratch_reg, scratch_vram_addr))
+    lines.extend(_load_large_int_list(temp_reg, temp_vram_addr))
 
     # HBM stride=W_padded, scale=total input size (for H_PREFETCH_V stride mode)
     lines.append("")
     lines.append("; -- Setup: HBM stride and scale --")
-    lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {W_padded}")
+    lines.extend(_load_large_int_list(basis_reg, W_padded))
     lines.append(f"C_SET_STRIDE_REG gp{basis_reg}")
     input_tensor_elems = C_in * H * W_padded
-    lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {input_tensor_elems}")
+    lines.extend(_load_large_int_list(basis_reg, input_tensor_elems))
     lines.append(f"C_SET_SCALE_REG gp{basis_reg}")
 
     # Main loop: tiles × output positions. VRAM is column-block-major:
@@ -173,7 +175,7 @@ def im2col_asm_no_shift(
 
             lines.append("")
             lines.append(f"; ==== tile={tile_t} output row m={m}  oh={oh}  ow={ow}  vram={out_vram_addr} ====")
-            lines.append(f"S_ADDI_INT gp{out_reg}, gp0, {out_vram_addr}")
+            lines.extend(_load_large_int_list(out_reg, out_vram_addr))
 
             # Zero unwritten FP_SRAM slots for partial last tile
             if tile_width < vlen:
@@ -191,14 +193,14 @@ def im2col_asm_no_shift(
                     hbm_offset = (c * H + oh + kr) * W_padded + ow
 
                     lines.append(f"; (c={c}, kr={kr})  hbm_off={hbm_offset}")
-                    lines.append(f"S_ADDI_INT gp{off_reg}, gp0, {hbm_offset}")
+                    lines.extend(_load_large_int_list(off_reg, hbm_offset))
                     lines.append(f"H_PREFETCH_V gp{scratch_reg}, gp{off_reg}, a{input_hbm_base_addr_reg}, 1, 0")
 
                     for kc in contributing_kcs:
                         local_pos = c * K * K + kr * K + kc - tile_start
                         basis_addr = basis_vram_base + kc * vlen
 
-                        lines.append(f"S_ADDI_INT gp{basis_reg}, gp0, {basis_addr}")
+                        lines.extend(_load_large_int_list(basis_reg, basis_addr))
                         lines.append(f"V_MUL_VV gp{temp_reg}, gp{scratch_reg}, gp{basis_reg}, 0")
                         lines.append(f"S_ADD_FP f{fp_ex_reg}, f0, f0")
                         lines.append(f"V_RED_SUM f{fp_ex_reg}, gp{temp_reg}, 0, 0")

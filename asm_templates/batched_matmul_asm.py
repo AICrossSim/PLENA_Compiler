@@ -1,3 +1,6 @@
+from ._imm import load_large_int_str as _load_large_int
+
+
 def batched_matmul_asm(
     mlen: int,
     blen: int,
@@ -47,7 +50,7 @@ def batched_matmul_asm(
     tiles_per_mlen = mlen // blen  # n-tiles that fit in one matrix SRAM bank width
     stride_len = n // mlen  # VRAM row stride for mm_wo (N/mlen vectors per result row)
 
-    generated_code += f"S_ADDI_INT gp{result_actual_register}, gp0, {result_base_address} \n"
+    generated_code += _load_large_int(result_actual_register, result_base_address)
     for batch in range(1, b + 1):
         batch_offset = (batch - 1) * m * n
         for i in range(n_tiles):
@@ -56,17 +59,15 @@ def batched_matmul_asm(
                 assert w_prefetch_amount >= k, "w_prefetch_amount must be greater than or equal to k"
                 # Set scale and stride for weight matrix prefetch
                 # Weight layout in HBM: (B, K, N), scale = K*N per batch, stride = N
-                generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {b * k * n} \n"
+                generated_code += _load_large_int(w_actual_register, b * k * n)
                 generated_code += f"C_SET_SCALE_REG gp{w_actual_register} \n"
-                generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {n} \n"
+                generated_code += _load_large_int(w_actual_register, n)
                 generated_code += f"C_SET_STRIDE_REG gp{w_actual_register} \n"
                 # Prefetch all k-tiles of weight into separate matrix SRAM banks
                 # HBM column offset for this n-group
                 n_group_col_offset = (i // tiles_per_mlen) * mlen
                 generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
-                generated_code += (
-                    f"S_ADDI_INT gp{a_actual_register}, gp0, {(batch - 1) * k * n + n_group_col_offset} \n"
-                )
+                generated_code += _load_large_int(a_actual_register, (batch - 1) * k * n + n_group_col_offset)
                 for g in range(k_tiles):
                     generated_code += (
                         f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{w_base_hbm_offset_reg}, 1, 0 \n"
@@ -76,9 +77,9 @@ def batched_matmul_asm(
 
                 # Set scale and stride for activation prefetch
                 # Activation layout in HBM: (B, M, K), scale = M*K per batch, stride = K
-                generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {b * m * k} \n"
+                generated_code += _load_large_int(w_actual_register, b * m * k)
                 generated_code += f"C_SET_SCALE_REG gp{w_actual_register} \n"
-                generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {k} \n"
+                generated_code += _load_large_int(w_actual_register, k)
                 generated_code += f"C_SET_STRIDE_REG gp{w_actual_register} \n"
 
             # Column offset within the current matrix SRAM bank
@@ -93,24 +94,24 @@ def batched_matmul_asm(
                 for g in range(k_tiles):
                     vram_dest = g * blen * mlen
                     hbm_g_off = hbm_j_base + g * mlen
-                    generated_code += f"S_ADDI_INT gp{result_actual_register}, gp0, {vram_dest} \n"
-                    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {hbm_g_off} \n"
+                    generated_code += _load_large_int(result_actual_register, vram_dest)
+                    generated_code += _load_large_int(a_actual_register, hbm_g_off)
                     generated_code += f"H_PREFETCH_V gp{result_actual_register}, gp{a_actual_register}, a{a_base_hbm_offset_reg}, 1, 0 \n"
                 # M_MM for each k-tile; set absolute MSRAM bank offset before each M_MM
                 for g in range(k_tiles):
                     a_vram = g * blen * mlen
                     msram_bank_offset = g * mlen * mlen  # absolute, not cumulative
-                    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {a_vram} \n"
-                    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {msram_bank_offset + col_offset} \n"
+                    generated_code += _load_large_int(a_actual_register, a_vram)
+                    generated_code += _load_large_int(w_actual_register, msram_bank_offset + col_offset)
                     generated_code += f"M_MM 0, gp{w_actual_register}, gp{a_actual_register} \n"
                 # Set result address BEFORE M_MM_WO:
                 # v_addr = result_base + batch_offset + j*blen*n + (i//tiles_per_mlen)*mlen + (i%tiles_per_mlen)*blen
                 result_addr = (
                     result_base_address + batch_offset + j * blen * n + (i // tiles_per_mlen) * mlen + col_offset
                 )
-                generated_code += f"S_ADDI_INT gp{result_actual_register}, gp0, {result_addr} \n"
+                generated_code += _load_large_int(result_actual_register, result_addr)
                 # Set stride register for mm_wo (N/mlen vectors per result row)
-                generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {stride_len} \n"
+                generated_code += _load_large_int(w_actual_register, stride_len)
                 generated_code += f"M_MM_WO gp{result_actual_register}, gp{w_actual_register}, 0 \n"
             generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, 0 \n"
             generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"

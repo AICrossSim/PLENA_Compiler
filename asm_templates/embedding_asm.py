@@ -1,3 +1,6 @@
+from ._imm import load_large_int_str as _load_large_int
+
+
 def embedding_asm(
     vlen: int,
     batch: int,
@@ -81,8 +84,8 @@ def embedding_asm(
         vram_start = activation_base_address + token_idx * hidden_size
         hbm_byte_offset_start = token_id * voc_table_row_bytes
         generated_code += f"; token {token_idx} (id={token_id})\n"
-        generated_code += f"S_ADDI_INT gp{vram_dest_reg}, gp0, {vram_start} \n"
-        generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {hbm_byte_offset_start} \n"
+        generated_code += _load_large_int(vram_dest_reg, vram_start)
+        generated_code += _load_large_int(hbm_offset_reg, hbm_byte_offset_start)
         for _ in range(rows_per_token):
             generated_code += (
                 f"H_PREFETCH_V gp{vram_dest_reg}, gp{hbm_offset_reg}, "
