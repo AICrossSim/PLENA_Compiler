@@ -102,8 +102,8 @@ def test_smolvlm2_vision_encoder_graph():
     vgraph = parser.create_vision_symbolic_graph(batch_size=1)
     assert vgraph is not None, "create_vision_symbolic_graph returned None for SmolVLM2"
 
-    # patch_embed + 27*(norm,attn,res,norm,ffn,res) + final_norm
-    expected_vision_nodes = 1 + 27 * 6 + 1
+    # patch_embed + 27*(norm,attn,res,norm,ffn,res) + final_norm + vision_connector
+    expected_vision_nodes = 1 + 27 * 6 + 1 + 1
     assert vgraph["total_nodes"] == expected_vision_nodes
     assert vgraph.get("component") == "vision_encoder"
 
