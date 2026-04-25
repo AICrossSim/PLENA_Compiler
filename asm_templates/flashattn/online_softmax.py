@@ -17,7 +17,8 @@ def online_softmax_code(
     alive_registers_fp: list[int],
     s_address: int,
     m_start_address: int,
-    qk_scale_address: int = 5,  # was 1; canonical slot is now 5 (attn_scale)
+    qk_scale_address: int = 5,
+    causal_mask: bool = True,
 ) -> str:
     """
     Args:
@@ -26,6 +27,10 @@ def online_softmax_code(
     alive_registers_fp: the list of alive registers for floating point operations
     mlen: also Br: the number of row of the QKT result
     qk_scale_address: the FP SRAM address containing qk_scale (default 5)
+    causal_mask: if True, causal (decoder) attention; if False, bidirectional
+        (SigLIP/ViT). Currently the online softmax kernel does not emit explicit
+        upper-triangle masking — causal behaviour is enforced by tiling order.
+        This parameter is accepted for forward-compatibility.
     Description:
         This part of asm is for the inner loop of the flash attention, mapping to line 9 to line 10 process,
         which requires per row level computation, hence with the loop mlen times.
