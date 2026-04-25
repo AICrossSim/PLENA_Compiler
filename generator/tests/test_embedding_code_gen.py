@@ -20,11 +20,27 @@ def test_embeddings_code_generation():
     test_node = {
         "name": "embeddings",
         "operation_type": "embeddings",
-        "dimensions": {"hidden_size": 4096, "num_attention_heads": 32, "head_dim": 128, "num_key_value_heads": 8},
+        "dimensions": {"hidden_size": 64, "num_attention_heads": 1, "head_dim": 64, "num_key_value_heads": 1},
     }
-    hardware_config = {"mlen": 256, "blen": 4}
-    model_info = {"batch_size": 4, "vocab_size": 128256}
-    scheduler = {"activation_base_address": 0, "register_assignment": {"hbm_addr_reg": {"token_table_offset": 0}}}
+    hardware_config = {
+        "MLEN": 64,
+        "VLEN": 64,
+        "BLEN": 4,
+        "block_dim": 4,
+        "act_block_width": 32,
+        "scale_width": 8,
+        "alive_registers": [1, 2],
+    }
+    model_info = {"batch_size": 1, "seq_len": 4, "vocab_size": 1024}
+    scheduler = {
+        "memory_layout": {
+            "vector_sram_addr": {"block1": 0},
+            "fp_sram": {},
+        },
+        "register_assignment": {
+            "hbm_addr_reg": {"token_table_offset": 1},
+        },
+    }
 
     # Generate the assembly code
     generated_code = _generate_embedding_code(

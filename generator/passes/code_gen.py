@@ -40,23 +40,58 @@ def _generate_embedding_code(
     """Generate assembly code for embedding operations."""
     vocab_size = model_info["vocab_size"]
     dim = node["dimensions"]
-    # TODO need to add a dot product at the end.
+    hidden_size = dim["hidden_size"]
+
+    # Hardware-precision fields are unconditionally populated by
+    # hardware_parser() (see generator/parser/hardware_parser.py).  Use direct
+    # indexing so a missing key surfaces as a clear KeyError instead of being
+    # silently masked by a default.
+    assert "act_block_width" in hardware_config, (
+        "hardware_config missing 'act_block_width' — was hardware_parser() called?"
+    )
+    assert "block_dim" in hardware_config, "hardware_config missing 'block_dim'"
+    block_dim = hardware_config["block_dim"]
+    act_block_width = hardware_config["act_block_width"]
+    # scale_width is intentionally excluded from voc_table_row_bytes; the
+    # emulator auto-derives scale byte offsets from the data byte offset
+    # (see main.rs:2031-2037).
+
+    # HBM row stride for the vocab table.  The Rust emulator's H_PREFETCH_V
+    # derives the scale byte-offset automatically from the data byte-offset
+    # (main.rs:2031-2037), so the ``offset`` register advanced by the assembly
+    # must count *data bytes only* — advancing by data+scale would cause the
+    # auto-derived scale pointer to double-count.
+    # act_block_width is total data bits per (block_dim) block.  Data bytes
+    # per element = act_block_width / block_dim / 8.
+    assert act_block_width % (block_dim * 8) == 0, (
+        f"act_block_width={act_block_width} must be a multiple of block_dim*8={block_dim * 8}"
+    )
+    elem_bytes = act_block_width // (block_dim * 8)
+    voc_table_row_bytes = hidden_size * elem_bytes
+
+    batch_size = model_info.get("batch_size", 1)
+    seq_len = model_info.get("seq_len", 1)
+    # Embedding must produce ``batch * seq_len * hidden`` elements in VRAM — one
+    # row per token.  Generate placeholder ids covering the full sequence; the
+    # pattern (sequential modulo vocab_size) matches the token pattern used by
+    # the earlier `_build_vram_preload` path.
+    input_ids = [(i % max(1, vocab_size)) for i in range(batch_size * seq_len)]
+
     code = f"""
-; Embedding lookup: vocab_size={vocab_size}
-; Input: token_ids, Output: embedded_vectors
+; Embedding lookup: vocab_size={vocab_size} batch={batch_size} seq_len={seq_len}
+; Input: token_ids ({batch_size * seq_len} total), Output: embedded_vectors
 """
     code += embedding_asm(
-        mlen=hardware_config.get("MLEN", 64),
-        blen=hardware_config.get("BLEN", 4),
-        batch=model_info.get("batch_size", 1),
-        hidden_size=dim["hidden_size"],
+        vlen=hardware_config.get("VLEN", 64),
+        batch=batch_size * seq_len,
+        hidden_size=hidden_size,
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
-        voc_table_row_size=vocab_size,
-        activation_base_address=scheduler.get("activation_base_address", 0),
+        activation_base_address=scheduler.get("memory_layout", {}).get("vector_sram_addr", {}).get("block1", 0),
         voc_table_base_addr_reg_index=scheduler.get("register_assignment", {})
         .get("hbm_addr_reg", {})
         .get("token_table_offset", 0),
-        input_ids=[1 for _ in range(model_info.get("batch_size", 1))],
+        input_ids=input_ids,
+        voc_table_row_bytes=voc_table_row_bytes,
     )
 
     return code.strip()
