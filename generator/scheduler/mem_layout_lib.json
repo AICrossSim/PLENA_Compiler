@@ -8,7 +8,7 @@
         "infinity" : { "content": "", "addr": "0" },
         "eps"      : { "content": "", "addr": "1" },
         "hid_reciprocal" : { "content": "", "addr": "2" },
-        "silu_e" : { "content": "", "addr": "3" },
+        "silu_one" : { "content": "1.0", "addr": "3" },
         "gelu_1702" : { "content": "1.702", "addr": "4" },
         "attn_scale" : { "content": "1/sqrt(head_dim)", "addr": "5" }
     },

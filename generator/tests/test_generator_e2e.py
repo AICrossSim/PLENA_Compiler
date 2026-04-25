@@ -55,6 +55,7 @@ def _build_hbm_from_hf_weights(
     seq_len: int,
     hbm_path: Path,
     hbm_size_bytes: int,
+    preloaded_model=None,
 ) -> dict:
     """Populate hbm_for_behave_sim.bin with real HF model weights.
 
@@ -97,9 +98,13 @@ def _build_hbm_from_hf_weights(
     }
     hbm_row_width = config["HBM_WIDTH"]["value"]
 
-    print(f"      loading HF model: {model_id}")
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
-    model.eval()
+    if preloaded_model is None:
+        print(f"      loading HF model: {model_id}")
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+        model.eval()
+    else:
+        print(f"      reusing preloaded HF model for: {model_id}")
+        model = preloaded_model
 
     # Locate layer-0 attention + MLP. HF Llama-family exposes these under
     # model.model.layers[0].{self_attn,mlp}; fall back to the transformer's
@@ -230,11 +235,21 @@ def _build_fp_sram_preload(
 ) -> dict:
     """Seed fp_sram.bin with the FPRAM constants the generator expects.
 
+    KNOWN LIMITATION (VLMs): a single ``attn_scale`` slot can only hold one
+    1/sqrt(head_dim) value.  Vision-language models typically have a
+    different head_dim for the text decoder and the vision encoder, so the
+    second attention domain reads a stale scale and produces incorrect
+    logits.  The flash-attn template would need a per-call attn_scale_fp
+    slot (or the harness needs to refresh slot 5 between text and vision
+    runs) to fix this.  Tracking issue: TODO.
+
     Slot map (from compiler/generator/scheduler/mem_layout_lib.json):
       0: infinity      — softmax masking sentinel (use a large fp16 negative)
       1: eps           — RMSNorm epsilon
       2: hid_reciprocal — 1.0 / hidden_size
-      3: silu_e        — 1.0 (SiLU sigmoid identity, GELU multiplicative identity)
+      3: silu_one      — 1.0 (SiLU sigmoid identity, GELU multiplicative identity).
+                       Renamed from `silu_e` in the canonical layout to avoid
+                       implying Euler's constant; the value is just 1.0.
       4: gelu_1702     — 1.702 (GELU sigmoid-approximation constant)
       5: attn_scale    — 1.0 / sqrt(head_dim)
     Slots 6..N are zero-padded to fill total_bytes.
@@ -246,7 +261,7 @@ def _build_fp_sram_preload(
         inf_value,                  # slot 0: infinity
         eps_value,                  # slot 1: eps
         1.0 / hidden_size,          # slot 2: hid_reciprocal
-        1.0,                        # slot 3: silu_e
+        1.0,                        # slot 3: silu_one (1.0; renamed from silu_e)
         1.702,                      # slot 4: gelu_1702
         1.0 / math.sqrt(head_dim),  # slot 5: attn_scale
     ] + [0.0] * (num_slots - 6)    # slots 6..N: reserved / zero pad
@@ -261,7 +276,7 @@ def _build_fp_sram_preload(
             "infinity": inf_value,
             "eps": eps_value,
             "hid_reciprocal": 1.0 / hidden_size,
-            "silu_e": 1.0,
+            "silu_one": 1.0,
             "gelu_1702": 1.702,
             "attn_scale": 1.0 / math.sqrt(head_dim),
         },
@@ -335,12 +350,21 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     HBM_SIZE = 256 << 20  # 256 MiB (same as prior stub).
     FPSRAM_BYTES = 1024 * 2
     INTSRAM_BYTES = 1024 * 4
-    _build_hbm_from_hf_weights(model_id, seq_len, hbm_path, HBM_SIZE)
+    # Load HF model once and reuse it for both HBM weight population and
+    # FPRAM-constant derivation (hidden_size, head_dim).  Previously the
+    # model was loaded twice — once inside _build_hbm_from_hf_weights and
+    # again in this run_pipeline body — doubling peak host RAM during the
+    # harness's [3/5] -> [3.5/5] transition for no benefit.
+    print("[3.0a/5] loading HF model (single load shared with FPRAM seed)")
+    _hf_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+    _hf_model.eval()
+    _build_hbm_from_hf_weights(
+        model_id, seq_len, hbm_path, HBM_SIZE, preloaded_model=_hf_model
+    )
 
     # FPRAM constant seeding — generator templates expect specific values
     # at fixed slots (mem_layout_lib.json::fp_sram).
     print("[3.5/5] FPRAM seed: deriving hidden_size and head_dim from HF config")
-    _hf_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
     _text_cfg = getattr(_hf_model.config, "text_config", _hf_model.config)
     hidden_size = _text_cfg.hidden_size
     head_dim = getattr(
