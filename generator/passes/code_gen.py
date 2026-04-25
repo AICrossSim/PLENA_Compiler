@@ -171,14 +171,14 @@ def _generate_attention_code(
         vlen=_proj_vlen,
     )
 
-    # Attention body. The flash_attn_asm template asserts
-    # `blen == q_index_2_kv_index_ratio` (= hq // hkv); for SigLIP/ViT
-    # hq == hkv so the ratio is 1 while hardware blen is typically 4.
-    # When that asymmetry blocks the monolithic template we emit a
-    # compositional skeleton (S = Q@K^T, scale + softmax, O = S@V) using
-    # the existing ISA mnemonics inline so the block is no longer just a
-    # placeholder comment. For decoder-style GQA where the ratio matches,
-    # we reuse the full flash_attn_asm template directly.
+    # Attention body.  flash_attn_asm now supports arbitrary GQA ratios
+    # subject to two rules (see asm_templates/flashattn/overall.py):
+    #   * ratio >= blen requires ratio % blen == 0 (multi-pass over Q heads).
+    #   * ratio <  blen is supported as a single best-effort pass; M_BTMM
+    #     still emits ``blen`` head slots but only ``ratio`` are consumed.
+    # Configurations outside that envelope (e.g. ratio=5 on blen=4) and
+    # bidirectional/SigLIP attention without the causal mask still drop to
+    # the compositional skeleton emitted below.
     num_kv_heads = dims.get("num_key_value_heads", num_heads)
     q_index_2_kv_index_ratio = num_heads // max(num_kv_heads, 1)
     seq_len = model_info.get("seq_len", model_info.get("context_length", mlen))
@@ -190,7 +190,11 @@ def _generate_attention_code(
     k_hbm_reg = hbm_addr_reg.get("k_weight_offset", 0)
     v_hbm_reg = hbm_addr_reg.get("v_weight_offset", 0)
 
-    use_flash_template = causal_mask and q_index_2_kv_index_ratio == blen
+    flash_ratio_supported = q_index_2_kv_index_ratio >= 1 and (
+        q_index_2_kv_index_ratio < blen
+        or q_index_2_kv_index_ratio % blen == 0
+    )
+    use_flash_template = causal_mask and flash_ratio_supported
     if use_flash_template:
         code += "\n; -- Flash attention (causal decoder, GQA-aware) --\n"
         code += flash_attn_asm(
@@ -214,7 +218,10 @@ def _generate_attention_code(
         reason = (
             "bidirectional (ViT)"
             if not causal_mask
-            else f"blen={blen} != q/kv ratio={q_index_2_kv_index_ratio}"
+            else (
+                f"unsupported GQA ratio={q_index_2_kv_index_ratio} for blen={blen} "
+                f"(needs ratio<blen or ratio%blen==0)"
+            )
         )
         # Compositional skeleton: this emits instruction mnemonics for the
         # three attention stages using registers disjoint from the Q/K/V
