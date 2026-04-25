@@ -36,6 +36,34 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
+
+def _load_model_for_weights(model_id: str, torch_dtype=None):
+    """Load a HF model for weight extraction, handling VLM architectures.
+
+    Falls back from AutoModelForCausalLM to the concrete class named in the
+    model config's ``architectures`` list (e.g. SmolVLMForConditionalGeneration).
+    This covers models like SmolVLM2 that are not registered with either
+    AutoModelForCausalLM or AutoModelForVision2Seq in older transformers builds.
+    """
+    import transformers
+    kwargs = {} if torch_dtype is None else {"torch_dtype": torch_dtype}
+    try:
+        return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    except (ValueError, KeyError):
+        pass
+    # Try each architecture listed in the config.
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(model_id)
+    for arch_name in getattr(cfg, "architectures", []):
+        cls = getattr(transformers, arch_name, None)
+        if cls is not None:
+            print(f"      AutoModelForCausalLM unsupported; using {arch_name} directly")
+            return cls.from_pretrained(model_id, **kwargs)
+    raise RuntimeError(
+        f"Cannot load {model_id}: AutoModelForCausalLM failed and no supported "
+        f"architecture found in config.architectures={getattr(cfg, 'architectures', [])}"
+    )
+
 from assembler import AssemblyToBinary  # noqa: E402
 
 # Tools imports for HBM weight population (same stack create_mem_for_sim uses).
@@ -100,17 +128,36 @@ def _build_hbm_from_hf_weights(
 
     if preloaded_model is None:
         print(f"      loading HF model: {model_id}")
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+        model = _load_model_for_weights(model_id, torch_dtype=torch.float32)
         model.eval()
     else:
         print(f"      reusing preloaded HF model for: {model_id}")
         model = preloaded_model
 
-    # Locate layer-0 attention + MLP. HF Llama-family exposes these under
-    # model.model.layers[0].{self_attn,mlp}; fall back to the transformer's
-    # `h[0]` style if needed.
-    root = getattr(model, "model", model)
-    layers = getattr(root, "layers", None) or getattr(root, "h", None)
+    # Locate the text-decoder root and layer list.
+    # Priority order to find decoder layers:
+    #   1. model.model.layers / model.model.h          (Llama, GPT-2, etc.)
+    #   2. model.model.text_model.layers               (SmolVLM2: ForConditionalGeneration)
+    #   3. model.language_model.model.layers           (LLaVA-style VLMs)
+    #   4. model.language_model.layers                 (some LLaVA variants)
+    #   5. model.text_model.layers                     (base SmolVLMModel)
+    def _find_root_and_layers(model):
+        _inner = getattr(model, "model", None)
+        for candidate in [
+            _inner,
+            getattr(_inner, "text_model", None) if _inner is not None else None,
+            getattr(getattr(model, "language_model", None), "model", None),
+            getattr(model, "language_model", None),
+            getattr(model, "text_model", None),
+        ]:
+            if candidate is None:
+                continue
+            layers = getattr(candidate, "layers", None) or getattr(candidate, "h", None)
+            if layers is not None and len(layers) > 0:
+                return candidate, layers
+        return model, None
+
+    root, layers = _find_root_and_layers(model)
     if layers is None or len(layers) == 0:
         raise RuntimeError(f"Could not locate decoder layers on {type(model).__name__}")
     layer0 = layers[0]
@@ -128,7 +175,10 @@ def _build_hbm_from_hf_weights(
                 return obj
         return None
 
-    embed = _get(root, "embed_tokens", "wte")
+    embed = (
+        _get(root, "embed_tokens", "wte")
+        or _get(getattr(model, "text_model", model), "embed_tokens", "wte")
+    )
     q_proj = _get(layer0, "self_attn.q_proj", "attn.q_proj", "attention.q_proj")
     k_proj = _get(layer0, "self_attn.k_proj", "attn.k_proj", "attention.k_proj")
     v_proj = _get(layer0, "self_attn.v_proj", "attn.v_proj", "attention.v_proj")
@@ -136,7 +186,9 @@ def _build_hbm_from_hf_weights(
     gate_proj = _get(layer0, "mlp.gate_proj", "mlp.w1")
     up_proj = _get(layer0, "mlp.up_proj", "mlp.w3")
     down_proj = _get(layer0, "mlp.down_proj", "mlp.w2")
-    lm_head = _get(model, "lm_head")
+    lm_head = _get(model, "lm_head") or _get(
+        getattr(model, "language_model", model), "lm_head"
+    )
 
     # Build the ordered list of (name, offset_expr, tensor) to write.
     # Offsets come from generator/scheduler/mem_layout_lib.json. The
@@ -356,7 +408,7 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     # again in this run_pipeline body — doubling peak host RAM during the
     # harness's [3/5] -> [3.5/5] transition for no benefit.
     print("[3.0a/5] loading HF model (single load shared with FPRAM seed)")
-    _hf_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+    _hf_model = _load_model_for_weights(model_id, torch_dtype=torch.float32)
     _hf_model.eval()
     _build_hbm_from_hf_weights(
         model_id, seq_len, hbm_path, HBM_SIZE, preloaded_model=_hf_model
