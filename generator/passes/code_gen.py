@@ -190,8 +190,12 @@ def _generate_attention_code(
     k_hbm_reg = hbm_addr_reg.get("k_weight_offset", 0)
     v_hbm_reg = hbm_addr_reg.get("v_weight_offset", 0)
 
+    # When ratio < blen AND hkv > 1, the under-pack Q-tile addresses
+    # misalign with blen-lane boundaries in M_BTMM (head_offset overflow).
+    # Workaround: route those models through the compositional skeleton
+    # instead. SigLIP (hkv=1) is unaffected.
     flash_ratio_supported = q_index_2_kv_index_ratio >= 1 and (
-        q_index_2_kv_index_ratio < blen
+        (q_index_2_kv_index_ratio < blen and num_kv_heads == 1)
         or q_index_2_kv_index_ratio % blen == 0
     )
     use_flash_template = causal_mask and flash_ratio_supported
