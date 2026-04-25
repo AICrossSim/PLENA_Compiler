@@ -1,3 +1,6 @@
+from ._imm import load_large_int as _load_large_int_list
+
+
 def rope_asm(
     alive_registers: list,
     x_base_address: int,
@@ -40,16 +43,16 @@ def rope_asm(
     num_chunks = head_dim // vlen
 
     lines = ["; RoPE: x = x * cos + rotate_half(x) * sin  (in-place)"]
-    lines.append(f"S_ADDI_INT gp{scratch_addr}, gp0, {scratchpad_base_address} ")
+    lines.extend(_load_large_int_list(scratch_addr, scratchpad_base_address))
 
     for j in range(num_chunks):
         chunk_base = j * seq_len * vlen
         for i in range(seq_len):
             addr = chunk_base + i * vlen
-            lines.append(f"S_ADDI_INT gp{x_addr},    gp0, {x_base_address + addr} ")
-            lines.append(f"S_ADDI_INT gp{xrot_addr}, gp0, {x_rot_base_address + addr} ")
-            lines.append(f"S_ADDI_INT gp{cos_addr},  gp0, {cos_base_address + addr} ")
-            lines.append(f"S_ADDI_INT gp{sin_addr},  gp0, {sin_base_address + addr} ")
+            lines.extend(_load_large_int_list(x_addr, x_base_address + addr))
+            lines.extend(_load_large_int_list(xrot_addr, x_rot_base_address + addr))
+            lines.extend(_load_large_int_list(cos_addr, cos_base_address + addr))
+            lines.extend(_load_large_int_list(sin_addr, sin_base_address + addr))
             lines.append(f"V_MUL_VV gp{scratch_addr}, gp{xrot_addr}, gp{sin_addr}, 0 ")
             lines.append(f"V_MUL_VV gp{x_addr}, gp{x_addr}, gp{cos_addr}, 0 ")
             lines.append(f"V_ADD_VV gp{x_addr}, gp{x_addr}, gp{scratch_addr}, 0 ")

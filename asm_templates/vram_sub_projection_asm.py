@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import math
 
+from ._imm import load_large_int as _load_large_int_list
+
 
 def vram_sub_projection_asm_impl(
     mlen: int,
@@ -87,19 +89,19 @@ def vram_sub_projection_asm_impl(
                 for ih in range(num_hidden_blocks):
                     act_addr = act_row_addr + ih * vram_hidden_block_stride
                     mat_addr = mat_col_addr + ih * mram_hidden_block_stride
-                    lines.append(f"S_ADDI_INT gp{gp_act}, gp0, {act_addr}")
-                    lines.append(f"S_ADDI_INT gp{gp_mat}, gp0, {mat_addr}")
+                    lines.extend(_load_large_int_list(gp_act, act_addr))
+                    lines.extend(_load_large_int_list(gp_mat, mat_addr))
                     if transposed:
                         lines.append(f"M_TMM 0, gp{gp_act}, gp{gp_mat}")
                     else:
                         lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
-                lines.append(f"S_ADDI_INT gp{gp_result}, gp0, {result_addr}")
+                lines.extend(_load_large_int_list(gp_result, result_addr))
                 lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
     else:
-        lines.append(f"S_ADDI_INT gp{gp_mat_col_base}, gp0, {mram_start_addr}")
-        lines.append(f"S_ADDI_INT gp{gp_result_col_base}, gp0, {result_vram_addr}")
+        lines.extend(_load_large_int_list(gp_mat_col_base, mram_start_addr))
+        lines.extend(_load_large_int_list(gp_result_col_base, result_vram_addr))
         lines.append(f"C_LOOP_START gp{gp_loop_outer}, {tiles_per_mlen}")
-        lines.append(f"S_ADDI_INT gp{gp_act_row_base}, gp0, {vram_row_start_addr}")
+        lines.extend(_load_large_int_list(gp_act_row_base, vram_row_start_addr))
         lines.append(f"S_ADDI_INT gp{gp_result}, gp{gp_result_col_base}, 0")
         lines.append(f"C_LOOP_START gp{gp_loop_middle}, {row_loop_count}")
         lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act_row_base}, 0")

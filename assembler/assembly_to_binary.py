@@ -114,7 +114,12 @@ class AssemblyToBinary:
         else:
             binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
 
-        # Print in hex with fixed 16-bit width
+        if binary_instruction > 0xFFFFFFFF:
+            raise ValueError(
+                f"Instruction encoding overflow (0x{binary_instruction:X} > 32 bits): "
+                f"mnemonic={instruction.opcode}, rd={rd}, rs1={rs1}, rs2={rs2}, imm={imm}. "
+                f"Use load_large_int from asm_templates._imm for immediates >= {1 << 18}."
+            )
         return binary_instruction
 
     def write_binary_to_file(self, binary_instructions, output_file: str):

@@ -130,7 +130,7 @@ def _ffn_asm_unrolled(
     # Settings for up and gate weight matrices prefetching
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register} \n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {intermediate_size} \n"
+    generated_code += _load_large_int(w_actual_register, intermediate_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
     # Set the address for on-chip sram
@@ -202,7 +202,7 @@ def _ffn_asm_unrolled(
     generated_code += f"S_LD_FP f1, gp0, {const_one_fp_address} \n"
     generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
     generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp0, {activation_base_address} \n"
+    generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # SiLU: sigmoid(x) * x * gate, using activation region as scratchpad
     for b in range(batch * seq_len):
@@ -223,7 +223,7 @@ def _ffn_asm_unrolled(
     generated_code += "; FFN Downsize Linear Generation \n"
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register} \n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {hidden_size} \n"
+    generated_code += _load_large_int(w_actual_register, hidden_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
     generated_code += f"S_ADDI_INT gp{m_stride_register}, gp0, {((batch * seq_len) // blen)} \n"
@@ -575,7 +575,7 @@ def ffn_up_silu_asm(
     # Setup: scale/stride registers
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register}\n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {intermediate_size}\n"
+    generated_code += _load_large_int(w_actual_register, intermediate_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register}\n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
@@ -617,7 +617,7 @@ def ffn_up_silu_asm(
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen}\n"
 
     # Inner loop: act_col iterations
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(a_actual_register, activation_base_address)
     generated_code += f"; Inner loop: {num_act_cols} activation columns\n"
     generated_code += f"C_LOOP_START gp{loop_inner2_reg}, {num_act_cols}\n"
 
@@ -698,7 +698,7 @@ def ffn_intermediate_asm(
     # Setup: scale/stride registers
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register}\n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {intermediate_size}\n"
+    generated_code += _load_large_int(w_actual_register, intermediate_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register}\n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
@@ -740,7 +740,7 @@ def ffn_intermediate_asm(
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen}\n"
 
     # Reset activation base for each middle loop iteration
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(a_actual_register, activation_base_address)
     generated_code += f"; Inner loop: {num_act_cols} activation columns\n"
     generated_code += f"C_LOOP_START gp{loop_inner2_reg}, {num_act_cols}\n"
 
@@ -811,7 +811,7 @@ def ffn_intermediate_asm(
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen}\n"
 
     # Reset activation base for each middle loop iteration
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(a_actual_register, activation_base_address)
     generated_code += f"; Inner loop: {num_act_cols} activation columns\n"
     generated_code += f"C_LOOP_START gp{loop_inner2_reg}, {num_act_cols}\n"
 
@@ -856,7 +856,7 @@ def ffn_intermediate_asm(
     # Reset addresses
     generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
     generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # Loop over batch * seq_len * (intermediate_size // vlen)
     num_silu_iters = batch * seq_len * (intermediate_size // vlen)
@@ -917,7 +917,7 @@ def _ffn_asm_with_loops(
     # Setup: scale/stride registers
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register}\n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {intermediate_size}\n"
+    generated_code += _load_large_int(w_actual_register, intermediate_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register}\n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
@@ -959,7 +959,7 @@ def _ffn_asm_with_loops(
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen}\n"
 
     # Reset activation base for each middle loop iteration
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(a_actual_register, activation_base_address)
     generated_code += f"; Inner loop: {num_act_cols} activation columns\n"
     generated_code += f"C_LOOP_START gp{loop_inner2_reg}, {num_act_cols}\n"
 
@@ -1030,7 +1030,7 @@ def _ffn_asm_with_loops(
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen}\n"
 
     # Reset activation base for each middle loop iteration
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(a_actual_register, activation_base_address)
     generated_code += f"; Inner loop: {num_act_cols} activation columns\n"
     generated_code += f"C_LOOP_START gp{loop_inner2_reg}, {num_act_cols}\n"
 
@@ -1075,7 +1075,7 @@ def _ffn_asm_with_loops(
     # Reset addresses
     generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
     generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # Loop over batch * seq_len * (intermediate_size // vlen)
     num_silu_iters = batch * seq_len * (intermediate_size // vlen)
@@ -1100,13 +1100,13 @@ def _ffn_asm_with_loops(
     # Setup scale and stride for downsize
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register}\n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {hidden_size}\n"
+    generated_code += _load_large_int(w_actual_register, hidden_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register}\n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
     # Result goes to activation base region
     act_result_register = gate_result_register
-    generated_code += f"S_ADDI_INT gp{act_result_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(act_result_register, activation_base_address)
     generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
 
     # Downsize: (b*s, intermediate_size) @ (intermediate_size, hidden_size) -> (b*s, hidden_size)
@@ -1220,7 +1220,7 @@ def _ffn_asm_fused_up_gate(
     # Setup: scale/stride registers
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register}\n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {intermediate_size}\n"
+    generated_code += _load_large_int(w_actual_register, intermediate_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register}\n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
@@ -1263,7 +1263,7 @@ def _ffn_asm_fused_up_gate(
         )
 
     # Setup for UP compute and GATE prefetch overlap
-    generated_code += f"S_ADDI_INT gp{w_gate_base_register}, gp0, {gate_mram_offset}\n"
+    generated_code += _load_large_int(w_gate_base_register, gate_mram_offset)
 
     # Reset for UP compute phase
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -1280,7 +1280,7 @@ def _ffn_asm_fused_up_gate(
 
     for tile_idx in range(tiles_per_mlen):
         # Reset activation base for this tile
-        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {activation_base_address}\n"
+        generated_code += _load_large_int(a_actual_register, activation_base_address)
 
         for act_col in range(num_act_cols):
             iter_num = tile_idx * num_act_cols + act_col
@@ -1293,7 +1293,7 @@ def _ffn_asm_fused_up_gate(
                 # Compute GATE HBM offset directly: base_offset + prefetch_count * stride
                 gate_hbm_offset = gate_prefetch_count * mlen * intermediate_size
                 # Set MRAM destination
-                generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {gate_mram_ptr}\n"
+                generated_code += _load_large_int(a_actual_register, gate_mram_ptr)
                 # Set HBM source: w_hbm_offset_register + gate_hbm_offset
                 generated_code += f"S_ADDI_INT gp{a_save_register}, gp{w_hbm_offset_register}, {gate_hbm_offset}\n"
                 generated_code += (
@@ -1338,7 +1338,7 @@ def _ffn_asm_fused_up_gate(
 
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen}\n"
 
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(a_actual_register, activation_base_address)
     generated_code += f"C_LOOP_START gp{loop_inner2_reg}, {num_act_cols}\n"
 
     generated_code += f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0\n"
@@ -1383,13 +1383,13 @@ def _ffn_asm_fused_up_gate(
     # Set up DOWN weight prefetch parameters
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
     generated_code += f"C_SET_SCALE_REG gp{w_actual_register}\n"
-    generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, {hidden_size}\n"
+    generated_code += _load_large_int(w_actual_register, hidden_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register}\n"
 
     # Initialize SILU pointers
     generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
     generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # Initialize DOWN prefetch pointers (w_actual_register=MRAM offset, a_actual_register=HBM offset)
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -1429,7 +1429,7 @@ def _ffn_asm_fused_up_gate(
     generated_code += "; FFN Downsize Linear Generation (first block pre-fetched during SILU)\n"
 
     act_result_register = gate_result_register
-    generated_code += f"S_ADDI_INT gp{act_result_register}, gp0, {activation_base_address}\n"
+    generated_code += _load_large_int(act_result_register, activation_base_address)
     generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
 
     down_act_col_advance = mlen * blen

@@ -1,3 +1,6 @@
+from ._imm import addi_large_int as _addi_large_int_list
+from ._imm import load_large_int as _load_large_int_list
+
 IMM2_BOUND = 2**18
 
 
@@ -55,31 +58,26 @@ def gemv_asm(
 
     # Setup scale and stride registers (use act_reg as temp)
     # Scale = total weight matrix size, Stride = output dimension
-    if in_features * out_features < IMM2_BOUND:
-        lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {in_features * out_features}")
-    else:
-        lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {in_features}")
-        lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {out_features}")
-        lines.append(f"S_MUL_INT gp{act_reg}, gp{w_actual_register}, gp{act_reg}")
+    lines.extend(_load_large_int_list(act_reg, in_features * out_features))
     lines.append(f"C_SET_SCALE_REG gp{act_reg}")
-    lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {out_features}")
+    lines.extend(_load_large_int_list(act_reg, out_features))
     lines.append(f"C_SET_STRIDE_REG gp{act_reg}")
 
     # Initialize activation register
-    lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address}")
-    lines.append(f"S_ADDI_INT gp{result_reg}, gp0, {result_base_address}")
+    lines.extend(_load_large_int_list(act_reg, activation_base_address))
+    lines.extend(_load_large_int_list(result_reg, result_base_address))
 
     for weight_row in range(out_features // blen):
         if weight_row % (mlen // blen) == 0:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
-            lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp0, {weight_row * blen} ")
+            lines.extend(_load_large_int_list(w_hbm_offset_register, weight_row * blen))
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
             for weight_col in range(hidden_size // mlen):
                 lines.append(
                     f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
-                lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen * out_features} ")
+                lines.extend(_addi_large_int_list(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register))
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
@@ -87,7 +85,7 @@ def gemv_asm(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
             )
 
-        lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address} ")
+        lines.extend(_load_large_int_list(act_reg, activation_base_address))
         lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
         for inner_loop_index in range(hidden_size // mlen):
             lines.append(f"M_MV 0, gp{w_temp_register}, gp{act_reg} ")

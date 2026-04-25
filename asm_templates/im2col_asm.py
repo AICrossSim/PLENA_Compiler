@@ -23,6 +23,8 @@ The mask vector [1,1,..,1, 0,..,0] (K ones followed by VLEN-K zeros) must be
 preloaded into VRAM at mask_vec_vram_addr by the host before execution.
 """
 
+from ._imm import load_large_int as _load_large_int_list
+
 PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows
 
 
@@ -143,7 +145,7 @@ def im2col_asm(
 
     lines.append("")
     lines.append(f"; -- Map FP_SRAM -> VRAM mask row at addr {mask_vec_vram_addr} --")
-    lines.append(f"S_ADDI_INT gp{temp_reg}, gp0, {mask_vec_vram_addr}")
+    lines.extend(_load_large_int_list(temp_reg, mask_vec_vram_addr))
     lines.append(f"S_MAP_V_FP gp{temp_reg}, gp0, 0")
 
     lines.append("")
@@ -163,16 +165,16 @@ def im2col_asm(
     # multiple of 64; using W_padded=64 guarantees this.
     lines.append("")
     lines.append("; -- configure HBM stride for H_PREFETCH_V --")
-    lines.append(f"S_ADDI_INT gp{temp_reg}, gp0, {W_padded}")
+    lines.extend(_load_large_int_list(temp_reg, W_padded))
     lines.append(f"C_SET_STRIDE_REG gp{temp_reg}")
 
     # ── set scale offset (total input tensor size in elements) ────────
     input_tensor_size = C_in * H * W_padded
-    lines.append(f"S_ADDI_INT gp{temp_reg}, gp0, {input_tensor_size}")
+    lines.extend(_load_large_int_list(temp_reg, input_tensor_size))
     lines.append(f"C_SET_SCALE_REG gp{temp_reg}")
 
     # ── set mask register address (constant across all rows) ─────────
-    lines.append(f"S_ADDI_INT gp{mask_reg}, gp0, {mask_vec_vram_addr}")
+    lines.extend(_load_large_int_list(mask_reg, mask_vec_vram_addr))
 
     # ── main loop: iterate over tiles × M output positions ───────────
     # VRAM is column-block-major (matches no_shift template):
@@ -193,13 +195,13 @@ def im2col_asm(
             lines.append(f"; ---- tile={tile_t} output row m={m}  (oh={oh}, ow={ow}) ----")
 
             # Point accumulator register at the output VRAM row.
-            lines.append(f"S_ADDI_INT gp{acc_reg}, gp0, {out_vram_addr}")
+            lines.extend(_load_large_int_list(acc_reg, out_vram_addr))
 
             # Zero the accumulator row: multiply mask vector by f0.
             lines.append(f"V_MUL_VF gp{acc_reg}, gp{mask_reg}, f0, 0")
 
             # Set scratch base address.
-            lines.append(f"S_ADDI_INT gp{scratch_reg}, gp0, {scratch_vram_addr}")
+            lines.extend(_load_large_int_list(scratch_reg, scratch_vram_addr))
 
             for c in range(C_in):
                 for kr in range(K):
@@ -218,7 +220,7 @@ def im2col_asm(
                     hbm_offset = (c * H + (oh + kr)) * W_padded + ow
 
                     # Load K contiguous elements from HBM into scratch row.
-                    lines.append(f"S_ADDI_INT gp{hbm_off_reg}, gp0, {hbm_offset}")
+                    lines.extend(_load_large_int_list(hbm_off_reg, hbm_offset))
                     lines.append(f"H_PREFETCH_V gp{scratch_reg}, gp{hbm_off_reg}, a{input_hbm_base_addr_reg}, 1, 0")
 
                     # Mask: zero out elements K..VLEN-1

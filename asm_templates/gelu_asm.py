@@ -1,3 +1,6 @@
+from ._imm import load_large_int_str as _load_large_int
+
+
 def gelu_asm(
     const_one_fp_address: int,
     const_1702_fp_address: int,
@@ -36,8 +39,8 @@ def gelu_asm(
     num_vectors = (batch_size * hidden_dim) // vlen
 
     generated_code = "; GELU Activation Generation\n"
-    generated_code += f"S_ADDI_INT gp{act_addr}, gp0, {activation_base_address}\n"
-    generated_code += f"S_ADDI_INT gp{scratchpad_addr}, gp0, {scratchpad_base_address}\n"
+    generated_code += _load_large_int(act_addr, activation_base_address)
+    generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
 
     # Load constants into FP registers
     generated_code += f"S_LD_FP f1, gp0, {const_one_fp_address}\n"

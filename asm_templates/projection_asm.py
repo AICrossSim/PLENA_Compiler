@@ -172,19 +172,19 @@ def projection_asm(
     # Scale = total weight matrix size, Stride = output dimension
     lines.extend(_load_large_int(act_reg, in_features * out_features))
     lines.append(f"C_SET_SCALE_REG gp{act_reg}")
-    lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {out_features}")
+    lines.extend(_load_large_int(act_reg, out_features))
     lines.append(f"C_SET_STRIDE_REG gp{act_reg}")
 
     if num_k_tiles <= MAX_K_TILES:
         lines.append(f" ; K-split inactive: num_k_tiles={num_k_tiles} <= MAX_K_TILES={MAX_K_TILES}")
         # Original single-pass path (unchanged behaviour)
-        lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address}")
-        lines.append(f"S_ADDI_INT gp{result_reg}, gp0, {result_base_address}")
+        lines.extend(_load_large_int(act_reg, activation_base_address))
+        lines.extend(_load_large_int(result_reg, result_base_address))
 
         for weight_row in range(out_features // blen):
             if weight_row % (mlen // blen) == 0:
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
-                lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp0, {weight_row * blen} ")
+                lines.extend(_load_large_int(w_hbm_offset_register, weight_row * blen))
                 lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
                 for weight_col in range(hidden_size // mlen):
                     lines.append(
@@ -201,7 +201,7 @@ def projection_asm(
                     f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
                 )
             for act_col in range(batch // blen):
-                lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address + act_col * mlen * blen} ")
+                lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
                 for inner_loop_index in range(hidden_size // mlen):
                     lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
@@ -315,11 +315,11 @@ def projection_T_asm(
     # Scale = total weight size, Stride = in_features (row stride of weight in HBM)
     lines.extend(_load_large_int(act_reg, in_features * out_features))
     lines.append(f"C_SET_SCALE_REG gp{act_reg}")
-    lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {in_features}")
+    lines.extend(_load_large_int(act_reg, in_features))
     lines.append(f"C_SET_STRIDE_REG gp{act_reg}")
 
-    lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address}")
-    lines.append(f"S_ADDI_INT gp{result_reg}, gp0, {result_base_address}")
+    lines.extend(_load_large_int(act_reg, activation_base_address))
+    lines.extend(_load_large_int(result_reg, result_base_address))
 
     for weight_row in range(out_features // blen):
         if weight_row % tiles_per_mlen == 0:
@@ -341,7 +341,7 @@ def projection_T_asm(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % tiles_per_mlen) * blen} "
             )
         for act_col in range(batch // blen):
-            lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {activation_base_address + act_col * mlen * blen} ")
+            lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
             for inner_loop_index in range(hidden_size // mlen):
                 lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")

@@ -1,3 +1,6 @@
+from ._imm import load_large_int_str as _load_large_int
+
+
 def rms_norm_asm(
     _eps_offset: int,
     reci_hid_offset: int,
@@ -16,7 +19,7 @@ def rms_norm_asm(
     stats_addr = alive_registers[2]
 
     generated_code = "; RMS Norm generation \n"
-    generated_code += f"S_ADDI_INT gp{scratchpad_addr}, gp0, {scratchpad_base_address} \n"
+    generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
 
     # Load eps into f1
     generated_code += f"S_LD_FP f1, gp0, {_eps_offset} \n"
@@ -27,9 +30,9 @@ def rms_norm_asm(
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch
-        generated_code += f"S_ADDI_INT gp{act_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
         # Set stats_addr to same position for iteration
-        generated_code += f"S_ADDI_INT gp{stats_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
 
         # First loop: compute sum of squares using stats_addr
         for i in range(hidden_dim // vlen):
@@ -84,7 +87,7 @@ def layer_norm_asm(
     stats_addr = alive_registers[2]
 
     generated_code = "; Layer Norm generation \n"
-    generated_code += f"S_ADDI_INT gp{scratchpad_addr}, gp0, {scratchpad_base_address} \n"
+    generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
 
     # Load constants
     generated_code += f"S_LD_FP f1, gp0, {_eps_offset} \n"  # epsilon
@@ -94,9 +97,9 @@ def layer_norm_asm(
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch
-        generated_code += f"S_ADDI_INT gp{act_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
         # Set stats_addr to same position for iteration
-        generated_code += f"S_ADDI_INT gp{stats_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
 
         # First loop: compute sum(x) and sum(x^2) using stats_addr
         for i in range(hidden_dim // vlen):

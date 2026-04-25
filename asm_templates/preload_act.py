@@ -28,7 +28,7 @@ def preload_act_asm(
     generated_code += _load_large_int(a_actual_register, hidden_size * batch)
     generated_code += f"C_SET_SCALE_REG gp{a_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, 0 \n"
-    generated_code += f"S_ADDI_INT gp{result_register}, gp0, {act_vram_offset} \n"
+    generated_code += _load_large_int(result_register, act_vram_offset)
     load_amount_per_hidden = math.ceil(hidden_size / vlen)
 
     if batch == 1:

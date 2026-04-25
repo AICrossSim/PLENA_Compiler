@@ -1,5 +1,7 @@
 import math
 
+from ._imm import load_large_int_str as _load_large_int
+
 
 def store_act_asm(
     vlen: int,
@@ -28,7 +30,7 @@ def store_act_asm(
     store_amount_per_hidden = math.ceil(hidden_size / vlen)
 
     # Initialize VRAM source address
-    generated_code += f"S_ADDI_INT gp{vram_reg}, gp0, {act_vram_offset}\n"
+    generated_code += _load_large_int(vram_reg, act_vram_offset)
     # Initialize HBM offset to 0
     generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, 0\n"
 
@@ -41,7 +43,7 @@ def store_act_asm(
             generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {elements_per_store}\n"
     else:
         # Set stride register (HBM row stride = hidden_size)
-        generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len}\n"
+        generated_code += _load_large_int(set_stride_register, stride_len)
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register}\n"
         hbm_base_reg = set_stride_register  # reuse after stride is set
 
