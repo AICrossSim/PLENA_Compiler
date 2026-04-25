@@ -26,6 +26,8 @@ def flash_attn_asm(
     fp_sram_start_address: int,
     k_base_hbm_offset_reg: int,
     v_base_hbm_offset_reg: int,
+    attn_scale_fp_address: int = 5,
+    inf_fp_address: int = 0,
 ) -> str:
     """
     Args:
@@ -33,6 +35,17 @@ def flash_attn_asm(
     fp_sram_start_address: the start address of the fp SRAM
     k_base_hbm_offset_reg: the offset register of the k base address in HBM
     v_base_hbm_offset_reg: the offset register of the v base address in HBM
+    attn_scale_fp_address: FP SRAM slot holding 1/sqrt(head_dim) for QK
+        scaling. Defaults to 5 to match
+        ``mem_layout_lib.json::fp_sram::attn_scale``. The scheduler-provided
+        slot is forwarded by the caller; previously this was hardcoded to 1
+        (the eps slot) and produced catastrophically mis-scaled attention
+        logits once fp_sram.bin was seeded per the JSON convention.
+    inf_fp_address: FP SRAM slot holding the -inf sentinel used to seed the
+        running-max state at the start of each kv tile. Defaults to 0 to match
+        ``mem_layout_lib.json::fp_sram::infinity``. Previously hardcoded to 2
+        (the hid_reciprocal slot ~= 0.016), which made the running-max start
+        at a positive value and corrupted the entire flash softmax accumulation.
     Description:
         This part of asm takes the multi-loops, looping over kv head, then two loops for the flash atten, with small loops over q head per kv head within the inner loop.
     """
@@ -51,14 +64,16 @@ def flash_attn_asm(
 
     # Memory Layout:
     # -- FP SRAM --
-    # Defalt 0 - zero
-    # 1 - infinity
-    # fp_sram_start_address - 1 - qk_scale
-    # per head dimension * q_index_2_kv_index_ratio level {
-    # - m old (MLEN) - 0
-    # - m res (MLEN) - 1
-    # - l old (MLEN) - 2
-    # }
+    # ``inf_fp_address`` (default 0) - infinity sentinel for running-max init.
+    # ``attn_scale_fp_address`` (default 5) - 1/sqrt(head_dim) (QK scale).
+    # Both slot indices are forwarded by the caller from
+    # ``scheduler["memory_layout"]["fp_sram"]`` so mem_layout_lib.json is the
+    # single source of truth for FPRAM constant placement; this template no
+    # longer hardcodes addresses 1 and 2.
+    # ``fp_sram_start_address`` onwards holds, for each q head in the kv-group:
+    # - m old (br)
+    # - m res (br)
+    # - l old (br)
 
     print("=" * 5, "VSRAM Memory Layout", "=" * 5)
     # -- Vector SRAM --
@@ -94,13 +109,18 @@ def flash_attn_asm(
             # Reset m_fp_sram_start_address for each iteration
             m_fp_sram_start_address = fp_sram_start_address
 
-            # Reset m old for every q_index_2_kv_index_ratio q heads with -inf
+            # Reset m old for every q_index_2_kv_index_ratio q heads with -inf.
+            # ``inf_fp_address`` is forwarded by the caller from
+            # ``scheduler["memory_layout"]["fp_sram"]["infinity"]`` (default 0
+            # per mem_layout_lib.json).  The previous hardcoded value 2 was
+            # the hid_reciprocal slot (~ 0.016 once seeded), which left the
+            # running-max init positive and broke flash-softmax accumulation.
             generated_code += reset_fpsram_code(
                 reset_start_address=m_fp_sram_start_address,
                 per_stride_dim=br,
                 stride_dist=3 * br,
                 reset_amount=q_index_2_kv_index_ratio,
-                reset_val_address=2,
+                reset_val_address=inf_fp_address,
                 alive_registers_fp=alive_registers_fp[0:1],
                 alive_registers_int=alive_registers_int[0:4],
             )
@@ -148,7 +168,10 @@ def flash_attn_asm(
                 # Now the S is in expected to stored in (blen, br, bc) in vsram
 
                 for inner_q_head_index in range(q_index_2_kv_index_ratio):
-                    # Per Q head level online softmax
+                    # Per Q head level online softmax.  ``attn_scale_fp_address``
+                    # is forwarded by the caller from
+                    # ``scheduler["memory_layout"]["fp_sram"]["attn_scale"]``
+                    # so this template no longer hardcodes the QK-scale slot.
                     generated_code += online_softmax_code(
                         mlen=mlen,
                         stage=stage,
@@ -156,7 +179,7 @@ def flash_attn_asm(
                         alive_registers_fp=alive_registers_fp[0:5],
                         s_address=s_base_address + inner_q_head_index * br * bc,
                         m_start_address=m_fp_sram_start_address,
-                        qk_scale_address=1,  # qk_scale preloaded at FP SRAM address 1
+                        qk_scale_address=attn_scale_fp_address,
                     )
                     # P is stored in s_base_address + inner_q_head_index * mlen * mlen, taking (blen, mlen, mlen) as a block
                     m_fp_sram_start_address += br * 3

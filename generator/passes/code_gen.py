@@ -221,7 +221,16 @@ def _generate_attention_code(
     # the dedicated q_scratch region rather than the old block2 alias.
     vsram_fa_base = _q_scratch
     fp_sram_map = scheduler["memory_layout"].get("fp_sram", {})
-    fp_sram_fa_base = fp_sram_map.get("silu_e", 3)
+    # ``silu_one`` is the canonical name (value = 1.0); fall back to legacy
+    # ``silu_e`` for older mem_layout_lib snapshots that pre-date the rename.
+    fp_sram_fa_base = fp_sram_map.get("silu_one", fp_sram_map.get("silu_e", 3))
+    # Drive the flash-attn template's QK-scale and -inf slot indices from the
+    # mem_layout_lib.json source of truth.  Previously these were hardcoded to
+    # 1 (eps) and 2 (hid_reciprocal) inside flash_attn_asm/online_softmax,
+    # which produced a worse-than-zero-fill state once PR #16 began seeding
+    # fp_sram.bin per the JSON convention.
+    attn_scale_fp = fp_sram_map.get("attn_scale", 5)
+    inf_fp = fp_sram_map.get("infinity", 0)
     k_hbm_reg = hbm_addr_reg.get("k_weight_offset", 0)
     v_hbm_reg = hbm_addr_reg.get("v_weight_offset", 0)
 
@@ -244,6 +253,8 @@ def _generate_attention_code(
             fp_sram_start_address=fp_sram_fa_base,
             k_base_hbm_offset_reg=k_hbm_reg,
             v_base_hbm_offset_reg=v_hbm_reg,
+            attn_scale_fp_address=attn_scale_fp,
+            inf_fp_address=inf_fp,
         )
     else:
         reason = (
@@ -267,12 +278,11 @@ def _generate_attention_code(
         s_addr = vsram.get("k_split_scratch", vsram.get("block2", 0))
         p_addr = _v_scratch  # safe: consumed after V in O = P @ V
         o_addr = vsram.get("attn_out_scratch", vsram.get("block4", 0))
-        # attn_scale = 1/sqrt(head_dim); the harness seeds this FP slot at
-        # runtime.  Falling back to slot 5 (the dedicated attn_scale slot in
-        # mem_layout_lib.json); older scheduler dicts missing the key get
-        # flagged by the 5 fallback rather than the catastrophic eps value.
-        scale_fp = fp_sram_map.get("attn_scale", 5)
-        neg_inf_fp = fp_sram_map.get("infinity", 0)
+        # Reuse the scheduler-derived slots extracted above.  The harness
+        # seeds attn_scale = 1/sqrt(head_dim) and infinity = -65504 at these
+        # FPRAM addresses (mem_layout_lib.json::fp_sram).
+        scale_fp = attn_scale_fp
+        neg_inf_fp = inf_fp
         code += f"\n; -- Bidirectional attention (compositional skeleton; {reason}) --\n"
         code += (
             f"; S = Q @ K^T  (shape: [{seq_len}, {seq_len}] per head, {num_heads} heads)\n"
@@ -364,7 +374,7 @@ def _generate_ffn_code(
                 # harness seeds FP slot 3 with 1.0 for SiLU sigmoid base; GELU
                 # reuses that same slot as its multiplicative identity.  Do
                 # not rename without also retargeting the harness preload.
-                const_one_fp_address=fp_sram.get("silu_e", 3),
+                const_one_fp_address=fp_sram.get("silu_one", fp_sram.get("silu_e", 3)),
                 const_1702_fp_address=fp_sram.get("gelu_1702", 4),
                 alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
                 # fc1 wrote here; GELU reads/writes in-place.
@@ -414,7 +424,8 @@ def _generate_ffn_code(
         gate_weight_hbm_offset_reg=ffn_gate_reg,
         up_weight_hbm_offset_reg=ffn_up_reg,
         down_weight_hbm_offset_reg=ffn_down_reg,
-        const_one_fp_address=scheduler["memory_layout"].get("fp_sram", {}).get("silu_e", 0),
+        const_one_fp_address=scheduler.get("memory_layout", {}).get("fp_sram", {}).get("silu_one",
+            scheduler.get("memory_layout", {}).get("fp_sram", {}).get("silu_e", 3)),
         activation_base_address=vsram.get("block1", 0),
         matrix_sram_size=hardware_config.get("MATRIX_SRAM_SIZE", 1024),
     )
@@ -433,8 +444,9 @@ def _generate_normalization_code(
     dims = node["dimensions"]
     hidden_size = dims["normalized_shape"]
     norm_type = dims.get("norm_type", "rms_norm")
-    eps_offset = scheduler.get("fp_sram", {}).get("eps", 0)
-    reci_hid_offset = scheduler.get("fp_sram", {}).get("hid_reciprocal", 0)
+    _fp_sram = scheduler.get("memory_layout", {}).get("fp_sram", {})
+    eps_offset = _fp_sram.get("eps", 1)
+    reci_hid_offset = _fp_sram.get("hid_reciprocal", 2)
     vlen = hardware_config.get("VLEN", 64)
     batch_size = model_info.get("batch_size", 1)
     activation_base = scheduler.get("vector_sram_addr", {}).get("block1", 0)
