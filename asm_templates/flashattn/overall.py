@@ -28,6 +28,7 @@ def flash_attn_asm(
     v_base_hbm_offset_reg: int,
     attn_scale_fp_address: int = 5,
     inf_fp_address: int = 0,
+    causal_mask: bool = True,
 ) -> str:
     """
     Args:
@@ -58,9 +59,11 @@ def flash_attn_asm(
     br = min(mlen, q_len)
     bc = min(mlen, kv_len)
 
-    # Assemptions
-    # In current Version (Not Complete)
-    assert blen == q_index_2_kv_index_ratio, "Blen must be equal to q_index_2_kv_index_ratio in current version"
+    # blen >= ratio is required so M_BTMM can process ratio heads in one call.
+    # Extra tiles (blen - ratio) are written but never read by softmax/PV.
+    assert blen >= q_index_2_kv_index_ratio, (
+        f"blen ({blen}) must be >= GQA ratio ({q_index_2_kv_index_ratio})"
+    )
 
     # Memory Layout:
     # -- FP SRAM --
@@ -81,10 +84,12 @@ def flash_attn_asm(
     q_base_address = vector_sram_base_address
     print(f"Q Base Address: {q_base_address}")
     # tmp S (MLEN, MLEN, blen) and also tmp P.
+    # M_BMM_WO writes blen tiles; allocate blen tiles even though only ratio are
+    # consumed by softmax/PV (the extra tiles are harmless dead writes).
     s_base_address = q_base_address + q_len * hq * d  # Q size = seq_len * num_q_heads * head_dim
     print(f"S Base Address: {s_base_address}")
     # PV (q_index_2_kv_index_ratio, mlen, mlen)
-    pv_base_address = s_base_address + mlen * mlen * q_index_2_kv_index_ratio
+    pv_base_address = s_base_address + mlen * mlen * blen
     print(f"PV Base Address: {pv_base_address}")
     # O_Old (q_len, HEAD_DIM * Hq * batch)
     o_old_base_address = pv_base_address + mlen * mlen * q_index_2_kv_index_ratio
@@ -161,7 +166,8 @@ def flash_attn_asm(
                     k_base_hbm_offset_reg=k_base_hbm_offset_reg,
                     q_head_index=kv_head_index * q_index_2_kv_index_ratio,
                     k_head_index=kv_head_index,
-                    s_base_address=s_base_address + kv_head_index * br * bc,
+                    s_base_address=s_base_address,  # S scratch reused per kv-head (no kv_head offset)
+                    s_head_offset=0,  # M_BMM_WO writes blen tiles starting at s_base
                 )
                 generated_code += reset_reg_asm(alive_registers_int[0:2])
 
@@ -180,6 +186,7 @@ def flash_attn_asm(
                         s_address=s_base_address + inner_q_head_index * br * bc,
                         m_start_address=m_fp_sram_start_address,
                         qk_scale_address=attn_scale_fp_address,
+                        causal_mask=causal_mask,
                     )
                     # P is stored in s_base_address + inner_q_head_index * mlen * mlen, taking (blen, mlen, mlen) as a block
                     m_fp_sram_start_address += br * 3

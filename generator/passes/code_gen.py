@@ -103,10 +103,9 @@ def _generate_attention_code(
     """Generate assembly code for attention operations.
 
     Handles both causal (Llama-style decoder) and bidirectional (SigLIP/ViT)
-    attention.  When ``dims["causal_mask"]`` is False we skip RoPE on Q/K and
-    annotate the block as bidirectional — the monolithic flash_attn template
-    does not accept a causal flag today, so the softmax step is emitted without
-    masking by design (matching SigLIP's full-visibility attention pattern).
+    attention with any GQA ratio (hq/hkv need not equal blen).
+    When ``dims["causal_mask"]`` is False we skip RoPE on Q/K and pass
+    ``causal_mask=False`` to ``flash_attn_asm`` for bidirectional softmax.
     """
 
     dims = node["dimensions"]
@@ -206,16 +205,7 @@ def _generate_attention_code(
         vlen=_proj_vlen,
     )
 
-    # Attention body. The flash_attn_asm template asserts
-    # `blen == q_index_2_kv_index_ratio` (= hq // hkv); for SigLIP/ViT
-    # hq == hkv so the ratio is 1 while hardware blen is typically 4.
-    # When that asymmetry blocks the monolithic template we emit a
-    # compositional skeleton (S = Q@K^T, scale + softmax, O = S@V) using
-    # the existing ISA mnemonics inline so the block is no longer just a
-    # placeholder comment. For decoder-style GQA where the ratio matches,
-    # we reuse the full flash_attn_asm template directly.
     num_kv_heads = dims.get("num_key_value_heads", num_heads)
-    q_index_2_kv_index_ratio = num_heads // max(num_kv_heads, 1)
     seq_len = model_info.get("seq_len", model_info.get("context_length", mlen))
     # flash_attn_asm uses ``vector_sram_base_address`` as the Q base; feed it
     # the dedicated q_scratch region rather than the old block2 alias.
@@ -234,78 +224,28 @@ def _generate_attention_code(
     k_hbm_reg = hbm_addr_reg.get("k_weight_offset", 0)
     v_hbm_reg = hbm_addr_reg.get("v_weight_offset", 0)
 
-    use_flash_template = causal_mask and q_index_2_kv_index_ratio == blen
-    if use_flash_template:
-        code += "\n; -- Flash attention (causal decoder, GQA-aware) --\n"
-        code += flash_attn_asm(
-            mlen=mlen,
-            vlen=hardware_config.get("VLEN", 64),
-            blen=blen,
-            batch=batch,
-            hq=num_heads,
-            hkv=num_kv_heads,
-            d=head_dim,
-            q_len=seq_len,
-            kv_len=seq_len,
-            alive_registers_int=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            alive_registers_fp=[1, 2, 3, 4, 5, 6, 7],
-            vector_sram_base_address=vsram_fa_base,
-            fp_sram_start_address=fp_sram_fa_base,
-            k_base_hbm_offset_reg=k_hbm_reg,
-            v_base_hbm_offset_reg=v_hbm_reg,
-            attn_scale_fp_address=attn_scale_fp,
-            inf_fp_address=inf_fp,
-        )
-    else:
-        reason = (
-            "bidirectional (ViT)"
-            if not causal_mask
-            else f"blen={blen} != q/kv ratio={q_index_2_kv_index_ratio}"
-        )
-        # Compositional skeleton: this emits instruction mnemonics for the
-        # three attention stages using registers disjoint from the Q/K/V
-        # projection epilogue. It is structural (non-tiled) and not a
-        # drop-in replacement for flash_attn; it exists so downstream
-        # tooling sees real opcodes instead of a bare comment.
-        #
-        # Addresses use the dedicated q_scratch/k_scratch/v_scratch regions
-        # (written by the three projections above) and a distinct
-        # attn_out_scratch for the output.  Intermediate S (Q@K^T) reuses
-        # k_split_scratch / block_fallback; P (softmax output) reuses
-        # v_scratch as working buffer after V has been consumed by O = P@V
-        # (NOTE: sequential semantics — P is not read until after we are
-        # done reading V, so the aliasing is safe in this skeleton).
-        s_addr = vsram.get("k_split_scratch", vsram.get("block2", 0))
-        p_addr = _v_scratch  # safe: consumed after V in O = P @ V
-        o_addr = vsram.get("attn_out_scratch", vsram.get("block4", 0))
-        # Reuse the scheduler-derived slots extracted above.  The harness
-        # seeds attn_scale = 1/sqrt(head_dim) and infinity = -65504 at these
-        # FPRAM addresses (mem_layout_lib.json::fp_sram).
-        scale_fp = attn_scale_fp
-        neg_inf_fp = inf_fp
-        code += f"\n; -- Bidirectional attention (compositional skeleton; {reason}) --\n"
-        code += (
-            f"; S = Q @ K^T  (shape: [{seq_len}, {seq_len}] per head, {num_heads} heads)\n"
-            f"S_ADDI_INT gp10, gp0, {_q_scratch}  ; Q base (written by Q projection)\n"
-            f"S_ADDI_INT gp14, gp0, {_k_scratch}  ; K base (written by K projection)\n"
-            f"S_ADDI_INT gp15, gp0, {_v_scratch}  ; V base (written by V projection)\n"
-            f"S_ADDI_INT gp11, gp0, {s_addr}  ; S scratch base\n"
-            f"M_MM_VV gp11, gp10, gp14, 0  ; Q @ K^T -> S\n"
-            f"; scale: S *= 1/sqrt(head_dim)\n"
-            f"S_LD_FP f1, gp0, {scale_fp}\n"
-            f"V_MUL_VF gp11, gp11, f1, 0\n"
-            f"; softmax(S) -> P  (bidirectional: no causal mask applied)\n"
-            f"S_ADDI_INT gp12, gp0, {p_addr}  ; P scratch base (reuses v_scratch)\n"
-            f"V_EXP_V gp12, gp11, 0\n"
-            f"V_RECI_V gp12, gp12, 0  ; normalize (placeholder; proper row-wise L1 norm TODO)\n"
-            f"; O = P @ V\n"
-            f"S_ADDI_INT gp13, gp0, {o_addr}  ; O output base (attn_out_scratch)\n"
-            f"M_MM_VV gp13, gp12, gp15, 0  ; P @ V -> O\n"
-            f"; NOTE: downstream RMSNorm reads from block1; the harness or a\n"
-            f"; follow-up copy pass is responsible for moving attn_out_scratch\n"
-            f"; -> block1 between the attention block and the residual add.\n"
-            f"; -- end bidirectional attention skeleton --\n"
-        )
+    attn_kind = "bidirectional" if not causal_mask else "causal decoder"
+    code += f"\n; -- Flash attention ({attn_kind}, GQA-aware) --\n"
+    code += flash_attn_asm(
+        mlen=mlen,
+        vlen=hardware_config.get("VLEN", 64),
+        blen=blen,
+        batch=batch,
+        hq=num_heads,
+        hkv=num_kv_heads,
+        d=head_dim,
+        q_len=seq_len,
+        kv_len=seq_len,
+        alive_registers_int=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        alive_registers_fp=[1, 2, 3, 4, 5, 6, 7],
+        vector_sram_base_address=vsram_fa_base,
+        fp_sram_start_address=fp_sram_fa_base,
+        k_base_hbm_offset_reg=k_hbm_reg,
+        v_base_hbm_offset_reg=v_hbm_reg,
+        attn_scale_fp_address=attn_scale_fp,
+        inf_fp_address=inf_fp,
+        causal_mask=causal_mask,
+    )
 
     return code.strip()
 

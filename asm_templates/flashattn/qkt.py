@@ -13,6 +13,7 @@ def qkt_multiply(
     q_head_index: int,
     k_head_index: int,
     s_base_address: int = 0,
+    s_head_offset: int = 0,
 ) -> str:
     """
     Args:
@@ -48,15 +49,17 @@ def qkt_multiply(
     generated_code += f"H_PREFETCH_M gp0, gp{k_base_register}, a{k_base_hbm_offset_reg}, 0, 1 \n"
 
     # QKT multiply
+    # s_head_offset is the relative head offset (0..ratio-1) for S writeback.
+    # q_head_index is absolute and used only for Q VRAM read addressing above.
     if stage == "prefill":
         generated_code += f"M_BTMM 0, gp{q_base_register}, gp0 \n"
-        assert s_base_address + q_head_index * mlen * mlen < IMM2_BOUND, "S base address is too large"
-        generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + q_head_index * mlen * mlen} \n"
+        assert s_base_address + s_head_offset * mlen * mlen < IMM2_BOUND, "S base address is too large"
+        generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen * mlen} \n"
         generated_code += f"M_BMM_WO gp{s_base_register}, 0 \n"
     else:
         generated_code += f"M_BTMV 0, gp{q_base_register}, gp0 \n"
-        assert s_base_address + q_head_index * mlen < IMM2_BOUND, "S base address is too large"
-        generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + q_head_index * mlen} \n"
+        assert s_base_address + s_head_offset * mlen < IMM2_BOUND, "S base address is too large"
+        generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen} \n"
         generated_code += f"M_BMV_WO gp{s_base_register}, 0 \n"
 
     return generated_code
