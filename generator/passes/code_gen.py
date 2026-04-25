@@ -49,13 +49,12 @@ def _generate_embedding_code(
     assert "act_block_width" in hardware_config, (
         "hardware_config missing 'act_block_width' — was hardware_parser() called?"
     )
-    assert "scale_width" in hardware_config, (
-        "hardware_config missing 'scale_width' — was hardware_parser() called?"
-    )
     assert "block_dim" in hardware_config, "hardware_config missing 'block_dim'"
     block_dim = hardware_config["block_dim"]
     act_block_width = hardware_config["act_block_width"]
-    scale_width = hardware_config["scale_width"]
+    # scale_width is intentionally excluded from voc_table_row_bytes; the
+    # emulator auto-derives scale byte offsets from the data byte offset
+    # (see main.rs:2031-2037).
 
     # HBM row stride for the vocab table.  The Rust emulator's H_PREFETCH_V
     # derives the scale byte-offset automatically from the data byte-offset
@@ -87,8 +86,8 @@ def _generate_embedding_code(
         batch=batch_size * seq_len,
         hidden_size=hidden_size,
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
-        activation_base_address=scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0),
-        voc_table_base_addr_reg_index=scheduler["register_assignment"]
+        activation_base_address=scheduler.get("memory_layout", {}).get("vector_sram_addr", {}).get("block1", 0),
+        voc_table_base_addr_reg_index=scheduler.get("register_assignment", {})
         .get("hbm_addr_reg", {})
         .get("token_table_offset", 0),
         input_ids=input_ids,

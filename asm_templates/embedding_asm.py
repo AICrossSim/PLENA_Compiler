@@ -56,11 +56,16 @@ def embedding_asm(
     assert len(alive_registers) >= 2, "embedding_asm needs at least 2 alive registers"
 
     rows_per_token = hidden_size // vlen
-    assert voc_table_row_bytes % rows_per_token == 0, (
-        f"voc_table_row_bytes {voc_table_row_bytes} must be divisible by rows_per_token "
-        f"{rows_per_token} (hidden_size // vlen)"
-    )
     hbm_bytes_per_vlen_chunk = voc_table_row_bytes // rows_per_token
+    assert hbm_bytes_per_vlen_chunk * rows_per_token == voc_table_row_bytes, (
+        f"stride mismatch: {hbm_bytes_per_vlen_chunk} * {rows_per_token} "
+        f"!= {voc_table_row_bytes}"
+    )
+    assert hbm_bytes_per_vlen_chunk < (1 << 18), (
+        f"hbm_bytes_per_vlen_chunk ({hbm_bytes_per_vlen_chunk}) exceeds S_ADDI_INT 18-bit immediate. "
+        f"Use addi_large_int_str for chunk advance."
+    )
+    assert vlen < (1 << 18), f"vlen ({vlen}) exceeds S_ADDI_INT 18-bit immediate"
 
     vram_dest_reg = alive_registers[0]
     hbm_offset_reg = alive_registers[1]
