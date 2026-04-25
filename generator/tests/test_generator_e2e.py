@@ -274,6 +274,20 @@ def _build_hbm_from_hf_weights(
         # Expand HBM size in that case; never truncate real weight data.
         pass
 
+    # Write hbm_size.txt sidecar — the actual max HBM byte offset the
+    # generated ASM may reference. emulator_runner.py reads this to size
+    # the HBM allocation precisely instead of using a 2× heuristic.
+    max_hbm_byte = max(
+        (s["offset"] + s["bytes"]) for s in summary.values()
+    ) if summary else hbm_size_bytes
+    # Add 10% headroom for any scratch/output regions the ASM may write
+    # past the last weight tensor.
+    hbm_required = ((int(max_hbm_byte * 1.1) + 63) // 64) * 64
+    hbm_size_path = hbm_path.parent / "hbm_size.txt"
+    hbm_size_path.write_text(str(hbm_required))
+    print(f"      hbm_size.txt: {hbm_required} bytes ({hbm_required / (1024*1024):.1f} MiB)")
+
+    summary["hbm_required"] = hbm_required
     return summary
 
 
