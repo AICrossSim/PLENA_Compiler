@@ -195,34 +195,51 @@ def _generate_attention_code(
         or q_index_2_kv_index_ratio % blen == 0
     )
     use_flash_template = causal_mask and flash_ratio_supported
+    flash_failure_reason: str | None = None
     if use_flash_template:
-        code += "\n; -- Flash attention (causal decoder, GQA-aware) --\n"
-        code += flash_attn_asm(
-            mlen=mlen,
-            vlen=hardware_config.get("VLEN", 64),
-            blen=blen,
-            batch=batch,
-            hq=num_heads,
-            hkv=num_kv_heads,
-            d=head_dim,
-            q_len=seq_len,
-            kv_len=seq_len,
-            alive_registers_int=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            alive_registers_fp=[1, 2, 3, 4, 5, 6, 7],
-            vector_sram_base_address=vsram_fa_base,
-            fp_sram_start_address=fp_sram_fa_base,
-            k_base_hbm_offset_reg=k_hbm_reg,
-            v_base_hbm_offset_reg=v_hbm_reg,
-        )
-    else:
-        reason = (
-            "bidirectional (ViT)"
-            if not causal_mask
-            else (
-                f"unsupported GQA ratio={q_index_2_kv_index_ratio} for blen={blen} "
-                f"(needs ratio<blen or ratio%blen==0)"
+        # Try the flash-attn template; if any internal assertion (e.g.
+        # qkt_multiply's S-base bound check) or value error fires, fall
+        # through to the compositional skeleton below rather than letting
+        # the exception propagate to the caller.
+        try:
+            flash_body = flash_attn_asm(
+                mlen=mlen,
+                vlen=hardware_config.get("VLEN", 64),
+                blen=blen,
+                batch=batch,
+                hq=num_heads,
+                hkv=num_kv_heads,
+                d=head_dim,
+                q_len=seq_len,
+                kv_len=seq_len,
+                alive_registers_int=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                alive_registers_fp=[1, 2, 3, 4, 5, 6, 7],
+                vector_sram_base_address=vsram_fa_base,
+                fp_sram_start_address=fp_sram_fa_base,
+                k_base_hbm_offset_reg=k_hbm_reg,
+                v_base_hbm_offset_reg=v_hbm_reg,
             )
-        )
+            code += "\n; -- Flash attention (causal decoder, GQA-aware) --\n"
+            code += flash_body
+        except (AssertionError, ValueError) as exc:
+            use_flash_template = False
+            flash_failure_reason = f"{exc.__class__.__name__}: {exc}"
+            code += (
+                f"\n; -- flash_attn_asm rejected ({flash_failure_reason}); "
+                f"falling back to compositional skeleton --\n"
+            )
+    if not use_flash_template:
+        if flash_failure_reason is not None:
+            reason = f"flash_attn_asm rejected ({flash_failure_reason})"
+        else:
+            reason = (
+                "bidirectional (ViT)"
+                if not causal_mask
+                else (
+                    f"unsupported GQA ratio={q_index_2_kv_index_ratio} for blen={blen} "
+                    f"(needs ratio<blen or ratio%blen==0)"
+                )
+            )
         # Compositional skeleton: this emits instruction mnemonics for the
         # three attention stages using registers disjoint from the Q/K/V
         # projection epilogue. It is structural (non-tiled) and not a

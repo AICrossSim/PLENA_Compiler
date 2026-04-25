@@ -10,7 +10,9 @@ Supports arbitrary GQA ratios (``ratio = hq // hkv``):
 * ``ratio < blen``: best-effort single-pass with ``effective_blen = ratio``.
   M_BTMM still emits its full ``blen``-wide block, but the inner softmax/PV/O
   loop only consumes the first ``ratio`` head slots.  Useful for SigLIP-style
-  MHA (ratio=1) where the redundant slots are inert.
+  MHA (ratio=1) where the redundant slots are inert (only when ``hkv == 1``;
+  for ``hkv > 1``, the absolute-Q-head writeback below ensures distinct
+  output columns regardless of ratio).
 * Other ratios (``ratio % blen != 0`` and ``ratio > blen``): the dispatch in
   ``_generate_attention_code`` falls back to the compositional skeleton.
 """
@@ -99,26 +101,25 @@ def flash_attn_asm(
     # - l old (MLEN) - 2
     # }
 
-    print("=" * 5, "VSRAM Memory Layout", "=" * 5)
     # -- Vector SRAM --
     # Q  (q_len, hq, d) - Q is stored with shape [seq_len, num_q_heads, head_dim]
     q_base_address = vector_sram_base_address
-    print(f"Q Base Address: {q_base_address}")
-    # tmp S (MLEN, MLEN, blen) and also tmp P. M_BTMM emits blen tile slots
-    # regardless of heads_per_pass, so we still allocate blen-sized scratch.
-    s_tile_count = max(blen, q_index_2_kv_index_ratio)
+    # tmp S and tmp P scratch.  qkt_multiply addresses S as
+    # ``s_base_address + absolute_q_head * mlen * mlen`` (using the absolute
+    # Q-head index across all kv-groups), so we must allocate one tile per Q
+    # head (``hq`` tiles total) -- not just ``ratio`` per kv-group, otherwise
+    # writes from kv_head_index > 0 spill into the PV-scratch region and
+    # corrupt downstream consumers.  Memory cost: ``hq * mlen * mlen``
+    # elements (e.g. 16 * 64 * 64 = 65536 elements for hq=16, mlen=64),
+    # which is acceptable for typical VRAM budgets.  We also keep at least
+    # ``blen`` tiles available because M_BTMM emits ``blen`` head slots per
+    # pass regardless of hq.
+    s_tile_count = max(blen, hq)
     s_base_address = q_base_address + q_len * hq * d  # Q size = seq_len * num_q_heads * head_dim
-    print(f"S Base Address: {s_base_address}")
     # PV (s_tile_count, mlen, mlen)
     pv_base_address = s_base_address + mlen * mlen * s_tile_count
-    print(f"PV Base Address: {pv_base_address}")
     # O_Old (q_len, HEAD_DIM * Hq * batch)
     o_old_base_address = pv_base_address + mlen * mlen * s_tile_count
-    print(f"O_Old Base Address: {o_old_base_address}")
-    print(
-        f"GQA: hq={hq}, hkv={hkv}, ratio={q_index_2_kv_index_ratio}, blen={blen}, "
-        f"num_q_passes={num_q_passes}, heads_per_pass={heads_per_pass}"
-    )
 
     generated_code = (
         f"; Flash Attention Generation (ratio={q_index_2_kv_index_ratio}, blen={blen}, "
@@ -137,8 +138,6 @@ def flash_attn_asm(
     for kv_head_index in range(hkv):
         # loop over per kv head kv_len // MLEN
         for _ in range(k_seq_iteration_number):
-            print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in GQA mode")
-
             # Reset m_fp_sram_start_address for each iteration.  The full
             # ``ratio`` head state lives in FP SRAM regardless of how many
             # passes process it.
@@ -250,7 +249,13 @@ def flash_attn_asm(
                         # in-kv-group head index as q_head_index for PV's
                         # internal P-tile addressing (which assumes a per-pass
                         # block of blen heads), then steer the write with the
-                        # absolute head_offset within the row.
+                        # ABSOLUTE Q-head index so distinct kv-heads do NOT
+                        # collide on the same packed-row column.  When
+                        # ``hkv > 1`` and ``ratio < blen`` (e.g. SigLIP with
+                        # hkv=4, ratio=1, blen=4) the in-group offset is
+                        # always 0 and every kv-head would otherwise write
+                        # column 0; absolute_q_head spreads them across
+                        # columns 0..hq-1.
                         generated_code += computing_pv_code(
                             head_dim=d,
                             blen=blen,
@@ -263,14 +268,16 @@ def flash_attn_asm(
                             q_head_index=inner_q_head_index,
                             v_head_index=kv_head_index,
                             output_base_address=pv_base_address,
-                            head_offset=in_group_q_head,
+                            head_offset=absolute_q_head,
                         )
 
                         generated_code += reset_reg_asm(alive_registers_int[0:6])
-                        # V_MASK selects the in-group head's columns within
-                        # the packed row.
+                        # V_MASK selects this Q head's column within the
+                        # packed row.  Use the ABSOLUTE Q-head index so that
+                        # distinct kv-heads write to distinct columns
+                        # (matches head_offset above).
                         generated_code += reset_vmask_asm(
-                            alive_registers_int[0], 1 << in_group_q_head
+                            alive_registers_int[0], 1 << absolute_q_head
                         )
                         generated_code += computing_o_code(
                             mlen=mlen,
