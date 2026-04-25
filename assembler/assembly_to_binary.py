@@ -107,6 +107,7 @@ class AssemblyToBinary:
             "M_TMV",
             "M_BTMM",
             "M_BTMV",
+            "M_MM_VV",
             # CSR: addr reg destination + 2 GP sources (a{N}, gp{X}, gp{Y} → rd, rs1, rs2)
             "C_SET_ADDR_REG",
         ]:

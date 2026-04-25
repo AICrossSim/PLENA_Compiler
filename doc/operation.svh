@@ -173,7 +173,10 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_SHIFT_V              = 6'h31,
     C_BREAK                = 6'h32,  // Rust emulator: 0x32 (V_SHFTL_V retired)
     V_PS_V                 = 6'h32,  // spec-only, not implemented in Rust emulator
-    C_HADAMARD_TRANSFORM   = 6'h33   // spec-only, not implemented in Rust emulator
+    C_HADAMARD_TRANSFORM   = 6'h33,  // spec-only, not implemented in Rust emulator
+
+    // Vector-Vector Matrix Multiply (compositional attention skeleton, e.g. SigLIP)
+    M_MM_VV                = 6'h34
 } CUSTOM_ISA_OPCODE;
 
 
