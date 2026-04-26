@@ -130,7 +130,7 @@ def flash_attn_asm(
                 alive_registers_int=alive_registers_int[0:4],
             )
 
-            # Reset l with zeros
+            # Reset l_old to zero (use hardware f0, not FP SRAM slot 0 which is -inf)
             generated_code += reset_fpsram_code(
                 reset_start_address=m_fp_sram_start_address + 2 * br,
                 per_stride_dim=br,
@@ -139,6 +139,7 @@ def flash_attn_asm(
                 reset_val_address=0,
                 alive_registers_fp=alive_registers_fp[0:1],
                 alive_registers_int=alive_registers_int[0:4],
+                use_zero_reg=True,
             )
 
             # Reset O_old with zeros
