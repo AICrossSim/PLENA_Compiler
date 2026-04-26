@@ -11,6 +11,7 @@ def reset_fpsram_code(
     reset_val_address: int,
     alive_registers_fp: list[int],
     alive_registers_int: list[int],
+    use_zero_reg: bool = False,
 ) -> str:
     """
     Args:
@@ -18,9 +19,13 @@ def reset_fpsram_code(
     per_stride_dim: the dimension of the reset per stride
     stride_dist: the stride distance between two consecutive resets
     reset_amount: the amount of the consecutive resets
-    reset_val_address: the address of the reset value
+    reset_val_address: the address of the reset value (FP SRAM slot to load from)
+    use_zero_reg: if True, use f0 (hardware zero register = 0.0) instead of
+        loading from FP SRAM.  This avoids accidentally loading a non-zero
+        sentinel (e.g. -inf at slot 0) when the intent is to zero-fill.
     """
-    generated_code = f"; Reset FPSRAM Code from {reset_start_address} to {reset_start_address + reset_amount * per_stride_dim} with value {reset_val_address}\n"
+    val_label = "f0(0.0)" if use_zero_reg else f"fp_sram[{reset_val_address}]"
+    generated_code = f"; Reset FPSRAM Code from {reset_start_address} to {reset_start_address + reset_amount * per_stride_dim} with value {val_label}\n"
 
     addr_register = alive_registers_int[0]
     outer_loop_register = alive_registers_int[1]
@@ -29,8 +34,17 @@ def reset_fpsram_code(
     fp_val_register = alive_registers_fp[0]
 
     generated_code += f"S_ADDI_INT gp{addr_register}, gp0, {reset_start_address} \n"
-    generated_code += f"S_ADDI_INT gp{offset_register}, gp0, {stride_dist} \n"
-    generated_code += f"S_LD_FP f{fp_val_register}, gp0, {reset_val_address} \n"
+    # offset_register tracks the base address of the next stride.  Initialize
+    # to reset_start_address + stride_dist so stride N starts at the correct
+    # absolute FP SRAM address (previous code started at stride_dist, dropping
+    # reset_start_address for strides >= 1).
+    generated_code += f"S_ADDI_INT gp{offset_register}, gp0, {reset_start_address + stride_dist} \n"
+    if use_zero_reg:
+        # Use f0 directly (hardware zero register = 0.0).  No S_LD_FP needed;
+        # assign fp_val_register to 0 so the ST below writes f0.
+        fp_val_register = 0
+    else:
+        generated_code += f"S_LD_FP f{fp_val_register}, gp0, {reset_val_address} \n"
 
     # Total iterations = reset_amount * per_stride_dim
     if reset_amount > 1:
