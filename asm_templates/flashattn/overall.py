@@ -130,7 +130,11 @@ def flash_attn_asm(
                 alive_registers_int=alive_registers_int[0:4],
             )
 
-            # Reset l with zeros
+            # Reset l with zeros.  Use the hardware zero register (f0 = 0.0)
+            # rather than loading from FP SRAM slot 0 — slot 0 holds the -inf
+            # sentinel, not 0.0.  Initializing l_old to -inf instead of 0
+            # causes l to stay -inf throughout the online softmax accumulation,
+            # leading to O / l = NaN in the final row-wise normalization.
             generated_code += reset_fpsram_code(
                 reset_start_address=m_fp_sram_start_address + 2 * br,
                 per_stride_dim=br,
@@ -139,6 +143,7 @@ def flash_attn_asm(
                 reset_val_address=0,
                 alive_registers_fp=alive_registers_fp[0:1],
                 alive_registers_int=alive_registers_int[0:4],
+                use_zero_reg=True,
             )
 
             # Reset O_old with zeros
