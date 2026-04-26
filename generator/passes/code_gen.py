@@ -15,6 +15,7 @@ from asm_templates import (
     flash_attn_asm,
     gelu_asm,
     im2col_asm,
+    im2col_asm_no_shift,
     layer_norm_asm,
     lm_head_asm,
     projection_asm,
@@ -473,23 +474,60 @@ def _generate_conv2d_code(
 ; im2col output shape: ({M}, {K_col})
 """
 
-    # Step 1: im2col  (requires K | vlen for multi-tile; patch_size=16, vlen=64 satisfies this)
-    code += im2col_asm(
-        mlen=mlen,
-        vlen=vlen,
-        C_in=in_channels,
-        H=image_size,
-        W=image_size,
-        K=patch_size,
-        OH=OH,
-        OW=OW,
-        M=M,
-        alive_registers=alive_registers,
-        input_hbm_base_addr_reg=input_hbm_base_addr_reg,
-        mask_vec_vram_addr=mask_vec_vram_addr,
-        scratch_vram_addr=scratch_vram_addr,
-        output_vram_base=output_vram_base,
-    )
+    conv_stride = dims.get("stride", patch_size)
+
+    # Check whether every output column produces a 64-aligned HBM pixel
+    # offset.  When it does, the fast V_SHIFT_V template can be used;
+    # otherwise fall back to the no-shift (basis-vector) template which
+    # handles arbitrary alignment via per-element extraction.
+    _all_cols_aligned = all((ow * conv_stride) % 64 == 0 for ow in range(OW))
+
+    # Step 1: im2col
+    if _all_cols_aligned:
+        code += im2col_asm(
+            mlen=mlen,
+            vlen=vlen,
+            C_in=in_channels,
+            H=image_size,
+            W=image_size,
+            K=patch_size,
+            OH=OH,
+            OW=OW,
+            M=M,
+            alive_registers=alive_registers,
+            input_hbm_base_addr_reg=input_hbm_base_addr_reg,
+            mask_vec_vram_addr=mask_vec_vram_addr,
+            scratch_vram_addr=scratch_vram_addr,
+            output_vram_base=output_vram_base,
+            stride=conv_stride,
+        )
+    else:
+        # Fall back to no-shift template: tolerates non-64-aligned pixel
+        # columns by loading from the aligned row base and offsetting the
+        # basis-vector index.
+        # basis_vram_base sits after the mask area; temp_vram sits after basis vectors.
+        _max_intra = max((ow * conv_stride) % 64 for ow in range(OW))
+        _num_basis = len({(ow * conv_stride) % 64 + kc for ow in range(OW) for kc in range(patch_size)})
+        basis_vram_base = mask_vec_vram_addr + vlen  # after mask row
+        temp_vram_addr = basis_vram_base + _num_basis * vlen
+        code += im2col_asm_no_shift(
+            mlen=mlen,
+            vlen=vlen,
+            C_in=in_channels,
+            H=image_size,
+            W=image_size,
+            K=patch_size,
+            OH=OH,
+            OW=OW,
+            M=M,
+            alive_registers=alive_registers,
+            input_hbm_base_addr_reg=input_hbm_base_addr_reg,
+            basis_vram_base=basis_vram_base,
+            scratch_vram_addr=scratch_vram_addr,
+            temp_vram_addr=temp_vram_addr,
+            output_vram_base=output_vram_base,
+            stride=conv_stride,
+        )
 
     # Step 2: matmul against the Conv2d weight (C_out, K_col).
     # Reuse projection_asm with out_features=C_out.
