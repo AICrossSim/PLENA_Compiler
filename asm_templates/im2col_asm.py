@@ -8,19 +8,27 @@ C_in channels -- i.e. length C_in*K*K.
 
 Algorithm per output row m:
     oh = m // OW,  ow = m % OW
+    pixel_row = oh * stride + kr
+    pixel_col = ow * stride
     accum = zeros(VLEN)
     for c in 0 .. C_in-1:
         for kr in 0 .. K-1:
-            hbm_off = c*H*W + (oh+kr)*W + ow      # start of K contiguous elements
+            hbm_off = c*H*W_padded + pixel_row*W_padded + pixel_col
             tmp = load_from_hbm(hbm_off)            # VLEN elements, first K useful
-            tmp = tmp * mask_vec                    # zero out positions K..VLEN-1
+            tmp = tmp * mask_vec                     # zero out positions K..VLEN-1
             shift_amt = c*K*K + kr*K
-            tmp = right_shift(tmp, shift_amt)       # place K elements at target position
+            tmp = right_shift(tmp, shift_amt)        # place K elements at target position
             accum += tmp
     store accum -> output_vram[m]
 
 The mask vector [1,1,..,1, 0,..,0] (K ones followed by VLEN-K zeros) must be
 preloaded into VRAM at mask_vec_vram_addr by the host before execution.
+
+HBM alignment: H_PREFETCH_V requires the element address to be a multiple of
+64.  When stride==1 and W_padded is a multiple of 64, the column offset ``ow``
+is in 0..OW-1 and may not be 64-aligned.  This template requires that
+``ow * stride`` is always a multiple of 64 for every ow.  The code_gen layer
+should route to ``im2col_asm_no_shift`` when this cannot be guaranteed.
 """
 
 from ._imm import load_large_int as _load_large_int_list
@@ -46,6 +54,7 @@ def im2col_asm(
     W_padded: int | None = None,
     fp_one_reg: int = 1,  # FP register holding 1.0 (must be in fp_preload[fp_one_reg])
     fp_sram_precious_slots: list | None = None,  # fp_sram slots to save before mask construction
+    stride: int = 1,  # convolution stride (patch_size for patch-embedding Conv2d)
 ) -> str:
     """
     Generate PLENA assembly for on-chip im2col.
@@ -77,6 +86,10 @@ def im2col_asm(
             elements = 4 * 64 = 256 slots).
         output_vram_base:
             VRAM base address for the M im2col output rows.
+        stride:
+            Convolution stride (default 1).  Every ``ow * stride`` must be a
+            multiple of 64 for HBM alignment.  When this cannot be guaranteed,
+            use ``im2col_asm_no_shift`` instead.
 
     Returns:
         Generated assembly code as a string.
@@ -102,6 +115,14 @@ def im2col_asm(
     if W_padded is None:
         W_padded = W
 
+    # Validate HBM alignment: every pixel column offset must be 64-aligned.
+    for ow in range(OW):
+        pixel_col = ow * stride
+        assert pixel_col % 64 == 0, (
+            f"im2col_asm: ow={ow}, pixel_col={pixel_col} is not 64-aligned. "
+            f"Use im2col_asm_no_shift for stride={stride} with non-64-aligned columns."
+        )
+
     # Compute save f_regs for precious fp_sram slots (mirrors im2col_asm_no_shift).
     # Mask construction zeroes fp_sram[0..VLEN-1] then writes mask values, corrupting
     # any pre-loaded values in those slots. Hardware supports f_regs 0..7 only.
@@ -119,7 +140,7 @@ def im2col_asm(
     lines.append("; ============================================================")
     lines.append("; im2col (with V_SHIFT_V): NCHW input in HBM -> im2col matrix in VRAM")
     lines.append(f";   input shape : (1, {C_in}, {H}, {W})  in HBM (W_padded={W_padded})")
-    lines.append(f";   kernel      : {K}x{K},  OH={OH}, OW={OW}")
+    lines.append(f";   kernel      : {K}x{K},  OH={OH}, OW={OW}, stride={stride}")
     lines.append(f";   output      : ({M}, {K_col}) in VRAM starting at {output_vram_base}")
     lines.append(f"; Requires: f0=0.0 (hw const), fp_preload[{fp_one_reg}]=1.0")
     lines.append("; ============================================================")
@@ -191,6 +212,9 @@ def im2col_asm(
             ow = m % OW
             out_vram_addr = output_vram_base + tile_t * M * vlen + m * vlen
 
+            # Stride-aware pixel column (guaranteed 64-aligned by assertion above).
+            pixel_col = ow * stride
+
             lines.append("")
             lines.append(f"; ---- tile={tile_t} output row m={m}  (oh={oh}, ow={ow}) ----")
 
@@ -216,8 +240,9 @@ def im2col_asm(
 
                     local_shift = g - tile_start
 
-                    # HBM offset for this (c, kr, ow) combination.
-                    hbm_offset = (c * H + (oh + kr)) * W_padded + ow
+                    # Stride-aware pixel row and HBM offset (64-aligned).
+                    pixel_row = oh * stride + kr
+                    hbm_offset = (c * H + pixel_row) * W_padded + pixel_col
 
                     # Load K contiguous elements from HBM into scratch row.
                     lines.extend(_load_large_int_list(hbm_off_reg, hbm_offset))
