@@ -78,6 +78,8 @@ from emulator_runner import run_emulator  # noqa: E402
 from transactional_emulator.tools.check_mem import read_bin_file_as_array  # noqa: E402
 
 
+
+
 def _build_hbm_from_hf_weights(
     model_id: str,
     seq_len: int,
@@ -273,6 +275,21 @@ def _build_hbm_from_hf_weights(
     elif final_bytes > hbm_size_bytes:
         # Expand HBM size in that case; never truncate real weight data.
         pass
+
+    # Write hbm_size.txt sidecar — the actual max HBM byte offset the
+    # generated ASM may reference. emulator_runner.py reads this to size
+    # the HBM allocation precisely instead of using a 2× heuristic.
+    if summary:
+        max_hbm_byte = max(
+            (s["offset"] + s["bytes"]) for s in summary.values()
+        )
+        # Exact sizing: the generator ASM only reads from HBM (H_PREFETCH_V/M
+        # for weights). No writes past the weight region. If KV cache writeback
+        # is added later, the codegen should update this sidecar accordingly.
+        hbm_required = ((max_hbm_byte + 63) // 64) * 64
+        hbm_size_path = hbm_path.parent / "hbm_size.txt"
+        hbm_size_path.write_text(str(hbm_required) + "\n")
+        print(f"      hbm_size.txt: {hbm_required} bytes ({hbm_required / (1024*1024):.1f} MiB)")
 
     return summary
 
