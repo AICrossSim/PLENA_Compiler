@@ -521,6 +521,41 @@ def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128, num_layer
     return 0
 
 
+def run_test_aten(
+    model_id: str = "AICrossSim/clm-60m",
+    seq_len: int = 64,
+    num_layers: int = 1,
+) -> int:
+    """Run the ATen-backed e2e pipeline (PlenaCompiler + ops.*).
+
+    Unlike ``run_test`` which uses the generator's own codegen path and has
+    numerical verification deferred, this immediately gets full numerical
+    correctness via the mature ATen compilation backend.
+    """
+    from generator.aten_runner import run_aten_e2e
+
+    print("=" * 80)
+    print(f"Generator e2e harness (ATen backend) — {model_id} — "
+          f"seq_len={seq_len}, num_layers={num_layers}")
+    print("=" * 80)
+
+    result = run_aten_e2e(
+        model_id=model_id,
+        seq_len=seq_len,
+        num_layers=num_layers,
+    )
+
+    if result.get("passed"):
+        rate = result.get("allclose_match_rate", 0)
+        print(f"\n[PASS] ATen e2e — allclose={rate:.2f}%, "
+              f"elapsed={result.get('elapsed_s', 0):.1f}s")
+        return 0
+    else:
+        error = result.get("error", "numerical check failed")
+        print(f"\n[FAIL] ATen e2e — {error}")
+        return 1
+
+
 if __name__ == "__main__":
     import argparse as _argparse
     _ap = _argparse.ArgumentParser(description="Generator e2e harness")
@@ -528,5 +563,14 @@ if __name__ == "__main__":
     _ap.add_argument("seq_len", nargs="?", type=int, default=128)
     _ap.add_argument("--num-layers", type=int, default=None,
                      help="Override num_hidden_layers (e.g. 1 for fast e2e runs, ~22x less ASM)")
+    _ap.add_argument("--aten", action="store_true",
+                     help="Use ATen backend (PlenaCompiler + ops.*) instead of generator codegen")
     _args = _ap.parse_args()
-    sys.exit(run_test(_args.model_id, _args.seq_len, num_layers=_args.num_layers))
+    if _args.aten:
+        sys.exit(run_test_aten(
+            _args.model_id,
+            _args.seq_len,
+            num_layers=_args.num_layers if _args.num_layers is not None else 1,
+        ))
+    else:
+        sys.exit(run_test(_args.model_id, _args.seq_len, num_layers=_args.num_layers))
