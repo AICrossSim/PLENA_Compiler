@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Generator runner — unified CLI for both codegen and ATen compilation modes.
+PLENA Generator Runner -- entry point for both compilation pipelines.
 
 Modes:
-    codegen   — generator's own symbolic-graph → ISA pipeline (ASM output only)
-    aten      — PlenaCompiler + ops.* numerically-verified e2e pipeline
-    utilization — PE utilization analysis (no ISA emitted)
+  codegen      -- Pipeline 2 (Generator): HF config -> symbolic graph ->
+                  code_gen_pass -> ASM. Valid ISA for analysis/profiling;
+                  numerically incomplete (HBM address registers not set).
+  aten         -- Pipeline 1 (ATen): HF model -> PlenaCompiler -> verified
+                  ISA. Numerically verified, 98-100% allclose.
+  utilization  -- PE utilization analysis report (no ISA emitted).
 
 Examples:
     python -m generator.runner codegen AICrossSim/clm-60m output.asm --seq-len 512
     python -m generator.runner aten AICrossSim/clm-60m --seq-len 32 --num-layers 1
-    python -m generator.runner utilization AICrossSim/clm-60m dummy.asm --seq-len 512
+
+See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
 
 import argparse
