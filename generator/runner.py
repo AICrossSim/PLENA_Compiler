@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""
+Generator runner — unified CLI for both codegen and ATen compilation modes.
+
+Modes:
+    codegen   — generator's own symbolic-graph → ISA pipeline (ASM output only)
+    aten      — PlenaCompiler + ops.* numerically-verified e2e pipeline
+    utilization — PE utilization analysis (no ISA emitted)
+
+Examples:
+    python -m generator.runner codegen AICrossSim/clm-60m output.asm --seq-len 512
+    python -m generator.runner aten AICrossSim/clm-60m --seq-len 32 --num-layers 1
+    python -m generator.runner utilization AICrossSim/clm-60m dummy.asm --seq-len 512
+"""
 
 import argparse
 import sys
@@ -10,32 +23,42 @@ from generator.passes.utilization_report import analyse_overall_utilization
 from generator.scheduler import gen_scheduler
 
 
-def run():
-    if len(sys.argv) < 4:
-        print("Usage: python -m generator.runner <mode> <model_name_or_path> <output_file.asm> [--seq-len N]")
-        print("Example: python -m generator.runner codegen AICrossSim/clm-60m output.asm --seq-len 512")
-        return
-    mode = sys.argv[1]
-    model_path = sys.argv[2]
-    output_file = sys.argv[3]
+def _run_aten(args) -> int:
+    """ATen-backed end-to-end: PlenaCompiler + ops.* → emulator → numerical check."""
+    from generator.aten_runner import run_aten_e2e
 
-    # Parse optional arguments after the positional ones
-    arg_parser = argparse.ArgumentParser(add_help=False)
-    arg_parser.add_argument("--seq-len", type=int, default=512)
-    arg_parser.add_argument("--num-layers", type=int, default=None,
-                            help="Override num_hidden_layers in model config (e.g. 1 for fast e2e runs)")
-    extra_args, _ = arg_parser.parse_known_args(sys.argv[4:])
-    seq_len = extra_args.seq_len
-    num_layers_override = extra_args.num_layers
+    result = run_aten_e2e(
+        model_id=args.model_path,
+        seq_len=args.seq_len,
+        num_layers=args.num_layers if args.num_layers is not None else 1,
+        build_dir=args.build_dir,
+        trust_remote_code=args.trust_remote_code,
+        partial_load=args.partial_load,
+    )
+    return 0 if result["passed"] else 1
+
+
+def _run_codegen(args) -> int:
+    """Original generator codegen path — symbolic graph → ISA → .asm file."""
+    model_path = args.model_path
+    output_file = args.output_file
+    seq_len = args.seq_len
+    num_layers_override = args.num_layers
+
+    if output_file is None:
+        print("Error: codegen mode requires an output .asm file")
+        print("Usage: python -m generator.runner codegen <model> <output.asm> [--seq-len N]")
+        return 1
+
     hardware_config_path = Path(__file__).resolve().parents[1] / "doc" / "configuration.svh"
     precision_config_path = Path(__file__).resolve().parents[1] / "doc" / "precision.svh"
     mem_layout_lib_path = Path(__file__).resolve().parents[0] / "scheduler" / "mem_layout_lib.json"
     reg_assignment_lib_path = Path(__file__).resolve().parents[0] / "scheduler" / "reg_assignment_lib.json"
-    # Validate that output file ends with .asm
+
     if not output_file.endswith(".asm"):
         print("Error: Output file must end with .asm extension")
-        print("Example: python runner.py AICrossSim/clm-60m output.asm")
-        return
+        print("Example: python -m generator.runner codegen AICrossSim/clm-60m output.asm")
+        return 1
 
     print(f"Loading model: {model_path}")
     parser = LLMModelParser(model_path)
@@ -103,14 +126,14 @@ def run():
         model_info["has_vision"] = False
 
     # Run code generation pass
-    if mode == "utilization":
+    if args.mode == "utilization":
         m_dim = 64
         k_dim = 64
         n_dim = 64
         print("\nRunning utilization analysis...")
         utilization_report = analyse_overall_utilization(symbolic_graph, model_info, m_dim, k_dim, n_dim)
         print(f"Utilization Report:\n{utilization_report}")
-        return
+        return 0
 
     hardware_config = hardware_parser(hardware_config_path, precision_config_path)
     scheduler = gen_scheduler(hardware_config, model_info, mem_layout_lib_path, reg_assignment_lib_path)
@@ -133,6 +156,42 @@ def run():
     if len(lines) > 20:
         print(f"... and {len(lines) - 20} more lines")
     print("=" * 50)
+    return 0
+
+
+def run():
+    # Use proper argparse for all modes
+    parser = argparse.ArgumentParser(
+        description="Generator runner — codegen and ATen compilation modes",
+        prog="python -m generator.runner",
+    )
+    parser.add_argument("mode", choices=["codegen", "aten", "utilization"],
+                        help="Execution mode: codegen (ASM generation), "
+                             "aten (PlenaCompiler e2e with emulator), "
+                             "utilization (PE utilization report)")
+    parser.add_argument("model_path", help="HuggingFace model ID (e.g. AICrossSim/clm-60m)")
+    parser.add_argument("output_file", nargs="?", default=None,
+                        help="Output .asm file (required for codegen/utilization, ignored for aten)")
+    parser.add_argument("--seq-len", type=int, default=512,
+                        help="Sequence length (default: 512 for codegen, 64 for aten)")
+    parser.add_argument("--num-layers", type=int, default=None,
+                        help="Override num_hidden_layers in model config")
+    parser.add_argument("--build-dir", type=str, default=None,
+                        help="Build directory for aten mode sim artifacts")
+    parser.add_argument("--trust-remote-code", action="store_true",
+                        help="Trust remote code for HF model loading (aten mode)")
+    parser.add_argument("--partial-load", action="store_true",
+                        help="Load only needed weight shards for large models (aten mode)")
+
+    args = parser.parse_args()
+
+    if args.mode == "aten":
+        # Default seq_len for aten mode is 64 (sim-optimal), not 512
+        if "--seq-len" not in sys.argv:
+            args.seq_len = 64
+        return _run_aten(args)
+    else:
+        return _run_codegen(args)
 
 
 if __name__ == "__main__":
