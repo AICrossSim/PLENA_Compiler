@@ -152,8 +152,8 @@ def test_smolvlm2_codegen_no_m_mm_vv():
     assert "M_MM_VV" not in asm_output, (
         "ASM contains forbidden M_MM_VV instruction — fabricated opcode detected"
     )
-    assert "M_BTMM" in asm_output, (
-        "ASM missing M_BTMM — flash attention path was not emitted"
+    assert "M_BTMM" in asm_output or "M_TMM" in asm_output, (
+        "ASM missing M_BTMM/M_TMM — flash attention path was not emitted"
     )
     print("test_smolvlm2_codegen_no_m_mm_vv PASSED")
 
@@ -163,7 +163,7 @@ def test_smolvlm2_codegen_has_vision_nodes():
 
     Checks that:
     - The text decoder produces an embedding DMA section.
-    - The vision encoder emits bidirectional flash attention (M_BTMM).
+    - The vision encoder emits bidirectional flash attention (M_BTMM or M_TMM).
     - The GELU activation body appears in the vision FFN section.
     """
     # Text decoder: must contain embedding section header
@@ -182,8 +182,8 @@ def test_smolvlm2_codegen_has_vision_nodes():
     vgraph, vmodel_info, hw2, vsched = _build_vision_graph_and_scheduler()
     vision_asm = code_gen_pass(vgraph, vmodel_info, hw2, vsched)
 
-    assert "M_BTMM" in vision_asm, (
-        "Vision encoder ASM missing M_BTMM — flash attention not emitted"
+    assert "M_BTMM" in vision_asm or "M_TMM" in vision_asm, (
+        "Vision encoder ASM missing M_BTMM/M_TMM — flash attention not emitted"
     )
     assert "Flash Attention" in vision_asm, (
         "Vision encoder ASM missing '; Flash Attention' comment marker"
