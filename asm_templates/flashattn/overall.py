@@ -59,11 +59,11 @@ def flash_attn_asm(
     br = min(mlen, q_len)
     bc = min(mlen, kv_len)
 
-    # blen >= ratio is required so M_BTMM can process ratio heads in one call.
-    # Extra tiles (blen - ratio) are written but never read by softmax/PV.
-    assert blen >= q_index_2_kv_index_ratio, (
-        f"blen ({blen}) must be >= GQA ratio ({q_index_2_kv_index_ratio})"
-    )
+    # Batched path (M_BTMM) when ratio == blen — maximum throughput.
+    # Per-head path (M_TMM) for all other ratios — avoids M_BTMM over-read
+    # panic when ratio < blen (the extra blen-ratio "dummy" heads would read
+    # Q past the kv-group allocation).
+    use_batched = q_index_2_kv_index_ratio == blen
 
     # Memory Layout:
     # -- FP SRAM --
@@ -83,13 +83,15 @@ def flash_attn_asm(
     # Q  (q_len, hq, d) - Q is stored with shape [seq_len, num_q_heads, head_dim]
     q_base_address = vector_sram_base_address
     print(f"Q Base Address: {q_base_address}")
-    # tmp S (MLEN, MLEN, blen) and also tmp P.
-    # M_BMM_WO writes blen tiles; allocate blen tiles even though only ratio are
-    # consumed by softmax/PV (the extra tiles are harmless dead writes).
+    # tmp S (MLEN, MLEN, s_tile_count) and also tmp P.
+    # Batched path: M_BMM_WO writes blen tiles; allocate blen tiles even though
+    # only ratio are consumed by softmax/PV (harmless dead writes).
+    # Per-head path: only 1 S tile needed at a time (reused per head).
+    s_tile_count = blen if use_batched else 1
     s_base_address = q_base_address + q_len * hq * d  # Q size = seq_len * num_q_heads * head_dim
     print(f"S Base Address: {s_base_address}")
     # PV (q_index_2_kv_index_ratio, mlen, mlen)
-    pv_base_address = s_base_address + mlen * mlen * blen
+    pv_base_address = s_base_address + mlen * mlen * s_tile_count
     print(f"PV Base Address: {pv_base_address}")
     # O_Old (q_len, HEAD_DIM * Hq * batch)
     o_old_base_address = pv_base_address + mlen * mlen * q_index_2_kv_index_ratio
@@ -154,42 +156,70 @@ def flash_attn_asm(
 
             # # loop over per q_index_2_kv_index_ratio q heads (q_len // MLEN), compute q_index_2_kv_index_ratio heads in parallel.
             for _ in range(q_seq_iteration_number):
-                # Compute S = QKT result for this Q head
-                # Q layout: (batch, s_q, num_q_heads, h_qkv) -> qkt_multiply adds q_head_index * d internally
-                # Q row stride = (hq * d) / mlen = total elements per token / mlen
                 stored_m_fp_res_address = m_fp_sram_start_address + br
-                generated_code += qkt_multiply(
-                    d=d,
-                    mlen=mlen,
-                    stage=stage,
-                    alive_registers=alive_registers_int[0:2],
-                    q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
-                    k_base_hbm_offset_reg=k_base_hbm_offset_reg,
-                    q_head_index=kv_head_index * q_index_2_kv_index_ratio,
-                    k_head_index=kv_head_index,
-                    s_base_address=s_base_address,  # S scratch reused per kv-head (no kv_head offset)
-                    s_head_offset=0,  # M_BMM_WO writes blen tiles starting at s_base
-                )
-                generated_code += reset_reg_asm(alive_registers_int[0:2])
 
-                # Now the S is in expected to stored in (blen, br, bc) in vsram
+                if use_batched:
+                    # --- Batched path: M_BTMM computes all ratio heads at once ---
+                    # Q layout: (batch, s_q, num_q_heads, h_qkv)
+                    generated_code += qkt_multiply(
+                        d=d,
+                        mlen=mlen,
+                        stage=stage,
+                        alive_registers=alive_registers_int[0:2],
+                        q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                        k_base_hbm_offset_reg=k_base_hbm_offset_reg,
+                        q_head_index=kv_head_index * q_index_2_kv_index_ratio,
+                        k_head_index=kv_head_index,
+                        s_base_address=s_base_address,
+                        s_head_offset=0,
+                        use_batched=True,
+                        blen=blen,
+                    )
+                    generated_code += reset_reg_asm(alive_registers_int[0:2])
 
                 for inner_q_head_index in range(q_index_2_kv_index_ratio):
+                    if not use_batched:
+                        # --- Per-head path: M_TMM computes one head's QKT ---
+                        # K prefetch is inside qkt_multiply (one H_PREFETCH_M
+                        # per head).  Since MSRAM tile 0 is reloaded each time,
+                        # the K data is always fresh.
+                        abs_q_head = kv_head_index * q_index_2_kv_index_ratio + inner_q_head_index
+                        generated_code += qkt_multiply(
+                            d=d,
+                            mlen=mlen,
+                            stage=stage,
+                            alive_registers=alive_registers_int[0:9],
+                            q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                            k_base_hbm_offset_reg=k_base_hbm_offset_reg,
+                            q_head_index=abs_q_head,
+                            k_head_index=kv_head_index,
+                            s_base_address=s_base_address,
+                            s_head_offset=0,  # single S tile, always at offset 0
+                            use_batched=False,
+                            blen=blen,
+                        )
+                        generated_code += reset_reg_asm(alive_registers_int[0:9])
+
                     # Per Q head level online softmax.  ``attn_scale_fp_address``
                     # is forwarded by the caller from
                     # ``scheduler["memory_layout"]["fp_sram"]["attn_scale"]``
                     # so this template no longer hardcodes the QK-scale slot.
+                    #
+                    # For batched path: S tiles are at s_base + head * br * bc.
+                    # For per-head path: S tile is always at s_base (offset 0).
+                    s_softmax_addr = s_base_address + (inner_q_head_index * br * bc if use_batched else 0)
                     generated_code += online_softmax_code(
                         mlen=mlen,
                         stage=stage,
                         alive_registers_int=alive_registers_int[0:5],
                         alive_registers_fp=alive_registers_fp[0:5],
-                        s_address=s_base_address + inner_q_head_index * br * bc,
+                        s_address=s_softmax_addr,
                         m_start_address=m_fp_sram_start_address,
                         qk_scale_address=attn_scale_fp_address,
                         causal_mask=causal_mask,
                     )
-                    # P is stored in s_base_address + inner_q_head_index * mlen * mlen, taking (blen, mlen, mlen) as a block
+                    # P is stored in s_base_address (per-head) or
+                    # s_base_address + inner_q_head_index * mlen * mlen (batched)
                     m_fp_sram_start_address += br * 3
                     generated_code += reset_fpreg_asm(alive_registers_fp[0:6])
                     generated_code += reset_reg_asm(alive_registers_int[0:6])
