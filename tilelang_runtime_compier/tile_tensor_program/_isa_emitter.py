@@ -8,13 +8,14 @@ the program object.
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-from compiler.asm_templates import preload_addr_reg_asm
+from compiler.asm_templates import preload_addr_reg_asm, reset_reg_asm
 
 from ._types import *  # noqa: F401,F403
 from ._helpers import *  # noqa: F401,F403
@@ -25,6 +26,124 @@ class ISAEmitter:
 
     def __init__(self, program: "TileTensorProgram") -> None:
         self.program = program
+
+    def _emit_preload_tile_isa(
+        self,
+        *,
+        vlen: int,
+        preload_len: int,
+        batch: int,
+        hidden_size: int,
+        act_vram_offset: int,
+        alive_registers: List[int],
+        activation_offset_reg: int,
+        stride_size: Optional[int] = None,
+        scale_size: Optional[int] = None,
+        hbm_start_offset: int = 0,
+    ) -> str:
+        generated_code = "; Preload Activation Generation \n"
+        a_actual_register = alive_registers[0]
+        set_stride_register = alive_registers[1]
+        result_register = alive_registers[2]
+        outer_loop_register = alive_registers[3]
+        inner_loop_register = alive_registers[4]
+
+        stride_len = vlen if stride_size is None else int(stride_size)
+        scale_len = hidden_size * batch if scale_size is None else int(scale_size)
+        load_amount_per_hidden = math.ceil(hidden_size / vlen)
+
+        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {scale_len} \n"
+        generated_code += f"C_SET_SCALE_REG gp{a_actual_register} \n"
+        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {int(hbm_start_offset)} \n"
+        generated_code += f"S_ADDI_INT gp{result_register}, gp0, {act_vram_offset} \n"
+
+        if batch == 1:
+            elements_per_prefetch = vlen * preload_len
+            for _ in range(math.ceil(hidden_size / elements_per_prefetch)):
+                generated_code += (
+                    f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, "
+                    f"a{activation_offset_reg}, 0, 0, 0 \n"
+                )
+                generated_code += (
+                    f"S_ADDI_INT gp{result_register}, gp{result_register}, {elements_per_prefetch} \n"
+                )
+                generated_code += (
+                    f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {elements_per_prefetch} \n"
+                )
+            return generated_code
+
+        generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len} \n"
+        generated_code += f"C_SET_STRIDE_REG gp{set_stride_register} \n"
+        a_offset_register = set_stride_register
+        generated_code += f"C_LOOP_START gp{outer_loop_register}, {load_amount_per_hidden} \n"
+        generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_actual_register}, 0 \n"
+        if batch > preload_len:
+            generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / preload_len)} \n"
+        generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, a{activation_offset_reg}, 1, 0 \n"
+        generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len} \n"
+        if batch > preload_len:
+            generated_code += (
+                f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {stride_len * preload_len} \n"
+            )
+            generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
+        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
+        generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
+        return generated_code
+
+    def _emit_store_tile_isa(
+        self,
+        *,
+        vlen: int,
+        batch: int,
+        hidden_size: int,
+        alive_registers: List[int],
+        act_vram_offset: int,
+        hbm_addr_reg: int,
+        stride_size: Optional[int] = None,
+        scale_size: Optional[int] = None,
+        hbm_start_offset: int = 0,
+        store_amount: int = 4,
+    ) -> str:
+        generated_code = "; Store Activation Generation\n"
+
+        hbm_offset_reg = alive_registers[0]
+        set_stride_register = alive_registers[1]
+        vram_reg = alive_registers[2]
+        outer_loop_register = alive_registers[3]
+        inner_loop_register = alive_registers[4]
+
+        stride_len = hidden_size if stride_size is None else int(stride_size)
+        scale_len = hidden_size * batch if scale_size is None else int(scale_size)
+        store_amount_per_hidden = math.ceil(hidden_size / vlen)
+
+        generated_code += f"S_ADDI_INT gp{vram_reg}, gp0, {act_vram_offset}\n"
+        generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {scale_len}\n"
+        generated_code += f"C_SET_SCALE_REG gp{hbm_offset_reg}\n"
+        generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {int(hbm_start_offset)}\n"
+
+        if batch == 1:
+            elements_per_store = vlen * store_amount
+            for _ in range(math.ceil(hidden_size / elements_per_store)):
+                generated_code += f"H_STORE_V gp{vram_reg}, gp{hbm_offset_reg}, a{hbm_addr_reg}, 0, 0\n"
+                generated_code += f"S_ADDI_INT gp{vram_reg}, gp{vram_reg}, {elements_per_store}\n"
+                generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {elements_per_store}\n"
+            return generated_code
+
+        generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len}\n"
+        generated_code += f"C_SET_STRIDE_REG gp{set_stride_register}\n"
+        hbm_base_reg = set_stride_register
+        generated_code += f"C_LOOP_START gp{outer_loop_register}, {store_amount_per_hidden}\n"
+        generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_offset_reg}, 0\n"
+        if batch > store_amount:
+            generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / store_amount)}\n"
+        generated_code += f"H_STORE_V gp{vram_reg}, gp{hbm_base_reg}, a{hbm_addr_reg}, 1, 0\n"
+        generated_code += f"S_ADDI_INT gp{vram_reg}, gp{vram_reg}, {vlen * store_amount}\n"
+        if batch > store_amount:
+            generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_base_reg}, {stride_len * store_amount}\n"
+            generated_code += f"C_LOOP_END gp{inner_loop_register}\n"
+        generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {vlen}\n"
+        generated_code += f"C_LOOP_END gp{outer_loop_register}\n"
+        return generated_code
 
     def emit_hbm_tile_to_mram(
         self,
@@ -74,18 +193,34 @@ class ISAEmitter:
         hbm_scale_size: Optional[int] = None,
         hbm_start_offset: int = 0,
     ) -> None:
-        isa = self.program.compiler.load_tile_from_hbm(
-            hbm_addr=hbm_addr,
-            vram_addr=vram_addr,
-            batch=self.program.mlen,
-            hidden_size=self.program.mlen,
-            hbm_stride=self.program.mlen if hbm_stride is None else int(hbm_stride),
-            hbm_scale_size=self.program.tile_elems if hbm_scale_size is None else int(hbm_scale_size),
-            hbm_start_offset=int(hbm_start_offset),
+        addr_reg = self.program.compiler.register_allocator.allocate_addr(1)[0]
+        gp_addr = self.program.compiler.register_allocator.allocate_gp(1)
+        gp_preload = self.program.compiler.register_allocator.allocate_gp(5)
+
+        isa = ""
+        isa += preload_addr_reg_asm(
+            addr_reg_to_set=[addr_reg],
+            available_registers=gp_addr,
+            addr_reg_val=[int(hbm_addr)],
+        )
+        isa += reset_reg_asm(alive_registers=gp_preload)
+        isa += self._emit_preload_tile_isa(
             vlen=self.program.mlen,
             preload_len=self.program.blen,
+            batch=self.program.mlen,
+            hidden_size=self.program.mlen,
+            act_vram_offset=vram_addr,
+            alive_registers=gp_preload,
+            activation_offset_reg=addr_reg,
+            stride_size=self.program.mlen if hbm_stride is None else int(hbm_stride),
+            scale_size=self.program.tile_elems if hbm_scale_size is None else int(hbm_scale_size),
+            hbm_start_offset=int(hbm_start_offset),
         )
         self.program.compiler.generated_code += isa
+
+        self.program.compiler.register_allocator.free_gp(gp_addr)
+        self.program.compiler.register_allocator.free_gp(gp_preload)
+        self.program.compiler.register_allocator.free_addr([addr_reg])
 
     def emit_store_tile_to_hbm(
         self,
@@ -96,18 +231,33 @@ class ISAEmitter:
         hbm_scale_size: Optional[int] = None,
         hbm_start_offset: int = 0,
     ) -> None:
-        isa = self.program.compiler.store_tile_to_hbm(
-            vram_addr=vram_addr,
-            hbm_addr=hbm_addr,
+        addr_reg = self.program.compiler.register_allocator.allocate_addr(1)[0]
+        gp_addr = self.program.compiler.register_allocator.allocate_gp(1)
+        gp_store = self.program.compiler.register_allocator.allocate_gp(5)
+
+        isa = ""
+        isa += preload_addr_reg_asm(
+            addr_reg_to_set=[addr_reg],
+            available_registers=gp_addr,
+            addr_reg_val=[int(hbm_addr)],
+        )
+        isa += self._emit_store_tile_isa(
+            vlen=self.program.mlen,
             batch=self.program.mlen,
             hidden_size=self.program.mlen,
-            hbm_stride=self.program.mlen if hbm_stride is None else int(hbm_stride),
-            hbm_scale_size=self.program.tile_elems if hbm_scale_size is None else int(hbm_scale_size),
+            alive_registers=gp_store,
+            act_vram_offset=vram_addr,
+            hbm_addr_reg=addr_reg,
+            stride_size=self.program.mlen if hbm_stride is None else int(hbm_stride),
+            scale_size=self.program.tile_elems if hbm_scale_size is None else int(hbm_scale_size),
             hbm_start_offset=int(hbm_start_offset),
-            vlen=self.program.mlen,
             store_amount=self.program.blen,
         )
         self.program.compiler.generated_code += isa
+
+        self.program.compiler.register_allocator.free_gp(gp_addr)
+        self.program.compiler.register_allocator.free_gp(gp_store)
+        self.program.compiler.register_allocator.free_addr([addr_reg])
 
     def emit_zero_vram_tile(self, vram_addr: int) -> None:
         gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
@@ -587,4 +737,3 @@ class ISAEmitter:
 
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
-

@@ -11,6 +11,8 @@ def store_act_asm(
     act_vram_offset: int,
     hbm_addr_reg: int,
     stride_size: Optional[int] = None,
+    scale_size: Optional[int] = None,
+    hbm_start_offset: int = 0,
     store_amount: int = 4,
 ) -> str:
     """
@@ -55,12 +57,15 @@ def store_act_asm(
     inner_loop_register  = alive_registers[4]
 
     stride_len = hidden_size if stride_size is None else stride_size
+    scale_len = hidden_size * batch if scale_size is None else scale_size
     store_amount_per_hidden = math.ceil(hidden_size / vlen)
 
     # Initialize VRAM source address
     generated_code += f"S_ADDI_INT gp{vram_reg}, gp0, {act_vram_offset}\n"
-    # Initialize HBM offset to 0
-    generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, 0\n"
+    generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {scale_len}\n"
+    generated_code += f"C_SET_SCALE_REG gp{hbm_offset_reg}\n"
+    # Initialize HBM offset
+    generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {hbm_start_offset}\n"
 
     if batch == 1:
         # Simple case: no stride needed, store sequentially
@@ -89,7 +94,7 @@ def store_act_asm(
         generated_code += f"S_ADDI_INT gp{vram_reg}, gp{vram_reg}, {vlen * store_amount}\n"
 
         if batch > store_amount:
-            generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_base_reg}, {hidden_size * store_amount}\n"
+            generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_base_reg}, {stride_len * store_amount}\n"
             generated_code += f"C_LOOP_END gp{inner_loop_register}\n"
 
         # Move to next column block in HBM

@@ -138,7 +138,7 @@ class ValueManager:
             tile = canonical_tile
         if isinstance(tile, TensorTile) and not self._is_narrow_tensor_tile(tile):
             old_value = self.resolve_value_tile(tile)
-            old_value_tile_id = self._detach_tile_value_pointer(tile.tile_id)
+            old_value_tile_id = self._detach_tile_value_pointer(tile.tile_id, auto_free=False)
             if old_value_tile_id is None:
                 raise RuntimeError(f"Wide destination tile {tile.tile_id} had no bound value to detach")
             new_value = self.prepare_vram_backing_value(old_value)
@@ -484,7 +484,6 @@ class ValueManager:
         if value is None:
             if not self._protected_vram_value_tile_ids:
                 return
-            old_value_ids = sorted(self._protected_vram_value_tile_ids)
             self._protected_vram_value_tile_ids.clear()
             return
         if value.value_tile_id not in self._protected_vram_value_tile_ids:
@@ -1562,9 +1561,20 @@ class ValueManager:
                 alloc_name = evict_value.residency.get(name_key)
                 if alloc_name is not None:
                     allocator.free(str(alloc_name), strict=False)
+                vram_addr_before = evict_value.residency.get(addr_key)
+                hbm_addr_after = evict_value.residency.get("hbm_addr")
                 evict_value.residency.pop(addr_key, None)
                 evict_value.residency.pop(name_key, None)
                 residency_table.pop(evict_id, None)
+                self.program.eviction_warnings.append({
+                    "op_index": len(self.program.operation_snapshots),
+                    "value_tile_id": evict_id,
+                    "tensor_refs": list(self.value_tile_tensor_refs.get(evict_id, set())),
+                    "vram_addr": vram_addr_before,
+                    "hbm_addr": hbm_addr_after,
+                    "score": self._value_tile_vram_protection_score(evict_value),
+                    "max_score_filter": max_score,
+                })
                 return
             raise RuntimeError(f"{place.upper()} allocation requested but no resident value tile was available for FIFO eviction")
 
@@ -1722,6 +1732,7 @@ class ValueManager:
             target_changed=target_changed,
             shared_tensor_refs=shared_tensor_refs,
         )
+        self._release_vram_if_only_input_refs(writeback_value.value_tile_id)
 
     def _detach_input_backing_identity(self, value: ValueTile) -> None:
         if not value.from_input_tile and value.source_input_tile_id is None:
@@ -1759,7 +1770,28 @@ class ValueManager:
         self.full_tile_bindings[tile_id] = value_tile_id
         self.value_tile_tensor_refs.setdefault(value_tile_id, set()).add(tile_id)
 
-    def _detach_tile_value_pointer(self, tile_id: str) -> Optional[str]:
+    def _release_unreferenced_value_tile(self, value_tile_id: str) -> None:
+        if self.value_tile_tensor_refs.get(value_tile_id):
+            return
+        if self._is_input_backed_value_tile(value_tile_id):
+            self._free_value_tile_vram_residency(value_tile_id)
+            return
+        self.free_value_tile(value_tile_id)
+
+    def _release_vram_if_only_input_refs(self, value_tile_id: str) -> bool:
+        value = self.value_tiles.get(value_tile_id)
+        if value is None:
+            return False
+        refs = self.value_tile_tensor_refs.get(value_tile_id, set())
+        if not refs:
+            return False
+        if any(ref_id not in self.program.tensor_manager.input_tiles for ref_id in refs):
+            return False
+        if not bool(value.residency.get("hbm_ready")):
+            return False
+        return self._free_value_tile_vram_residency(value_tile_id)
+
+    def _detach_tile_value_pointer(self, tile_id: str, *, auto_free: bool = True) -> Optional[str]:
         old_value_tile_id = self.full_tile_bindings.pop(tile_id, None)
         if old_value_tile_id is None:
             return None
@@ -1768,6 +1800,9 @@ class ValueManager:
             old_refs.discard(tile_id)
             if not old_refs:
                 self.value_tile_tensor_refs.pop(old_value_tile_id, None)
+        if auto_free:
+            self._release_unreferenced_value_tile(old_value_tile_id)
+            self._release_vram_if_only_input_refs(old_value_tile_id)
         return old_value_tile_id
 
     def _unbind_tile_value_pointer(self, tile_id: str) -> None:
@@ -1828,10 +1863,9 @@ class ValueManager:
             released_vram = False
             if not self._non_input_value_refs(value_tile_id):
                 if self._is_input_backed_value_tile(value_tile_id):
-                    released_vram = self._free_value_tile_vram_residency(value_tile_id)
+                    released_vram = value_tile_id not in self._value_tiles_in_vram
                 else:
-                    self.free_value_tile(value_tile_id)
-                    released_vram = True
+                    released_vram = value_tile_id not in self.value_tiles
             self.program._record_operation_snapshot(
                 "free_tensor_tile",
                 mode="auto",

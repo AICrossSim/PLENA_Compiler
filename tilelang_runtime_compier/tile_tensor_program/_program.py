@@ -86,6 +86,7 @@ class TileTensorProgram:
         self._auto_name_counters: Dict[str, int] = {}
         self.loop_hints: List[Dict[str, int | str]] = []
         self.operation_snapshots: List[Dict[str, object]] = []
+        self.eviction_warnings: List[Dict[str, object]] = []
         self._active_parallel_region_ids: List[int] = []
         self._parallel_region_counter = 0
         self._parallel_snapshot_keys: set[Tuple[int, str, int, str]] = set()
@@ -526,6 +527,17 @@ class TileTensorProgram:
         delta_text = build_delta_report(parse_operation_report(report_text))
         delta_path.write_text(delta_text, encoding="utf-8")
 
+    def write_eviction_warnings(self, output_path: str | Path) -> None:
+        output_path = Path(output_path)
+        if not self.eviction_warnings:
+            output_path.write_text("(no FIFO VRAM evictions recorded)\n", encoding="utf-8")
+            return
+        lines: List[str] = [f"FIFO VRAM evictions: {len(self.eviction_warnings)}", ""]
+        for entry in self.eviction_warnings:
+            fields = ", ".join(f"{key}={value}" for key, value in entry.items())
+            lines.append(f"WARN evict {fields}")
+        output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
     def mapf(self, operand: object) -> List[FPVar]:
         return self.tensor_manager.mapf(operand)
 
@@ -822,6 +834,8 @@ class TileTensorProgram:
                 op=op,
                 task_id=f"atomic_{op}.{group_index}",
             )
+            if isinstance(dst_tile, TensorTile) and not prepared_write.reuse_old:
+                self.value_manager._release_unreferenced_value_tile(prepared_write.old_value.value_tile_id)
             signal_4.append(
                 {
                     "control": f"atomic_{op}_tile",
@@ -997,6 +1011,8 @@ class TileTensorProgram:
                     task_id=f"view_matmul.{dst_tile.tile_id}.term{term_index}",
                     zero_dst=(term_index == 0),
                 )
+            if not prepared_write.reuse_old:
+                self.value_manager._release_unreferenced_value_tile(prepared_write.old_value.value_tile_id)
 
             signal_4.append(
                 {
@@ -1280,6 +1296,8 @@ class TileTensorProgram:
                 op=op,
                 task_id=task_id or f"row_op.{op}.{group_index}",
             )
+            if mutates_src and isinstance(src_tile, TensorTile) and not prepared_write.reuse_old:
+                self.value_manager._release_unreferenced_value_tile(prepared_write.old_value.value_tile_id)
             records.append(record)
         self._record_operation_snapshot(
             "row_op",
