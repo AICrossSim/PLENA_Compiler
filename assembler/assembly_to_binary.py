@@ -32,20 +32,20 @@ class AssemblyToBinary:
         """
         # Example conversion logic (to be replaced with actual logic)
         opcode = self.isa_definitions[instruction.opcode]
-        rd =  instruction.rd
-        rs1 = instruction.rs1
-        rs2 = instruction.rs2
-        rstride = instruction.rstride
-        funct1 = instruction.funct1
-        funct2 = instruction.funct2
-        imm = instruction.imm
-        rmask = instruction.rmask
+        rd = 0 if instruction.rd is None else instruction.rd
+        rs1 = 0 if instruction.rs1 is None else instruction.rs1
+        rs2 = 0 if instruction.rs2 is None else instruction.rs2
+        rstride = 0 if instruction.rstride is None else instruction.rstride
+        funct1 = 0 if instruction.funct1 is None else instruction.funct1
+        funct2 = 0 if instruction.funct2 is None else instruction.funct2
+        imm = 0 if instruction.imm is None else instruction.imm
+        rmask = 0 if instruction.rmask is None else instruction.rmask
         binary_instruction = 0
         # print(f"Converting instruction: {instruction.opcode} with opcode={hex(opcode)}, rd={rd}, rs1={rs1}, rs2={rs2}, rstride={rstride}, funct1={funct1}, funct2={funct2}, imm={imm}")
         ow = self.operands_width
         opw = self.opcode_width
 
-        if instruction.opcode in ["S_ADDI_INT",  "M_MM_WO", "S_LD_FP", "S_ST_FP", "S_LD_INT", "S_ST_INT", "S_MAP_V_FP", "V_RED_MAX", "V_RECI_V", "V_EXP_V"]:
+        if instruction.opcode in ["S_ADDI_INT",  "M_MM_WO", "S_LD_FP", "S_ST_FP", "S_LD_INT", "S_ST_INT", "S_MAP_V_FP"]:
             binary_instruction = (
                 (imm << (opw + 2 * ow)) +
                 (rs1 << (opw + ow)) +
@@ -58,7 +58,7 @@ class AssemblyToBinary:
                 (rd << opw) +
                 opcode
             )
-        elif instruction.opcode in [ "S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"]:
+        elif instruction.opcode in [ "S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP"]:
             binary_instruction = (
                 (rs1 << (opw + ow)) +
                 (rd << opw) +
@@ -101,7 +101,8 @@ class AssemblyToBinary:
                 opcode
             )
 
-        # Print in hex with fixed 16-bit width
+        if self.instruction_length and self.instruction_length > 0:
+            binary_instruction &= (1 << self.instruction_length) - 1
         return binary_instruction
     
     def write_binary_to_file(self, binary_instructions, output_file: str):
