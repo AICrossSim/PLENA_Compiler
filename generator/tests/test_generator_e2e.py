@@ -93,11 +93,9 @@ def _build_hbm_from_hf_weights(
     operates directly on HF tensors (no intermediate .pt files) and writes
     each weight block at the scheduler-assigned HBM offset.
 
-    Weights loaded (layer-0 of the HF model, used as a representative layer
-    since the generator ASM currently does not emit C_SET_ADDR_REG to
-    partition per-layer weights — all `a1..a9` HBM address registers
-    default to 0, so weights overlay at offset 0 but we fill HBM with
-    concrete values so the emulator pulls realistic data):
+    Weights loaded (layer-0 of the HF model, used as a representative
+    layer).  The generator ASM emits C_SET_ADDR_REG instructions whose
+    byte offsets match the sequential layout written here:
 
         token_table    (embed_tokens weight)
         q_weight       (layer_0 q_proj.weight, transposed)
@@ -192,14 +190,10 @@ def _build_hbm_from_hf_weights(
         getattr(model, "language_model", model), "lm_head"
     )
 
-    # Build the ordered list of (name, offset_expr, tensor) to write.
-    # Offsets come from generator/scheduler/mem_layout_lib.json. The
-    # current scheduler reports each as an INCREMENT rather than an
-    # absolute offset; and a1..a9 default to 0 anyway, so we place each
-    # weight at an absolute offset anchored at 0 but separated by tensor
-    # size (cumulative). The emulator reads whichever offset the ASM
-    # computes; any collapse onto offset 0 simply overlays Q-weight on
-    # top.
+    # Weights are written sequentially starting at byte 0.  The cumulative
+    # byte offsets match the analytical formula used by code_gen_pass's
+    # _generate_addr_reg_init, so the C_SET_ADDR_REG instructions in the
+    # generated ASM point to the correct locations.
     to_write: list[tuple[str, torch.Tensor]] = []
     if embed is not None and hasattr(embed, "weight"):
         # Embedding table stored as (vocab, hidden) — natural PLENA layout.
@@ -221,8 +215,10 @@ def _build_hbm_from_hf_weights(
         if embed is None or lm_head.weight.data_ptr() != embed.weight.data_ptr():
             to_write.append(("lm_head", lm_head.weight.detach().T.contiguous()))
 
-    # Ensure HBM file is cleared + sized.
-    hbm_path.write_bytes(b"\x00" * hbm_size_bytes)
+    # Start with an empty file. Weights are appended sequentially starting
+    # at offset 0.  The file is padded to the emulator's required size after
+    # all weights are written.
+    hbm_path.write_bytes(b"")
 
     summary: dict = {}
     # Use a scratch directory for any intermediate rand_gen state (unused
@@ -399,19 +395,9 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     print(f"      .mem written: {mem_path} ({mem_path.stat().st_size} bytes)")
 
     # Step 3: HBM setup — populate with real HF weights.
-    # Mirrors compiler/sim_env_utils/build_env.py::create_mem_for_sim but
-    # without the intermediate .pt file round-trip: pull weights straight
-    # from AutoModelForCausalLM, quantize to MXFP8, and write each tensor
-    # into hbm_for_behave_sim.bin in append order.
-    #
-    # Caveat: the current generator does not emit C_SET_ADDR_REG for the
-    # a1..a9 HBM address registers, so they all default to 0. That means
-    # the ASM reads every weight from offset 0. We still populate HBM with
-    # real tensor values because (a) layer-0 Q weights at offset 0 give
-    # the first matmul real data, (b) subsequent weights stack into HBM
-    # behind so any wider H_PREFETCH reads plausible (non-zero) bytes,
-    # and (c) this unblocks numerical verification once the scheduler
-    # learns to emit per-weight a_reg initialization.
+    # Weights are written sequentially from offset 0.  The byte offsets
+    # match the C_SET_ADDR_REG instructions that code_gen_pass emits,
+    # so each H_PREFETCH reads from the correct weight region.
     print("[3/5] HBM weights (HF model → MXFP8 quantized)")
     hbm_path = build_dir / "hbm_for_behave_sim.bin"
     fpsram_path = build_dir / "fp_sram.bin"
@@ -501,8 +487,8 @@ def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128, num_layer
     vram_size = artifacts["vram"].stat().st_size
     print(f"\nVRAM dump size: {vram_size} bytes")
 
-    # TODO: once weights are threaded, activate this check.
-    # For now we only gate on "pipeline ran end-to-end".
+    # TODO: activate numerical verification now that HBM weights are
+    # correctly addressed via C_SET_ADDR_REG.
     torch.manual_seed(42)
     # Placeholder — skip PyTorch reference if numerical check isn't wired yet.
     # input_ids = torch.randint(0, 1000, (1, seq_len), dtype=torch.long)
