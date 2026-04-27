@@ -6,10 +6,9 @@ dispatching each node to the appropriate asm_template function. This is
 the generator's own compilation backend, separate from the ATen path's
 PlenaCompiler.
 
-NOTE: This pipeline generates structurally valid ISA but does not
-initialize HBM address registers (C_SET_ADDR_REG). For numerically
-correct end-to-end execution, use the ATen path via
-``generator.aten_runner.run_aten_e2e`` or ``generator.runner aten``.
+HBM address registers are initialized via C_SET_ADDR_REG at the top of
+the generated program, with byte offsets matching the HBM weight layout
+that test_generator_e2e._build_hbm_from_hf_weights writes.
 
 See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
@@ -27,6 +26,7 @@ from asm_templates import (
     im2col_asm_no_shift,
     layer_norm_asm,
     lm_head_asm,
+    preload_addr_reg_asm,
     projection_asm,
     rms_norm_asm,
 )
@@ -708,6 +708,79 @@ def _generate_program_footer() -> str:
 """
 
 
+def _weight_hbm_bytes(rows: int, cols: int, hardware_config: dict) -> int:
+    """Compute MXFP8 HBM byte size for a (rows, cols) weight tensor.
+
+    Format: data blocks + scale blocks, each padded to HBM row width.
+    Matches the byte output of tools/memory_mapping/memory_map.py's
+    map_mx_data_to_hbm_for_behave_sim.
+    """
+    block_dim = hardware_config.get("block_dim", 4)
+    wt_block_width = hardware_config.get("wt_block_width", 32)
+    scale_width = hardware_config.get("scale_width", 8)
+    return rows * (cols // block_dim) * ((wt_block_width // 8) + (scale_width // 8))
+
+
+def _generate_addr_reg_init(
+    model_info: dict[str, Any],
+    hardware_config: dict[str, Any],
+    scheduler: dict[str, Any],
+) -> str:
+    """Emit C_SET_ADDR_REG instructions for all weight HBM address registers.
+
+    Computes cumulative MXFP8 byte offsets matching the HBM layout that
+    _build_hbm_from_hf_weights writes.  Must be emitted before any node
+    that references HBM weights.
+    """
+    hidden_size = model_info.get("hidden_size", 64)
+    intermediate_size = model_info.get("intermediate_size", 256)
+    vocab_size = model_info.get("vocab_size", 1024)
+    num_heads = model_info.get("num_attention_heads", 4)
+    num_kv_heads = model_info.get("num_key_value_heads", num_heads)
+    head_dim = model_info.get("head_dim", hidden_size // num_heads)
+
+    hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
+
+    # Weight layout: ordered list of (name, rows, cols, addr_reg_key).
+    # addr_reg_key is None for weights without a dedicated register.
+    layout = [
+        ("token_table", vocab_size, hidden_size, "token_table_offset"),
+        ("q_weight", hidden_size, num_heads * head_dim, "q_weight_offset"),
+        ("k_weight", hidden_size, num_kv_heads * head_dim, "k_weight_offset"),
+        ("v_weight", hidden_size, num_kv_heads * head_dim, "v_weight_offset"),
+        ("o_weight", num_heads * head_dim, hidden_size, None),  # no addr reg
+        ("ffn_gate", hidden_size, intermediate_size, "ffn_gate_offset"),
+        ("ffn_up", hidden_size, intermediate_size, "ffn_up_offset"),
+        ("ffn_down", intermediate_size, hidden_size, "ffn_down_offset"),
+    ]
+
+    # Compute cumulative offsets
+    offset = 0
+    addr_regs_to_set: list[int] = []
+    addr_reg_vals: list[int] = []
+
+    for name, rows, cols, reg_key in layout:
+        if reg_key is not None:
+            reg_idx = hbm_addr_reg.get(reg_key, 0)
+            if reg_idx > 0:  # skip if reg not assigned
+                addr_regs_to_set.append(reg_idx)
+                addr_reg_vals.append(offset)
+        size = _weight_hbm_bytes(rows, cols, hardware_config)
+        offset += size
+
+    if not addr_regs_to_set:
+        return ""
+
+    code = "\n; --- HBM address register initialization ---\n"
+    code += f"; Total HBM weight footprint: {offset} bytes ({offset / 1024:.1f} KiB)\n"
+    code += preload_addr_reg_asm(
+        addr_reg_to_set=addr_regs_to_set,
+        available_registers=[9, 10, 11, 12, 13, 14, 15][:len(addr_regs_to_set)],
+        addr_reg_val=addr_reg_vals,
+    )
+    return code
+
+
 def code_gen_pass(
     symbolic_graph: dict[str, Any],
     model_info: dict[str, Any],
@@ -726,6 +799,11 @@ def code_gen_pass(
     """
     # Generate program header
     asm_code = [_generate_program_header(model_info)]
+
+    # Initialize HBM address registers with weight byte offsets
+    addr_reg_init = _generate_addr_reg_init(model_info, hardware_config, scheduler)
+    if addr_reg_init:
+        asm_code.append(addr_reg_init)
 
     # Process each node in execution order
     nodes = symbolic_graph["nodes"]

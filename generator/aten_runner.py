@@ -67,6 +67,7 @@ def run_aten_e2e(
     """
     from transactional_emulator.testbench.model_layer_test_builder import (
         build_and_run_decoder_test,
+        build_and_run_multi_layer_test,
         get_model_dims,
         slice_dims_for_sim,
         MLEN,
@@ -119,8 +120,10 @@ def run_aten_e2e(
     # For multi-layer: iterate layers (each is independent at sim scale).
     # ------------------------------------------------------------------
     results_per_layer = []
-    for li in range(num_layers):
-        current_layer = layer_idx + li
+
+    if num_layers == 1:
+        # Single layer: use proven single-layer path (with RoPE)
+        current_layer = layer_idx
         asm_name = f"aten_{model_id.split('/')[-1]}_l{current_layer}"
         layer_build = build_path / f"layer_{current_layer}"
 
@@ -128,25 +131,12 @@ def run_aten_e2e(
         print(f"[3/5] Setting up sim environment: {layer_build}")
         print(f"[4/5] Running Rust transactional emulator")
 
-        # Determine if this model needs special flags
         extra_kwargs = {}
         if trust_remote_code:
             extra_kwargs["trust_remote_code"] = True
         if partial_load:
             extra_kwargs["partial_load"] = True
 
-        # build_and_run_decoder_test runs the full pipeline including
-        # emulator execution and comparison.  It calls sys.exit(1) on
-        # numerical failure — we intercept that by running the pipeline
-        # in parts: first build + run, then compare separately.
-        #
-        # Actually, we can just call it directly and catch SystemExit.
-        # But that's fragile.  Instead, replicate its emulator + compare
-        # steps using the building blocks it itself uses.  The ISA build
-        # + sim env creation is done by the function; we just need to
-        # handle the comparison ourselves.
-
-        # Use build_and_run_decoder_test but catch sys.exit(1)
         try:
             build_and_run_decoder_test(
                 model_id=model_id,
@@ -158,8 +148,6 @@ def run_aten_e2e(
                 inter_dim=inter_dim,
                 **extra_kwargs,
             )
-            # If we reach here, the test passed (run_and_assert didn't exit)
-            # Read back the comparison results
             comp_results, comp_params = compare_emulator_output(layer_build)
             results_per_layer.append({
                 "layer": current_layer,
@@ -170,15 +158,12 @@ def run_aten_e2e(
                 "mse": comp_results["mse"],
             })
         except SystemExit as e:
-            # run_and_assert calls sys.exit(1) on failure — capture it
             if e.code == 0:
-                # Skip (HF unavailable)
                 return {
                     "passed": False,
                     "error": "HuggingFace model unavailable (skipped)",
                     "model_id": model_id,
                 }
-            # Numerical failure — still read comparison results
             try:
                 comp_results, comp_params = compare_emulator_output(layer_build)
                 results_per_layer.append({
@@ -192,6 +177,65 @@ def run_aten_e2e(
             except Exception:
                 results_per_layer.append({
                     "layer": current_layer,
+                    "passed": False,
+                    "error": f"Emulator comparison failed after exit code {e.code}",
+                })
+    else:
+        # Multi-layer: chain N layers with residual connections (no RoPE)
+        asm_name = f"aten_{model_id.split('/')[-1]}_chain{num_layers}"
+        chain_build = build_path / f"chain_{num_layers}layers"
+
+        print(f"\n[2/5] Building chained {num_layers}-layer ISA via PlenaCompiler + ops.*")
+        print(f"[3/5] Setting up sim environment: {chain_build}")
+        print(f"[4/5] Running Rust transactional emulator")
+
+        extra_kwargs = {}
+        if trust_remote_code:
+            extra_kwargs["trust_remote_code"] = True
+        if partial_load:
+            extra_kwargs["partial_load"] = True
+
+        try:
+            build_and_run_multi_layer_test(
+                model_id=model_id,
+                asm_name=asm_name,
+                build_dir=chain_build,
+                num_layers=num_layers,
+                layer_idx_start=layer_idx,
+                seq_len=seq_len,
+                hidden_size=hidden_size,
+                inter_dim=inter_dim,
+                **extra_kwargs,
+            )
+            comp_results, comp_params = compare_emulator_output(chain_build)
+            results_per_layer.append({
+                "layer": f"chain_{num_layers}",
+                "passed": True,
+                "allclose_match_rate": comp_results["allclose_match_rate"],
+                "max_error": comp_results["max_error"],
+                "mae": comp_results["mae"],
+                "mse": comp_results["mse"],
+            })
+        except SystemExit as e:
+            if e.code == 0:
+                return {
+                    "passed": False,
+                    "error": "HuggingFace model unavailable (skipped)",
+                    "model_id": model_id,
+                }
+            try:
+                comp_results, comp_params = compare_emulator_output(chain_build)
+                results_per_layer.append({
+                    "layer": f"chain_{num_layers}",
+                    "passed": False,
+                    "allclose_match_rate": comp_results["allclose_match_rate"],
+                    "max_error": comp_results["max_error"],
+                    "mae": comp_results["mae"],
+                    "mse": comp_results["mse"],
+                })
+            except Exception:
+                results_per_layer.append({
+                    "layer": f"chain_{num_layers}",
                     "passed": False,
                     "error": f"Emulator comparison failed after exit code {e.code}",
                 })
