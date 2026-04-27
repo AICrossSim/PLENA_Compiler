@@ -1,8 +1,17 @@
 """
-Code generation pass for LLM symbolic graph to assembly transformation.
+Code generation pass -- Generator Pipeline (Pipeline 2).
 
-This module transforms the symbolic graph representation of a LLM model
-into assembly code using predefined templates for different operation types.
+Transforms a symbolic graph (from LLMModelParser) into PLENA ISA by
+dispatching each node to the appropriate asm_template function. This is
+the generator's own compilation backend, separate from the ATen path's
+PlenaCompiler.
+
+NOTE: This pipeline generates structurally valid ISA but does not
+initialize HBM address registers (C_SET_ADDR_REG). For numerically
+correct end-to-end execution, use the ATen path via
+``generator.aten_runner.run_aten_e2e`` or ``generator.runner aten``.
+
+See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
 
 from pathlib import Path

@@ -1,12 +1,18 @@
-"""PlenaCompiler — unified single-class PLENA ISA compiler.
+"""PlenaCompiler -- ATen Pipeline (Pipeline 1) compilation backend.
 
-Contains the full inheritance chain: TileCompiler (memory bookkeeping) →
-DeveloperCompiler (ISA emission, FP/FPRAM ops, interrupts) → PlenaCompiler
+Manages VRAM/MRAM/FPRAM allocation, HBM weight layout, and address
+register initialization (C_SET_ADDR_REG). Produces numerically verified
+ISA (98-100% allclose against PyTorch golden reference).
+
+Contains the full inheritance chain: TileCompiler (memory bookkeeping) ->
+DeveloperCompiler (ISA emission, FP/FPRAM ops, interrupts) -> PlenaCompiler
 (user-facing DSL). Tensor proxy classes (TensorVar, InputVar, VRAMMatrixVar,
 FPVar) and the unified Tensor type union / TensorKind enum are re-exported
 from the same module.
 
 Previously aliased as ``PLENAProgram``; that alias has been retired.
+
+See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
 
 from __future__ import annotations
