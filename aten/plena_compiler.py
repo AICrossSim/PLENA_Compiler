@@ -5212,7 +5212,18 @@ class PlenaCompiler(DeveloperCompiler):
         """
         if rows is None:
             rows = list(range(matrix.shape[0]))
-        super().vram_fill_zero(matrix.name, rows)
+        else:
+            rows = list(rows)
+
+        total_rows, cols = matrix.shape
+        if any(row < 0 or row >= total_rows for row in rows):
+            raise ValueError(f"vram_fill_zero rows out of bounds for {matrix.name}: shape={matrix.shape}, rows={rows}")
+
+        # VRAM matrices are column-block-major. The low-level tile helper zeros
+        # one 64-column tile, so walk every column block for wide matrices.
+        num_col_blocks = (cols + self.mlen - 1) // self.mlen
+        for col_block in range(num_col_blocks):
+            super().vram_fill_zero(matrix.name, rows, tile_col_idx=col_block)
 
     def _ensure_hbm_sub_matrix_registered(self, input_var: InputVar):
         """Ensure an HBM input is registered in compiler sub-matrix manager."""
