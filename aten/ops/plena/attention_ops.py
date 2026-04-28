@@ -1,7 +1,7 @@
 """PLENA backend implementation for Flash Attention operator."""
 
 
-def flash_attention_plena(prog, Q, K, V, scale=None, hq=1, hkv=1, h_qkv=None):
+def flash_attention_plena(prog, Q, K, V, scale=None, hq=1, hkv=1, h_qkv=None, causal_mask=None):
     """PLENA backend: Flash Attention via PlenaCompiler.
 
     Dispatches to one of two codegen paths based on shape:
@@ -16,6 +16,8 @@ def flash_attention_plena(prog, Q, K, V, scale=None, hq=1, hkv=1, h_qkv=None):
         V:      InputVar — V in HBM, shape (seq_len, hkv*h_qkv_padded)
         scale:  Attention scale (default 1/sqrt(head_dim))
         hq, hkv, h_qkv: GQA params. Defaults treat input as single-head MHA.
+        causal_mask: VRAMMatrixVar or None — (mlen, mlen) mask with 0 on/below
+                     diagonal and -inf above. Added to S before softmax.
 
     Returns:
         VRAMMatrixVar for O, shape matching Q.
@@ -23,16 +25,29 @@ def flash_attention_plena(prog, Q, K, V, scale=None, hq=1, hkv=1, h_qkv=None):
 
     # Detect MHA vs GQA
     if hq == 1 and hkv == 1:
-        return _flash_attention_mha(prog, Q, K, V, scale)
+        return _flash_attention_mha(prog, Q, K, V, scale, causal_mask=causal_mask)
 
     # GQA: dispatch to fused codegen
     if h_qkv is None:
         raise ValueError("GQA mode requires h_qkv to be specified")
+    if causal_mask is not None:
+        raise NotImplementedError("causal_mask is not yet supported for GQA flash attention")
     return _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv)
 
 
-def _flash_attention_mha(prog, Q, K, V, scale):
-    """Single-head flash attention using PlenaCompiler primitives (online softmax)."""
+def _flash_attention_mha(prog, Q, K, V, scale, causal_mask=None):
+    """Single-head flash attention using PlenaCompiler primitives (online softmax).
+
+    Args:
+        prog:         PlenaCompiler instance
+        Q:            VRAMMatrixVar — query matrix in VRAM
+        K:            InputVar — key matrix in HBM
+        V:            InputVar — value matrix in HBM
+        scale:        Attention scale factor
+        causal_mask:  VRAMMatrixVar or None — (mlen, mlen) mask with 0 on/below
+                      diagonal and -inf above. When provided, added to S_block
+                      after QK^T and before online softmax.
+    """
     import math
 
     seq_len, head_dim = Q.shape
@@ -61,6 +76,9 @@ def _flash_attention_mha(prog, Q, K, V, scale):
                 target_row_idx=0,
                 target_col_idx=0,
             )
+            # Apply causal mask before softmax: S += mask (-inf above diagonal)
+            if causal_mask is not None:
+                prog.vram_add(S_block, causal_mask)
             prog.online_softmax_block(S_block, scale)
             prog.compute_pv(S_block, V, k_idx, PV, head_dim)
             prog.scale_o_row(O, q_idx)

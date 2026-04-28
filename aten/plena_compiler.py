@@ -4523,6 +4523,37 @@ class PlenaCompiler(DeveloperCompiler):
         self._tensors[internal_name] = var
         return var
 
+    def alloc_at(self, name: str, rows: int, cols: int, vram_addr: int) -> VRAMMatrixVar:
+        """Allocate a VRAM matrix view at a specific address.
+
+        Used to create views into existing VRAM matrices (e.g., per-head
+        slices of a multi-head Q projection output). Does NOT bump the
+        VRAM allocator -- the caller is responsible for ensuring the region
+        is valid.
+
+        Args:
+            name: matrix name (user-visible)
+            rows: number of rows
+            cols: number of columns
+            vram_addr: absolute VRAM address for this view
+
+        Returns:
+            VRAMMatrixVar proxy object
+        """
+        display_name = name
+        internal_name = self._scoped_name(name)
+        self._compiler.add_vram_object(
+            name=internal_name,
+            shape=(rows, cols),
+            vram_addr=vram_addr,
+            allocate_if_none=False,
+        )
+        isa_code = f"; VRAM View {name}: ({rows}, {cols}) at VRAM[{vram_addr}]\n"
+        self._compiler.generated_code += isa_code
+        var = VRAMMatrixVar(self, internal_name, (rows, cols), display_name=display_name)
+        self._tensors[internal_name] = var
+        return var
+
     def free_tensor(self, tensor_var: TensorVar):
         """
         Free a tensor in VRAM, reclaiming space for subsequent allocations.
