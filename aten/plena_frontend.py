@@ -216,9 +216,19 @@ def _extract_layer_weights(layer, hidden_slice, inter_slice, head_dim_slice, num
 # ---------------------------------------------------------------------------
 # Golden reference helpers (match hardware: MXFP8 HBM + BF16 intermediates)
 # ---------------------------------------------------------------------------
-def _flash_attn_ref(Q, K, V, scale):
-    """CPU reference: scaled dot-product attention."""
+def _flash_attn_ref(Q, K, V, scale, causal=False):
+    """CPU reference: scaled dot-product attention.
+
+    Args:
+        Q, K, V: query, key, value tensors
+        scale:   attention scale factor (1/sqrt(d))
+        causal:  if True, apply causal mask (position i can only attend to j <= i)
+    """
     scores = (Q @ K.T) * scale
+    if causal:
+        mask = torch.triu(torch.ones(scores.shape[-2], scores.shape[-1],
+                                     device=scores.device), diagonal=1).bool()
+        scores.masked_fill_(mask, float('-inf'))
     attn = F.softmax(scores, dim=-1)
     return attn @ V
 
@@ -586,7 +596,7 @@ def compile_hf_model(
                 # RoPE on Q_h: Q_rot = Q_h @ R_rope, Q_h = Q_h * cos + Q_rot * sin
                 Q_rot_h = torch.matmul(Q_h.to(torch.bfloat16).float(), R_rope_q.float()).to(torch.bfloat16).float()
                 Q_h = (Q_h * cos_table + Q_rot_h * sin_table)
-                O_h = _flash_attn_ref(Q_h, K_q_heads_i[kv_h], V_q_heads_i[kv_h], scale)
+                O_h = _flash_attn_ref(Q_h, K_q_heads_i[kv_h], V_q_heads_i[kv_h], scale, causal=True)
                 O_heads.append(O_h)
             attn_out = torch.cat(O_heads, dim=1)  # (seq, num_heads * head_dim)
             # O projection
@@ -594,7 +604,7 @@ def compile_hf_model(
             X_gold = O_gold + residual
         else:
             # Legacy: X is Q directly (no projection)
-            attn_out = _flash_attn_ref(X_gold, K_q_list[i], V_q_list[i], scale)
+            attn_out = _flash_attn_ref(X_gold, K_q_list[i], V_q_list[i], scale, causal=True)
             X_gold = attn_out + residual
 
         # --- FFN block ---
@@ -669,13 +679,13 @@ def compile_hf_model(
                     # RoPE on Q_h (float32)
                     Q_rot = Q_h @ R_mat_f32
                     Q_h = Q_h * cos_f32 + Q_rot * sin_f32
-                    O_h = _flash_attn_ref(Q_h, K_hf_heads[kv_h], V_hf_heads[kv_h], scale)
+                    O_h = _flash_attn_ref(Q_h, K_hf_heads[kv_h], V_hf_heads[kv_h], scale, causal=True)
                     O_heads_hf.append(O_h)
                 attn_out_hf = torch.cat(O_heads_hf, dim=1)
                 O_hf = attn_out_hf @ w["W_o"].float()
                 X_hf = O_hf + residual
             else:
-                attn_out_hf = _flash_attn_ref(X_normed, K_mats[i].float(), V_mats[i].float(), scale)
+                attn_out_hf = _flash_attn_ref(X_normed, K_mats[i].float(), V_mats[i].float(), scale, causal=True)
                 X_hf = attn_out_hf + residual
 
             # --- FFN block (float32) ---
@@ -723,6 +733,14 @@ def compile_hf_model(
         COS = prog.load_batch(cos_input, name="COS")
         SIN = prog.load_batch(sin_input, name="SIN")
 
+    # Causal mask: (mlen, mlen) with 0 on/below diagonal, -inf above
+    causal_mask_data = torch.zeros(mlen, mlen)
+    causal_mask_data.masked_fill_(
+        torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
+    )
+    causal_mask_input = prog.input("causal_mask", shape=(mlen, mlen))
+    CAUSAL_MASK = prog.load_batch(causal_mask_input, name="CAUSAL_MASK")
+
     # Per-layer weight inputs (order determines HBM layout)
     layer_inputs = []
     for i in range(n_layers):
@@ -768,6 +786,7 @@ def compile_hf_model(
     _current_bump = 2 * seq_len * hidden  # X + POS already allocated
     if native_mode:
         _current_bump += 2 * seq_len * head_dim  # COS + SIN loaded to VRAM
+    _current_bump += mlen * mlen  # CAUSAL_MASK loaded to VRAM
     if _current_bump < _ffn_intermediate_end:
         _pad_elems = _ffn_intermediate_end - _current_bump
         # Allocate enough mlen-wide rows to cover the padding
@@ -840,8 +859,9 @@ def compile_hf_model(
                 prog.rope(Q_h, Q_rot, COS, SIN)
                 prog.free_tensor(Q_rot)
 
-                # Single-head flash attention (K/V read from HBM)
-                O_h = ops.flash_attention(prog, Q_h, K_stored, V_stored, scale)
+                # Single-head flash attention (K/V read from HBM) with causal mask
+                O_h = ops.flash_attention(prog, Q_h, K_stored, V_stored, scale,
+                                          causal_mask=CAUSAL_MASK)
 
                 # Copy O_h to the right column block of O_full
                 o_h_dest_addr = o_full_addr + h * seq_len * mlen
@@ -863,8 +883,9 @@ def compile_hf_model(
             prog.vram_add(O_proj, scratch)
             current_after_attn = O_proj
         else:
-            # Legacy: X is Q directly (no projections)
-            O = ops.flash_attention(prog, current, li["K"], li["V"], scale)
+            # Legacy: X is Q directly (no projections), with causal mask
+            O = ops.flash_attention(prog, current, li["K"], li["V"], scale,
+                                    causal_mask=CAUSAL_MASK)
             prog.vram_add(O, scratch)
             current_after_attn = O
 
@@ -905,6 +926,8 @@ def compile_hf_model(
         input_tensors["COS"] = cos_table
         input_tensors["SIN"] = sin_table
         data_order.extend(["R_rope", "COS", "SIN"])
+    input_tensors["causal_mask"] = causal_mask_data
+    data_order.append("causal_mask")
     for i in range(n_layers):
         input_tensors[f"W_q_{i}"] = all_weights[i]["W_q"]
         input_tensors[f"W_o_{i}"] = all_weights[i]["W_o"]
