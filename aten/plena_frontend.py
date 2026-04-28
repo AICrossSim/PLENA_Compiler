@@ -27,10 +27,7 @@ import torch.nn.functional as F
 from compiler.aten.plena_compiler import PlenaCompiler
 from compiler.aten.ops.registry import OpRegistry, Backend
 import compiler.aten.ops as ops
-from transactional_emulator.testbench.model_layer_test_builder import (
-    quantize_to_mxfp,
-    _make_rope_tables,
-)
+from transactional_emulator.testbench.model_layer_test_builder import quantize_to_mxfp
 import re
 
 _IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
@@ -385,6 +382,85 @@ def _linear_projection(prog, input_var, weight_var, name):
 
 
 # ---------------------------------------------------------------------------
+# PLENA ISA helper: named linear projection (avoids name conflicts)
+# ---------------------------------------------------------------------------
+def _linear_projection(prog, input_var, weight_var, name):
+    """Emit a linear projection with a custom VRAM output name.
+
+    Equivalent to ops.linear but uses *name* for the output allocation so
+    that multiple projections in the same scope don't collide on the
+    default "linear_out" name.
+
+    Supports K-split: when K tiles exceed MRAM capacity (4 tiles), splits
+    into chunks and accumulates partial sums via a temporary buffer.
+    """
+    import math as _math
+
+    mlen = prog.mlen
+    MAX_K_TILES = 4  # MRAM capacity: 4 x mlen^2 elements
+
+    rows, k_total = input_var.shape
+    _, out_features = weight_var.shape
+    num_row_blocks = _math.ceil(rows / mlen)
+    num_col_blocks = out_features // mlen
+    num_k_tiles = _math.ceil(k_total / mlen)
+
+    output_strict = rows % mlen == 0
+    output = prog.alloc(name, rows, out_features, strict=output_strict)
+
+    if num_k_tiles <= MAX_K_TILES:
+        # Single pass: all K tiles fit in MRAM
+        for col_idx in range(num_col_blocks):
+            for row_idx in range(num_row_blocks):
+                prog.vram_sub_projection_to(
+                    input_var,
+                    row_idx,
+                    weight_var,
+                    col_idx,
+                    output,
+                    row_idx,
+                    col_idx,
+                )
+    else:
+        # K-split: chunk K tiles into groups of MAX_K_TILES
+        k_chunks = []
+        k_start = 0
+        while k_start < num_k_tiles:
+            k_end = min(k_start + MAX_K_TILES, num_k_tiles)
+            k_chunks.append((k_start, k_end - k_start))
+            k_start = k_end
+
+        temp = prog.alloc(f"{name}_ksplit_tmp", rows, out_features, strict=output_strict)
+
+        for k_chunk_idx, (k_block_start, k_block_count) in enumerate(k_chunks):
+            for col_idx in range(num_col_blocks):
+                for row_idx in range(num_row_blocks):
+                    if k_chunk_idx == 0:
+                        prog.vram_sub_projection_to(
+                            input_var, row_idx, weight_var, col_idx,
+                            output, row_idx, col_idx,
+                            k_block_start=k_block_start,
+                            k_block_count=k_block_count,
+                        )
+                    else:
+                        prog.vram_sub_projection_to(
+                            input_var, row_idx, weight_var, col_idx,
+                            temp, row_idx, col_idx,
+                            k_block_start=k_block_start,
+                            k_block_count=k_block_count,
+                        )
+                        prog.vram_block_add_to(
+                            output, row_idx, col_idx,
+                            temp, row_idx, col_idx,
+                            output, row_idx, col_idx,
+                        )
+
+        prog.free_tensor(temp)
+
+    return output
+
+
+# ---------------------------------------------------------------------------
 # Main compilation function
 # ---------------------------------------------------------------------------
 def compile_hf_model(
@@ -412,14 +488,6 @@ def compile_hf_model(
             residual = X
             X = rms_norm(X)
             Q = linear(X, W_q)           # Q projection
-            K_h = linear(X, W_k_h)       # K projection (per KV head, on-chip)
-            V_h = linear(X, W_v_h)       # V projection (per KV head, on-chip)
-            # RoPE (native mode only):
-            Q_rot_h = linear(Q_h, R_rope)  # rotate_half via matmul
-            Q_h = Q_h * cos + Q_rot_h * sin
-            K_rot_h = linear(K_h, R_rope)
-            K_h = K_h * cos + K_rot_h * sin
-            store K_h, V_h to HBM
             O = flash_attention(Q, K, V, scale)
             O = linear(O, W_o)           # O projection
             X = O + residual
@@ -431,8 +499,8 @@ def compile_hf_model(
         if include_lm_head:
             logits = linear(X, W_lm_head)  # (seq, vocab_size)
 
-    RoPE is applied in native mode via rotate_half matrix multiplication.
-    Q, K, V, and O linear projections are all computed on-chip.
+    RoPE is omitted (orthogonal to multi-layer compilation testing).
+    Q and O linear projections are included for the attention block.
 
     Args:
         model:          nn.Module (HF CausalLM model, already loaded)
@@ -528,8 +596,6 @@ def compile_hf_model(
     if native_mode:
         print(f"  MHA:    num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
               f"total_q_dim={total_q_dim}, total_kv_dim={total_kv_dim}")
-    if include_lm_head:
-        print(f"  lm_head: W_lm_head={lm_head_weight.shape}, vocab_size={vocab_size}")
     print("=" * 80)
 
     # ----------------------------------------------------------- weights
@@ -557,33 +623,27 @@ def compile_hf_model(
     # ----------------------------------------------------------- test data
     torch.manual_seed(seed)
 
-    # Embedding lookup: use real HF embedding table if available
-    if embed is not None:
-        input_ids = torch.randint(0, native_cfg["vocab_size"] or 32000, (seq_len,))
-        with torch.no_grad():
-            token_embeds = embed(input_ids).float()
-        if token_embeds.dim() == 3:
-            token_embeds = token_embeds.squeeze(0)
-        # Slice to target hidden dim (native mode uses full hidden)
-        token_embeds = token_embeds[:, :hidden]
-        print(f"\nEmbedding lookup: input_ids shape={input_ids.shape}, "
-              f"token_embeds={token_embeds.shape}")
-    else:
-        token_embeds = torch.randn(seq_len, hidden)
-        print(f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}")
-
-    # Llama-style models use RoPE (not learned position embeddings).
-    # Set pos_weight to zeros so embedding_add is a no-op for position.
-    pos_weight = torch.zeros(seq_len, hidden)
-
-    # K/V test data: native mode computes K/V on-chip, legacy mode uses precomputed
+    # K/V test data: per-KV-head in native mode, single matrix in legacy mode
     if native_mode:
-        # K/V are computed on-chip from X_normed @ W_k/W_v — no precomputed K/V needed
-        print(f"pos_weight:   zeros {pos_weight.shape} (Llama uses RoPE, not learned pos embed)")
+        # List of lists: K_head_mats[layer][kv_head] = (seq_len, head_dim)
+        K_head_mats = []
+        V_head_mats = []
+        for i in range(n_layers):
+            k_heads_i = []
+            v_heads_i = []
+            for kv_h in range(num_kv_heads):
+                X_ctx = torch.randn(seq_len, hidden)
+                k_heads_i.append(X_ctx @ all_weights[i]["W_k_heads"][kv_h])
+                v_heads_i.append(X_ctx @ all_weights[i]["W_v_heads"][kv_h])
+            K_head_mats.append(k_heads_i)
+            V_head_mats.append(v_heads_i)
+
+        print(f"\ntoken_embeds: {token_embeds.shape}")
+        print(f"pos_weight:   {pos_weight.shape}")
         for i in range(n_layers):
             for kv_h in range(num_kv_heads):
-                print(f"  W_k_{i}_h{kv_h}: {all_weights[i]['W_k_heads'][kv_h].shape}, "
-                      f"W_v_{i}_h{kv_h}: {all_weights[i]['W_v_heads'][kv_h].shape}")
+                print(f"  K_{i}_h{kv_h}: {K_head_mats[i][kv_h].shape}, "
+                      f"V_{i}_h{kv_h}: {V_head_mats[i][kv_h].shape}")
     else:
         K_mats = []
         V_mats = []
@@ -592,92 +652,60 @@ def compile_hf_model(
             K_mats.append(X_ctx @ all_weights[i]["W_k"])
             V_mats.append(X_ctx @ all_weights[i]["W_v"])
 
-        print(f"pos_weight:   zeros {pos_weight.shape} (Llama uses RoPE, not learned pos embed)")
+        print(f"\ntoken_embeds: {token_embeds.shape}")
+        print(f"pos_weight:   {pos_weight.shape}")
         for i in range(n_layers):
             print(f"  K_{i}: {K_mats[i].shape}, V_{i}: {V_mats[i].shape}")
     print(f"attn_scale: {scale:.6f}")
 
     # ----------------------------------------------------------- golden ref
-    _do_quant = golden_precision in ("hardware", "no_bf16")
-    _do_bf16 = golden_precision in ("hardware", "no_weight_quant")
-    _qw = quantize_to_mxfp if _do_quant else (lambda x: x)
-    _to_inter = (lambda x: x.to(torch.bfloat16)) if _do_bf16 else (lambda x: x)
-    _from_inter = (lambda x: x.float()) if _do_bf16 else (lambda x: x)
-    _prec_label = {"hardware": "MXFP8 weights + BF16 intermediates",
-                   "no_weight_quant": "float32 weights + BF16 intermediates",
-                   "no_bf16": "MXFP8 weights + float32 intermediates",
-                   "fp32": "float32 weights + float32 intermediates"}[golden_precision]
-    print(f"\n--- CPU Golden Reference ({_prec_label}) ---")
+    print("\n--- CPU Golden Reference (MXFP8 quantized HBM + BF16 intermediates) ---")
 
     if native_mode:
-        W_k_q_heads = [[_qw(all_weights[i]["W_k_heads"][h])
-                        for h in range(num_kv_heads)]
-                       for i in range(n_layers)]
-        W_v_q_heads = [[_qw(all_weights[i]["W_v_heads"][h])
-                        for h in range(num_kv_heads)]
-                       for i in range(n_layers)]
-    if native_mode:
-        R_matrix = _make_rotate_half_matrix(head_dim)
-        R_rope_q = _qw(R_matrix)
-        cos_table, sin_table = _make_rope_tables(seq_len, head_dim, native_cfg["rope_theta"])
-
+        # Quantize per-head K/V
+        K_q_heads = [[quantize_to_mxfp(K_head_mats[i][h]) for h in range(num_kv_heads)]
+                     for i in range(n_layers)]
+        V_q_heads = [[quantize_to_mxfp(V_head_mats[i][h]) for h in range(num_kv_heads)]
+                     for i in range(n_layers)]
     else:
-        K_q_list = [_qw(K_mats[i]) for i in range(n_layers)]
-        V_q_list = [_qw(V_mats[i]) for i in range(n_layers)]
+        K_q_list = [quantize_to_mxfp(K_mats[i]) for i in range(n_layers)]
+        V_q_list = [quantize_to_mxfp(V_mats[i]) for i in range(n_layers)]
 
-    X_gold = _qw(token_embeds.clone()) + _qw(pos_weight)  # embedding_add (MXFP8-quantized, matching HBM)
+    X_gold = token_embeds.clone() + pos_weight  # embedding_add
     ratio = num_heads // num_kv_heads
 
     for i in range(n_layers):
         w = all_weights[i]
-        W_q_q = _qw(w["W_q"])
-        W_o_q = _qw(w["W_o"])
-        W_gate_q = _qw(w["W_gate"])
-        W_up_q = _qw(w["W_up"])
-        W_down_q = _qw(w["W_down"])
+        W_q_q = quantize_to_mxfp(w["W_q"])
+        W_o_q = quantize_to_mxfp(w["W_o"])
+        W_gate_q = quantize_to_mxfp(w["W_gate"])
+        W_up_q = quantize_to_mxfp(w["W_up"])
+        W_down_q = quantize_to_mxfp(w["W_down"])
 
         # --- Attention block ---
         residual = X_gold.clone()
-        X_bf = _to_inter(X_gold)
-        # Hardware: scalar rms stays in f32, V_MUL_VF multiplies BF16 * f32 -> BF16
-        rms = torch.rsqrt(_from_inter(X_bf).pow(2).mean(-1, keepdim=True) + eps)
-        X_gold = (_from_inter(X_bf) * rms).to(torch.bfloat16).float()
+        # rms_norm with bfloat16 to match PLENA
+        X_bf = X_gold.to(torch.bfloat16)
+        rms = torch.rsqrt(X_bf.float().pow(2).mean(-1, keepdim=True) + eps).to(torch.bfloat16)
+        X_gold = (X_bf * rms).float()
         if native_mode:
-            Q_gold = _ksplit_matmul(X_gold, W_q_q, mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
-            Q_gold = _from_inter(_to_inter(Q_gold))  # VRAM write: BF16
-
-            K_q_heads_i = []
-            V_q_heads_i = []
-            for kv_h in range(num_kv_heads):
-                K_h = _ksplit_matmul(X_gold, W_k_q_heads[i][kv_h], mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
-                V_h = _ksplit_matmul(X_gold, W_v_q_heads[i][kv_h], mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
-                K_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(K_h)), _from_inter(_to_inter(R_rope_q)))))
-                # Hardware RoPE: V_MUL_VV (BF16*BF16->BF16), V_ADD_VV (BF16+BF16->BF16)
-                K_cos = _from_inter(_to_inter(K_h.to(torch.bfloat16).float() * cos_table.to(torch.bfloat16).float()))
-                K_rot_sin = _from_inter(_to_inter(K_rot_h.to(torch.bfloat16).float() * sin_table.to(torch.bfloat16).float()))
-                K_h = _from_inter(_to_inter(K_cos) + _to_inter(K_rot_sin))
-                # Hardware stores K/V to HBM as MXFP8, loads back as BF16 for attention
-                K_q_heads_i.append(_from_inter(_to_inter(_qw(K_h))))
-                V_q_heads_i.append(_from_inter(_to_inter(_qw(V_h))))
-
+            # Q projection: X @ W_q (MXFP8-quantized weight, BF16 intermediate)
+            Q_gold = torch.matmul(X_gold.to(torch.bfloat16).float(), W_q_q.float()).to(torch.bfloat16).float()
+            # Per-head flash attention
             O_heads = []
             for h in range(num_heads):
                 kv_h = h // ratio
                 Q_h = Q_gold[:, h * head_dim:(h + 1) * head_dim]
-                Q_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(Q_h)), _from_inter(_to_inter(R_rope_q)))))
-                # Hardware RoPE: V_MUL_VV (BF16*BF16->BF16), V_ADD_VV (BF16+BF16->BF16)
-                Q_cos = _from_inter(_to_inter(Q_h.to(torch.bfloat16).float() * cos_table.to(torch.bfloat16).float()))
-                Q_rot_sin = _from_inter(_to_inter(Q_rot_h.to(torch.bfloat16).float() * sin_table.to(torch.bfloat16).float()))
-                Q_h = _from_inter(_to_inter(Q_cos) + _to_inter(Q_rot_sin))
-                O_h = _flash_attn_ref(Q_h, K_q_heads_i[kv_h], V_q_heads_i[kv_h], scale, causal=True)
+                O_h = _flash_attn_ref(Q_h, K_q_heads[i][kv_h], V_q_heads[i][kv_h], scale)
                 O_heads.append(O_h)
-            attn_out = _from_inter(_to_inter(torch.cat(O_heads, dim=1)))  # VRAM write: BF16
-            O_gold = _ksplit_matmul(attn_out, W_o_q, mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
-            O_gold = _from_inter(_to_inter(O_gold))  # VRAM write: BF16
-            X_gold = _from_inter(_to_inter(O_gold + residual))  # residual add -> VRAM write: BF16
+            attn_out = torch.cat(O_heads, dim=1)  # (seq, num_heads * head_dim)
+            # O projection
+            O_gold = torch.matmul(attn_out.to(torch.bfloat16).float(), W_o_q.float()).to(torch.bfloat16).float()
+            X_gold = O_gold + residual
         else:
-            attn_out = _flash_attn_ref(X_gold, K_q_list[i], V_q_list[i], scale, causal=True)
-            X_gold = _from_inter(_to_inter(attn_out + residual))  # residual add -> VRAM write: BF16
+            # Legacy: X is Q directly (no projection)
+            attn_out = _flash_attn_ref(X_gold, K_q_list[i], V_q_list[i], scale)
+            X_gold = attn_out + residual
 
         # --- FFN block ---
         residual = X_gold.clone()
@@ -823,14 +851,14 @@ def compile_hf_model(
         wq = prog.input(f"W_q_{i}", shape=(hidden, total_q_dim))
         wo = prog.input(f"W_o_{i}", shape=(total_q_dim, hidden))
         if native_mode:
-            wk_heads = []
-            wv_heads = []
+            k_heads = []
+            v_heads = []
             for kv_h in range(num_kv_heads):
-                wk_heads.append(prog.input(f"W_k_{i}_h{kv_h}", shape=(hidden, head_dim)))
-                wv_heads.append(prog.input(f"W_v_{i}_h{kv_h}", shape=(hidden, head_dim)))
+                k_heads.append(prog.input(f"K_{i}_h{kv_h}", shape=(seq_len, head_dim)))
+                v_heads.append(prog.input(f"V_{i}_h{kv_h}", shape=(seq_len, head_dim)))
             li_entry = {
                 "W_q": wq, "W_o": wo,
-                "W_k_heads": wk_heads, "W_v_heads": wv_heads,
+                "K_heads": k_heads, "V_heads": v_heads,
             }
         else:
             ki = prog.input(f"K_{i}", shape=(seq_len, head_dim))
@@ -844,11 +872,6 @@ def compile_hf_model(
         wd = prog.input(f"W_down_{i}", shape=(inter, hidden))
         li_entry.update({"W_gate": wg, "W_up": wu, "W_down": wd})
         layer_inputs.append(li_entry)
-
-    # lm_head weight input (after all layer weights in HBM layout)
-    lm_head_input = None
-    if include_lm_head and lm_head_weight is not None:
-        lm_head_input = prog.input("W_lm_head", shape=(hidden, vocab_size))
 
     # Load activations to VRAM
     X_batch = prog.load_batch(x_input, name="X")
@@ -864,10 +887,9 @@ def compile_hf_model(
         _current_bump += 2 * seq_len * head_dim  # COS + SIN loaded to VRAM
     _current_bump += mlen * mlen  # CAUSAL_MASK loaded to VRAM
     if _current_bump < _ffn_intermediate_end:
-        _pad_elems = _ffn_intermediate_end - _current_bump
-        # Allocate enough mlen-wide rows to cover the padding
-        _pad_rows = (_pad_elems + mlen - 1) // mlen
-        # Round up to mlen for VRAM alignment
+        _pad_size = _ffn_intermediate_end - _current_bump
+        _pad_rows = max(1, _pad_size // mlen)
+        # Round up to mlen multiple for VRAM alignment
         _pad_rows = ((_pad_rows + mlen - 1) // mlen) * mlen
         prog.alloc("_vram_padding", _pad_rows, mlen, strict=False)
 
@@ -895,52 +917,22 @@ def compile_hf_model(
             # Q projection: current (seq, hidden) @ W_q (hidden, total_q_dim)
             Q = _linear_projection(prog, current, li["W_q"], f"Q_{i}")
 
-            # Per-KV-head: compute K/V on-chip, store to HBM, then run Q-heads
+            # Per-head flash attention with VRAM views
             q_full_addr = prog._compiler.get_vram_addr(Q.name)
 
             # Allocate O_full for concatenated head outputs
             O_full = prog.alloc(f"O_full_{i}", seq_len, total_q_dim)
             o_full_addr = prog._compiler.get_vram_addr(O_full.name)
 
-            # Store K/V InputVars for each KV head (filled during loop below)
-            kv_stored = []
-
-            for kv_h in range(num_kv_heads):
-                # K projection: current (seq, hidden) @ W_k_h (hidden, head_dim)
-                K_h = _linear_projection(prog, current, li["W_k_heads"][kv_h], f"K_{i}_h{kv_h}")
-                # V projection: current (seq, hidden) @ W_v_h (hidden, head_dim)
-                V_h = _linear_projection(prog, current, li["W_v_heads"][kv_h], f"V_{i}_h{kv_h}")
-
-                # RoPE on K_h: K_rot = linear(K_h, R_rope), then K_h = K_h * cos + K_rot * sin
-                K_rot = _linear_projection(prog, K_h, r_input, f"K_rot_{i}_h{kv_h}")
-                prog.rope(K_h, K_rot, COS, SIN)
-                prog.free_tensor(K_rot)
-
-                # Store K/V from VRAM to HBM (auto-allocates HBM space)
-                K_stored = prog.store(K_h, name=f"K_stored_{i}_h{kv_h}")
-                V_stored = prog.store(V_h, name=f"V_stored_{i}_h{kv_h}")
-                kv_stored.append((K_stored, V_stored))
-
-                # Free K/V VRAM — data is in HBM now
-                prog.free_tensor(K_h)
-                prog.free_tensor(V_h)
-
             for h in range(num_heads):
                 kv_h = h // ratio
-                K_stored, V_stored = kv_stored[kv_h]
 
                 # View for this head's Q slice: column block h in Q_full
                 q_h_addr = q_full_addr + h * seq_len * mlen
                 Q_h = prog.alloc_at(f"Q_h{h}_{i}", seq_len, head_dim, q_h_addr)
 
-                # RoPE on Q_h: Q_rot = linear(Q_h, R_rope), then Q_h = Q_h * cos + Q_rot * sin
-                Q_rot = _linear_projection(prog, Q_h, r_input, f"Q_rot_{i}_h{h}")
-                prog.rope(Q_h, Q_rot, COS, SIN)
-                prog.free_tensor(Q_rot)
-
-                # Single-head flash attention (K/V read from HBM) with causal mask
-                O_h = ops.flash_attention(prog, Q_h, K_stored, V_stored, scale,
-                                          causal_mask=CAUSAL_MASK)
+                # Single-head flash attention (allocates S, PV, O internally)
+                O_h = ops.flash_attention(prog, Q_h, li["K_heads"][kv_h], li["V_heads"][kv_h], scale)
 
                 # Copy O_h to the right column block of O_full
                 o_h_dest_addr = o_full_addr + h * seq_len * mlen
@@ -962,9 +954,8 @@ def compile_hf_model(
             prog.vram_add(O_proj, scratch)
             current_after_attn = O_proj
         else:
-            # Legacy: X is Q directly (no projections), with causal mask
-            O = ops.flash_attention(prog, current, li["K"], li["V"], scale,
-                                    causal_mask=CAUSAL_MASK)
+            # Legacy: X is Q directly (no projections)
+            O = ops.flash_attention(prog, current, li["K"], li["V"], scale)
             prog.vram_add(O, scratch)
             current_after_attn = O
 
@@ -983,7 +974,6 @@ def compile_hf_model(
         prog.vram_add(current_after_attn, scratch)
 
         current = current_after_attn  # carry forward
-        prog._compiler.generated_code += f"; === LAYER {i}/{n_layers} COMPLETE ===\n"
 
     # Final norm
     prog.rms_norm(current, eps_offset=3, reci_hid_offset=4)
@@ -1013,8 +1003,8 @@ def compile_hf_model(
         input_tensors[f"W_o_{i}"] = all_weights[i]["W_o"]
         if native_mode:
             for kv_h in range(num_kv_heads):
-                input_tensors[f"W_k_{i}_h{kv_h}"] = all_weights[i]["W_k_heads"][kv_h]
-                input_tensors[f"W_v_{i}_h{kv_h}"] = all_weights[i]["W_v_heads"][kv_h]
+                input_tensors[f"K_{i}_h{kv_h}"] = K_head_mats[i][kv_h]
+                input_tensors[f"V_{i}_h{kv_h}"] = V_head_mats[i][kv_h]
         else:
             input_tensors[f"K_{i}"] = K_mats[i]
             input_tensors[f"V_{i}"] = V_mats[i]
@@ -1025,7 +1015,7 @@ def compile_hf_model(
         kv_keys = []
         if native_mode:
             for kv_h in range(num_kv_heads):
-                kv_keys.extend([f"W_k_{i}_h{kv_h}", f"W_v_{i}_h{kv_h}"])
+                kv_keys.extend([f"K_{i}_h{kv_h}", f"V_{i}_h{kv_h}"])
         else:
             kv_keys = [f"K_{i}", f"V_{i}"]
         data_order.extend([
@@ -1033,11 +1023,6 @@ def compile_hf_model(
             *kv_keys,
             f"W_gate_{i}", f"W_up_{i}", f"W_down_{i}",
         ])
-
-    # lm_head weight in input_tensors + data_order
-    if include_lm_head and lm_head_weight is not None:
-        input_tensors["W_lm_head"] = lm_head_weight
-        data_order.append("W_lm_head")
 
     # FPRAM layout (same as single-layer decoder):
     #   slot 0 = 0.0        (reserved)
@@ -1077,8 +1062,6 @@ def compile_hf_model(
         "num_heads": num_heads if native_mode else 1,
         "num_kv_heads": num_kv_heads if native_mode else 1,
         "native_mode": native_mode,
-        "include_lm_head": include_lm_head and lm_head_weight is not None,
-        "vocab_size": vocab_size if (include_lm_head and lm_head_weight is not None) else None,
         "mlen": mlen,
         "blen": blen,
         "isa_lines": len(lines),
