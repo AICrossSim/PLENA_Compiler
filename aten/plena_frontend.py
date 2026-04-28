@@ -498,7 +498,6 @@ def compile_hf_model(
     blen: int = 4,
     seed: int = 42,
     include_lm_head: bool = False,
-    golden_precision: str = "hardware",
 ) -> dict:
     """Compile a HuggingFace model to PLENA ISA via PlenaCompiler.
 
@@ -545,11 +544,6 @@ def compile_hf_model(
         blen:           Batch tile length (default 4)
         seed:           Random seed for test data generation
         include_lm_head: If True, add lm_head projection after final norm (default False)
-        golden_precision: Precision mode for golden reference computation.
-            "hardware"       — MXFP8 weights + BF16 intermediates (default, matches HW)
-            "no_weight_quant" — float32 weights + BF16 intermediates (isolates MXFP8 effect)
-            "no_bf16"        — MXFP8 weights + float32 intermediates (isolates BF16 effect)
-            "fp32"           — float32 weights + float32 intermediates (should match HF exactly)
 
     Returns:
         dict with:
@@ -628,6 +622,8 @@ def compile_hf_model(
     if native_mode:
         print(f"  MHA:    num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
               f"total_q_dim={total_q_dim}, total_kv_dim={total_kv_dim}")
+    if include_lm_head:
+        print(f"  lm_head: W_lm_head={lm_head_weight.shape}, vocab_size={vocab_size}")
     print("=" * 80)
 
     # ----------------------------------------------------------- weights
@@ -655,11 +651,29 @@ def compile_hf_model(
     # ----------------------------------------------------------- test data
     torch.manual_seed(seed)
 
+    # Embedding lookup: use real HF embedding table if available
+    if embed is not None:
+        input_ids = torch.randint(0, native_cfg["vocab_size"] or 32000, (seq_len,))
+        with torch.no_grad():
+            token_embeds = embed(input_ids).float()
+        if token_embeds.dim() == 3:
+            token_embeds = token_embeds.squeeze(0)
+        # Slice to target hidden dim (native mode uses full hidden)
+        token_embeds = token_embeds[:, :hidden]
+        print(f"\nEmbedding lookup: input_ids shape={input_ids.shape}, "
+              f"token_embeds={token_embeds.shape}")
+    else:
+        token_embeds = torch.randn(seq_len, hidden)
+        print(f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}")
+
+    # Llama-style models use RoPE (not learned position embeddings).
+    # Set pos_weight to zeros so embedding_add is a no-op for position.
+    pos_weight = torch.zeros(seq_len, hidden)
+
     # K/V test data: native mode computes K/V on-chip, legacy mode uses precomputed
     if native_mode:
         # K/V are computed on-chip from X_normed @ W_k/W_v — no precomputed K/V needed
-        print(f"\ntoken_embeds: {token_embeds.shape}")
-        print(f"pos_weight:   {pos_weight.shape}")
+        print(f"pos_weight:   zeros {pos_weight.shape} (Llama uses RoPE, not learned pos embed)")
         for i in range(n_layers):
             for kv_h in range(num_kv_heads):
                 print(f"  W_k_{i}_h{kv_h}: {all_weights[i]['W_k_heads'][kv_h].shape}, "
@@ -672,8 +686,7 @@ def compile_hf_model(
             K_mats.append(X_ctx @ all_weights[i]["W_k"])
             V_mats.append(X_ctx @ all_weights[i]["W_v"])
 
-        print(f"\ntoken_embeds: {token_embeds.shape}")
-        print(f"pos_weight:   {pos_weight.shape}")
+        print(f"pos_weight:   zeros {pos_weight.shape} (Llama uses RoPE, not learned pos embed)")
         for i in range(n_layers):
             print(f"  K_{i}: {K_mats[i].shape}, V_{i}: {V_mats[i].shape}")
     print(f"attn_scale: {scale:.6f}")
@@ -781,9 +794,8 @@ def compile_hf_model(
     # lm_head projection (optional)
     if include_lm_head and lm_head_weight is not None:
         W_lm_q = quantize_to_mxfp(lm_head_weight)
-        # Hardware: MXFP8 → BF16 (MRAM) → float32 (M_MM)
         logits_gold = torch.matmul(
-            X_gold.to(torch.bfloat16).float(), W_lm_q.to(torch.bfloat16).float()
+            X_gold.to(torch.bfloat16).float(), W_lm_q.float()
         ).to(torch.bfloat16).float()
         golden_out = logits_gold
         print(f"  logits_gold: {golden_out.shape}")
@@ -913,6 +925,11 @@ def compile_hf_model(
         wd = prog.input(f"W_down_{i}", shape=(inter, hidden))
         li_entry.update({"W_gate": wg, "W_up": wu, "W_down": wd})
         layer_inputs.append(li_entry)
+
+    # lm_head weight input (after all layer weights in HBM layout)
+    lm_head_input = None
+    if include_lm_head and lm_head_weight is not None:
+        lm_head_input = prog.input("W_lm_head", shape=(hidden, vocab_size))
 
     # Load activations to VRAM
     X_batch = prog.load_batch(x_input, name="X")
@@ -1092,6 +1109,11 @@ def compile_hf_model(
             f"W_gate_{i}", f"W_up_{i}", f"W_down_{i}",
         ])
 
+    # lm_head weight in input_tensors + data_order
+    if include_lm_head and lm_head_weight is not None:
+        input_tensors["W_lm_head"] = lm_head_weight
+        data_order.append("W_lm_head")
+
     # FPRAM layout (same as single-layer decoder):
     #   slot 0 = 0.0        (reserved)
     #   slot 1 = attn_scale  (flash_attention)
@@ -1130,6 +1152,8 @@ def compile_hf_model(
         "num_heads": num_heads if native_mode else 1,
         "num_kv_heads": num_kv_heads if native_mode else 1,
         "native_mode": native_mode,
+        "include_lm_head": include_lm_head and lm_head_weight is not None,
+        "vocab_size": vocab_size if (include_lm_head and lm_head_weight is not None) else None,
         "mlen": mlen,
         "blen": blen,
         "isa_lines": len(lines),
