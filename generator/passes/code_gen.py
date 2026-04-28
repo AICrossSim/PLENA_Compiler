@@ -716,6 +716,9 @@ def _weight_hbm_bytes(rows: int, cols: int, hardware_config: dict) -> int:
     map_mx_data_to_hbm_for_behave_sim.
     """
     block_dim = hardware_config.get("block_dim", 4)
+    assert cols % block_dim == 0, (
+        f"cols ({cols}) must be a multiple of block_dim ({block_dim})"
+    )
     wt_block_width = hardware_config.get("wt_block_width", 32)
     scale_width = hardware_config.get("scale_width", 8)
     return rows * (cols // block_dim) * ((wt_block_width // 8) + (scale_width // 8))
