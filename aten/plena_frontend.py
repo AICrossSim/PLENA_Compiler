@@ -844,13 +844,13 @@ def compile_hf_model(
                     # RoPE on Q_h (float32)
                     Q_rot = Q_h @ R_mat_f32
                     Q_h = Q_h * cos_f32 + Q_rot * sin_f32
-                    O_h = _flash_attn_ref(Q_h, K_hf_heads[kv_h], V_hf_heads[kv_h], scale, causal=True)
+                    O_h = _flash_attn_ref(Q_h, K_hf_heads[kv_h], V_hf_heads[kv_h], scale)
                     O_heads_hf.append(O_h)
                 attn_out_hf = torch.cat(O_heads_hf, dim=1)
                 O_hf = attn_out_hf @ w["W_o"].float()
                 X_hf = O_hf + residual
             else:
-                attn_out_hf = _flash_attn_ref(X_normed, K_mats[i].float(), V_mats[i].float(), scale, causal=True)
+                attn_out_hf = _flash_attn_ref(X_normed, K_mats[i].float(), V_mats[i].float(), scale)
                 X_hf = attn_out_hf + residual
 
             # --- FFN block (float32) ---
@@ -1296,5 +1296,25 @@ def compile_and_run(
         comp_results["vram_stage_pass"] = stage_pass
     except Exception as e:
         print(f"  (skipped: {e})")
+
+    comp_results, _params = compare_emulator_output(build_dir)
+
+    # Three-way comparison
+    golden = result["golden_output"]
+    hf_gt = result["hf_ground_truth"]
+    print("\n--- Three-way comparison ---")
+    if hf_gt is not None and golden is not None:
+        # HF float32 vs golden (MXFP8 + BF16)
+        n = min(hf_gt.numel(), golden.numel())
+        allclose_hf_vs_gold = (
+            torch.isclose(hf_gt.float().flatten()[:n],
+                          golden.float().flatten()[:n], atol=1e-2)
+            .float().mean().item() * 100
+        )
+        print(f"  HF float32 vs golden (MXFP8+BF16):  {allclose_hf_vs_gold:.2f}% allclose")
+    # Emulator vs golden: reported by compare_emulator_output
+    emu_match = comp_results.get("allclose_match_rate", None)
+    if emu_match is not None:
+        print(f"  Emulator vs golden (MXFP8+BF16):    {emu_match:.2f}% allclose")
 
     return {**result["info"], **comp_results}
