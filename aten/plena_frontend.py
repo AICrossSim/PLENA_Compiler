@@ -629,6 +629,77 @@ def compile_hf_model(
     print(f"  golden_out: {golden_out.shape}")
     print(f"  golden_out[0,:4]: {golden_out[0, :4].tolist()}")
 
+    # ----------------------------------------------------------- HF ground truth
+    # Same pipeline as golden but pure float32: no MXFP8 quantization, no BF16 casting.
+    # This is the "best possible" reference for the sliced weight dimensions being tested.
+    print(f"\n--- HF Ground Truth (float32, {n_layers} layers, no quantization) ---")
+    with torch.no_grad():
+        X_hf = token_embeds.clone() + pos_weight  # embedding_add
+
+        for i in range(n_layers):
+            w = all_weights[i]
+            eps_i = w["eps"]
+
+            # --- Attention block (float32) ---
+            residual = X_hf.clone()
+            rms = torch.rsqrt(X_hf.pow(2).mean(-1, keepdim=True) + eps_i)
+            X_normed = X_hf * rms
+
+            if native_mode:
+                Q_hf = X_normed @ w["W_q"].float()
+
+                K_hf_heads = []
+                V_hf_heads = []
+                R_mat_f32 = R_matrix.float()
+                cos_f32 = cos_table.float()
+                sin_f32 = sin_table.float()
+                for kv_h in range(num_kv_heads):
+                    K_h = X_normed @ w["W_k_heads"][kv_h].float()
+                    V_h = X_normed @ w["W_v_heads"][kv_h].float()
+                    # RoPE on K_h (float32)
+                    K_rot = K_h @ R_mat_f32
+                    K_h = K_h * cos_f32 + K_rot * sin_f32
+                    K_hf_heads.append(K_h)
+                    V_hf_heads.append(V_h)
+
+                O_heads_hf = []
+                for h in range(num_heads):
+                    kv_h = h // ratio
+                    Q_h = Q_hf[:, h * head_dim:(h + 1) * head_dim]
+                    # RoPE on Q_h (float32)
+                    Q_rot = Q_h @ R_mat_f32
+                    Q_h = Q_h * cos_f32 + Q_rot * sin_f32
+                    O_h = _flash_attn_ref(Q_h, K_hf_heads[kv_h], V_hf_heads[kv_h], scale)
+                    O_heads_hf.append(O_h)
+                attn_out_hf = torch.cat(O_heads_hf, dim=1)
+                O_hf = attn_out_hf @ w["W_o"].float()
+                X_hf = O_hf + residual
+            else:
+                attn_out_hf = _flash_attn_ref(X_normed, K_mats[i].float(), V_mats[i].float(), scale)
+                X_hf = attn_out_hf + residual
+
+            # --- FFN block (float32) ---
+            residual = X_hf.clone()
+            rms = torch.rsqrt(X_hf.pow(2).mean(-1, keepdim=True) + eps_i)
+            X_normed = X_hf * rms
+            up_out = F.silu(X_normed @ w["W_up"].float())
+            gate_out = X_normed @ w["W_gate"].float()
+            X_hf = (up_out * gate_out) @ w["W_down"].float() + residual
+
+            print(f"  After layer {i}: X_hf[0,:4] = {X_hf[0, :4].tolist()}")
+
+        # Final norm (float32)
+        rms = torch.rsqrt(X_hf.pow(2).mean(-1, keepdim=True) + eps)
+        X_hf = X_hf * rms
+
+        if include_lm_head and lm_head_weight is not None:
+            hf_ground_truth = (X_hf @ lm_head_weight.float())
+        else:
+            hf_ground_truth = X_hf
+
+    print(f"  hf_ground_truth: {hf_ground_truth.shape}")
+    print(f"  hf_ground_truth[0,:4]: {hf_ground_truth[0, :4].tolist()}")
+
     # ----------------------------------------------------------- PLENA ISA
     print("\n--- PLENA Backend (ISA generation) ---")
     registry = OpRegistry.load()
@@ -918,6 +989,7 @@ def compile_hf_model(
     return {
         "isa": isa_code,
         "golden_output": golden_out,
+        "hf_ground_truth": hf_ground_truth,
         "input_tensors": input_tensors,
         "data_order": data_order,
         "fp_preload": fp_preload,
@@ -994,5 +1066,24 @@ def compile_and_run(
     # Run emulator and compare
     run_and_assert(build_dir, asm_name, mlen=mlen, blen=blen)
 
-    comp_results, _ = compare_emulator_output(build_dir)
+    comp_results, _params = compare_emulator_output(build_dir)
+
+    # Three-way comparison
+    golden = result["golden_output"]
+    hf_gt = result["hf_ground_truth"]
+    print("\n--- Three-way comparison ---")
+    if hf_gt is not None and golden is not None:
+        # HF float32 vs golden (MXFP8 + BF16)
+        n = min(hf_gt.numel(), golden.numel())
+        allclose_hf_vs_gold = (
+            torch.isclose(hf_gt.float().flatten()[:n],
+                          golden.float().flatten()[:n], atol=1e-2)
+            .float().mean().item() * 100
+        )
+        print(f"  HF float32 vs golden (MXFP8+BF16):  {allclose_hf_vs_gold:.2f}% allclose")
+    # Emulator vs golden: reported by compare_emulator_output
+    emu_match = comp_results.get("allclose_match_rate", None)
+    if emu_match is not None:
+        print(f"  Emulator vs golden (MXFP8+BF16):    {emu_match:.2f}% allclose")
+
     return {**result["info"], **comp_results}
