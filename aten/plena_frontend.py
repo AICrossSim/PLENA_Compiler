@@ -113,6 +113,7 @@ def _extract_config(model):
     native_head_dim = native_hidden // native_heads
     eps = getattr(config, "rms_norm_eps", 1e-5)
     rope_theta = getattr(config, "rope_theta", 10000.0)
+    vocab_size = getattr(config, "vocab_size", None)
     return {
         "hidden_size": native_hidden,
         "inter_dim": native_inter,
@@ -121,6 +122,7 @@ def _extract_config(model):
         "head_dim": native_head_dim,
         "eps": eps,
         "rope_theta": rope_theta,
+        "vocab_size": vocab_size,
         "model_type": getattr(config, "model_type", "unknown"),
     }
 
@@ -323,6 +325,7 @@ def compile_hf_model(
     mlen: int = 64,
     blen: int = 4,
     seed: int = 42,
+    include_lm_head: bool = False,
 ) -> dict:
     """Compile a HuggingFace model to PLENA ISA via PlenaCompiler.
 
@@ -330,7 +333,8 @@ def compile_hf_model(
     proper residual connections for multi-layer decoders.
 
     The pipeline implemented (per-layer, with pre-norm + residual):
-        X = embedding_add(token_embeds, pos_weight)
+        X = embed_tokens(input_ids)      # real HF embedding lookup
+        X = embedding_add(X, zeros)      # pos_weight=0 for Llama (RoPE handles position)
         for each layer:
             residual = X
             X = rms_norm(X)
@@ -351,6 +355,8 @@ def compile_hf_model(
             X = ffn(X, gate, up, down)
             X = X + residual
         X = rms_norm(X)  # final norm
+        if include_lm_head:
+            logits = linear(X, W_lm_head)  # (seq, vocab_size)
 
     RoPE is applied in native mode via rotate_half matrix multiplication.
     Q, K, V, and O linear projections are all computed on-chip.
@@ -365,6 +371,7 @@ def compile_hf_model(
         mlen:           Matrix tile length (default 64)
         blen:           Batch tile length (default 4)
         seed:           Random seed for test data generation
+        include_lm_head: If True, add lm_head projection after final norm (default False)
 
     Returns:
         dict with:
@@ -406,6 +413,33 @@ def compile_hf_model(
 
     scale = 1.0 / math.sqrt(head_dim)
 
+    # ----------------------------------------------------------- embedding
+    embed = getattr(root, "embed_tokens", getattr(root, "wte", None))
+
+    # ----------------------------------------------------------- lm_head
+    lm_head_weight = None
+    vocab_size = native_cfg.get("vocab_size")
+    if include_lm_head:
+        lm_head_mod = getattr(model, "lm_head", None)
+        if lm_head_mod is None:
+            lm_head_mod = getattr(
+                getattr(model, "language_model", model), "lm_head", None
+            )
+        if lm_head_mod is not None and hasattr(lm_head_mod, "weight"):
+            # nn.Linear stores (vocab, hidden) -> transpose to (hidden, vocab)
+            lm_head_weight_raw = lm_head_mod.weight.detach().T.contiguous()
+            # Slice to hidden if we're in sliced mode
+            lm_head_weight = lm_head_weight_raw[:hidden, :]
+            vocab_size = lm_head_weight.shape[1]
+            # Ensure vocab_size is a multiple of mlen (pad if needed)
+            if vocab_size % mlen != 0:
+                pad_cols = mlen - (vocab_size % mlen)
+                lm_head_weight = F.pad(lm_head_weight, (0, pad_cols))
+                vocab_size = lm_head_weight.shape[1]
+        else:
+            print("WARNING: include_lm_head=True but no lm_head module found; skipping")
+            include_lm_head = False
+
     print("=" * 80)
     print(f"Model Compiler - {native_cfg['model_type']}  ({n_layers} layers)")
     print(f"  native: hidden={native_cfg['hidden_size']}, inter={native_cfg['inter_dim']}, "
@@ -416,6 +450,8 @@ def compile_hf_model(
     if native_mode:
         print(f"  MHA:    num_heads={num_heads}, num_kv_heads={num_kv_heads}, "
               f"total_q_dim={total_q_dim}, total_kv_dim={total_kv_dim}")
+    if include_lm_head:
+        print(f"  lm_head: W_lm_head={lm_head_weight.shape}, vocab_size={vocab_size}")
     print("=" * 80)
 
     # ----------------------------------------------------------- weights
@@ -442,14 +478,30 @@ def compile_hf_model(
 
     # ----------------------------------------------------------- test data
     torch.manual_seed(seed)
-    token_embeds = torch.randn(seq_len, hidden)
-    pos_weight = torch.randn(seq_len, hidden)
+
+    # Embedding lookup: use real HF embedding table if available
+    if embed is not None:
+        input_ids = torch.randint(0, native_cfg["vocab_size"] or 32000, (seq_len,))
+        with torch.no_grad():
+            token_embeds = embed(input_ids).float()
+        if token_embeds.dim() == 3:
+            token_embeds = token_embeds.squeeze(0)
+        # Slice to target hidden dim (native mode uses full hidden)
+        token_embeds = token_embeds[:, :hidden]
+        print(f"\nEmbedding lookup: input_ids shape={input_ids.shape}, "
+              f"token_embeds={token_embeds.shape}")
+    else:
+        token_embeds = torch.randn(seq_len, hidden)
+        print(f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}")
+
+    # Llama-style models use RoPE (not learned position embeddings).
+    # Set pos_weight to zeros so embedding_add is a no-op for position.
+    pos_weight = torch.zeros(seq_len, hidden)
 
     # K/V test data: native mode computes K/V on-chip, legacy mode uses precomputed
     if native_mode:
         # K/V are computed on-chip from X_normed @ W_k/W_v — no precomputed K/V needed
-        print(f"\ntoken_embeds: {token_embeds.shape}")
-        print(f"pos_weight:   {pos_weight.shape}")
+        print(f"pos_weight:   zeros {pos_weight.shape} (Llama uses RoPE, not learned pos embed)")
         for i in range(n_layers):
             for kv_h in range(num_kv_heads):
                 print(f"  W_k_{i}_h{kv_h}: {all_weights[i]['W_k_heads'][kv_h].shape}, "
@@ -462,8 +514,7 @@ def compile_hf_model(
             K_mats.append(X_ctx @ all_weights[i]["W_k"])
             V_mats.append(X_ctx @ all_weights[i]["W_v"])
 
-        print(f"\ntoken_embeds: {token_embeds.shape}")
-        print(f"pos_weight:   {pos_weight.shape}")
+        print(f"pos_weight:   zeros {pos_weight.shape} (Llama uses RoPE, not learned pos embed)")
         for i in range(n_layers):
             print(f"  K_{i}: {K_mats[i].shape}, V_{i}: {V_mats[i].shape}")
     print(f"attn_scale: {scale:.6f}")
@@ -565,7 +616,16 @@ def compile_hf_model(
     # Final norm
     X_gold = _rms_norm_ref(X_gold, eps)
 
-    golden_out = X_gold
+    # lm_head projection (optional)
+    if include_lm_head and lm_head_weight is not None:
+        W_lm_q = quantize_to_mxfp(lm_head_weight)
+        logits_gold = torch.matmul(
+            X_gold.to(torch.bfloat16).float(), W_lm_q.float()
+        ).to(torch.bfloat16).float()
+        golden_out = logits_gold
+        print(f"  logits_gold: {golden_out.shape}")
+    else:
+        golden_out = X_gold
     print(f"  golden_out: {golden_out.shape}")
     print(f"  golden_out[0,:4]: {golden_out[0, :4].tolist()}")
 
@@ -619,6 +679,11 @@ def compile_hf_model(
         wd = prog.input(f"W_down_{i}", shape=(inter, hidden))
         li_entry.update({"W_gate": wg, "W_up": wu, "W_down": wd})
         layer_inputs.append(li_entry)
+
+    # lm_head weight input (after all layer weights in HBM layout)
+    lm_head_input = None
+    if include_lm_head and lm_head_weight is not None:
+        lm_head_input = prog.input("W_lm_head", shape=(hidden, vocab_size))
 
     # Load activations to VRAM
     X_batch = prog.load_batch(x_input, name="X")
@@ -751,6 +816,11 @@ def compile_hf_model(
     # Final norm
     prog.rms_norm(current, eps_offset=3, reci_hid_offset=4)
 
+    # lm_head projection (optional): logits = linear(current, W_lm_head)
+    if include_lm_head and lm_head_input is not None:
+        logits = _linear_projection(prog, current, lm_head_input, "logits")
+        current = logits
+
     isa_code = prog.compile()
     isa_code = _fix_large_immediates(isa_code)
     lines = isa_code.splitlines()
@@ -790,6 +860,11 @@ def compile_hf_model(
             f"W_gate_{i}", f"W_up_{i}", f"W_down_{i}",
         ])
 
+    # lm_head weight in input_tensors + data_order
+    if include_lm_head and lm_head_weight is not None:
+        input_tensors["W_lm_head"] = lm_head_weight
+        data_order.append("W_lm_head")
+
     # FPRAM layout (same as single-layer decoder):
     #   slot 0 = 0.0        (reserved)
     #   slot 1 = attn_scale  (flash_attention)
@@ -800,16 +875,22 @@ def compile_hf_model(
     #   slots 6-9 = 0.0      (padding)
     fp_preload = [0.0, scale, float("-inf"), eps, 1.0 / hidden, 1.0] + [0.0] * 4
 
-    # Result is at current's VRAM location (last O from flash_attention chain)
+    # Result is at current's VRAM location
     o_vram_addr = prog._compiler.get_vram_addr(current.name)
+
+    # Output dimensions depend on whether lm_head is included
+    if include_lm_head and lm_head_weight is not None:
+        out_features = vocab_size
+    else:
+        out_features = hidden
 
     comparison_params = {
         "start_row_idx": o_vram_addr // mlen,
-        "num_rows": (seq_len * hidden) // mlen,
+        "num_rows": (seq_len * out_features) // mlen,
         "num_batches": seq_len,
-        "elements_per_batch": hidden,
+        "elements_per_batch": out_features,
         "row_dim": mlen,
-        "use_stride_mode": hidden > mlen,
+        "use_stride_mode": out_features > mlen,
     }
 
     info = {
@@ -822,6 +903,8 @@ def compile_hf_model(
         "num_heads": num_heads if native_mode else 1,
         "num_kv_heads": num_kv_heads if native_mode else 1,
         "native_mode": native_mode,
+        "include_lm_head": include_lm_head and lm_head_weight is not None,
+        "vocab_size": vocab_size if (include_lm_head and lm_head_weight is not None) else None,
         "mlen": mlen,
         "blen": blen,
         "isa_lines": len(lines),
@@ -829,6 +912,8 @@ def compile_hf_model(
 
     print(f"\nCompilation complete: {info['isa_lines']} ISA lines, "
           f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
+    if include_lm_head and lm_head_weight is not None:
+        print(f"  lm_head: output shape=({seq_len}, {vocab_size})")
 
     return {
         "isa": isa_code,
