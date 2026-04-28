@@ -27,7 +27,10 @@ import torch.nn.functional as F
 from compiler.aten.plena_compiler import PlenaCompiler
 from compiler.aten.ops.registry import OpRegistry, Backend
 import compiler.aten.ops as ops
-from transactional_emulator.testbench.model_layer_test_builder import quantize_to_mxfp
+from transactional_emulator.testbench.model_layer_test_builder import (
+    quantize_to_mxfp,
+    _make_rope_tables,
+)
 import re
 
 _IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
@@ -62,6 +65,24 @@ def _fix_large_immediates(isa_code: str) -> str:
 # Constants
 # ---------------------------------------------------------------------------
 REAL_DATA_RATIO = (8 * 8 + 8) / (8 * 8)
+
+
+# ---------------------------------------------------------------------------
+# RoPE helpers
+# ---------------------------------------------------------------------------
+def _make_rotate_half_matrix(head_dim: int) -> torch.Tensor:
+    """Build the (head_dim, head_dim) matrix that computes rotate_half.
+
+    rotate_half(x) = x @ R, where R permutes the halves with a sign flip:
+      output[:d//2] = -input[d//2:]
+      output[d//2:] = +input[:d//2]
+    """
+    R = torch.zeros(head_dim, head_dim)
+    half = head_dim // 2
+    for i in range(half):
+        R[i + half, i] = -1.0   # first half of output = negated second half of input
+        R[i, i + half] = 1.0    # second half of output = first half of input
+    return R
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +335,14 @@ def compile_hf_model(
             residual = X
             X = rms_norm(X)
             Q = linear(X, W_q)           # Q projection
+            K_h = linear(X, W_k_h)       # K projection (per KV head, on-chip)
+            V_h = linear(X, W_v_h)       # V projection (per KV head, on-chip)
+            # RoPE (native mode only):
+            Q_rot_h = linear(Q_h, R_rope)  # rotate_half via matmul
+            Q_h = Q_h * cos + Q_rot_h * sin
+            K_rot_h = linear(K_h, R_rope)
+            K_h = K_h * cos + K_rot_h * sin
+            store K_h, V_h to HBM
             O = flash_attention(Q, K, V, scale)
             O = linear(O, W_o)           # O projection
             X = O + residual
@@ -323,8 +352,8 @@ def compile_hf_model(
             X = X + residual
         X = rms_norm(X)  # final norm
 
-    RoPE is omitted (orthogonal to multi-layer compilation testing).
-    Q and O linear projections are included for the attention block.
+    RoPE is applied in native mode via rotate_half matrix multiplication.
+    Q, K, V, and O linear projections are all computed on-chip.
 
     Args:
         model:          nn.Module (HF CausalLM model, already loaded)
@@ -416,27 +445,15 @@ def compile_hf_model(
     token_embeds = torch.randn(seq_len, hidden)
     pos_weight = torch.randn(seq_len, hidden)
 
-    # K/V test data: per-KV-head in native mode, single matrix in legacy mode
+    # K/V test data: native mode computes K/V on-chip, legacy mode uses precomputed
     if native_mode:
-        # List of lists: K_head_mats[layer][kv_head] = (seq_len, head_dim)
-        K_head_mats = []
-        V_head_mats = []
-        for i in range(n_layers):
-            k_heads_i = []
-            v_heads_i = []
-            for kv_h in range(num_kv_heads):
-                X_ctx = torch.randn(seq_len, hidden)
-                k_heads_i.append(X_ctx @ all_weights[i]["W_k_heads"][kv_h])
-                v_heads_i.append(X_ctx @ all_weights[i]["W_v_heads"][kv_h])
-            K_head_mats.append(k_heads_i)
-            V_head_mats.append(v_heads_i)
-
+        # K/V are computed on-chip from X_normed @ W_k/W_v — no precomputed K/V needed
         print(f"\ntoken_embeds: {token_embeds.shape}")
         print(f"pos_weight:   {pos_weight.shape}")
         for i in range(n_layers):
             for kv_h in range(num_kv_heads):
-                print(f"  K_{i}_h{kv_h}: {K_head_mats[i][kv_h].shape}, "
-                      f"V_{i}_h{kv_h}: {V_head_mats[i][kv_h].shape}")
+                print(f"  W_k_{i}_h{kv_h}: {all_weights[i]['W_k_heads'][kv_h].shape}, "
+                      f"W_v_{i}_h{kv_h}: {all_weights[i]['W_v_heads'][kv_h].shape}")
     else:
         K_mats = []
         V_mats = []
@@ -455,11 +472,18 @@ def compile_hf_model(
     print("\n--- CPU Golden Reference (MXFP8 quantized HBM + BF16 intermediates) ---")
 
     if native_mode:
-        # Quantize per-head K/V
-        K_q_heads = [[quantize_to_mxfp(K_head_mats[i][h]) for h in range(num_kv_heads)]
-                     for i in range(n_layers)]
-        V_q_heads = [[quantize_to_mxfp(V_head_mats[i][h]) for h in range(num_kv_heads)]
-                     for i in range(n_layers)]
+        # Quantize per-KV-head projection weights for golden reference
+        W_k_q_heads = [[quantize_to_mxfp(all_weights[i]["W_k_heads"][h])
+                        for h in range(num_kv_heads)]
+                       for i in range(n_layers)]
+        W_v_q_heads = [[quantize_to_mxfp(all_weights[i]["W_v_heads"][h])
+                        for h in range(num_kv_heads)]
+                       for i in range(n_layers)]
+    if native_mode:
+        R_matrix = _make_rotate_half_matrix(head_dim)
+        R_rope_q = quantize_to_mxfp(R_matrix)
+        cos_table, sin_table = _make_rope_tables(seq_len, head_dim, native_cfg["rope_theta"])
+
     else:
         K_q_list = [quantize_to_mxfp(K_mats[i]) for i in range(n_layers)]
         V_q_list = [quantize_to_mxfp(V_mats[i]) for i in range(n_layers)]
@@ -484,12 +508,34 @@ def compile_hf_model(
         if native_mode:
             # Q projection: X @ W_q (MXFP8-quantized weight, BF16 intermediate)
             Q_gold = torch.matmul(X_gold.to(torch.bfloat16).float(), W_q_q.float()).to(torch.bfloat16).float()
-            # Per-head flash attention
+
+            # On-chip K/V projections: X_normed @ W_k_h / W_v_h per KV head
+            # K/V are stored to HBM (MXFP8 quantized) then read back
+            K_q_heads_i = []
+            V_q_heads_i = []
+            for kv_h in range(num_kv_heads):
+                K_h = torch.matmul(
+                    X_gold.to(torch.bfloat16).float(), W_k_q_heads[i][kv_h].float()
+                ).to(torch.bfloat16).float()
+                V_h = torch.matmul(
+                    X_gold.to(torch.bfloat16).float(), W_v_q_heads[i][kv_h].float()
+                ).to(torch.bfloat16).float()
+                # RoPE on K_h: K_rot = K_h @ R_rope, K_h = K_h * cos + K_rot * sin
+                K_rot_h = torch.matmul(K_h.to(torch.bfloat16).float(), R_rope_q.float()).to(torch.bfloat16).float()
+                K_h = (K_h * cos_table + K_rot_h * sin_table)
+                # Quantize for HBM store+load round-trip
+                K_q_heads_i.append(quantize_to_mxfp(K_h))
+                V_q_heads_i.append(quantize_to_mxfp(V_h))
+
+            # Per-head flash attention (with RoPE on Q per head)
             O_heads = []
             for h in range(num_heads):
                 kv_h = h // ratio
                 Q_h = Q_gold[:, h * head_dim:(h + 1) * head_dim]
-                O_h = _flash_attn_ref(Q_h, K_q_heads[i][kv_h], V_q_heads[i][kv_h], scale)
+                # RoPE on Q_h: Q_rot = Q_h @ R_rope, Q_h = Q_h * cos + Q_rot * sin
+                Q_rot_h = torch.matmul(Q_h.to(torch.bfloat16).float(), R_rope_q.float()).to(torch.bfloat16).float()
+                Q_h = (Q_h * cos_table + Q_rot_h * sin_table)
+                O_h = _flash_attn_ref(Q_h, K_q_heads_i[kv_h], V_q_heads_i[kv_h], scale)
                 O_heads.append(O_h)
             attn_out = torch.cat(O_heads, dim=1)  # (seq, num_heads * head_dim)
             # O projection
@@ -534,20 +580,32 @@ def compile_hf_model(
     x_input = prog.input("X", shape=(seq_len, hidden))
     pos_input = prog.input("POS", shape=(seq_len, hidden))
 
+    # RoPE inputs (native mode only: R_rope matrix + cos/sin tables)
+    if native_mode:
+        rope_theta = native_cfg["rope_theta"]
+        R_matrix = _make_rotate_half_matrix(head_dim)
+        cos_table, sin_table = _make_rope_tables(seq_len, head_dim, rope_theta)
+
+        r_input = prog.input("R_rope", shape=(head_dim, head_dim))
+        cos_input = prog.input("COS", shape=(seq_len, head_dim))
+        sin_input = prog.input("SIN", shape=(seq_len, head_dim))
+        COS = prog.load_batch(cos_input, name="COS")
+        SIN = prog.load_batch(sin_input, name="SIN")
+
     # Per-layer weight inputs (order determines HBM layout)
     layer_inputs = []
     for i in range(n_layers):
         wq = prog.input(f"W_q_{i}", shape=(hidden, total_q_dim))
         wo = prog.input(f"W_o_{i}", shape=(total_q_dim, hidden))
         if native_mode:
-            k_heads = []
-            v_heads = []
+            wk_heads = []
+            wv_heads = []
             for kv_h in range(num_kv_heads):
-                k_heads.append(prog.input(f"K_{i}_h{kv_h}", shape=(seq_len, head_dim)))
-                v_heads.append(prog.input(f"V_{i}_h{kv_h}", shape=(seq_len, head_dim)))
+                wk_heads.append(prog.input(f"W_k_{i}_h{kv_h}", shape=(hidden, head_dim)))
+                wv_heads.append(prog.input(f"W_v_{i}_h{kv_h}", shape=(hidden, head_dim)))
             li_entry = {
                 "W_q": wq, "W_o": wo,
-                "K_heads": k_heads, "V_heads": v_heads,
+                "W_k_heads": wk_heads, "W_v_heads": wv_heads,
             }
         else:
             ki = prog.input(f"K_{i}", shape=(seq_len, head_dim))
@@ -572,6 +630,8 @@ def compile_hf_model(
     # The residual scratch buffer must be placed ABOVE this region.
     _ffn_intermediate_end = seq_len * hidden + 2 * inter * seq_len
     _current_bump = 2 * seq_len * hidden  # X + POS already allocated
+    if native_mode:
+        _current_bump += 2 * seq_len * head_dim  # COS + SIN loaded to VRAM
     if _current_bump < _ffn_intermediate_end:
         _pad_elems = _ffn_intermediate_end - _current_bump
         # Allocate enough mlen-wide rows to cover the padding
@@ -601,22 +661,51 @@ def compile_hf_model(
             # Q projection: current (seq, hidden) @ W_q (hidden, total_q_dim)
             Q = _linear_projection(prog, current, li["W_q"], f"Q_{i}")
 
-            # Per-head flash attention with VRAM views
+            # Per-KV-head: compute K/V on-chip, store to HBM, then run Q-heads
             q_full_addr = prog._compiler.get_vram_addr(Q.name)
 
             # Allocate O_full for concatenated head outputs
             O_full = prog.alloc(f"O_full_{i}", seq_len, total_q_dim)
             o_full_addr = prog._compiler.get_vram_addr(O_full.name)
 
+            # Store K/V InputVars for each KV head (filled during loop below)
+            kv_stored = []
+
+            for kv_h in range(num_kv_heads):
+                # K projection: current (seq, hidden) @ W_k_h (hidden, head_dim)
+                K_h = _linear_projection(prog, current, li["W_k_heads"][kv_h], f"K_{i}_h{kv_h}")
+                # V projection: current (seq, hidden) @ W_v_h (hidden, head_dim)
+                V_h = _linear_projection(prog, current, li["W_v_heads"][kv_h], f"V_{i}_h{kv_h}")
+
+                # RoPE on K_h: K_rot = linear(K_h, R_rope), then K_h = K_h * cos + K_rot * sin
+                K_rot = _linear_projection(prog, K_h, r_input, f"K_rot_{i}_h{kv_h}")
+                prog.rope(K_h, K_rot, COS, SIN)
+                prog.free_tensor(K_rot)
+
+                # Store K/V from VRAM to HBM (auto-allocates HBM space)
+                K_stored = prog.store(K_h, name=f"K_stored_{i}_h{kv_h}")
+                V_stored = prog.store(V_h, name=f"V_stored_{i}_h{kv_h}")
+                kv_stored.append((K_stored, V_stored))
+
+                # Free K/V VRAM — data is in HBM now
+                prog.free_tensor(K_h)
+                prog.free_tensor(V_h)
+
             for h in range(num_heads):
                 kv_h = h // ratio
+                K_stored, V_stored = kv_stored[kv_h]
 
                 # View for this head's Q slice: column block h in Q_full
                 q_h_addr = q_full_addr + h * seq_len * mlen
                 Q_h = prog.alloc_at(f"Q_h{h}_{i}", seq_len, head_dim, q_h_addr)
 
-                # Single-head flash attention (allocates S, PV, O internally)
-                O_h = ops.flash_attention(prog, Q_h, li["K_heads"][kv_h], li["V_heads"][kv_h], scale)
+                # RoPE on Q_h: Q_rot = linear(Q_h, R_rope), then Q_h = Q_h * cos + Q_rot * sin
+                Q_rot = _linear_projection(prog, Q_h, r_input, f"Q_rot_{i}_h{h}")
+                prog.rope(Q_h, Q_rot, COS, SIN)
+                prog.free_tensor(Q_rot)
+
+                # Single-head flash attention (K/V read from HBM)
+                O_h = ops.flash_attention(prog, Q_h, K_stored, V_stored, scale)
 
                 # Copy O_h to the right column block of O_full
                 o_h_dest_addr = o_full_addr + h * seq_len * mlen
@@ -670,13 +759,18 @@ def compile_hf_model(
     # ----------------------------------------------------------- build return
     input_tensors = {"X": token_embeds, "POS": pos_weight}
     data_order = ["X", "POS"]
+    if native_mode:
+        input_tensors["R_rope"] = R_matrix
+        input_tensors["COS"] = cos_table
+        input_tensors["SIN"] = sin_table
+        data_order.extend(["R_rope", "COS", "SIN"])
     for i in range(n_layers):
         input_tensors[f"W_q_{i}"] = all_weights[i]["W_q"]
         input_tensors[f"W_o_{i}"] = all_weights[i]["W_o"]
         if native_mode:
             for kv_h in range(num_kv_heads):
-                input_tensors[f"K_{i}_h{kv_h}"] = K_head_mats[i][kv_h]
-                input_tensors[f"V_{i}_h{kv_h}"] = V_head_mats[i][kv_h]
+                input_tensors[f"W_k_{i}_h{kv_h}"] = all_weights[i]["W_k_heads"][kv_h]
+                input_tensors[f"W_v_{i}_h{kv_h}"] = all_weights[i]["W_v_heads"][kv_h]
         else:
             input_tensors[f"K_{i}"] = K_mats[i]
             input_tensors[f"V_{i}"] = V_mats[i]
@@ -687,7 +781,7 @@ def compile_hf_model(
         kv_keys = []
         if native_mode:
             for kv_h in range(num_kv_heads):
-                kv_keys.extend([f"K_{i}_h{kv_h}", f"V_{i}_h{kv_h}"])
+                kv_keys.extend([f"W_k_{i}_h{kv_h}", f"W_v_{i}_h{kv_h}"])
         else:
             kv_keys = [f"K_{i}", f"V_{i}"]
         data_order.extend([
