@@ -402,6 +402,9 @@ def _linear_projection(prog, input_var, weight_var, name):
     rows, k_total = input_var.shape
     _, out_features = weight_var.shape
     num_row_blocks = _math.ceil(rows / mlen)
+    assert out_features % mlen == 0, (
+        f"out_features ({out_features}) must be a multiple of mlen ({mlen})"
+    )
     num_col_blocks = out_features // mlen
     num_k_tiles = _math.ceil(k_total / mlen)
 
@@ -887,9 +890,10 @@ def compile_hf_model(
         _current_bump += 2 * seq_len * head_dim  # COS + SIN loaded to VRAM
     _current_bump += mlen * mlen  # CAUSAL_MASK loaded to VRAM
     if _current_bump < _ffn_intermediate_end:
-        _pad_size = _ffn_intermediate_end - _current_bump
-        _pad_rows = max(1, _pad_size // mlen)
-        # Round up to mlen multiple for VRAM alignment
+        _pad_elems = _ffn_intermediate_end - _current_bump
+        # Allocate enough mlen-wide rows to cover the padding
+        _pad_rows = (_pad_elems + mlen - 1) // mlen
+        # Round up to mlen for VRAM alignment
         _pad_rows = ((_pad_rows + mlen - 1) // mlen) * mlen
         prog.alloc("_vram_padding", _pad_rows, mlen, strict=False)
 
