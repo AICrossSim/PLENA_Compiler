@@ -804,6 +804,9 @@ def compile_hf_model(
     for i in range(n_layers):
         li = layer_inputs[i]
 
+        # Layer progress marker (visible in non-quiet emulator output)
+        prog._compiler.generated_code += f"; === LAYER {i}/{n_layers} START ===\n"
+
         # --- Attention block ---
         # Save residual: scratch = current (zero then add)
         prog.vram_fill_zero(scratch)
@@ -904,6 +907,7 @@ def compile_hf_model(
         prog.vram_add(current_after_attn, scratch)
 
         current = current_after_attn  # carry forward
+        prog._compiler.generated_code += f"; === LAYER {i}/{n_layers} COMPLETE ===\n"
 
     # Final norm
     prog.rms_norm(current, eps_offset=3, reci_hid_offset=4)
