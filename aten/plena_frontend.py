@@ -1065,6 +1065,7 @@ def compile_hf_model(
         prog.vram_add(current_after_attn, scratch)
 
         current = current_after_attn  # carry forward
+        prog._compiler.generated_code += f"; === LAYER {i}/{n_layers} COMPLETE ===\n"
 
     # Final norm
     prog.rms_norm(current, eps_offset=3, reci_hid_offset=4)
