@@ -1,4 +1,5 @@
 from .batched_matmul_asm import batched_matmul_asm
+from .columnwise_scan_asm import columnwise_scan_asm
 from .elementwise_add_asm import elementwise_add_asm
 from .embedding_asm import embedding_asm
 from .ffn_asm import ffn_asm, ffn_intermediate_asm, ffn_up_silu_asm
@@ -18,6 +19,7 @@ from .gemv_asm import gemv_asm
 
 __all__ = [
     "batched_matmul_asm",
+    "columnwise_scan_asm",
     "elementwise_add_asm",
     "embedding_asm",
     "ffn_asm",
