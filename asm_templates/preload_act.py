@@ -13,7 +13,9 @@ def preload_act_asm(
     act_vram_offset: int,
     alive_registers: List[int],
     activation_offset_reg: int,
-    stride_size = None
+    stride_size=None,
+    scale_size: Optional[int] = None,
+    hbm_start_offset: int = 0,
 ) -> str:
     """
     Generates assembly code for preloading activation.
@@ -28,11 +30,12 @@ def preload_act_asm(
     inner_loop_register = alive_registers[4]
 
     stride_len = vlen if stride_size is None else stride_size
+    scale_len = hidden_size * batch if scale_size is None else scale_size
 
     # Set scale offset
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {hidden_size * batch} \n"
+    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {scale_len} \n"
     generated_code += f"C_SET_SCALE_REG gp{a_actual_register} \n"
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, 0 \n"
+    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {hbm_start_offset} \n"
     generated_code += f"S_ADDI_INT gp{result_register}, gp0, {act_vram_offset} \n"
     load_amount_per_hidden = math.ceil(hidden_size / vlen)
     
@@ -56,7 +59,7 @@ def preload_act_asm(
         generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, a{activation_offset_reg}, 1, 0 \n"
         generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len} \n"
         if batch > preload_len:  
-            generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {hidden_size * preload_len} \n"
+            generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {stride_len * preload_len} \n"
             generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
         generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
