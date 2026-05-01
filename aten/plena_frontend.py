@@ -336,6 +336,7 @@ def compile_hf_model(
     blen: int = 4,
     seed: int = 42,
     include_lm_head: bool = False,
+    golden_precision: str = "hardware",
 ) -> dict:
     """Compile a HuggingFace model to PLENA ISA via PlenaCompiler.
 
@@ -382,6 +383,11 @@ def compile_hf_model(
         blen:           Batch tile length (default 4)
         seed:           Random seed for test data generation
         include_lm_head: If True, add lm_head projection after final norm (default False)
+        golden_precision: Precision mode for golden reference computation.
+            "hardware"       — MXFP8 weights + BF16 intermediates (default, matches HW)
+            "no_weight_quant" — float32 weights + BF16 intermediates (isolates MXFP8 effect)
+            "no_bf16"        — MXFP8 weights + float32 intermediates (isolates BF16 effect)
+            "fp32"           — float32 weights + float32 intermediates (should match HF exactly)
 
     Returns:
         dict with:
@@ -530,95 +536,92 @@ def compile_hf_model(
     print(f"attn_scale: {scale:.6f}")
 
     # ----------------------------------------------------------- golden ref
-    print("\n--- CPU Golden Reference (MXFP8 quantized HBM + BF16 intermediates) ---")
+    _do_quant = golden_precision in ("hardware", "no_bf16")
+    _do_bf16 = golden_precision in ("hardware", "no_weight_quant")
+    _qw = quantize_to_mxfp if _do_quant else (lambda x: x)
+    _to_inter = (lambda x: x.to(torch.bfloat16)) if _do_bf16 else (lambda x: x)
+    _from_inter = (lambda x: x.float()) if _do_bf16 else (lambda x: x)
+    _prec_label = {"hardware": "MXFP8 weights + BF16 intermediates",
+                   "no_weight_quant": "float32 weights + BF16 intermediates",
+                   "no_bf16": "MXFP8 weights + float32 intermediates",
+                   "fp32": "float32 weights + float32 intermediates"}[golden_precision]
+    print(f"\n--- CPU Golden Reference ({_prec_label}) ---")
 
     if native_mode:
-        # Quantize per-KV-head projection weights for golden reference
-        W_k_q_heads = [[quantize_to_mxfp(all_weights[i]["W_k_heads"][h])
+        W_k_q_heads = [[_qw(all_weights[i]["W_k_heads"][h])
                         for h in range(num_kv_heads)]
                        for i in range(n_layers)]
-        W_v_q_heads = [[quantize_to_mxfp(all_weights[i]["W_v_heads"][h])
+        W_v_q_heads = [[_qw(all_weights[i]["W_v_heads"][h])
                         for h in range(num_kv_heads)]
                        for i in range(n_layers)]
     if native_mode:
         R_matrix = _make_rotate_half_matrix(head_dim)
-        R_rope_q = quantize_to_mxfp(R_matrix)
+        R_rope_q = _qw(R_matrix)
         cos_table, sin_table = _make_rope_tables(seq_len, head_dim, native_cfg["rope_theta"])
 
     else:
-        K_q_list = [quantize_to_mxfp(K_mats[i]) for i in range(n_layers)]
-        V_q_list = [quantize_to_mxfp(V_mats[i]) for i in range(n_layers)]
+        K_q_list = [_qw(K_mats[i]) for i in range(n_layers)]
+        V_q_list = [_qw(V_mats[i]) for i in range(n_layers)]
 
     X_gold = token_embeds.clone() + pos_weight  # embedding_add
     ratio = num_heads // num_kv_heads
 
     for i in range(n_layers):
         w = all_weights[i]
-        W_q_q = quantize_to_mxfp(w["W_q"])
-        W_o_q = quantize_to_mxfp(w["W_o"])
-        W_gate_q = quantize_to_mxfp(w["W_gate"])
-        W_up_q = quantize_to_mxfp(w["W_up"])
-        W_down_q = quantize_to_mxfp(w["W_down"])
+        W_q_q = _qw(w["W_q"])
+        W_o_q = _qw(w["W_o"])
+        W_gate_q = _qw(w["W_gate"])
+        W_up_q = _qw(w["W_up"])
+        W_down_q = _qw(w["W_down"])
 
         # --- Attention block ---
         residual = X_gold.clone()
-        # rms_norm with bfloat16 to match PLENA
-        X_bf = X_gold.to(torch.bfloat16)
-        rms = torch.rsqrt(X_bf.float().pow(2).mean(-1, keepdim=True) + eps).to(torch.bfloat16)
-        X_gold = (X_bf * rms).float()
+        X_bf = _to_inter(X_gold)
+        rms = torch.rsqrt(_from_inter(X_bf).pow(2).mean(-1, keepdim=True) + eps)
+        rms = _to_inter(rms)
+        X_gold = _from_inter(X_bf * rms)
         if native_mode:
-            # Q projection: X @ W_q (MXFP8-quantized weight, BF16 intermediate)
-            Q_gold = torch.matmul(X_gold.to(torch.bfloat16).float(), W_q_q.float()).to(torch.bfloat16).float()
+            Q_gold = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(X_gold)), W_q_q.float())))
 
-            # On-chip K/V projections: X_normed @ W_k_h / W_v_h per KV head
-            # K/V are stored to HBM (MXFP8 quantized) then read back
             K_q_heads_i = []
             V_q_heads_i = []
             for kv_h in range(num_kv_heads):
-                K_h = torch.matmul(
-                    X_gold.to(torch.bfloat16).float(), W_k_q_heads[i][kv_h].float()
-                ).to(torch.bfloat16).float()
-                V_h = torch.matmul(
-                    X_gold.to(torch.bfloat16).float(), W_v_q_heads[i][kv_h].float()
-                ).to(torch.bfloat16).float()
-                # RoPE on K_h: K_rot = K_h @ R_rope, K_h = K_h * cos + K_rot * sin
-                K_rot_h = torch.matmul(K_h.to(torch.bfloat16).float(), R_rope_q.float()).to(torch.bfloat16).float()
+                K_h = _from_inter(_to_inter(torch.matmul(
+                    _from_inter(_to_inter(X_gold)), W_k_q_heads[i][kv_h].float()
+                )))
+                V_h = _from_inter(_to_inter(torch.matmul(
+                    _from_inter(_to_inter(X_gold)), W_v_q_heads[i][kv_h].float()
+                )))
+                K_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(K_h)), R_rope_q.float())))
                 K_h = (K_h * cos_table + K_rot_h * sin_table)
-                # Quantize for HBM store+load round-trip
-                K_q_heads_i.append(quantize_to_mxfp(K_h))
-                V_q_heads_i.append(quantize_to_mxfp(V_h))
+                K_q_heads_i.append(_qw(K_h))
+                V_q_heads_i.append(_qw(V_h))
 
-            # Per-head flash attention (with RoPE on Q per head)
             O_heads = []
             for h in range(num_heads):
                 kv_h = h // ratio
                 Q_h = Q_gold[:, h * head_dim:(h + 1) * head_dim]
-                # RoPE on Q_h: Q_rot = Q_h @ R_rope, Q_h = Q_h * cos + Q_rot * sin
-                Q_rot_h = torch.matmul(Q_h.to(torch.bfloat16).float(), R_rope_q.float()).to(torch.bfloat16).float()
+                Q_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(Q_h)), R_rope_q.float())))
                 Q_h = (Q_h * cos_table + Q_rot_h * sin_table)
                 O_h = _flash_attn_ref(Q_h, K_q_heads_i[kv_h], V_q_heads_i[kv_h], scale, causal=True)
                 O_heads.append(O_h)
-            attn_out = torch.cat(O_heads, dim=1)  # (seq, num_heads * head_dim)
-            # O projection
-            O_gold = torch.matmul(attn_out.to(torch.bfloat16).float(), W_o_q.float()).to(torch.bfloat16).float()
+            attn_out = torch.cat(O_heads, dim=1)
+            O_gold = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(attn_out)), W_o_q.float())))
             X_gold = O_gold + residual
         else:
-            # Legacy: X is Q directly (no projection)
             attn_out = _flash_attn_ref(X_gold, K_q_list[i], V_q_list[i], scale, causal=True)
             X_gold = attn_out + residual
 
         # --- FFN block ---
         residual = X_gold.clone()
-        # rms_norm with bfloat16
-        X_bf = X_gold.to(torch.bfloat16)
-        rms = torch.rsqrt(X_bf.float().pow(2).mean(-1, keepdim=True) + eps).to(torch.bfloat16)
-        X_gold = (X_bf * rms).float()
-        # FFN with MXFP8 weights + BF16 intermediates
-        up_out = torch.matmul(X_gold.to(torch.bfloat16).float(), W_up_q.float()).to(torch.bfloat16)
-        gate_out = torch.matmul(X_gold.to(torch.bfloat16).float(), W_gate_q.float()).to(torch.bfloat16)
-        silu_gate = (F.silu(up_out.float()) * gate_out.float()).to(torch.bfloat16)
-        X_gold = torch.matmul(silu_gate.float(), W_down_q.float()).to(torch.bfloat16).float()
-        # FFN residual
+        X_bf = _to_inter(X_gold)
+        rms = torch.rsqrt(_from_inter(X_bf).pow(2).mean(-1, keepdim=True) + eps)
+        rms = _to_inter(rms)
+        X_gold = _from_inter(X_bf * rms)
+        up_out = _to_inter(torch.matmul(_from_inter(_to_inter(X_gold)), W_up_q.float()))
+        gate_out = _to_inter(torch.matmul(_from_inter(_to_inter(X_gold)), W_gate_q.float()))
+        silu_gate = _to_inter(F.silu(_from_inter(up_out)) * _from_inter(gate_out))
+        X_gold = _from_inter(_to_inter(torch.matmul(_from_inter(silu_gate), W_down_q.float())))
         X_gold = X_gold + residual
 
         print(f"  After layer {i}: X_gold[0,:4] = {X_gold[0, :4].tolist()}")
@@ -1022,6 +1025,7 @@ def compile_hf_model(
         "fp_preload": fp_preload,
         "comparison_params": comparison_params,
         "info": info,
+        "golden_precision": golden_precision,
     }
 
 
