@@ -1,4 +1,5 @@
 from .batched_matmul_asm import batched_matmul_asm
+from .sequence_scan_asm import sequence_scan_asm
 from .columnwise_scan_asm import columnwise_scan_asm
 from .columnwise_scan_stride_asm import columnwise_scan_stride_asm
 from .elementwise_add_asm import elementwise_add_asm
@@ -21,6 +22,7 @@ from .gemv_asm import gemv_asm
 __all__ = [
     "batched_matmul_asm",
     "columnwise_scan_asm",
+    "sequence_scan_asm",
     "columnwise_scan_stride_asm",
     "elementwise_add_asm",
     "embedding_asm",

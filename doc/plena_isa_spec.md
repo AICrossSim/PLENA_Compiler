@@ -719,3 +719,13 @@ End of a hardware loop. If the loop counter (in register `rd`) is greater than 0
 **Description:**
 
 Shift the vector elements left by the amount specified by `gp_reg<rs2>`. Elements are shifted left, and zeros are filled in from the right. For example, `[a0, a1, a2, a3]` with shift=2 becomes `[a2, a3, 0, 0]`.
+
+### H_PREFETCH_R_V
+
+**Format:** `H_PREFETCH_R_V rd, rs1, rs2, rstride, precision`
+
+**Operation:** `Vector_SRAM[gp_reg<rd>] = HBM[gp_reg<rs1> + hbm_addr_reg<rs2>]`
+
+**Description:**
+
+Prefetches vector elemeents from HBM to Vector SRAM, similarly to **H_PREFETCH_V**, but with a reverse stride. Loads **HBM_V_Prefetch_Amount × VLEN** elements (typically BLEN × VLEN = 4 × 64 = 256 elements) in reverse order.
