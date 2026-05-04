@@ -78,7 +78,7 @@ jobs:
         run: |
           PYTHONPATH=. python3 -c "
           from assembler import AssemblyToBinary
-          asm = AssemblyToBinary('doc/operation.svh', 'doc/precision.svh')
+          asm = AssemblyToBinary('doc/operation.svh', 'doc/configuration.svh')
           asm.generate_binary('/tmp/clm60m.asm', '/tmp/clm60m.mem')
           print('clm-60m assembled OK')
           "
@@ -104,7 +104,7 @@ jobs:
         run: |
           PYTHONPATH=. python3 -c "
           from assembler import AssemblyToBinary
-          asm = AssemblyToBinary('doc/operation.svh', 'doc/precision.svh')
+          asm = AssemblyToBinary('doc/operation.svh', 'doc/configuration.svh')
           asm.generate_binary('/tmp/smolvlm2.asm', '/tmp/smolvlm2.mem')
           print('SmolVLM2 assembled OK')
           "
