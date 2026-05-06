@@ -37,7 +37,7 @@ Instructions follow one of the following encoding formats:
 
 | Format | Operands | Used By |
 |--------|----------|---------|
-| `OPCODE rd, rs1, rs2, rstride, precision` | 5 operands | H_PREFETCH_M, H_PREFETCH_V, H_STORE_V |
+| `OPCODE rd, rs1, rs2, rstride, precision` | 5 operands | H_PREFETCH_M, H_PREFETCH_V, H_PREFETCH_R_V, H_STORE_V, H_STORE_R_V |
 | `OPCODE rd, rs1, fp2, rmask, rorder` | 5 operands | V_SUB_VF |
 | `OPCODE rd, rs1, rs2, rmask` | 4 operands | V_ADD_VV, V_MUL_VV, V_ADD_VF, V_MUL_VF, V_SUB_VV |
 | `OPCODE rd, rs1, rmask` | 3 operands | V_EXP_V, V_RECI_V |
@@ -729,3 +729,13 @@ Shift the vector elements left by the amount specified by `gp_reg<rs2>`. Element
 **Description:**
 
 Prefetches vector elemeents from HBM to Vector SRAM, similarly to **H_PREFETCH_V**, but with a reverse stride. Loads **HBM_V_Prefetch_Amount × VLEN** elements (typically BLEN × VLEN = 4 × 64 = 256 elements) in reverse order.
+
+### H_STORE_R_V
+
+**Format:** `H_STORE_R_V rd, rs1, rs2, rstride, precision`
+
+**Operation:** `HBM[gp_reg<rs1> + hbm_addr_reg<rs2>] = Vector[gp_reg<rd>]`
+
+**Description:**
+
+Like **H_STORE_V**, but consumes source Vector SRAM rows in reverse stride order. Use this when the source block should be written back to HBM in the opposite row order.

@@ -64,7 +64,7 @@ class AssemblyToBinary:
         elif instruction.opcode in ["C_LOOP_START"]:
             # C_LOOP_START rd, imm - uses 22-bit immediate like S_LUI_INT
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
-        elif instruction.opcode in ["H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"]:
+        elif instruction.opcode in ["H_PREFETCH_M", "H_PREFETCH_V", "H_PREFETCH_R_V", "H_STORE_V", "H_STORE_R_V", "V_SUB_VF"]:
             binary_instruction = (
                 (funct1 << (opw + 4 * ow))
                 + (rstride << (opw + 3 * ow))

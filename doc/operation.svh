@@ -175,6 +175,7 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_PS_V                 = 6'h32,  // spec-only, not implemented in Rust emulator
     C_HADAMARD_TRANSFORM   = 6'h33,  // spec-only, not implemented in Rust emulator
     H_PREFETCH_R_V         = 6'h34,  
+    H_STORE_R_V            = 6'h35,
 } CUSTOM_ISA_OPCODE;
 
 
