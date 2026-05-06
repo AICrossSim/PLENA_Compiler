@@ -168,14 +168,22 @@ def parse_asm_file(file_path: str) -> List[Instruction]:
                         imm = int(operand_1)
                     except ValueError:
                         imm = None
-                # If it looks like register, rs2; else, imm (overwrites imm if rs1 not present)
-                if operand_2.strip().startswith(('gp','f','a')):
-                    rs2 = parse_reg_or_int(operand_2)
-                else:
+                # Some vector ops use a 3-operand form where the last field is
+                # rmask, not rs2/imm.
+                if opcode in {"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"}:
                     try:
-                        imm = int(operand_2)
+                        rstride = int(operand_2)
                     except ValueError:
-                        pass
+                        rstride = None
+                else:
+                    # If it looks like register, rs2; else, imm (overwrites imm if rs1 not present)
+                    if operand_2.strip().startswith(('gp','f','a')):
+                        rs2 = parse_reg_or_int(operand_2)
+                    else:
+                        try:
+                            imm = int(operand_2)
+                        except ValueError:
+                            pass
             elif len(operands) == 4:
                 operand_0, operand_1, operand_2, operand_3 = operands
                 rd = parse_reg_or_int(operand_0)

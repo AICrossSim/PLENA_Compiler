@@ -12,7 +12,7 @@ imperatively in Python because we are using TVM (no dialect machinery).
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import tvm
 from tvm import tir
@@ -126,23 +126,16 @@ class PlenaCodegen:
         elif isinstance(stmt, tir.LetStmt):
             self._collect_ops(stmt.body, ops)
         elif isinstance(stmt, tir.IfThenElse):
-            cond = stmt.condition
-            if isinstance(cond, tir.IntImm):
-                take_then = bool(int(cond.value))
-            else:
-                cond_s = str(cond).strip()
-                if cond_s == "T.bool(True)":
-                    take_then = True
-                elif cond_s == "T.bool(False)":
-                    take_then = False
-                else:
-                    raise CodegenError(
-                        "dynamic IfThenElse is not supported yet; "
-                        f"condition={cond!r}"
-                    )
-            branch = stmt.then_case if take_then else stmt.else_case
-            if branch is not None:
-                self._collect_ops(branch, ops)
+            # PLENA's ISA has no scalar branch instructions, and the previous
+            # "literal True/False only" handling was misleading -- it covered
+            # essentially nothing that a Python-level `if` at kernel-build
+            # time can't already express more clearly. Reject all TIR ifs.
+            raise CodegenError(
+                "tir.IfThenElse is not supported. Use a Python-level `if` in "
+                "the kernel factory to specialize at build time, or T.unroll "
+                "+ Python branching for per-iteration variants. PLENA has no "
+                "branch ISA, so dynamic conditions cannot be lowered."
+            )
         elif isinstance(stmt, tir.For):
             # Recursively collect the body into a fresh op list, then wrap
             # it in a structured ForOp. Pass 3 walks `body` while binding
@@ -308,19 +301,17 @@ class PlenaCodegen:
                 buffer_args.append(info.name)
                 scopes.append(info.scope)
                 continue
+            if isinstance(a, tir.BufferLoad) and a.buffer.data in self._buffers:
+                info = self._buffers[a.buffer.data]
+                if info.scope == _scope.FPRAM:
+                    scalar_args.append(_hlir.BufferElement(
+                        buffer=info.name,
+                        indices=tuple(self._normalize_scalar_expr(i) for i in a.indices),
+                    ))
+                    scopes.append(None)
+                    continue
             scopes.append(None)
-            if isinstance(a, tir.IntImm):
-                scalar_args.append(int(a.value))
-            elif isinstance(a, tir.FloatImm):
-                scalar_args.append(float(a.value))
-            elif isinstance(a, tir.StringImm):
-                scalar_args.append(str(a.value))
-            elif isinstance(a, tir.PrimExpr):
-                # Symbolic expression: loop var, computed offset, etc.
-                # Keep node-level so Pass 3 / ExprMaterializer can lower.
-                scalar_args.append(a)
-            else:
-                scalar_args.append(str(a))
+            scalar_args.append(self._normalize_scalar_expr(a))
         # Verify scopes against the registered intrinsic spec. We collapse
         # scopes from buffer/scalar args back into the original positional
         # order so verification matches op signatures.
@@ -455,6 +446,15 @@ class PlenaCodegen:
                 info = self._buffers[a]
                 resolved.append(info.name)
                 scopes.append(info.scope)
+            elif isinstance(a, tir.BufferLoad) and a.buffer.data in self._buffers:
+                info = self._buffers[a.buffer.data]
+                if info.scope == _scope.FPRAM:
+                    idx = ", ".join(str(self._normalize_scalar_expr(i)) for i in a.indices)
+                    resolved.append(f"{info.name}[{idx}]")
+                    scopes.append(None)
+                else:
+                    resolved.append(str(a))
+                    scopes.append(None)
             elif isinstance(a, (tir.IntImm, tir.FloatImm)):
                 resolved.append(str(a.value))
                 scopes.append(None)
@@ -467,6 +467,18 @@ class PlenaCodegen:
                 resolved.append(str(a))
                 scopes.append(None)
         return resolved, scopes
+
+    @staticmethod
+    def _normalize_scalar_expr(a):
+        if isinstance(a, tir.IntImm):
+            return int(a.value)
+        if isinstance(a, tir.FloatImm):
+            return float(a.value)
+        if isinstance(a, tir.StringImm):
+            return str(a.value)
+        if isinstance(a, tir.PrimExpr):
+            return a
+        return str(a)
 
     def _verify_scopes(
         self, spec: _intrin.IntrinsicSpec, name: str, scopes: list[Optional[str]]

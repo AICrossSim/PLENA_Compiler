@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import sys
 from pathlib import Path
 
@@ -72,6 +73,7 @@ def _resolve_kernel(spec: str, kwargs: dict | None = None):
         )
     mod_path, func_name = spec.split(":", 1)
     mod = importlib.import_module(mod_path)
+    print(f"[kernel] {mod_path} -> {mod.__file__}", file=sys.stderr)
     if not hasattr(mod, func_name):
         raise SystemExit(f"{mod_path!r} has no attribute {func_name!r}")
     obj = getattr(mod, func_name)
@@ -208,6 +210,27 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     if args.dump_hlir:
         Path(args.dump_hlir).write_text(format_hlir(compiled.hlir))
 
+    if args.dump_buffer_addrs:
+        # Single source of truth for buffer addresses: dump the post
+        # AddressAllocationPass HLIR addresses as JSON for testbenches /
+        # external tooling to consume. Avoids the constants-dict-vs-actual
+        # drift that bit us in flash_decode_min (the FPRAM SCALE/M_INIT/
+        # L_INIT addresses the testbench used were a hand-rolled mirror
+        # of `_slot_addresses`, off by 64 words from what TVM actually
+        # allocated, leading to head-1/2 numerical drift).
+        addr_table = {
+            buf.name: {
+                "scope": buf.scope,
+                "address": buf.address,
+                "shape": [int(s) for s in buf.shape],
+                "dtype": str(buf.dtype),
+            }
+            for buf in compiled.hlir.buffers.values()
+        }
+        Path(args.dump_buffer_addrs).write_text(
+            json.dumps(addr_table, indent=2)
+        )
+
     if args.output:
         Path(args.output).write_text(isa_text)
     else:
@@ -254,6 +277,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="If given, write a human-readable HLIR dump to this path "
              "(after address allocation; final form fed into ISA emit).",
+    )
+    p_compile.add_argument(
+        "--dump-buffer-addrs",
+        default=None,
+        help="If given, write a JSON dict {buffer_name: {scope, address, "
+             "shape, dtype}} so testbenches can read the *actual* allocated "
+             "addresses instead of mirroring them by hand. Single source of "
+             "truth for FPRAM / VRAM / MRAM / HBM offsets.",
     )
     p_compile.set_defaults(func=_cmd_compile)
 

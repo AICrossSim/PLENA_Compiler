@@ -1,62 +1,86 @@
-"""Minimal FlashAttention kernel (single Q-block x single KV-block).
+"""Flash-attention-min kernel — written in tilelang style.
 
-Mirrors `transactional_emulator/testbench/tile_tensor_kernel_programs/attention.py`
-but expressed in TIR + plena.* intrinsics. Intentionally simple:
+Multi-q-block × multi-kv-block flash attention with online softmax,
+head-fused via ``T.Kernel(num_q_blocks, head_count)``.
 
-  * one q_block, one kv_block (so no outer KV loop yet)
-  * no softmax scale
-  * no causal mask
-  * all lanes run the same online-softmax update
+Tilelang-DSL parts:
+  * ``T.Kernel(num_q_blocks, head_count) as (q_block, by)`` — grid axes;
+    ``by`` is the logical head axis. The frontend splits it into hardware
+    sync domains of width ``MLEN / hlen`` when DMAs / BTMM need fusion.
+  * ``T.copy`` for HBM↔VRAM/MRAM transfers.
+  * ``T.gemm(..., transpose_B=True)`` under ``T.attr(0, KIND, "btmm")``
+    for Q@K^T with head fusion.
+  * Per-lane buffers declared as 2D shapes get auto-expanded by the
+    ``allocate_group_memory`` pass into 4D BSHD-packed (column-direction
+    head packing) or BHSD-stacked (row-direction head stacking).
 
-Dataflow (per kv_block, here only one):
-  Q_v   = DMA(Q_hbm)
-  K_m   = DMA(K_hbm)              # MRAM for BTMM rhs
-  V_m   = DMA(V_hbm)
-  zero(O_v)
-  S_v   = BTMM(Q_v, K_m)          # Q @ K^T per head
-  -- online softmax in place on S_v --
-  for row in 0..mlen:
-      M_curr = max(M_old, max(S_v[row]))    # masked row-reduce
-      M_res  = exp(M_old - M_curr)
-      S_v[row] = exp(S_v[row] - M_curr)     # this becomes P
-      P_sum  = sum(S_v[row])
-      L_new  = L_old * M_res + P_sum
-      O_v[row] *= M_res                     # rescale running output
-      M_old <- M_curr ; L_old <- L_new
-  PV_v  = BTMM(S_v, V_m)
-  O_v   += PV_v
-  -- (final O / L_new is left to a follow-up; only matters once we have
-     the outer KV loop and accumulate over multiple blocks.)
-  DMA(O_v, O_hbm)
+Direct ``T.call_extern("plena.*")`` parts (no tilelang DSL equivalent
+yet):
+  * Per-head ``plena.matmul`` for ``P @ V``.
+  * ``plena.v_add`` / ``plena.zero_v`` for output accumulation.
 
-FP-state preload requirements (handled in testbench):
+The frontend pipeline handles lane-fusion segmentation automatically:
+each sync point (DMA / BTMM / vector op) fires once as a multi-lane HW
+op outside the per-lane for-by loop; per-lane FP / matmul / row ops run
+inside their own for-by loop.
+
+FP slot layout (1 flat FPRAM region starting at FPRAM_USER_BASE; 10
+slots, each ``hardware_lane_count*rows`` wide). Users declare each slot as a
+1D per-lane fragment ``(rows,)`` and the compiler expands it to
+``(hardware_lane_count, rows)`` inside the lane group. The testbench preloads
+the read-only slots:
   Scale[h, :]  = 1 / sqrt(d_k)
   M_init[h, :] = -inf surrogate
   L_init[h, :] = 0
 """
 
-import tvm
-from tvm.script import tir as T
+import tilelang.language as T
 
 from ..address_alloc import FPRAM_USER_BASE
+from ..frontend import compile_func
+from ..frontend.gemm_macros import KIND
 
 
 def make_flash_attention_min(
     *,
     rows: int = 64,
     hlen: int = 16,
-    lane_count: int = 4,
+    head_count: int | None = None,
+    lane_count: int | None = None,
     active_lane: int = 0,
     num_kv_blocks: int = 2,
     num_q_blocks: int = 2,
 ):
     MLEN = 64
     if rows != MLEN:
-        raise ValueError(f"flash_attention_min currently requires rows == MLEN ({MLEN}), got {rows}")
-    if lane_count * hlen != MLEN:
-        raise ValueError(f"lane_count*hlen must == MLEN ({MLEN})")
-    if not (0 <= active_lane < lane_count):
-        raise ValueError(f"active_lane out of range")
+        raise ValueError(
+            f"flash_attention_min requires rows == MLEN ({MLEN}), got {rows}"
+        )
+    if MLEN % hlen != 0:
+        raise ValueError(
+            f"hlen must divide MLEN ({MLEN}); got hlen={hlen}"
+        )
+    hardware_lane_count = MLEN // hlen
+    # Backward compatibility for older scripts: `lane_count` used to mean
+    # logical head count. New callers should pass `head_count`.
+    if head_count is None:
+        head_count = lane_count if lane_count is not None else hardware_lane_count
+    elif lane_count is not None and lane_count != head_count:
+        raise ValueError(
+            f"head_count and legacy lane_count disagree: {head_count} vs {lane_count}"
+        )
+    if head_count < 1:
+        raise ValueError(f"head_count must be >= 1, got {head_count}")
+    if head_count % hardware_lane_count != 0:
+        raise ValueError(
+            f"head_count must be a multiple of hardware lane width "
+            f"MLEN/hlen={hardware_lane_count}; got {head_count}"
+        )
+    if not (0 <= active_lane < hardware_lane_count):
+        raise ValueError(
+            f"active_lane out of hardware lane range [0, {hardware_lane_count}): "
+            f"{active_lane}"
+        )
     if num_kv_blocks < 1:
         raise ValueError(f"num_kv_blocks must be >= 1, got {num_kv_blocks}")
     if num_q_blocks < 1:
@@ -65,261 +89,149 @@ def make_flash_attention_min(
     grouped = hlen < MLEN
     kv_seq = num_kv_blocks * rows
     q_seq = num_q_blocks * rows
-    # Q and O cover all Q blocks back-to-back along the seq dim.
-    Q_HBM_SHAPE = (1, q_seq, lane_count, hlen)
-    O_HBM_SHAPE = (1, q_seq, lane_count, hlen)
-    # On-chip Q / O tiles hold one Q block at a time.
-    Q_TILE_SHAPE = (1, rows, lane_count, hlen)
-    O_TILE_SHAPE = (1, rows, lane_count, hlen)
-    # K and V cover all KV blocks back-to-back along the seq dim.
-    KV_HBM_SHAPE = (1, kv_seq, lane_count, hlen)
-    # On-chip K/V tiles hold ONE block at a time -- we re-DMA per kv iter.
-    KV_TILE_SHAPE = (1, rows, lane_count, hlen)
-    # BTMM #1 writes a (B, H, M, M) tile; flat the last dim into lane_count*hlen
-    # for HBM compatibility (BHSD layout). For our intermediate VRAM tile, we
-    # use the BHSD shape directly so per-head P[h] starts at h*mlen*mlen.
-    S_SHAPE = (1, lane_count, rows, MLEN)
-    # PV mirrors O's BSHD layout so the v_add accumulator has identical
-    # per-head column-slot striding. mm_slot writes head h's hlen
-    # columns at dst_col_offset = h*hlen within the mlen-wide row.
-    PV_SHAPE = (1, rows, lane_count, hlen)
-    FP_STATE_SHAPE = (lane_count, rows)
+
+    fp_state_elems = hardware_lane_count * rows
 
     @T.prim_func
     def flash_attention_min(
-        Q_hbm: T.Buffer(Q_HBM_SHAPE, "float16"),
-        K_hbm: T.Buffer(KV_HBM_SHAPE, "float16"),
-        V_hbm: T.Buffer(KV_HBM_SHAPE, "float16"),
-        O_hbm: T.Buffer(O_HBM_SHAPE, "float16"),
+        Q_hbm: T.Tensor((1, q_seq,  head_count, hlen), "float16"),
+        K_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
+        V_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
+        O_hbm: T.Tensor((1, q_seq,  head_count, hlen), "float16"),
     ):
-        Q_v   = T.alloc_buffer(Q_TILE_SHAPE, "float16", scope="vram")
-        K_m   = T.alloc_buffer(KV_TILE_SHAPE, "float16", scope="mram")
-        V_m   = T.alloc_buffer(KV_TILE_SHAPE, "float16", scope="mram")
-        S_v   = T.alloc_buffer(S_SHAPE, "float16", scope="vram")
-        PV_v  = T.alloc_buffer(PV_SHAPE, "float16", scope="vram")
-        O_v   = T.alloc_buffer(O_TILE_SHAPE, "float16", scope="vram")
-        M_old = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        M_curr = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        M_res = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        L_old = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        L_new = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        P_sum = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        # Softmax scale (= 1 / sqrt(d_k)). Preloaded by the testbench for
-        # every head segment with all-equal `1/sqrt(hlen)` values.
-        Scale = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        # Reciprocal of L_new, used for the final O = O / L_new step.
-        L_inv = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        # Per-q_block reset constants. Preloaded by the testbench:
-        #   M_init[h, :] = -inf surrogate
-        #   L_init[h, :] = 0
-        # The kernel copies these into M_old / L_old at the start of each
-        # q_block iteration so the FP state carrying online softmax across
-        # KV blocks is correctly reset between Q tiles.
-        M_init = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
-        L_init = T.alloc_buffer(FP_STATE_SHAPE, "float16", scope="fpram")
+        with T.Kernel(num_q_blocks, head_count, threads=128) as (q_block, by):
+            # Per-lane (rows, hlen) — col-pack expanded to 4D BSHD-packed.
+            Q_sh = T.alloc_shared((rows, hlen), "float16")
+            K_sh = T.alloc_shared((rows, hlen), "float16")  # gemm RHS → mram
+            V_sh = T.alloc_shared((rows, hlen), "float16")  # matmul RHS → mram (via DMA + gemm)
+            # Per-lane (rows, hlen) for output / per-head P@V — also col-packed.
+            PV_loc = T.alloc_fragment((rows, hlen), "float16")
+            O_loc  = T.alloc_fragment((rows, hlen), "float16")
+            # BTMM output: per-lane (rows, MLEN), row-stack expanded to 4D BHSD.
+            S_loc = T.alloc_fragment((rows, MLEN), "float16")
+            # Per-lane FP softmax state. The compiler expands these
+            # inside the lane group to (lane_count, rows) in FPRAM.
+            M_OLD = T.alloc_fragment((rows,), "float16")
+            M_CURR = T.alloc_fragment((rows,), "float16")
+            M_RES = T.alloc_fragment((rows,), "float16")
+            L_OLD = T.alloc_fragment((rows,), "float16")
+            L_NEW = T.alloc_fragment((rows,), "float16")
+            P_SUM = T.alloc_fragment((rows,), "float16")
+            SCALE = T.alloc_fragment((rows,), "float16")
+            L_INV = T.alloc_fragment((rows,), "float16")
+            M_INIT = T.alloc_fragment((rows,), "float16")
+            L_INIT = T.alloc_fragment((rows,), "float16")
 
-        # ---- Q outer loop ----
-        # Per Q tile we (re)stage Q, reset the running m/l state, run all
-        # KV blocks through the online softmax, finalize O = O / L_new,
-        # and DMA the result out at the q_block-th slot of O_hbm. Unrolled
-        # so q_block is a compile-time constant in DMA scalars.
-        for q_block in T.unroll(num_q_blocks):
-            # DMA Q[q_block] -> Q_v.
-            T.evaluate(T.call_extern(
-                "handle", "plena.dma_h2v_slice",
-                Q_hbm.data, Q_v.data, 4,
-                0, q_block * rows, 0, 0,
-                1, rows, lane_count, hlen,
-            ))
+            # Q DMA — sync, fires once per q_block (multi-lane).
+            T.copy(Q_hbm[0, q_block * rows, by, 0], Q_sh)
 
-            # Clear running output accumulator for this Q tile.
-            T.evaluate(T.call_extern("handle", "plena.zero_v", O_v.data))
+            # Zero running output. The nested ``T.serial(rows) +
+            # T.Parallel(hlen)`` pattern is folded by fuse_elementwise
+            # into a single whole-buffer plena.zero_v: with lane fusion
+            # the two loops together iterate exactly rows*hlen*lane_count
+            # = post-expansion-buffer elements, matching the HW op's
+            # whole-buffer scope. Source code stays semantically faithful
+            # — no "name only row 0 to trick the compiler" hack.
+            for row in T.serial(rows):
+                for col in T.Parallel(hlen):
+                    O_loc[row, col] = T.float16(0)
 
-            # Reset M_old / L_old for this Q tile by copying the preloaded
-            # constants (M_init = -inf, L_init = 0) into every head's FP
-            # segment. Without this every q_block past the first would
-            # inherit the previous tile's m_old / l_old.
-            for h in T.serial(lane_count):
+            # Reset per-lane FP softmax state for this q tile.
+            for row in T.serial(rows):
+                M_OLD[row] = M_INIT[row]
+                L_OLD[row] = L_INIT[row]
+
+            for kv_block in T.unroll(num_kv_blocks):
+                # K, V DMAs — sync, multi-lane.
+                T.copy(K_hbm[0, kv_block * rows, by, 0], K_sh)
+                T.copy(V_hbm[0, kv_block * rows, by, 0], V_sh)
+
+                # BTMM Q @ K^T → S_loc (head-fused, sync, multi-lane).
+                with T.attr(0, KIND, "btmm"):
+                    T.gemm(Q_sh, K_sh, S_loc, transpose_B=True)
+
+                # Per-lane online softmax body.
+                # S_loc is BHSD (last dim == mlen) → (dim2=head, dim3=row)
+                # O_loc is BSHD-packed-narrow → (dim2=row, dim3=lane)
                 for row in T.serial(rows):
-                    T.evaluate(T.call_extern(
-                        "handle", "plena.fp_copy_at",
-                        M_init.data, M_old.data, h * rows + row,
-                    ))
-                    T.evaluate(T.call_extern(
-                        "handle", "plena.fp_copy_at",
-                        L_init.data, L_old.data, h * rows + row,
-                    ))
+                    for col in T.Parallel(MLEN):
+                        S_loc[row, col] = S_loc[row, col] * SCALE[row]
+                    M_CURR[row] = M_OLD[row]
 
-            # ---- KV outer loop ----
-            # Software-unroll so kv_block becomes a compile-time constant.
-            # Per-iter body:
-            #     1. DMA K[kv], V[kv] -> on-chip K_m / V_m
-            #     2. BTMM #1: Q @ K^T -> S_v
-            #     3. online softmax over every head-row in S_v
-            #        (also rescales O_v by exp(m_old - m_curr))
-            #     4. BTMM #2: per head P @ V -> PV_v
-            #     5. v_add: O_v += PV_v
-            for kv_block in T.serial(num_kv_blocks):
-                T.evaluate(T.call_extern(
-                    "handle", "plena.dma_h2m_slice",
-                    K_hbm.data, K_m.data, 4,
-                    0, kv_block * rows, 0, 0,
-                    1, rows, lane_count, hlen,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.dma_h2m_slice",
-                    V_hbm.data, V_m.data, 4,
-                    0, kv_block * rows, 0, 0,
-                    1, rows, lane_count, hlen,
-                ))
+                T.reduce_max(S_loc, M_CURR, dim=1, clear=False)
 
-                # Q @ K^T -> S_v (lane_count heads, mlen x mlen score per head).
-                T.evaluate(T.call_extern(
-                    "handle", "plena.btmm",
-                    Q_v.data, K_m.data, S_v.data, lane_count,
-                ))
-
-                # ---- online softmax over S_v + rescale O_v ----
-                # `_at` row ops now take logical (dim2, dim3) coordinates and
-                # let the emitter derive physical row packing automatically.
-                # For S_v (BHSD) we address (head, row); for O_v (BSHD) we
-                # address (row, head).
-                # ---- online softmax over S_v + per-head P @ V ----
-                # Each head's softmax state is independent, so we can finish the
-                # row-wise update for one head and immediately launch mm_slot for
-                # that same head. v_add stays outside because it consumes the
-                # whole packed PV_v tile once every head slot has been overwritten.
-                for h in T.serial(lane_count):
-                    for row in T.serial(rows):
-                        # Scale: S_v[h, row, :] *= 1/sqrt(d_k).
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.row_mul_fp_at",
-                            S_v.data, Scale.data, S_v.data,
-                            h, row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_copy_at",
-                            M_old.data, M_curr.data, h * rows + row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.row_reduce_max_at",
-                            S_v.data, M_curr.data, h, row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_sub_at",
-                            M_old.data, M_curr.data, M_res.data, h * rows + row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_exp_at",
-                            M_res.data, M_res.data, h * rows + row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.row_sub_fp_at",
-                            S_v.data, M_curr.data, S_v.data,
-                            h, row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.row_exp_at",
-                            S_v.data, S_v.data,
-                            h, row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_copy_at",
-                            L_init.data, P_sum.data, h * rows + row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.row_reduce_sum_at",
-                            S_v.data, P_sum.data,
-                            h, row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_mul_at",
-                            L_old.data, M_res.data, L_new.data, h * rows + row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_add_at",
-                            L_new.data, P_sum.data, L_new.data, h * rows + row,
-                        ))
-                        # Rescale running output: O_v[row, h, :] *= M_res
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.row_mul_fp_at",
-                            O_v.data, M_res.data, O_v.data,
-                            row, h,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_copy_at",
-                            M_curr.data, M_old.data, h * rows + row,
-                        ))
-                        T.evaluate(T.call_extern(
-                            "handle", "plena.fp_copy_at",
-                            L_new.data, L_old.data, h * rows + row,
-                        ))
-
-                    T.evaluate(T.call_extern(
-                        "handle", "plena.mm_slot",
-                        S_v.data, V_m.data, PV_v.data,
-                        h * MLEN * MLEN,   # lhs_row_offset (head h's tile in S_v)
-                        h * hlen,          # rhs_col_offset (head h's V columns)
-                        h * hlen,          # dst_col_offset (head h's PV columns)
-                        hlen,              # col_count
-                    ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.v_add",
-                    O_v.data, PV_v.data, O_v.data,
-                ))
-
-            # Final softmax normalization: O[row, h, :] /= L_new[h, row].
-            for h in T.serial(lane_count):
                 for row in T.serial(rows):
-                    T.evaluate(T.call_extern(
-                        "handle", "plena.fp_reci_at",
-                        L_new.data, L_inv.data, h * rows + row,
-                    ))
-                    T.evaluate(T.call_extern(
-                        "handle", "plena.row_mul_fp_at",
-                        O_v.data, L_inv.data, O_v.data,
-                        row, h,
-                    ))
+                    M_RES[row] = M_OLD[row] - M_CURR[row]
+                    M_RES[row] = T.exp(M_RES[row])
+                    for col in T.Parallel(MLEN):
+                        S_loc[row, col] = S_loc[row, col] - M_CURR[row]
+                    for col in T.Parallel(MLEN):
+                        S_loc[row, col] = T.exp(S_loc[row, col])
+                    P_SUM[row] = L_INIT[row]
 
-            # DMA this Q tile's normalized output back to O_hbm[q_block].
-            T.evaluate(T.call_extern(
-                "handle", "plena.dma_v2h_slice",
-                O_v.data, O_hbm.data, 4,
-                0, q_block * rows, 0, 0,
-                1, rows, lane_count, hlen,
-            ))
+                T.reduce_sum(S_loc, P_SUM, dim=1, clear=False)
 
-    fp_state_elems = lane_count * rows
+                for row in T.serial(rows):
+                    L_NEW[row] = L_OLD[row] * M_RES[row]
+                    L_NEW[row] = L_NEW[row] + P_SUM[row]
+                    for col in T.Parallel(hlen):
+                        O_loc[row, col] = O_loc[row, col] * M_RES[row]
+                    M_OLD[row] = M_CURR[row]
+                    L_OLD[row] = L_NEW[row]
+
+                # Per-head P @ V — default kind. S_loc has rows=rows>1
+                # so the compiler picks plena.matmul (M_MM); per-lane
+                # offsets (LHS=by*MLEN*MLEN row-stacked, RHS / DST=by*hlen
+                # col-packed) are auto-injected from each buffer's
+                # lane-axis stride. PV_loc is fragment-only and gets
+                # marked COL_PACK by the gemm itself (no surrounding
+                # DMA / extern to do it).
+                T.gemm(S_loc, V_sh, PV_loc)
+
+                # O += PV. The nested ``T.serial(rows) + T.Parallel(hlen)``
+                # pattern is folded by fuse_elementwise into a single
+                # whole-buffer plena.v_add — semantically faithful (no
+                # "name only row 0" hack) and matches the HW op's
+                # whole-buffer scope after lane fusion.
+                for row in T.serial(rows):
+                    for col in T.Parallel(hlen):
+                        O_loc[row, col] = O_loc[row, col] + PV_loc[row, col]
+
+            # Final O = O / L_new for this q_block.
+            for row in T.serial(rows):
+                L_INV[row] = 1.0 / L_NEW[row]
+                for col in T.Parallel(hlen):
+                    O_loc[row, col] = O_loc[row, col] * L_INV[row]
+
+            # Write O back to HBM at this q_block slot.
+            T.copy(O_loc, O_hbm[0, q_block * rows, by, 0])
+
+    # The factory must return a TIR PrimFunc already lowered through
+    # the new tilelang frontend, since the CLI's `compile_kernel`
+    # consumes plain TIR (post-frontend) directly.
+    lowered = compile_func(flash_attention_min)
+
     constants = {
         "ROWS": rows,
         "MLEN": MLEN,
         "HLEN": hlen,
-        "LANE_COUNT": lane_count,
+        "HEAD_COUNT": head_count,
+        "LANE_COUNT": hardware_lane_count,
+        "HARDWARE_LANE_COUNT": hardware_lane_count,
         "ACTIVE_LANE": active_lane,
         "GROUPED": grouped,
         "FPRAM_USER_BASE": FPRAM_USER_BASE,
         "FP_STATE_ELEMS": fp_state_elems,
-        # FP buffer ordering matches T.alloc_buffer declarations above.
-        "M_OLD_ADDR":  FPRAM_USER_BASE + 0 * fp_state_elems,
-        "M_CURR_ADDR": FPRAM_USER_BASE + 1 * fp_state_elems,
-        "M_RES_ADDR":  FPRAM_USER_BASE + 2 * fp_state_elems,
-        "L_OLD_ADDR":  FPRAM_USER_BASE + 3 * fp_state_elems,
-        "L_NEW_ADDR":  FPRAM_USER_BASE + 4 * fp_state_elems,
-        "P_SUM_ADDR":  FPRAM_USER_BASE + 5 * fp_state_elems,
-        "SCALE_ADDR":  FPRAM_USER_BASE + 6 * fp_state_elems,
-        "L_INV_ADDR":  FPRAM_USER_BASE + 7 * fp_state_elems,
-        "M_INIT_ADDR": FPRAM_USER_BASE + 8 * fp_state_elems,
-        "L_INIT_ADDR": FPRAM_USER_BASE + 9 * fp_state_elems,
+        # FPRAM scalar-slot addresses are exposed via the compiler's
+        # --dump-buffer-addrs JSON (single source of truth — see
+        # PIPELINE_ARCHITECTURE.md § 5.6). Don't add ``*_ADDR`` keys
+        # back here; they were a hand-rolled mirror of
+        # AddressAllocationPass and were the root cause of the
+        # flash_decode_min FPRAM bug when they drifted.
         "NUM_KV_BLOCKS": num_kv_blocks,
         "NUM_Q_BLOCKS": num_q_blocks,
     }
-    return flash_attention_min, constants
+    return lowered, constants
 
 
-def build_module(
-    *, rows: int = 64, hlen: int = 16, lane_count: int = 4, active_lane: int = 0,
-) -> tvm.IRModule:
-    func, _ = make_flash_attention_min(
-        rows=rows, hlen=hlen, lane_count=lane_count, active_lane=active_lane,
-    )
-    return tvm.IRModule({"flash_attention_min": func})
+__all__ = ["make_flash_attention_min"]

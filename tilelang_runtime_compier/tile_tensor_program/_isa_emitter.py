@@ -462,6 +462,69 @@ class ISAEmitter:
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
+    def emit_matmul_narrow_tile_hwloop(
+        self,
+        *,
+        lhs_vram_addr: int,
+        rhs_mram_addr: int,
+        dst_vram_addr: int,
+        hlen: int,
+        rhs_col_offset: int = 0,
+        dst_col_offset: int = 0,
+        dst_row_stride: Optional[int] = None,
+        task_id: str = "matmul_narrow_hwloop",
+        zero_dst: bool = False,
+    ) -> None:
+        """Emit `mlen x mlen @ mlen x hlen` through M_MM/M_MM_WO."""
+        if hlen <= 0:
+            raise ValueError("emit_matmul_narrow_tile_hwloop requires positive hlen")
+        if hlen > self.program.mlen:
+            raise ValueError(
+                f"emit_matmul_narrow_tile_hwloop requires hlen <= mlen={self.program.mlen}, got {hlen}"
+            )
+        if hlen % self.program.blen != 0:
+            raise ValueError(
+                f"emit_matmul_narrow_tile_hwloop requires hlen divisible by blen={self.program.blen}, got {hlen}"
+            )
+        if dst_row_stride is None:
+            dst_row_stride = int(hlen)
+        if dst_row_stride < hlen:
+            raise ValueError(
+                f"emit_matmul_narrow_tile_hwloop requires dst_row_stride >= hlen ({hlen}), got {dst_row_stride}"
+            )
+        if zero_dst:
+            self.emit_zero_vram_tile(dst_vram_addr)
+
+        gp_regs = self.program.compiler.register_allocator.allocate_gp(5)
+        gp_act, gp_mat, gp_out, gp_stride, gp_loop = gp_regs
+        tiles_per_mlen = self.program.mlen // self.program.blen
+        tiles_per_slot = hlen // self.program.blen
+        output_row_stride = self.program.blen * int(dst_row_stride)
+        lines = [
+            f"; narrow matmul task {task_id} lhs=vram[{lhs_vram_addr}] "
+            f"rhs=mram[{rhs_mram_addr}] rhs_col_offset={rhs_col_offset} "
+            f"dst=vram[{dst_vram_addr}] dst_col_offset={dst_col_offset} "
+            f"hlen={hlen} dst_row_stride={dst_row_stride}"
+        ]
+        lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, 1")
+
+        for oc in range(tiles_per_slot):
+            act_addr = lhs_vram_addr
+            mat_addr = rhs_mram_addr + rhs_col_offset + oc * self.program.blen
+            out_addr = dst_vram_addr + dst_col_offset + oc * self.program.blen
+            lines.append(f"S_ADDI_INT gp{gp_act}, gp0, {act_addr}")
+            lines.append(f"S_ADDI_INT gp{gp_mat}, gp0, {mat_addr}")
+            lines.append(f"S_ADDI_INT gp{gp_out}, gp0, {out_addr}")
+            lines.append(f"C_LOOP_START gp{gp_loop}, {tiles_per_mlen}")
+            lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
+            lines.append(f"M_MM_WO gp{gp_out}, gp0, 0")
+            lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {self.program.blen * self.program.mlen}")
+            lines.append(f"S_ADDI_INT gp{gp_out}, gp{gp_out}, {output_row_stride}")
+            lines.append(f"C_LOOP_END gp{gp_loop}")
+
+        self.program.compiler.register_allocator.free_gp(gp_regs)
+        self.program.compiler.generated_code += "\n".join(lines) + "\n"
+
     def emit_tile_binary(
         self,
         *,

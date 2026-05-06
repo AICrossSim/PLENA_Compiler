@@ -99,6 +99,19 @@ class BufferSlice:
     extents: Tuple[int, ...]                  # int per dim
 
 
+@dataclass(frozen=True)
+class BufferElement:
+    """One scalar element reference within a buffer.
+
+    Used for FPRAM-backed `_at` operands where the frontend keeps
+    tilelang-style indexing (`buf[row]`, later expanded to `buf[by,row]`)
+    but the ISA ultimately expects a flat scalar address.
+    """
+
+    buffer: str
+    indices: Tuple[Any, ...]
+
+
 @dataclass
 class Op:
     """One HLIR op.
@@ -237,6 +250,10 @@ def _fmt_buf_arg(a) -> str:
 
 def _fmt_scalar(x) -> str:
     """Compact display for ints / strs / PrimExprs."""
+    if isinstance(x, BufferElement):
+        idx = ", ".join(str(i) if isinstance(i, (int, float, str)) else f"<{type(i).__name__}>"
+                        for i in x.indices)
+        return f"{x.buffer}[{idx}]"
     if isinstance(x, (int, float, str)):
         return str(x)
     return f"<{type(x).__name__} {x}>"
@@ -252,7 +269,7 @@ def assert_addresses_resolved(mod: HLIRModule) -> None:
 
 
 __all__ = [
-    "Buffer", "BufferSlice", "Op", "HLIRModule",
+    "Buffer", "BufferSlice", "BufferElement", "Op", "HLIRModule",
     "make_for_op",
     "assert_addresses_resolved", "format_hlir",
 ]

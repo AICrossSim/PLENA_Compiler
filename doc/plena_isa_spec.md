@@ -407,6 +407,60 @@ S_ADDI_INT gp2, gp1, 64     ; gp2 = 128 + 64 = 192
 
 Load upper immediate value into the integer register.
 
+#### S_SLL_INT
+
+**Format:** `S_SLL_INT rd, rs1, rs2`
+
+**Operation:** `gp_reg<rd> = gp_reg<rs1> << (gp_reg<rs2> & 0x1F)`
+
+**Description:**
+
+Logical shift left, shift amount taken from the lower 5 bits of `gp_reg<rs2>`.
+
+#### S_SLLI_INT
+
+**Format:** `S_SLLI_INT rd, rs1, imm`
+
+**Operation:** `gp_reg<rd> = gp_reg<rs1> << (imm & 0x1F)`
+
+**Description:**
+
+Logical shift left by an immediate. The lower 5 bits of `imm` are used as the shift amount; upper bits are ignored.
+
+**Example:**
+```asm
+S_ADDI_INT gp1, gp0, 5         ; gp1 = 5
+S_SLLI_INT gp2, gp1, 3         ; gp2 = 5 << 3 = 40
+```
+
+#### S_SRL_INT
+
+**Format:** `S_SRL_INT rd, rs1, rs2`
+
+**Operation:** `gp_reg<rd> = gp_reg<rs1> >> (gp_reg<rs2> & 0x1F)` (logical, zero-fill)
+
+**Description:**
+
+Logical shift right, shift amount taken from the lower 5 bits of `gp_reg<rs2>`.
+
+#### S_SRLI_INT
+
+**Format:** `S_SRLI_INT rd, rs1, imm`
+
+**Operation:** `gp_reg<rd> = gp_reg<rs1> >> (imm & 0x1F)` (logical, zero-fill)
+
+**Description:**
+
+Logical shift right by an immediate. The lower 5 bits of `imm` are used as the shift amount.
+
+**Example:**
+```asm
+S_ADDI_INT gp1, gp0, 200       ; gp1 = 200
+S_SRLI_INT gp2, gp1, 3         ; gp2 = 200 >> 3 = 25
+```
+
+**Note on omissions:** PLENA does **not** provide arithmetic right shift (SRA) -- the integer pool is treated as unsigned for address arithmetic. There is also no AND/OR/XOR; bit-level masking is not part of the kernel programming model.
+
 #### S_LD_INT
 
 **Format:** `S_LD_INT rd, rs1, imm`

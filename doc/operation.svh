@@ -146,6 +146,7 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     S_LD_FP                = 6'h1E,
     S_ST_FP                = 6'h1F,
     S_MAP_V_FP             = 6'h20,
+    S_MAP_FP_V             = 6'h35,
 
     // Scalar Operations (INT)
     S_ADD_INT              = 6'h21,
@@ -155,6 +156,13 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     S_LUI_INT              = 6'h25,
     S_LD_INT               = 6'h26,
     S_ST_INT               = 6'h27,
+    // Logical shifts. Arithmetic-right (SRA) intentionally omitted: PLENA's
+    // integer domain is unsigned address/index arithmetic, no negative values
+    // ever flow through the GP pool, so sign-extension on shift is a no-op.
+    S_SLL_INT              = 6'h36,
+    S_SLLI_INT             = 6'h37,
+    S_SRL_INT              = 6'h38,
+    S_SRLI_INT             = 6'h39,
 
     // Memory Operations
     H_PREFETCH_M           = 6'h28,

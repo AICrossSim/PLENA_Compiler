@@ -418,6 +418,121 @@ class ISAEmitter:
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
         self.program.compiler.register_allocator.free_gp([gp_out])
 
+    def emit_mv(
+        self,
+        *,
+        lhs_vram_addr,
+        rhs_mram_addr,
+        dst_vram_addr,
+        task_id: str = "mv",
+        lhs_offset_reg=None,
+        rhs_offset_reg=None,
+        dst_offset_reg=None,
+        n: int | None = None,
+    ) -> None:
+        """Per-head M_MV + M_MV_WO (single-lane matrix-vector).
+
+        Each (M_MV, M_MV_WO) pair processes BLEN-wide column blocks: M_MV
+        accumulates ``vec[mlen] @ mat[mlen, blen]`` into the systolic array
+        first row, M_MV_WO drains those blen elements to VRAM. To cover
+        ``n`` columns total (defaults to ``btmm_hlen`` -- one full head),
+        we loop ``n / blen`` times, advancing both the matrix column
+        offset and the destination offset by blen each iteration.
+
+        Mirrors emit_matmul's blen-loop (used by plena.matmul / M_MM) but
+        with the LHS being a single row and the writeback being M_MV_WO.
+        """
+        if n is None:
+            n = int(self.program.btmm_hlen)
+        blen = int(self.program.blen)
+        if n % blen != 0:
+            raise ValueError(
+                f"emit_mv: column extent n={n} must be a multiple of blen={blen}"
+            )
+        tiles = n // blen
+
+        gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
+        gp_v, gp_m, gp_o = gp_regs
+        lines = [
+            (
+                f"; mv task {task_id} v=vram[{lhs_vram_addr}]"
+                f" m=mram[{rhs_mram_addr}] dst=vram[{dst_vram_addr}]"
+                f" tiles={tiles} blen={blen}"
+            ),
+            # Set up vector base (lhs).
+            f"S_ADDI_INT gp{gp_v}, gp0, {lhs_vram_addr}",
+        ]
+        if lhs_offset_reg is not None:
+            lines.append(f"S_ADD_INT gp{gp_v}, gp{gp_v}, gp{lhs_offset_reg}")
+
+        # Each iteration walks the matrix and dst by blen elements. Set
+        # up the per-iteration starting m_addr / dst_addr (head base) once,
+        # then bump them by blen inside the loop body.
+        lines.append(f"S_ADDI_INT gp{gp_m}, gp0, {rhs_mram_addr}")
+        if rhs_offset_reg is not None:
+            lines.append(f"S_ADD_INT gp{gp_m}, gp{gp_m}, gp{rhs_offset_reg}")
+        lines.append(f"S_ADDI_INT gp{gp_o}, gp0, {dst_vram_addr}")
+        if dst_offset_reg is not None:
+            lines.append(f"S_ADD_INT gp{gp_o}, gp{gp_o}, gp{dst_offset_reg}")
+
+        for t in range(tiles):
+            lines.append(f"M_MV gp0, gp{gp_m}, gp{gp_v}")
+            lines.append(f"M_MV_WO gp{gp_o}, 0")
+            if t < tiles - 1:
+                lines.append(f"S_ADDI_INT gp{gp_m}, gp{gp_m}, {blen}")
+                lines.append(f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {blen}")
+
+        self.program.compiler.generated_code += "\n".join(lines) + "\n"
+        self.program.compiler.register_allocator.free_gp(gp_regs)
+
+    def emit_btmv(
+        self,
+        *,
+        lhs_packed_vram_addr: int,
+        rhs_mram_addr: int,
+        task_id: str = "btmv",
+    ) -> None:
+        """Lane-fused vector × matrix^T (M_BTMV).
+
+        Mirrors emit_btmm — same MRAM/VRAM register setup, same operand
+        order, just the M_BTMM opcode swapped for M_BTMV. The hardware
+        consumes a 1-row vector LHS instead of an mlen-row matrix LHS.
+        """
+        gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
+        gp_mram_base, gp_lhs_base = gp_regs
+        lines = [
+            (
+                f"; btmv task {task_id} lhs_packed=vram[{lhs_packed_vram_addr}] "
+                f"rhs_mram={rhs_mram_addr} lanes={self.program.btmm_lane_count} head_width={self.program.btmm_hlen}"
+            ),
+            f"S_ADDI_INT gp{gp_mram_base}, gp0, {rhs_mram_addr}",
+            f"S_ADDI_INT gp{gp_lhs_base}, gp0, {lhs_packed_vram_addr}",
+            f"M_BTMV gp0, gp{gp_mram_base}, gp{gp_lhs_base}",
+        ]
+        self.program.compiler.generated_code += "\n".join(lines) + "\n"
+        self.program.compiler.register_allocator.free_gp(gp_regs)
+
+    def emit_bmv_wo(
+        self,
+        *,
+        base_addr: int,
+        task_id: str = "bmv_wo",
+    ) -> None:
+        """Drain accumulator from systolic-array first row to VRAM
+        (M_BMV_WO). Writes lane_count MLEN-wide rows starting at base_addr.
+        """
+        gp_out = self.program.compiler.register_allocator.allocate_gp(1)[0]
+        lines = [
+            (
+                f"; bmv write-only task {task_id} out=vram[{base_addr}] "
+                f"lanes={self.program.btmm_lane_count} head_width={self.program.btmm_hlen}"
+            ),
+            f"S_ADDI_INT gp{gp_out}, gp0, {base_addr}",
+            f"M_BMV_WO gp{gp_out}, 0",
+        ]
+        self.program.compiler.generated_code += "\n".join(lines) + "\n"
+        self.program.compiler.register_allocator.free_gp([gp_out])
+
     def emit_matmul(
         self,
         *,
@@ -669,6 +784,168 @@ class ISAEmitter:
 
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
         ra.free_gp(gp_regs)
+
+    def emit_matmul_general(
+        self,
+        *,
+        M_tiles: int,
+        K_tiles: int,
+        N: int,
+        lhs_vram_base: int,
+        lhs_offset: int = 0,
+        lhs_offset_reg: Optional[int] = None,
+        lhs_m_tile_stride: Optional[int] = None,
+        lhs_k_tile_stride: Optional[int] = None,
+        rhs_mram_base: int,
+        rhs_offset: int = 0,
+        rhs_offset_reg: Optional[int] = None,
+        rhs_k_tile_stride: Optional[int] = None,
+        rhs_n_mlen_tile_stride: Optional[int] = None,
+        dst_vram_base: int,
+        dst_offset: int = 0,
+        dst_offset_reg: Optional[int] = None,
+        dst_m_tile_stride: Optional[int] = None,
+        dst_row_stride: Optional[int] = None,
+        task_id: str = "matmul",
+    ) -> None:
+        """Unified `(M, K) @ (K, N) -> (M, N)` matmul.
+
+        K is folded into the systolic-array accumulator: each output
+        BLEN×BLEN sub-tile is produced by K_tiles `M_MM` issuances followed
+        by one `M_MM_WO`. No software scratch / v_add is needed for K
+        accumulation.
+
+        Shape constraints:
+          M : multiple of mlen,  M_tiles = M / mlen
+          K : multiple of mlen,  K_tiles = K / mlen
+          N : multiple of hlen   (hlen = btmm_hlen on the shim)
+
+        N may exceed mlen — the emitter walks B in (K_tiles × N_mlen_tiles)
+        mlen-wide blocks, where N_mlen_tiles = ceil(N / mlen). The trailing
+        N-mlen block is allowed to carry < mlen valid columns (down to the
+        nearest hlen boundary).
+
+        Layout assumptions (defaults match a packed tile-grid layout):
+          A in VRAM    : (M_tiles × K_tiles) grid of (mlen, mlen) tiles,
+                         packed:    A_tile(m, k) = base + m*K_tiles*mlen² + k*mlen².
+          B in MRAM    : (K_tiles × N_mlen_tiles) grid of (mlen, mlen) tiles,
+                         packed K-major:
+                         B_tile(k, nm) = base + k*N_mlen_tiles*mlen² + nm*mlen².
+          C in VRAM    : row-major (M, N) with `dst_row_stride` elements
+                         between consecutive output rows (defaults to N).
+                         M-tile spacing defaults to `mlen * dst_row_stride`.
+
+        Offsets:
+          `lhs_offset` / `rhs_offset` / `dst_offset` are static element
+          offsets added to the corresponding base addresses. Useful when
+          A/B/C are sub-regions of larger packed buffers (mm_slot pattern).
+          For each side, pass the ``*_offset_reg`` form instead to use a
+          dynamic (PrimExpr-derived) offset already materialised to a gp
+          register; when ``*_offset_reg`` is set, the matching static
+          ``*_offset`` is ignored and the per-iteration pointer is formed
+          via ``S_ADDI_INT gp_dst, gp{*_offset_reg}, <static-residual>``.
+        """
+        mlen = self.program.mlen
+        blen = self.program.blen
+        hlen = int(self.program.btmm_hlen)
+        if M_tiles <= 0 or K_tiles <= 0 or N <= 0:
+            raise ValueError(f"M_tiles, K_tiles, N must be positive; got {M_tiles}, {K_tiles}, {N}")
+        if N % hlen != 0:
+            raise ValueError(f"N must be divisible by hlen={hlen}; got N={N}")
+
+        N_mlen_tiles = (N + mlen - 1) // mlen
+
+        if lhs_k_tile_stride is None:
+            lhs_k_tile_stride = mlen * mlen
+        if lhs_m_tile_stride is None:
+            lhs_m_tile_stride = K_tiles * mlen * mlen
+        if rhs_n_mlen_tile_stride is None:
+            rhs_n_mlen_tile_stride = mlen * mlen
+        if rhs_k_tile_stride is None:
+            rhs_k_tile_stride = N_mlen_tiles * mlen * mlen
+        if dst_row_stride is None:
+            dst_row_stride = N
+        if dst_m_tile_stride is None:
+            dst_m_tile_stride = mlen * int(dst_row_stride)
+
+        tiles_per_mlen = mlen // blen
+        a_orow_step = blen * mlen
+        c_orow_step = blen * int(dst_row_stride)
+
+        ra = self.program.compiler.register_allocator
+        gp_regs = ra.allocate_gp(7)
+        (gp_act_orow, gp_out_orow, gp_act, gp_mat, gp_out,
+         gp_loop_orow, gp_loop_k) = gp_regs
+
+        lines = [
+            f"; matmul (general) task {task_id} "
+            f"M={M_tiles * mlen} K={K_tiles * mlen} N={N}  "
+            f"(M_tiles={M_tiles} K_tiles={K_tiles} N_mlen_tiles={N_mlen_tiles})"
+        ]
+
+        for m in range(M_tiles):
+            # Static-residual addresses (everything that doesn't depend on
+            # a dynamic offset register). When the matching `*_offset_reg`
+            # is set we issue `S_ADDI_INT gp_X, gp{reg}, <static>` to fold
+            # the runtime offset in; otherwise we just load the absolute
+            # static value.
+            lhs_static_full = int(lhs_vram_base) + int(lhs_offset) + m * int(lhs_m_tile_stride)
+            lhs_static_dyn  = int(lhs_vram_base) + m * int(lhs_m_tile_stride)
+            dst_m_base_static_full = int(dst_vram_base) + int(dst_offset) + m * int(dst_m_tile_stride)
+            dst_m_base_static_dyn  = int(dst_vram_base) + m * int(dst_m_tile_stride)
+            for n_mlen in range(N_mlen_tiles):
+                rhs_n_mlen_static_full = (
+                    int(rhs_mram_base) + int(rhs_offset)
+                    + n_mlen * int(rhs_n_mlen_tile_stride)
+                )
+                rhs_n_mlen_static_dyn = (
+                    int(rhs_mram_base) + n_mlen * int(rhs_n_mlen_tile_stride)
+                )
+                cols_here = min(mlen, N - n_mlen * mlen)
+                tiles_per_n_mlen = cols_here // blen
+                for oc in range(tiles_per_n_mlen):
+                    dst_col = n_mlen * mlen + oc * blen
+                    if lhs_offset_reg is not None:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_act_orow}, gp{lhs_offset_reg}, "
+                            f"{lhs_static_dyn}"
+                        )
+                    else:
+                        lines.append(f"S_ADDI_INT gp{gp_act_orow}, gp0, {lhs_static_full}")
+                    if dst_offset_reg is not None:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_out_orow}, gp{dst_offset_reg}, "
+                            f"{dst_m_base_static_dyn + dst_col}"
+                        )
+                    else:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_out_orow}, gp0, "
+                            f"{dst_m_base_static_full + dst_col}"
+                        )
+                    lines.append(f"C_LOOP_START gp{gp_loop_orow}, {tiles_per_mlen}")
+                    lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act_orow}, 0")
+                    if rhs_offset_reg is not None:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_mat}, gp{rhs_offset_reg}, "
+                            f"{rhs_n_mlen_static_dyn + oc * blen}"
+                        )
+                    else:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_mat}, gp0, "
+                            f"{rhs_n_mlen_static_full + oc * blen}"
+                        )
+                    lines.append(f"C_LOOP_START gp{gp_loop_k}, {K_tiles}")
+                    lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
+                    lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {int(lhs_k_tile_stride)}")
+                    lines.append(f"S_ADDI_INT gp{gp_mat}, gp{gp_mat}, {int(rhs_k_tile_stride)}")
+                    lines.append(f"C_LOOP_END gp{gp_loop_k}")
+                    lines.append(f"M_MM_WO gp{gp_out_orow}, gp0, 0")
+                    lines.append(f"S_ADDI_INT gp{gp_act_orow}, gp{gp_act_orow}, {a_orow_step}")
+                    lines.append(f"S_ADDI_INT gp{gp_out_orow}, gp{gp_out_orow}, {c_orow_step}")
+                    lines.append(f"C_LOOP_END gp{gp_loop_orow}")
+
+        ra.free_gp(gp_regs)
+        self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
     def emit_tile_binary(
         self,

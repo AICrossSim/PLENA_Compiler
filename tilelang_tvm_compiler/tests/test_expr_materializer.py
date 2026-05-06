@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 
+import tilelang_tvm_compiler  # noqa: F401  -- bootstraps tilelang's bundled TVM 0.23
 from tvm import tir
 
 from tilelang_tvm_compiler.expr_materializer import (

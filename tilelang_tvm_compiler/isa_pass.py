@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Tuple
 
+import tvm
 from tvm import tir
 
 from . import hlir as _hlir
@@ -48,42 +49,26 @@ class IsaEmitterPass:
             "dma_h2m_slice": self._emit_dma_h2m_slice,
             "dma_v2h_slice": self._emit_dma_v2h_slice,
             "btmm": self._emit_btmm,
+            "btmv": self._emit_btmv,
             "mm": self._emit_mm,
             "mm_slot": self._emit_mm_slot,
+            "matmul": self._emit_matmul,
+            "mv": self._emit_mv,
             "zero_v": self._emit_zero_v,
             "v_add": self._emit_v_add,
-            "map_fp_to_v": self._emit_map_fp_to_v,
-            "map_v_to_fp": self._emit_map_v_to_fp,
-            "fp_copy": self._emit_fp_copy,
+            "v_sub": self._emit_v_sub,
+            "v_mul": self._emit_v_mul,
             "fp_copy_at": self._emit_fp_copy_at,
-            "fp_add": self._emit_fp_add,
             "fp_add_at": self._emit_fp_add_at,
-            "fp_sub": self._emit_fp_sub,
             "fp_sub_at": self._emit_fp_sub_at,
-            "fp_mul": self._emit_fp_mul,
             "fp_mul_at": self._emit_fp_mul_at,
-            "fp_max": self._emit_fp_max,
             "fp_max_at": self._emit_fp_max_at,
-            "fp_exp": self._emit_fp_exp,
             "fp_exp_at": self._emit_fp_exp_at,
-            "fp_reci": self._emit_fp_reci,
             "fp_reci_at": self._emit_fp_reci_at,
-            "fp_sqrt": self._emit_fp_sqrt,
             "fp_sqrt_at": self._emit_fp_sqrt_at,
-            "row_reduce_max": self._emit_row_reduce_max,
-            "row_reduce_sum": self._emit_row_reduce_sum,
-            "row_exp": self._emit_row_exp,
-            "row_reci": self._emit_row_reci,
-            "row_add_fp": self._emit_row_add_fp,
-            "row_sub_fp": self._emit_row_sub_fp,
-            "row_mul_fp": self._emit_row_mul_fp,
-            "row_reduce_max_mask": self._emit_row_reduce_max_mask,
-            "row_reduce_sum_mask": self._emit_row_reduce_sum_mask,
-            "row_exp_mask": self._emit_row_exp_mask,
-            "row_reci_mask": self._emit_row_reci_mask,
-            "row_add_fp_mask": self._emit_row_add_fp_mask,
-            "row_sub_fp_mask": self._emit_row_sub_fp_mask,
-            "row_mul_fp_mask": self._emit_row_mul_fp_mask,
+            "row_load_v_to_fp": self._emit_row_load_v_to_fp,
+            "row_store_fp_to_v": self._emit_row_store_fp_to_v,
+            "copy_v_to_v": self._emit_copy_v_to_v,
             "row_reduce_max_at": self._emit_row_reduce_max_at,
             "row_reduce_sum_at": self._emit_row_reduce_sum_at,
             "row_exp_at": self._emit_row_exp_at,
@@ -136,14 +121,6 @@ class IsaEmitterPass:
         cols = int(shape[-2]) * int(shape[-1])
         return (rows, cols)
 
-    @staticmethod
-    def _flat_addrs(buf: _hlir.Buffer) -> List[int]:
-        return [int(buf.address) + i for i in range(buf.num_elements)]
-
-    def _fpram_buf_addrs(self, buf: _hlir.Buffer, op_kind: str, role: str) -> List[int]:
-        _check_scope(buf, _scope.FPRAM, op_kind, role)
-        return self._flat_addrs(buf)
-
     def _vram_row_shape(self, buf: _hlir.Buffer, op_kind: str, role: str) -> Tuple[int, int]:
         _check_scope(buf, _scope.VRAM, op_kind, role)
         rows, cols = self._logical_2d(buf.shape)
@@ -161,7 +138,7 @@ class IsaEmitterPass:
         role: str,
         dim2_expr,
         dim3_expr,
-    ) -> Tuple[tir.PrimExpr, tir.PrimExpr, tir.PrimExpr, tir.PrimExpr | None]:
+    ) -> Tuple[tir.PrimExpr, tir.PrimExpr | None]:
         _check_scope(buf, _scope.VRAM, op_kind, role)
         if len(buf.shape) != 4:
             raise IsaEmissionError(
@@ -179,8 +156,6 @@ class IsaEmitterPass:
             # vector directly, with dim2 selecting the head-like outer group.
             row_stride = tir.IntImm("int32", int(buf.shape[2]))
             vram_row_expr = tir.Add(tir.Mul(dim2_expr, row_stride), dim3_expr)
-            fp_row_expr = dim3_expr
-            fp_head_expr = dim2_expr
             mask_expr = None
         else:
             packed_heads = int(buf.shape[2])
@@ -193,54 +168,40 @@ class IsaEmitterPass:
             # Packed narrow rows: dim2 selects the physical row, dim3 selects the
             # head slot within that row. Emit a V_MASK for that slot.
             vram_row_expr = dim2_expr
-            fp_row_expr = dim2_expr
-            fp_head_expr = dim3_expr
             mask_expr = tir.shift_left(tir.IntImm("int32", 1), dim3_expr)
 
-        return vram_row_expr, fp_head_expr, fp_row_expr, mask_expr
+        return vram_row_expr, mask_expr
 
-    def _emit_fp_kernel_op(
+    def _resolve_fp_scalar_addr_arg(
         self,
         mod: _hlir.HLIRModule,
-        op: _hlir.Op,
-        *,
-        kernel_op: str,
-    ) -> None:
-        if kernel_op in {"copy", "exp", "reci", "sqrt"}:
-            src = mod.get_buffer(op.buffer_args[0])
-            dst = mod.get_buffer(op.buffer_args[1])
-            src_addrs = self._fpram_buf_addrs(src, op.kind, "src")
-            dst_addrs = self._fpram_buf_addrs(dst, op.kind, "dst")
-            if len(src_addrs) != len(dst_addrs):
+        arg,
+        op_kind: str,
+        role: str,
+    ):
+        if isinstance(arg, _hlir.BufferElement):
+            buf = mod.get_buffer(arg.buffer)
+            _check_scope(buf, _scope.FPRAM, op_kind, role)
+            if len(arg.indices) != len(buf.shape):
                 raise IsaEmissionError(
-                    f"{op.kind} src/dst lengths must match; got "
-                    f"{len(src_addrs)} and {len(dst_addrs)}"
+                    f"{op_kind} {role} buffer element {buf.name!r} has index rank {len(arg.indices)} "
+                    f"but buffer shape rank {len(buf.shape)}"
                 )
-            self.emitter.emit_fp_kernel(
-                src1_addrs=src_addrs,
-                dst_addrs=dst_addrs,
-                op=kernel_op,
-                task_id=op.annotations.get("intrinsic", op.kind),
-            )
-            return
-
-        lhs = mod.get_buffer(op.buffer_args[0])
-        rhs = mod.get_buffer(op.buffer_args[1])
-        dst = mod.get_buffer(op.buffer_args[2])
-        lhs_addrs = self._fpram_buf_addrs(lhs, op.kind, "lhs")
-        rhs_addrs = self._fpram_buf_addrs(rhs, op.kind, "rhs")
-        dst_addrs = self._fpram_buf_addrs(dst, op.kind, "dst")
-        if not (len(lhs_addrs) == len(rhs_addrs) == len(dst_addrs)):
-            raise IsaEmissionError(
-                f"{op.kind} lhs/rhs/dst lengths must match; got "
-                f"{len(lhs_addrs)}, {len(rhs_addrs)}, {len(dst_addrs)}"
-            )
-        self.emitter.emit_fp_kernel(
-            src1_addrs=lhs_addrs,
-            src2_addrs=rhs_addrs,
-            dst_addrs=dst_addrs,
-            op=kernel_op,
-            task_id=op.annotations.get("intrinsic", op.kind),
+            offset = tir.IntImm("int32", 0)
+            stride = 1
+            for dim, idx in zip(reversed(buf.shape), reversed(arg.indices)):
+                idx_expr = tir.IntImm("int32", int(idx)) if isinstance(idx, int) else idx
+                term = idx_expr if stride == 1 else tir.Mul(
+                    idx_expr, tir.IntImm("int32", int(stride)),
+                )
+                offset = term if stride == 1 and isinstance(offset, tir.IntImm) and int(offset.value) == 0 else tir.Add(term, offset)
+                stride *= int(dim)
+            return tir.Add(tir.IntImm("int32", int(buf.address)), offset)
+        if isinstance(arg, (int, tir.PrimExpr)):
+            return arg
+        raise IsaEmissionError(
+            f"{op_kind} {role} expects an FPRAM address or buffer element ref; "
+            f"got {type(arg).__name__}: {arg!r}"
         )
 
     def _emit_fp_scalar_op_at(
@@ -250,79 +211,54 @@ class IsaEmitterPass:
         *,
         kernel_op: str,
     ) -> None:
-        row_expr = op.scalar_args[0]
-        ra = self.shim.compiler.register_allocator
-        mats = []
-
-        # Materialize the row-offset expression ONCE, then derive each
-        # buffer's address with a single S_ADDI_INT (buf.address fits in the
-        # 12-bit immediate). Without this we'd recompute the full row_expr
-        # (e.g. `lane*64 + row` -> SLLI + ADD) per buffer, ballooning the
-        # inner-loop body and tripping the emulator's MAX_LOOP_INSTRUCTIONS.
-        m_row = self.materializer.materialize(row_expr)
-        self.shim.compiler.generated_code += m_row.isa
-        mats.append(m_row)
-        gp_row = m_row.register
-
-        def _addr_reg(buf_name):
-            buf = mod.get_buffer(buf_name)
-            _check_scope(buf, _scope.FPRAM, op.kind, buf_name)
-            r = ra.allocate_gp(1)[0]
-            self.shim.compiler.generated_code += (
-                f"S_ADDI_INT gp{r}, gp{gp_row}, {int(buf.address)}\n"
+        # FP `_at` operands are scalar fpram addresses (PrimExpr or int),
+        # already including any per-slot base offset. We materialize each
+        # address into its own GP register and emit S_LD_FP / S_ST_FP.
+        if kernel_op in {"copy", "exp", "reci", "sqrt"}:
+            expected = 2
+        else:
+            expected = 3
+        if len(op.scalar_args) != expected:
+            raise IsaEmissionError(
+                f"{op.kind} expects {expected} scalar address args, got {len(op.scalar_args)}"
             )
-            mats.append(MaterializedExpr(
-                register=r, isa="", owns_register=True, _materializer=self.materializer
-            ))
-            return r
 
-        regs = ra.allocate_gp(3)
-        gp_a, gp_b, gp_c = regs
+        addr_exprs = [
+            self._resolve_fp_scalar_addr_arg(mod, a, op.kind, f"arg{i}")
+            for i, a in enumerate(op.scalar_args)
+        ]
+        mats = [self.materializer.materialize(a) for a in addr_exprs]
+        for m in mats:
+            self.shim.compiler.generated_code += m.isa
+
         try:
-            if kernel_op in {"copy", "exp", "reci", "sqrt"}:
-                gp_src = _addr_reg(op.buffer_args[0])
-                gp_dst = _addr_reg(op.buffer_args[1])
-                lines = [f"; fp scalar task {op.annotations.get('intrinsic', op.kind)} op={kernel_op}"]
-                lines.append(f"S_ADDI_INT gp{gp_a}, gp{gp_src}, 0")
-                lines.append(f"S_ADDI_INT gp{gp_c}, gp{gp_dst}, 0")
-                lines.append(f"S_LD_FP f1, gp{gp_a}, 0")
-                unary = {"exp": "S_EXP_FP", "reci": "S_RECI_FP", "sqrt": "S_SQRT_FP"}
-                if kernel_op == "copy":
-                    lines.append(f"S_ST_FP f1, gp{gp_c}, 0")
-                elif kernel_op == "reci":
-                    lines.append(f"S_RECI_FP f1, f1")
-                    lines.append(f"S_ST_FP f1, gp{gp_c}, 0")
-                elif kernel_op == "sqrt":
-                    lines.append(f"S_SQRT_FP f1, f1")
-                    lines.append(f"S_ST_FP f1, gp{gp_c}, 0")
-                else:
-                    lines.append("S_EXP_FP f1, f1, 0")
-                    lines.append(f"S_ST_FP f1, gp{gp_c}, 0")
-                self.shim.compiler.generated_code += "\n".join(lines) + "\n"
-                return
-
-            gp_lhs = _addr_reg(op.buffer_args[0])
-            gp_rhs = _addr_reg(op.buffer_args[1])
-            gp_dst = _addr_reg(op.buffer_args[2])
-            opcode = {
-                "add": "S_ADD_FP",
-                "sub": "S_SUB_FP",
-                "mul": "S_MUL_FP",
-                "max": "S_MAX_FP",
-            }[kernel_op]
             lines = [f"; fp scalar task {op.annotations.get('intrinsic', op.kind)} op={kernel_op}"]
-            lines.append(f"S_ADDI_INT gp{gp_a}, gp{gp_lhs}, 0")
-            lines.append(f"S_ADDI_INT gp{gp_b}, gp{gp_rhs}, 0")
-            lines.append(f"S_ADDI_INT gp{gp_c}, gp{gp_dst}, 0")
-            lines.append("S_LD_FP f1, gp{0}, 0".format(gp_a))
-            lines.append("S_LD_FP f2, gp{0}, 0".format(gp_b))
-            lines.append(f"{opcode} f1, f1, f2")
-            lines.append(f"S_ST_FP f1, gp{gp_c}, 0")
+            if kernel_op in {"copy", "exp", "reci", "sqrt"}:
+                gp_src, gp_dst = mats[0].register, mats[1].register
+                lines.append(f"S_LD_FP f1, gp{gp_src}, 0")
+                if kernel_op == "exp":
+                    lines.append("S_EXP_FP f1, f1, 0")
+                elif kernel_op == "reci":
+                    lines.append("S_RECI_FP f1, f1")
+                elif kernel_op == "sqrt":
+                    lines.append("S_SQRT_FP f1, f1")
+                lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
+            else:
+                gp_lhs, gp_rhs, gp_dst = mats[0].register, mats[1].register, mats[2].register
+                opcode = {
+                    "add": "S_ADD_FP",
+                    "sub": "S_SUB_FP",
+                    "mul": "S_MUL_FP",
+                    "max": "S_MAX_FP",
+                }[kernel_op]
+                lines.append(f"S_LD_FP f1, gp{gp_lhs}, 0")
+                lines.append(f"S_LD_FP f2, gp{gp_rhs}, 0")
+                lines.append(f"{opcode} f1, f1, f2")
+                lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
             self.shim.compiler.generated_code += "\n".join(lines) + "\n"
         finally:
             for m in reversed(mats):
                 m.release()
-            ra.free_gp(regs)
 
     def _emit_row_scalar_op_at(
         self,
@@ -332,21 +268,37 @@ class IsaEmitterPass:
         row_op: str,
         reduce: bool = False,
         masked: bool = False,
+        has_fp: bool = False,
     ) -> None:
         src = mod.get_buffer(op.buffer_args[0])
         _check_scope(src, _scope.VRAM, op.kind, "src")
-        has_fp = reduce or len(op.buffer_args) == 3
-        expected_scalars = 2
-        if len(op.scalar_args) != expected_scalars:
-            raise IsaEmissionError(
-                f"{op.kind} expects {expected_scalars} scalar args, got {len(op.scalar_args)}"
+        # `reduce` always has an FP destination; otherwise has_fp is set by
+        # the per-op dispatcher to distinguish (vram, vram, dim2, dim3) from
+        # (vram, fp_addr, vram, dim2, dim3) at the HLIR level.
+        has_fp = has_fp or reduce
+        # Scalar layout (positional, after the buffer args):
+        #   reduce / has-fp non-reduce: [fp_addr, dim2, dim3]
+        #   exp / no-fp:                [dim2, dim3]
+        if has_fp:
+            if len(op.scalar_args) != 3:
+                raise IsaEmissionError(
+                    f"{op.kind} expects 3 scalar args (fp_addr, dim2, dim3); got {len(op.scalar_args)}"
+                )
+            fp_addr_expr = self._resolve_fp_scalar_addr_arg(
+                mod, op.scalar_args[0], op.kind, "fp",
             )
-        dim2_expr = op.scalar_args[0]
-        dim3_expr = op.scalar_args[1]
-        src_row_expr, fp_head_expr, fp_row_expr, mask_expr = self._resolve_row_at_coords(
+            dim2_expr, dim3_expr = op.scalar_args[1], op.scalar_args[2]
+        else:
+            if len(op.scalar_args) != 2:
+                raise IsaEmissionError(
+                    f"{op.kind} expects 2 scalar args (dim2, dim3); got {len(op.scalar_args)}"
+                )
+            fp_addr_expr = None
+            dim2_expr, dim3_expr = op.scalar_args[0], op.scalar_args[1]
+
+        src_row_expr, mask_expr = self._resolve_row_at_coords(
             src, op.kind, "src", dim2_expr, dim3_expr
         )
-        ra = self.shim.compiler.register_allocator
         mats = []
 
         emit_v_mask = masked and mask_expr is not None
@@ -361,17 +313,7 @@ class IsaEmitterPass:
         mats.append(m_src)
         gp_src = m_src.register
 
-        def _fp_offset_expr(fp_buf) -> tir.PrimExpr:
-            base = tir.IntImm("int32", int(fp_buf.address))
-            inner = tir.IntImm("int32", int(fp_buf.shape[-1]))
-            return tir.Add(
-                base,
-                tir.Add(tir.Mul(fp_head_expr, inner), fp_row_expr),
-            )
-
         gp_mask = None
-        regs = ra.allocate_gp(3)
-        gp_a, gp_b, gp_c = regs
         try:
             lines = [f"; row scalar task {op.annotations.get('intrinsic', op.kind)} op={row_op}"]
             if emit_v_mask:
@@ -382,21 +324,19 @@ class IsaEmitterPass:
                 lines.append(f"C_SET_V_MASK_REG gp{gp_mask}")
 
             if reduce:
-                dst = mod.get_buffer(op.buffer_args[1])
-                _check_scope(dst, _scope.FPRAM, op.kind, "dst")
-                dst_expr = _fp_offset_expr(dst)
-                m_dst = self.materializer.materialize(dst_expr)
+                # buffer_args=[vram_src]; FP destination is the scalar address.
+                m_dst = self.materializer.materialize(fp_addr_expr)
                 self.shim.compiler.generated_code += m_dst.isa
                 mats.append(m_dst)
-                lines.append(f"S_ADDI_INT gp{gp_a}, gp{m_dst.register}, 0")
-                lines.append("S_LD_FP f1, gp{0}, 0".format(gp_a))
                 opcode = {"reduce_max": "V_RED_MAX", "reduce_sum": "V_RED_SUM"}[row_op]
+                lines.append(f"S_LD_FP f1, gp{m_dst.register}, 0")
                 lines.append(f"{opcode} f1, gp{gp_src}, {use_mask_flag}")
-                lines.append(f"S_ST_FP f1, gp{gp_a}, 0")
-            elif len(op.buffer_args) == 2:
+                lines.append(f"S_ST_FP f1, gp{m_dst.register}, 0")
+            elif fp_addr_expr is None:
+                # exp / reci: buffer_args=[vram_src, vram_dst], no FP operand.
                 dst = mod.get_buffer(op.buffer_args[1])
                 _check_scope(dst, _scope.VRAM, op.kind, "dst")
-                dst_row_expr, _, _, dst_mask_expr = self._resolve_row_at_coords(
+                dst_row_expr, dst_mask_expr = self._resolve_row_at_coords(
                     dst, op.kind, "dst", dim2_expr, dim3_expr
                 )
                 if emit_v_mask and dst_mask_expr is None:
@@ -413,30 +353,27 @@ class IsaEmitterPass:
                 opcode = {"exp": "V_EXP_V", "reci": "V_RECI_V"}[row_op]
                 lines.append(f"{opcode} gp{m_dst.register}, gp{gp_src}, {use_mask_flag}")
             else:
-                rhs = mod.get_buffer(op.buffer_args[1])
-                dst = mod.get_buffer(op.buffer_args[2])
-                _check_scope(rhs, _scope.FPRAM, op.kind, "rhs")
+                # add/sub/mul: buffer_args=[vram_src, vram_dst]; FP scalar in fp_addr_expr.
+                dst = mod.get_buffer(op.buffer_args[1])
                 _check_scope(dst, _scope.VRAM, op.kind, "dst")
-                dst_row_expr, _, _, dst_mask_expr = self._resolve_row_at_coords(
+                dst_row_expr, dst_mask_expr = self._resolve_row_at_coords(
                     dst, op.kind, "dst", dim2_expr, dim3_expr
                 )
                 if emit_v_mask and dst_mask_expr is None:
                     raise IsaEmissionError(
                         f"{op.kind} src requires packed-head mask but dst {dst.name!r} does not"
                     )
-                rhs_expr = _fp_offset_expr(rhs)
                 dst_row_expr = tir.Add(
                     tir.IntImm("int32", int(dst.address)),
                     tir.Mul(dst_row_expr, tir.IntImm("int32", int(self.shim.mlen))),
                 )
-                m_rhs = self.materializer.materialize(rhs_expr)
+                m_rhs = self.materializer.materialize(fp_addr_expr)
                 self.shim.compiler.generated_code += m_rhs.isa
                 mats.append(m_rhs)
                 m_dst = self.materializer.materialize(dst_row_expr)
                 self.shim.compiler.generated_code += m_dst.isa
                 mats.append(m_dst)
-                lines.append(f"S_ADDI_INT gp{gp_b}, gp{m_rhs.register}, 0")
-                lines.append("S_LD_FP f1, gp{0}, 0".format(gp_b))
+                lines.append(f"S_LD_FP f1, gp{m_rhs.register}, 0")
                 if row_op == "sub":
                     lines.append(f"V_SUB_VF gp{m_dst.register}, gp{gp_src}, f1, {use_mask_flag}, 0")
                 else:
@@ -450,90 +387,6 @@ class IsaEmitterPass:
         finally:
             for m in reversed(mats):
                 m.release()
-            ra.free_gp(regs)
-
-    def _emit_row_scalar_op(
-        self,
-        mod: _hlir.HLIRModule,
-        op: _hlir.Op,
-        *,
-        row_op: str,
-        reduce: bool = False,
-        masked: bool = False,
-    ) -> None:
-        src = mod.get_buffer(op.buffer_args[0])
-        row_count, _ = self._vram_row_shape(src, op.kind, "src")
-        expected_scalar_count = 1 if masked else 0
-        if len(op.scalar_args) != expected_scalar_count:
-            raise IsaEmissionError(
-                f"{op.kind} expects {expected_scalar_count} scalar args, got {len(op.scalar_args)}"
-            )
-        mask_val = None
-        if masked:
-            try:
-                mask_val = int(op.scalar_args[0])
-            except TypeError as exc:
-                raise IsaEmissionError(
-                    f"{op.kind} mask must be a compile-time integer, got "
-                    f"{type(op.scalar_args[0]).__name__}: {op.scalar_args[0]!r}"
-                ) from exc
-        if reduce:
-            dst = mod.get_buffer(op.buffer_args[1])
-            dst_addrs = self._fpram_buf_addrs(dst, op.kind, "dst")
-            if len(dst_addrs) != row_count:
-                raise IsaEmissionError(
-                    f"{op.kind} dst fpram length must equal row_count={row_count}; "
-                    f"got {len(dst_addrs)} for buffer {dst.name}"
-                )
-            self.emitter.emit_row_operation(
-                src_vram_addr=src.address,
-                op=row_op,
-                row_count=row_count,
-                dst_addrs=dst_addrs,
-                mask_val=mask_val,
-                task_id=op.annotations.get("intrinsic", op.kind),
-            )
-            return
-
-        if len(op.buffer_args) == 2:
-            dst = mod.get_buffer(op.buffer_args[1])
-            dst_rows, _ = self._vram_row_shape(dst, op.kind, "dst")
-            if dst_rows != row_count:
-                raise IsaEmissionError(
-                    f"{op.kind} src/dst row counts must match; got {row_count} and {dst_rows}"
-                )
-            self.emitter.emit_row_operation(
-                src_vram_addr=src.address,
-                dst_vram_addr=dst.address,
-                op=row_op,
-                row_count=row_count,
-                mask_val=mask_val,
-                task_id=op.annotations.get("intrinsic", op.kind),
-            )
-            return
-
-        rhs = mod.get_buffer(op.buffer_args[1])
-        dst = mod.get_buffer(op.buffer_args[2])
-        dst_rows, _ = self._vram_row_shape(dst, op.kind, "dst")
-        if dst_rows != row_count:
-            raise IsaEmissionError(
-                f"{op.kind} src/dst row counts must match; got {row_count} and {dst_rows}"
-            )
-        rhs_addrs = self._fpram_buf_addrs(rhs, op.kind, "rhs")
-        if len(rhs_addrs) not in (1, row_count):
-            raise IsaEmissionError(
-                f"{op.kind} rhs fpram length must be 1 or row_count={row_count}; "
-                f"got {len(rhs_addrs)} for buffer {rhs.name}"
-            )
-        self.emitter.emit_row_operation(
-            src_vram_addr=src.address,
-            dst_vram_addr=dst.address,
-            op=row_op,
-            row_count=row_count,
-            rhs_addrs=rhs_addrs,
-            mask_val=mask_val,
-            task_id=op.annotations.get("intrinsic", op.kind),
-        )
 
     # ------------------------------------------------------------------
     # Per-op dispatchers. Each one is a thin glue between HLIR buffer
@@ -1021,6 +874,84 @@ class IsaEmitterPass:
             task_id=op.annotations.get("intrinsic", "btmm") + ".wo",
         )
 
+    def _emit_mv(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Per-head matrix-vector: M_MV + M_MV_WO.
+
+        HLIR signature:
+            buffer_args = [A_vram, B_mram, C_vram]
+            scalar_args = [lhs_offset, rhs_offset, dst_offset]
+              * each offset is int OR PrimExpr; PrimExpr is materialized
+                to a gp register and passed as a *_offset_reg.
+        """
+        lhs = mod.get_buffer(op.buffer_args[0])
+        rhs = mod.get_buffer(op.buffer_args[1])
+        dst = mod.get_buffer(op.buffer_args[2])
+        _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
+        _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
+        _check_scope(dst, _scope.VRAM, op.kind, "dst")
+        if len(op.scalar_args) != 3:
+            raise IsaEmissionError(
+                f"plena.mv expects 3 scalar args (lhs_offset, rhs_offset, "
+                f"dst_offset); got {len(op.scalar_args)}"
+            )
+
+        def _resolve(expr, name):
+            """Returns (static_int_or_None, gp_register_or_None, handle_or_None)."""
+            if isinstance(expr, tir.IntImm):
+                return int(expr.value), None, None
+            if isinstance(expr, int):
+                return int(expr), None, None
+            m = self.materializer.materialize(expr)
+            self.shim.compiler.generated_code += m.isa
+            return None, m.register, m
+
+        lhs_static, lhs_reg, lhs_h = _resolve(op.scalar_args[0], "lhs_offset")
+        rhs_static, rhs_reg, rhs_h = _resolve(op.scalar_args[1], "rhs_offset")
+        dst_static, dst_reg, dst_h = _resolve(op.scalar_args[2], "dst_offset")
+
+        try:
+            self.emitter.emit_mv(
+                lhs_vram_addr=lhs.address + (lhs_static or 0),
+                rhs_mram_addr=rhs.address + (rhs_static or 0),
+                dst_vram_addr=dst.address + (dst_static or 0),
+                lhs_offset_reg=lhs_reg,
+                rhs_offset_reg=rhs_reg,
+                dst_offset_reg=dst_reg,
+                task_id=op.annotations.get("intrinsic", "mv"),
+            )
+        finally:
+            for h in (lhs_h, rhs_h, dst_h):
+                if h is not None:
+                    h.release()
+
+    def _emit_btmv(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Lane-fused matrix-vector. Same address resolution as _emit_btmm,
+        but emits M_BTMV + M_BMV_WO."""
+        lhs = mod.get_buffer(op.buffer_args[0])
+        rhs = mod.get_buffer(op.buffer_args[1])
+        dst = mod.get_buffer(op.buffer_args[2])
+        _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
+        _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
+        _check_scope(dst, _scope.VRAM, op.kind, "dst")
+
+        if op.scalar_args:
+            ghs = int(op.scalar_args[0])
+            if ghs != self.shim.btmm_lane_count:
+                self.shim.compiler.generated_code += (
+                    f"; WARNING: btmv group_heads={ghs} != program btmm_lane_count="
+                    f"{self.shim.btmm_lane_count}\n"
+                )
+
+        self.emitter.emit_btmv(
+            lhs_packed_vram_addr=lhs.address,
+            rhs_mram_addr=rhs.address,
+            task_id=op.annotations.get("intrinsic", "btmv"),
+        )
+        self.emitter.emit_bmv_wo(
+            base_addr=dst.address,
+            task_id=op.annotations.get("intrinsic", "btmv") + ".wo",
+        )
+
     def _emit_mm(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         """Single-tile, single-head matrix multiply.
 
@@ -1081,6 +1012,108 @@ class IsaEmitterPass:
             dst_row_stride=dst_cols,
             task_id=op.annotations.get("intrinsic", "mm"),
         )
+
+    def _emit_matmul(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Unified `(M, K) @ (K, N) -> (M, N)` matmul; supersedes mm + mm_slot.
+
+        HLIR signature:
+            buffer_args = [A_vram, B_mram, C_vram]
+            scalar_args = [M_tiles, K_tiles, N,
+                           lhs_offset, rhs_offset,
+                           dst_offset, dst_row_stride]
+              * M_tiles, K_tiles, N : compile-time ints
+              * lhs_offset / rhs_offset / dst_offset : int OR PrimExpr.
+                Dynamic offsets get materialised to a gp register and
+                passed to `emit_matmul_general` via the corresponding
+                ``*_offset_reg`` parameter; static int offsets fold into
+                the emitter's own static residual.
+              * dst_row_stride      : compile-time int (0 -> default to N)
+
+        K reduction is folded into the matmul op (M_MM accumulate +
+        M_MM_WO drain), so no caller-side scratch / v_add is needed for
+        K. Layout assumes packed mlen-tile grids in VRAM/MRAM (see
+        `ISAEmitter.emit_matmul_general` for the precise convention).
+        """
+        lhs = mod.get_buffer(op.buffer_args[0])
+        rhs = mod.get_buffer(op.buffer_args[1])
+        dst = mod.get_buffer(op.buffer_args[2])
+        _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
+        _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
+        _check_scope(dst, _scope.VRAM, op.kind, "dst")
+        if len(op.scalar_args) != 7:
+            raise IsaEmissionError(
+                f"plena.matmul expects 7 scalar args (M_tiles, K_tiles, N, "
+                f"lhs_offset, rhs_offset, dst_offset, dst_row_stride); "
+                f"got {len(op.scalar_args)}"
+            )
+
+        def _as_int(x, name):
+            if isinstance(x, tir.IntImm):
+                return int(x.value)
+            if isinstance(x, int):
+                return int(x)
+            raise IsaEmissionError(
+                f"plena.matmul {name} must be a compile-time int; got {x!r}"
+            )
+
+        M_tiles = _as_int(op.scalar_args[0], "M_tiles")
+        K_tiles = _as_int(op.scalar_args[1], "K_tiles")
+        N = _as_int(op.scalar_args[2], "N")
+        dst_row_stride_raw = _as_int(op.scalar_args[6], "dst_row_stride")
+        dst_row_stride = dst_row_stride_raw if dst_row_stride_raw > 0 else None
+
+        # Each of lhs / rhs / dst offsets supports either a compile-time
+        # int (folded into the emitter's static residual) or an arbitrary
+        # PrimExpr (materialised to a gp register here, passed in via the
+        # matching `*_offset_reg`). Two offsets that are structurally the
+        # same PrimExpr (e.g. ``rhs = by*hlen``, ``dst = by*hlen``) share
+        # one materialised register so we don't run into the 16-GP cap.
+        # Materialised registers are released after the emit returns.
+        materialised_handles: List = []
+        cached: List = []  # list of (raw_expr, register) for CSE lookup
+
+        def _resolve_offset(raw, name: str):
+            if isinstance(raw, tir.IntImm):
+                return int(raw.value), None
+            if isinstance(raw, int):
+                return int(raw), None
+            if isinstance(raw, tir.PrimExpr):
+                for prev_raw, prev_reg in cached:
+                    if tvm.ir.structural_equal(prev_raw, raw):
+                        return 0, prev_reg
+                m = self.materializer.materialize(raw)
+                self.shim.compiler.generated_code += m.isa
+                materialised_handles.append(m)
+                cached.append((raw, m.register))
+                return 0, m.register
+            raise IsaEmissionError(
+                f"plena.matmul {name} must be int or PrimExpr; got {raw!r}"
+            )
+
+        lhs_off_static, lhs_off_reg = _resolve_offset(op.scalar_args[3], "lhs_offset")
+        rhs_off_static, rhs_off_reg = _resolve_offset(op.scalar_args[4], "rhs_offset")
+        dst_off_static, dst_off_reg = _resolve_offset(op.scalar_args[5], "dst_offset")
+
+        try:
+            self.emitter.emit_matmul_general(
+                M_tiles=M_tiles,
+                K_tiles=K_tiles,
+                N=N,
+                lhs_vram_base=int(lhs.address),
+                lhs_offset=lhs_off_static,
+                lhs_offset_reg=lhs_off_reg,
+                rhs_mram_base=int(rhs.address),
+                rhs_offset=rhs_off_static,
+                rhs_offset_reg=rhs_off_reg,
+                dst_vram_base=int(dst.address),
+                dst_offset=dst_off_static,
+                dst_offset_reg=dst_off_reg,
+                dst_row_stride=dst_row_stride,
+                task_id=op.annotations.get("intrinsic", "matmul"),
+            )
+        finally:
+            for m in materialised_handles:
+                m.release()
 
     def _emit_mm_slot(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         lhs = mod.get_buffer(op.buffer_args[0])
@@ -1215,141 +1248,67 @@ class IsaEmitterPass:
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
         self.emitter.emit_zero_vram_tile(dst.address)
 
-    def _emit_v_add(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """VRAM-VRAM tile add: dst = lhs + rhs."""
+    def _emit_v_binary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
+                       *, binary_op: str) -> None:
+        """VRAM-VRAM whole-tile elementwise binary op (add / sub / mul).
+
+        ``binary_op`` selects the HW opcode via emit_tile_binary's table
+        ({"add": V_ADD_VV, "sub": V_SUB_VV, "mul": V_MUL_VV}).
+        """
         lhs = mod.get_buffer(op.buffer_args[0])
         rhs = mod.get_buffer(op.buffer_args[1])
         dst = mod.get_buffer(op.buffer_args[2])
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.VRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        self.emitter.emit_tile_add(
+        self.emitter.emit_tile_binary(
             lhs_vram_addr=lhs.address,
             rhs_vram_addr=rhs.address,
             dst_vram_addr=dst.address,
-            task_id=op.annotations.get("intrinsic", "v_add"),
+            op=binary_op,
+            task_id=op.annotations.get("intrinsic", f"v_{binary_op}"),
         )
 
-    def _emit_map_fp_to_v(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        src = mod.get_buffer(op.buffer_args[0])
-        dst = mod.get_buffer(op.buffer_args[1])
-        src_addrs = self._fpram_buf_addrs(src, op.kind, "src")
-        rows, cols = self._vram_row_shape(dst, op.kind, "dst")
-        if len(src_addrs) != rows * cols:
-            raise IsaEmissionError(
-                f"{op.kind} src fpram length must equal dst elements ({rows * cols}); "
-                f"got {len(src_addrs)} for buffer {src.name}"
-            )
-        self.emitter.emit_map_v_fp_tile(
-            vram_addr=dst.address,
-            fpram_addr=src.address,
-            row_count=rows,
-            row_width=cols,
-            task_id=op.annotations.get("intrinsic", op.kind),
-        )
+    def _emit_v_add(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """VRAM-VRAM tile add: dst = lhs + rhs."""
+        self._emit_v_binary(mod, op, binary_op="add")
 
-    def _emit_map_v_to_fp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        src = mod.get_buffer(op.buffer_args[0])
-        dst = mod.get_buffer(op.buffer_args[1])
-        rows, cols = self._vram_row_shape(src, op.kind, "src")
-        dst_addrs = self._fpram_buf_addrs(dst, op.kind, "dst")
-        if len(dst_addrs) != rows * cols:
-            raise IsaEmissionError(
-                f"{op.kind} dst fpram length must equal src elements ({rows * cols}); "
-                f"got {len(dst_addrs)} for buffer {dst.name}"
-            )
-        self.emitter.emit_map_fp_v_tile(
-            fpram_addr=dst.address,
-            vram_addr=src.address,
-            row_count=rows,
-            row_width=cols,
-            task_id=op.annotations.get("intrinsic", op.kind),
-        )
+    def _emit_v_sub(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """VRAM-VRAM tile sub: dst = lhs - rhs."""
+        self._emit_v_binary(mod, op, binary_op="sub")
 
-    def _emit_fp_copy(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="copy")
+    def _emit_v_mul(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """VRAM-VRAM tile mul: dst = lhs * rhs (elementwise)."""
+        self._emit_v_binary(mod, op, binary_op="mul")
+
     def _emit_fp_copy_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="copy")
 
-    def _emit_fp_add(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="add")
     def _emit_fp_add_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="add")
 
-    def _emit_fp_sub(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="sub")
     def _emit_fp_sub_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="sub")
 
-    def _emit_fp_mul(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="mul")
     def _emit_fp_mul_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="mul")
 
-    def _emit_fp_max(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="max")
     def _emit_fp_max_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="max")
 
-    def _emit_fp_exp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="exp")
     def _emit_fp_exp_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="exp")
 
-    def _emit_fp_reci(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="reci")
     def _emit_fp_reci_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="reci")
 
-    def _emit_fp_sqrt(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_fp_kernel_op(mod, op, kernel_op="sqrt")
     def _emit_fp_sqrt_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="sqrt")
 
-    def _emit_row_reduce_max(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="reduce_max", reduce=True)
-
-    def _emit_row_reduce_sum(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="reduce_sum", reduce=True)
-
-    def _emit_row_exp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="exp")
-
-    def _emit_row_reci(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="reci")
-
-    def _emit_row_add_fp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="add")
-
-    def _emit_row_sub_fp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="sub")
-
-    def _emit_row_mul_fp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="mul")
-
-    def _emit_row_reduce_max_mask(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="reduce_max", reduce=True, masked=True)
-
-    def _emit_row_reduce_sum_mask(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="reduce_sum", reduce=True, masked=True)
-
-    def _emit_row_exp_mask(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="exp", masked=True)
-
-    def _emit_row_reci_mask(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="reci", masked=True)
-
-    def _emit_row_add_fp_mask(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="add", masked=True)
-
-    def _emit_row_sub_fp_mask(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="sub", masked=True)
-
-    def _emit_row_mul_fp_mask(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op(mod, op, row_op="mul", masked=True)
-    # Unified `_at` ops: scalars are the logical (dim2, dim3) indices of the
-    # source buffer. The emitter maps that pair to a physical VRAM row and, for
-    # narrow packed D tiles, synthesizes the required V_MASK automatically.
+    # `_at` row ops: scalars are (FP scalar address, dim2, dim3) for the
+    # variants that touch fpram, or just (dim2, dim3) for exp. The emitter
+    # maps (dim2, dim3) to a physical VRAM row and synthesizes a V_MASK
+    # for narrow packed D tiles.
     def _emit_row_reduce_max_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_row_scalar_op_at(mod, op, row_op="reduce_max", reduce=True, masked=True)
     def _emit_row_reduce_sum_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
@@ -1357,11 +1316,108 @@ class IsaEmitterPass:
     def _emit_row_exp_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_row_scalar_op_at(mod, op, row_op="exp", masked=True)
     def _emit_row_sub_fp_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op_at(mod, op, row_op="sub", masked=True)
+        self._emit_row_scalar_op_at(mod, op, row_op="sub", masked=True, has_fp=True)
     def _emit_row_mul_fp_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op_at(mod, op, row_op="mul", masked=True)
+        self._emit_row_scalar_op_at(mod, op, row_op="mul", masked=True, has_fp=True)
     def _emit_row_add_fp_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_scalar_op_at(mod, op, row_op="add", masked=True)
+        self._emit_row_scalar_op_at(mod, op, row_op="add", masked=True, has_fp=True)
+
+    # ------------------------------------------------------------------
+    # Row-wide VRAM <-> FPRAM transfer. One call = one S_MAP_*_FP/V
+    # instruction = mlen elements. Loop in TIR for multi-row tiles.
+    # ------------------------------------------------------------------
+    def _emit_row_v_fp_transfer(
+        self,
+        mod: _hlir.HLIRModule,
+        op: _hlir.Op,
+        *,
+        direction: str,  # "v_to_fp" or "fp_to_v"
+    ) -> None:
+        if direction == "v_to_fp":
+            vram = mod.get_buffer(op.buffer_args[0])
+            vram_offset_expr = op.scalar_args[0]
+            fp_addr_expr = op.scalar_args[1]
+            opcode = "S_MAP_FP_V"  # builds FP from V (V -> FP)
+        elif direction == "fp_to_v":
+            fp_addr_expr = op.scalar_args[0]
+            vram = mod.get_buffer(op.buffer_args[0])
+            vram_offset_expr = op.scalar_args[1]
+            opcode = "S_MAP_V_FP"  # builds V from FP (FP -> V)
+        else:
+            raise IsaEmissionError(f"unknown direction {direction!r}")
+
+        _check_scope(vram, _scope.VRAM, op.kind, "vram")
+
+        vram_addr_expr = tir.Add(
+            tir.IntImm("int32", int(vram.address)),
+            vram_offset_expr,
+        )
+        # Resolve fp_addr through the same path as the fp_*_at family so a
+        # BufferElement(fp_buf, indices) becomes (buf.address + linear_index).
+        fp_addr_expr = self._resolve_fp_scalar_addr_arg(
+            mod, fp_addr_expr, op.kind, "fp",
+        )
+        m_vram = self.materializer.materialize(vram_addr_expr)
+        self.shim.compiler.generated_code += m_vram.isa
+        m_fp = self.materializer.materialize(fp_addr_expr)
+        self.shim.compiler.generated_code += m_fp.isa
+        try:
+            lines = [f"; row vram<->fp transfer task {op.annotations.get('intrinsic', op.kind)} dir={direction}"]
+            if direction == "v_to_fp":
+                lines.append(f"{opcode} gp{m_fp.register}, gp{m_vram.register}, 0")
+            else:
+                lines.append(f"{opcode} gp{m_vram.register}, gp{m_fp.register}, 0")
+            self.shim.compiler.generated_code += "\n".join(lines) + "\n"
+        finally:
+            m_fp.release()
+            m_vram.release()
+
+    def _emit_row_load_v_to_fp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_row_v_fp_transfer(mod, op, direction="v_to_fp")
+
+    def _emit_row_store_fp_to_v(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_row_v_fp_transfer(mod, op, direction="fp_to_v")
+
+    def _emit_copy_v_to_v(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """One MLEN-wide row copy in VRAM via ``V_ADD_VF dst, src, f0, 0``.
+
+        Relies on the convention that fp_reg[0] (i.e. ``f0``) is held at
+        zero. Same convention plena.zero_v already depends on.
+        """
+        src = mod.get_buffer(op.buffer_args[0])
+        dst = mod.get_buffer(op.buffer_args[1])
+        _check_scope(src, _scope.VRAM, op.kind, "src")
+        _check_scope(dst, _scope.VRAM, op.kind, "dst")
+        if len(op.scalar_args) != 2:
+            raise IsaEmissionError(
+                f"plena.copy_v_to_v expects 2 scalar args (src_offset, dst_offset); "
+                f"got {len(op.scalar_args)}"
+            )
+        src_offset_expr = op.scalar_args[0]
+        dst_offset_expr = op.scalar_args[1]
+
+        src_addr_expr = tir.Add(
+            tir.IntImm("int32", int(src.address)),
+            src_offset_expr,
+        )
+        dst_addr_expr = tir.Add(
+            tir.IntImm("int32", int(dst.address)),
+            dst_offset_expr,
+        )
+        m_src = self.materializer.materialize(src_addr_expr)
+        self.shim.compiler.generated_code += m_src.isa
+        m_dst = self.materializer.materialize(dst_addr_expr)
+        self.shim.compiler.generated_code += m_dst.isa
+        try:
+            lines = [
+                f"; v→v row copy via V_ADD_VF f0=0 task "
+                f"{op.annotations.get('intrinsic', op.kind)}",
+                f"V_ADD_VF gp{m_dst.register}, gp{m_src.register}, f0, 0",
+            ]
+            self.shim.compiler.generated_code += "\n".join(lines) + "\n"
+        finally:
+            m_src.release()
+            m_dst.release()
 
     # ------------------------------------------------------------------
     # Structured ops: For

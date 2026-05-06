@@ -45,7 +45,7 @@ class AssemblyToBinary:
         ow = self.operands_width
         opw = self.opcode_width
 
-        if instruction.opcode in ["S_ADDI_INT",  "M_MM_WO", "S_LD_FP", "S_ST_FP", "S_LD_INT", "S_ST_INT", "S_MAP_V_FP", "V_RED_MAX", "V_RECI_V", "V_EXP_V"]:
+        if instruction.opcode in ["S_ADDI_INT", "S_SLLI_INT", "S_SRLI_INT", "M_MM_WO", "S_LD_FP", "S_ST_FP", "S_LD_INT", "S_ST_INT", "S_MAP_V_FP", "S_MAP_FP_V"]:
             binary_instruction = (
                 (imm << (opw + 2 * ow)) +
                 (rs1 << (opw + ow)) +
@@ -58,7 +58,7 @@ class AssemblyToBinary:
                 (rd << opw) +
                 opcode
             )
-        elif instruction.opcode in [ "S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"]:
+        elif instruction.opcode in [ "S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP"]:
             binary_instruction = (
                 (rs1 << (opw + ow)) +
                 (rd << opw) +
@@ -85,7 +85,15 @@ class AssemblyToBinary:
                 (rd << opw) +
                 opcode
             )
-        elif instruction.opcode in ["V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"]:
+        elif instruction.opcode in ["V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"]:
+            binary_instruction = (
+                (rmask << (opw + 3 * ow)) +
+                (0 << (opw + 2 * ow)) +
+                (rs1 << (opw + ow)) +
+                (rd << opw) +
+                opcode
+            )
+        elif instruction.opcode in ["V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF"]:
             binary_instruction = (
                 (rmask << (opw + 3 * ow)) +
                 (rs2 << (opw + 2 * ow)) +
