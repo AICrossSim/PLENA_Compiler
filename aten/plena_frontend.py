@@ -133,24 +133,6 @@ def _make_rotate_half_matrix(head_dim: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
-# RoPE helpers
-# ---------------------------------------------------------------------------
-def _make_rotate_half_matrix(head_dim: int) -> torch.Tensor:
-    """Build the (head_dim, head_dim) matrix that computes rotate_half.
-
-    rotate_half(x) = x @ R, where R permutes the halves with a sign flip:
-      output[:d//2] = -input[d//2:]
-      output[d//2:] = +input[:d//2]
-    """
-    R = torch.zeros(head_dim, head_dim)
-    half = head_dim // 2
-    for i in range(half):
-        R[i + half, i] = -1.0   # first half of output = negated second half of input
-        R[i, i + half] = 1.0    # second half of output = first half of input
-    return R
-
-
-# ---------------------------------------------------------------------------
 # Model structure helpers
 # ---------------------------------------------------------------------------
 def _find_model_root(model):
@@ -282,20 +264,27 @@ def _extract_layer_weights(layer, hidden_slice, inter_slice, head_dim_slice, num
 # Golden reference helpers (match hardware: MXFP8 HBM + BF16 intermediates)
 # ---------------------------------------------------------------------------
 def _flash_attn_ref(Q, K, V, scale, causal=False):
-    """CPU reference: scaled dot-product attention.
+    """CPU reference: scaled dot-product attention matching hardware BF16 precision.
 
-    Args:
-        Q, K, V: query, key, value tensors
-        scale:   attention scale factor (1/sqrt(d))
-        causal:  if True, apply causal mask (position i can only attend to j <= i)
+    Hardware path:
+      S = Q @ K^T (M_TMM in f32, written to VRAM as BF16 via M_MM_WO)
+      S *= scale (V_MUL_VF: BF16 * f32 -> BF16)
+      P = softmax(S) (online softmax on BF16 data)
+      O = P @ V (M_MM in f32, written to VRAM as BF16 via M_MM_WO)
+
+    We model the key BF16 truncation points to match hardware precision.
     """
-    scores = (Q @ K.T) * scale
+    # S = Q @ K^T, then truncate to BF16 (M_MM_WO writes BF16)
+    scores = (Q @ K.T).to(torch.bfloat16).float() * scale
+    scores = scores.to(torch.bfloat16).float()  # V_MUL_VF result is BF16
     if causal:
         mask = torch.triu(torch.ones(scores.shape[-2], scores.shape[-1],
                                      device=scores.device), diagonal=1).bool()
         scores.masked_fill_(mask, float('-inf'))
-    attn = F.softmax(scores, dim=-1)
-    return attn @ V
+    # Softmax output written to BF16 VRAM
+    attn = F.softmax(scores, dim=-1).to(torch.bfloat16).float()
+    # O = P @ V, result written to BF16 VRAM
+    return (attn @ V).to(torch.bfloat16).float()
 
 
 def _rms_norm_ref(x, eps):
@@ -311,88 +300,6 @@ def _rms_norm_ref(x, eps):
     rms = torch.rsqrt(x_bf.float().pow(2).mean(-1, keepdim=True) + eps)
     # V_MUL_VF: BF16 vector * f32 scalar -> quantized back to BF16
     return (x_bf.float() * rms).to(torch.bfloat16).float()
-
-
-# ---------------------------------------------------------------------------
-# PLENA ISA helper: named linear projection (avoids name conflicts)
-# ---------------------------------------------------------------------------
-def _linear_projection(prog, input_var, weight_var, name):
-    """Emit a linear projection with a custom VRAM output name.
-
-    Equivalent to ops.linear but uses *name* for the output allocation so
-    that multiple projections in the same scope don't collide on the
-    default "linear_out" name.
-
-    Supports K-split: when K tiles exceed MRAM capacity (4 tiles), splits
-    into chunks and accumulates partial sums via a temporary buffer.
-    """
-    import math as _math
-
-    mlen = prog.mlen
-    MAX_K_TILES = 4  # MRAM capacity: 4 x mlen^2 elements
-
-    rows, k_total = input_var.shape
-    _, out_features = weight_var.shape
-    num_row_blocks = _math.ceil(rows / mlen)
-    assert out_features % mlen == 0, (
-        f"out_features ({out_features}) must be a multiple of mlen ({mlen})"
-    )
-    num_col_blocks = out_features // mlen
-    num_k_tiles = _math.ceil(k_total / mlen)
-
-    output_strict = rows % mlen == 0
-    output = prog.alloc(name, rows, out_features, strict=output_strict)
-
-    if num_k_tiles <= MAX_K_TILES:
-        # Single pass: all K tiles fit in MRAM
-        for col_idx in range(num_col_blocks):
-            for row_idx in range(num_row_blocks):
-                prog.vram_sub_projection_to(
-                    input_var,
-                    row_idx,
-                    weight_var,
-                    col_idx,
-                    output,
-                    row_idx,
-                    col_idx,
-                )
-    else:
-        # K-split: chunk K tiles into groups of MAX_K_TILES
-        k_chunks = []
-        k_start = 0
-        while k_start < num_k_tiles:
-            k_end = min(k_start + MAX_K_TILES, num_k_tiles)
-            k_chunks.append((k_start, k_end - k_start))
-            k_start = k_end
-
-        temp = prog.alloc(f"{name}_ksplit_tmp", rows, out_features, strict=output_strict)
-
-        for k_chunk_idx, (k_block_start, k_block_count) in enumerate(k_chunks):
-            for col_idx in range(num_col_blocks):
-                for row_idx in range(num_row_blocks):
-                    if k_chunk_idx == 0:
-                        prog.vram_sub_projection_to(
-                            input_var, row_idx, weight_var, col_idx,
-                            output, row_idx, col_idx,
-                            k_block_start=k_block_start,
-                            k_block_count=k_block_count,
-                        )
-                    else:
-                        prog.vram_sub_projection_to(
-                            input_var, row_idx, weight_var, col_idx,
-                            temp, row_idx, col_idx,
-                            k_block_start=k_block_start,
-                            k_block_count=k_block_count,
-                        )
-                        prog.vram_block_add_to(
-                            output, row_idx, col_idx,
-                            temp, row_idx, col_idx,
-                            output, row_idx, col_idx,
-                        )
-
-        prog.free_tensor(temp)
-
-    return output
 
 
 # ---------------------------------------------------------------------------
@@ -732,52 +639,62 @@ def compile_hf_model(
         # --- Attention block ---
         residual = X_gold.clone()
         X_bf = _to_inter(X_gold)
+        # Hardware: scalar rms stays in f32, V_MUL_VF multiplies BF16 * f32 -> BF16
         rms = torch.rsqrt(_from_inter(X_bf).pow(2).mean(-1, keepdim=True) + eps)
-        rms = _to_inter(rms)
-        X_gold = _from_inter(X_bf * rms)
+        X_gold = (_from_inter(X_bf) * rms).to(torch.bfloat16).float()
         if native_mode:
-            Q_gold = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(X_gold)), W_q_q.float())))
+            Q_gold = _ksplit_matmul(X_gold, W_q_q, mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
+            Q_gold = _from_inter(_to_inter(Q_gold))  # VRAM write: BF16
 
             K_q_heads_i = []
             V_q_heads_i = []
             for kv_h in range(num_kv_heads):
-                K_h = _from_inter(_to_inter(torch.matmul(
-                    _from_inter(_to_inter(X_gold)), W_k_q_heads[i][kv_h].float()
-                )))
-                V_h = _from_inter(_to_inter(torch.matmul(
-                    _from_inter(_to_inter(X_gold)), W_v_q_heads[i][kv_h].float()
-                )))
-                K_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(K_h)), R_rope_q.float())))
-                K_h = (K_h * cos_table + K_rot_h * sin_table)
-                K_q_heads_i.append(_qw(K_h))
-                V_q_heads_i.append(_qw(V_h))
+                K_h = _ksplit_matmul(X_gold, W_k_q_heads[i][kv_h], mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
+                V_h = _ksplit_matmul(X_gold, W_v_q_heads[i][kv_h], mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
+                K_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(K_h)), _from_inter(_to_inter(R_rope_q)))))
+                # Hardware RoPE: V_MUL_VV (BF16*BF16->BF16), V_ADD_VV (BF16+BF16->BF16)
+                K_cos = _from_inter(_to_inter(K_h.to(torch.bfloat16).float() * cos_table.to(torch.bfloat16).float()))
+                K_rot_sin = _from_inter(_to_inter(K_rot_h.to(torch.bfloat16).float() * sin_table.to(torch.bfloat16).float()))
+                K_h = _from_inter(_to_inter(K_cos) + _to_inter(K_rot_sin))
+                # Hardware stores K/V to HBM as MXFP8, loads back as BF16 for attention
+                K_q_heads_i.append(_from_inter(_to_inter(_qw(K_h))))
+                V_q_heads_i.append(_from_inter(_to_inter(_qw(V_h))))
 
             O_heads = []
             for h in range(num_heads):
                 kv_h = h // ratio
                 Q_h = Q_gold[:, h * head_dim:(h + 1) * head_dim]
-                Q_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(Q_h)), R_rope_q.float())))
-                Q_h = (Q_h * cos_table + Q_rot_h * sin_table)
+                Q_rot_h = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(Q_h)), _from_inter(_to_inter(R_rope_q)))))
+                # Hardware RoPE: V_MUL_VV (BF16*BF16->BF16), V_ADD_VV (BF16+BF16->BF16)
+                Q_cos = _from_inter(_to_inter(Q_h.to(torch.bfloat16).float() * cos_table.to(torch.bfloat16).float()))
+                Q_rot_sin = _from_inter(_to_inter(Q_rot_h.to(torch.bfloat16).float() * sin_table.to(torch.bfloat16).float()))
+                Q_h = _from_inter(_to_inter(Q_cos) + _to_inter(Q_rot_sin))
                 O_h = _flash_attn_ref(Q_h, K_q_heads_i[kv_h], V_q_heads_i[kv_h], scale, causal=True)
                 O_heads.append(O_h)
-            attn_out = torch.cat(O_heads, dim=1)
-            O_gold = _from_inter(_to_inter(torch.matmul(_from_inter(_to_inter(attn_out)), W_o_q.float())))
-            X_gold = O_gold + residual
+            attn_out = _from_inter(_to_inter(torch.cat(O_heads, dim=1)))  # VRAM write: BF16
+            O_gold = _ksplit_matmul(attn_out, W_o_q, mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
+            O_gold = _from_inter(_to_inter(O_gold))  # VRAM write: BF16
+            X_gold = _from_inter(_to_inter(O_gold + residual))  # residual add -> VRAM write: BF16
         else:
             attn_out = _flash_attn_ref(X_gold, K_q_list[i], V_q_list[i], scale, causal=True)
-            X_gold = attn_out + residual
+            X_gold = _from_inter(_to_inter(attn_out + residual))  # residual add -> VRAM write: BF16
 
         # --- FFN block ---
         residual = X_gold.clone()
         X_bf = _to_inter(X_gold)
+        # Hardware: scalar rms stays in f32, V_MUL_VF multiplies BF16 * f32 -> BF16
         rms = torch.rsqrt(_from_inter(X_bf).pow(2).mean(-1, keepdim=True) + eps)
-        rms = _to_inter(rms)
-        X_gold = _from_inter(X_bf * rms)
-        up_out = _to_inter(torch.matmul(_from_inter(_to_inter(X_gold)), W_up_q.float()))
-        gate_out = _to_inter(torch.matmul(_from_inter(_to_inter(X_gold)), W_gate_q.float()))
-        silu_gate = _to_inter(F.silu(_from_inter(up_out)) * _from_inter(gate_out))
-        X_gold = _from_inter(_to_inter(torch.matmul(_from_inter(silu_gate), W_down_q.float())))
-        X_gold = X_gold + residual
+        X_gold = (_from_inter(X_bf) * rms).to(torch.bfloat16).float()
+        # Hardware path: MXFP8 (HBM) → BF16 (MRAM) → float32 (M_MM)
+        # Use _ksplit_matmul to match hardware K-split BF16 precision loss for
+        # projections that exceed MAX_K_TILES (e.g., hidden=576 → 9 tiles, inter=1536 → 24 tiles)
+        up_out = _ksplit_matmul(X_gold, W_up_q, mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
+        gate_out = _ksplit_matmul(X_gold, W_gate_q, mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
+        # Hardware: SiLU(up) * gate -> BF16 VRAM write before down projection
+        silu_gate = _to_inter(F.silu(_from_inter(_to_inter(up_out))) * _from_inter(_to_inter(gate_out)))
+        X_gold = _ksplit_matmul(_from_inter(silu_gate), W_down_q, mlen, _HW_MAX_K_TILES, _to_inter, _from_inter)
+        X_gold = _from_inter(_to_inter(X_gold))  # VRAM write: BF16 after down proj
+        X_gold = _from_inter(_to_inter(X_gold + residual))  # residual add -> VRAM write: BF16
 
         print(f"  After layer {i}: X_gold[0,:4] = {X_gold[0, :4].tolist()}")
 
@@ -787,8 +704,9 @@ def compile_hf_model(
     # lm_head projection (optional)
     if include_lm_head and lm_head_weight is not None:
         W_lm_q = quantize_to_mxfp(lm_head_weight)
+        # Hardware: MXFP8 → BF16 (MRAM) → float32 (M_MM)
         logits_gold = torch.matmul(
-            X_gold.to(torch.bfloat16).float(), W_lm_q.float()
+            X_gold.to(torch.bfloat16).float(), W_lm_q.to(torch.bfloat16).float()
         ).to(torch.bfloat16).float()
         golden_out = logits_gold
         print(f"  logits_gold: {golden_out.shape}")
