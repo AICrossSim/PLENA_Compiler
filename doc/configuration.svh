@@ -10,7 +10,6 @@ package configuration_pkg;
     parameter   BLEN = 4;
     parameter   HLEN = 8
     parameter   MLEN = 64;
-    parameter   Matrix_Parallel_Rd_Dim = 1;
     parameter   VLEN = 64;
     parameter   INST_BUFF_DEPTH = 16;
     parameter   ON_CHIP_ADDR_WIDTH = precision_pkg::INT_DATA_WIDTH;
@@ -35,6 +34,8 @@ package configuration_pkg;
     parameter   HBM_ELE_WIDTH           = 512;
     parameter   HBM_SCALE_WIDTH         = 512;
     parameter   HBM_WIDTH               = 512;
+    parameter   INSTRUCTION_STORAGE_OFFSET = 8192;
+
 endpackage
 
 package instruction_pkg;

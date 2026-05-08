@@ -75,7 +75,7 @@ from utils.load_config import load_toml_config  # noqa: E402
 # Use existing emulator runner for the Rust invocation.
 sys.path.insert(0, str(_REPO_ROOT / "transactional_emulator" / "testbench"))
 from emulator_runner import run_emulator  # noqa: E402
-from transactional_emulator.tools.check_mem import read_bin_file_as_array  # noqa: E402
+from verification.check_mem import read_bin_file_as_array  # noqa: E402
 
 
 

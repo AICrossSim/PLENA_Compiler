@@ -75,8 +75,8 @@ def env_setup(memory_data_manager, build_path: str, data_config, quant_config, h
         hbm_row_width: HBM row width
         test_file_name: Optional test file name
     """
-    isa_file_path = _PROJECT_ROOT / "compiler" / "doc" / "operation.svh"
-    config_file_path = _PROJECT_ROOT / "compiler" / "doc" / "configuration.svh"
+    isa_file_path = _PROJECT_ROOT / "PLENA_Compiler" / "doc" / "operation.svh"
+    config_file_path = _PROJECT_ROOT / "PLENA_Compiler" / "doc" / "configuration.svh"
 
     if test_file_name is None:
         assembler = AssemblyToBinary(str(isa_file_path), str(config_file_path))
@@ -166,11 +166,7 @@ def init_mem(build_path):
     hbm_write_scale_v_file.touch()
     vector_mem_result_file.touch()
 
-    addr_mapper_file = build_path / "hbm_addr_mapper.mem"
-    addr_mapper_file.touch()
-
     os.environ["VECTOR_MEM_RESULT_FILE"] = str(vector_mem_result_file)
-    os.environ["HBM_ADDR_MAPPER_FILE"] = str(addr_mapper_file)
     os.environ["FAKE_HBM_ELEMENT_WRITE_M_FILE"] = str(hbm_write_element_m_file)
     os.environ["FAKE_HBM_ELEMENT_WRITE_V_FILE"] = str(hbm_write_element_v_file)
     os.environ["FAKE_HBM_SCALE_WRITE_M_FILE"] = str(hbm_write_scale_m_file)

@@ -20,7 +20,7 @@ class AssemblyToBinary:
         self.instruction_length = config_settings.get("INSTRUCTION_LENGTH", 0)
         self.funct_width = config_settings.get("FUNCT_WIDTH", 0)
         self.funct_dist = self.instruction_length - 2 * self.funct_width
-
+        
     def _convert_to_binary(self, instruction):
         """
         Convert an instruction to its binary representation.
@@ -38,7 +38,6 @@ class AssemblyToBinary:
         imm = instruction.imm
         rmask = instruction.rmask
         binary_instruction = 0
-        # print(f"Converting instruction: {instruction.opcode} with opcode={hex(opcode)}, rd={rd}, rs1={rs1}, rs2={rs2}, rstride={rstride}, funct1={funct1}, funct2={funct2}, imm={imm}")
         ow = self.operands_width
         opw = self.opcode_width
 
@@ -142,18 +141,3 @@ class AssemblyToBinary:
         return binary_instructions
 
 
-# if __name__ == "__main__":
-#     import os
-#     from pathlib import Path
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('--layer', type=str, required=True, help='Input file name')
-#     parser.add_argument('--test_type', type=str, default='Layerwise_Benchmark', help='Input file name (default: basic)')
-#     args = parser.parse_args()
-
-#     isa_file_path = '../../src/definitions/operation.svh'
-#     config_file_path = '../../src/definitions/configuration.svh'
-#     asm_file_path = f'../../test/{args.test_type}/{args.layer}.asm'
-#     print(f'Assembling {asm_file_path} to {args.layer}.mem')
-#     output_file_path = f'../../test/{args.test_type}/{args.layer}.mem'
-#     assembler = AssemblyToBinary(isa_file_path, config_file_path)
-#     assembler.generate_binary(asm_file_path, output_file_path)
