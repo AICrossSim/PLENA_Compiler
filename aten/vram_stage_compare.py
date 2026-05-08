@@ -68,7 +68,7 @@ def compare_stages(vram_path, build_dir, hidden, inter, num_heads, num_kv_heads,
     # For clm-60m: different addresses. We compute from VRAM layout.
     tiles = hidden // mlen
     x_addr = 3 * mlen * mlen + 0  # after COS, SIN, mask (for native mode)
-    # Read final output address from comparison_params
+    # Actually, let's read the comparison_params for the final output address
     import json
     params = json.load(open(build / "comparison_params.json"))
     final_addr = params["start_row_idx"] * mlen
@@ -82,8 +82,9 @@ def compare_stages(vram_path, build_dir, hidden, inter, num_heads, num_kv_heads,
     W_down = quantize_to_mxfp(torch.load(build / "W_down_0.pt", weights_only=True))
 
     # --- Stage 1: O_full (attention output) ---
-    # Find O_full address from ISA comments
-    o_full_addr = final_addr - 2 * seq_len * hidden
+    # We trust O_full is correct (proven by per-head comparison)
+    o_full_addr = final_addr - 2 * seq_len * hidden  # O_full is 2 allocations before O_proj
+    # Actually, let's find O_full from ISA
     import re
     asm_path = build / "generated_asm_code.asm"
     if asm_path.exists():
