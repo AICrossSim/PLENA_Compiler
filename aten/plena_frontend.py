@@ -625,7 +625,7 @@ def compile_hf_model(
         K_q_list = [_qw(K_mats[i]) for i in range(n_layers)]
         V_q_list = [_qw(V_mats[i]) for i in range(n_layers)]
 
-    X_gold = token_embeds.clone() + pos_weight  # embedding_add
+    X_gold = _qw(token_embeds.clone()) + _qw(pos_weight)  # embedding_add (MXFP8-quantized, matching HBM)
     ratio = num_heads // num_kv_heads
 
     for i in range(n_layers):
