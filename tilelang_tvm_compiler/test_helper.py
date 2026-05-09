@@ -1,238 +1,368 @@
-"""TVM-compiler test harness.
+"""TVM testbench harness — single entry point for tvm_*_test.py drivers.
 
-Mirrors the role of tile_tensor_test_helper.py + testbench_runner.py from
-the runtime compiler, but adapted to our TVM/TIR pipeline.
+Each ``transactional_emulator/testbench/tvm_<kernel>_test.py`` had grown
+into 200-370 lines of mostly-identical boilerplate (subprocess into the
+TVM venv, write .pt files, call create_sim_env / create_mem_for_sim,
+write comparison_params.json). This helper collapses the shared flow
+into a single ``run(spec)`` call. Per-kernel code shrinks to:
 
-Per-kernel test driver should:
+    * a few constants (MLEN, HLEN, ...)
+    * a ``build_inputs_and_golden(seed)`` function
+    * an optional ``build_fp_preload`` and/or ``build_pre_kernel_stub``
+    * a ``build_comparison_params`` function (or static dict)
+    * a single ``TvmTestbenchSpec(...)`` and ``run(spec)`` call
 
-    from tilelang_tvm_compiler.test_helper import emit_single_output_testbench
+The helper itself does not import torch eagerly because this file lives
+in the compiler tree, which is loaded under multiple Python venvs.
+Torch is imported inside ``run()`` where the testbench's own venv has
+already set ``sys.path`` for it.
 
-    emit_single_output_testbench(
-        prim_func     = my_kernel,            # tvm.tir.PrimFunc
-        out_buffer    = "C_hbm",              # name of the HBM buffer holding the result
-        input_tensors = {"A_hbm": A, ...},    # numpy or torch tensors keyed by PrimFunc param name
-        golden_output = golden,               # numpy/torch tensor with the expected result
-        asm_name      = "tvm_btmm",
-        artifact_prefix = "tvm_btmm",
-        build_dir     = ".../testbench/build",
-    )
+Pipeline (in order):
 
-What it does (parallel to the runtime helper, layer by layer):
+    1. Subprocess into the TVM venv to compile TIR -> PLENA ISA text,
+       optionally dumping HLIR and the buffer-address JSON.
+    2. If ``parse_buffer_addrs`` was given, parse the JSON into the
+       address dict the per-kernel hooks expect.
+    3. If ``build_pre_kernel_stub`` was given, prepend its output to the
+       kernel ISA. Used by conv2d_min / flash_decode_min for the FPRAM
+       staging -> VRAM cache copy that has to happen before the kernel
+       proper.
+    4. ``build_inputs_and_golden(seed)`` produces:
+         - ``hbm_inputs``: dict[name -> torch.Tensor] for HBM staging
+         - ``golden_flat``: 2D flat golden the comparator diffs against
+         - any extras (e.g. ``q_token`` for flash_decode) consumed by
+           ``build_fp_preload``
+    5. If ``build_fp_preload`` was given, it returns the FP-preload
+       tensor positioned at the right FPRAM addresses.
+    6. ``create_sim_env`` writes .pt / .asm / fp_sram.bin / int_sram.bin
+       and the golden file. ``create_mem_for_sim`` assembles + packs HBM.
+    7. Write ``comparison_params.json`` so view_mem.py knows where to
+       read the staged output.
 
-  1. Compile the PrimFunc with PlenaCodegen           ~ prog.compile()
-  2. Append "compare staging" pseudo-ISA              ~ stage_input_tensor_for_stride_compare
-       which moves the HBM output back into VRAM[0..]
-       so the emulator can diff against the golden.
-  3. Save the input tensors as the HBM feed           ~ build_input_feed
-  4. Save the golden as .npy                          ~ create_sim_env(golden_result=...)
-  5. Write a manifest.json describing the test        ~ comparison_params.json + create_mem_for_sim
-
-For now everything downstream of the pseudo-ISA is also pseudo (we don't
-yet bind to create_sim_env / cargo run). The artifacts written here are
-the contract that real ISA emit will fulfil later.
+The helper does not call cargo / view_mem itself — those are still
+driven by `just build-emulator-debug <name>`. This file only produces
+the artefact set in ``build/``.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Mapping
-
-import numpy as np
-import tvm
-from tvm import tir
-
-from .codegen import PlenaCodegen, _BufferInfo
-from .pipeline import compile_kernel, PlenaTarget
-from . import scope as _scope
+from typing import Any, Callable, Mapping, Optional
 
 
-def _to_numpy(x: Any) -> np.ndarray:
-    """Accept torch tensors or numpy arrays; return numpy."""
-    if isinstance(x, np.ndarray):
-        return x
-    # duck-typed torch.Tensor support without importing torch
-    if hasattr(x, "detach") and hasattr(x, "cpu") and hasattr(x, "numpy"):
-        return x.detach().cpu().numpy()
-    raise TypeError(f"unsupported tensor type: {type(x)}")
+# ---------------------------------------------------------------------------
+# Repo discovery. The helper lives at:
+#   <repo>/compiler/tilelang_tvm_compiler/test_helper.py
+# so the repo root is two ``parent`` hops up.
+# ---------------------------------------------------------------------------
+_THIS_FILE = Path(__file__).resolve()
+REPO_ROOT = _THIS_FILE.parent.parent.parent
+TESTBENCH_DIR = REPO_ROOT / "transactional_emulator" / "testbench"
+
+# Default LD_LIBRARY_PATH for the ``.venv`` (Python 3.12) flow — torch
+# loaded from that venv requires this Nix-provided libstdc++. The older
+# ``.venv-tvm`` (Python 3.11, TVM-only) flow needs LD_LIBRARY_PATH="".
+DEFAULT_LD_LIBRARY_PATH = "/nix/store/si4q3zks5mn5jhzzyri9hhd3cv789vlm-gcc-15.2.0-lib/lib"
 
 
-def _byte_size(info: _BufferInfo) -> int:
-    elems = 1
-    for s in info.shape:
-        elems *= int(s)
-    # rough dtype byte width -- matches what we'd use in the manifest
-    dtype_bits = {
-        "float16": 16, "bfloat16": 16, "float32": 32, "int32": 32, "int8": 8,
-    }.get(info.dtype, 32)
-    return elems * dtype_bits // 8
+# ---------------------------------------------------------------------------
+# Spec
+# ---------------------------------------------------------------------------
+
+# Input-build hook contract:
+#   def build_inputs_and_golden(seed: int) -> dict
+# Required keys in the returned dict:
+#   - "hbm_inputs":  dict[str, torch.Tensor]   # buffers to stage into HBM
+#   - "golden_flat": torch.Tensor              # 2D flat golden (rows, MLEN-aligned cols)
+# Any other keys are kernel-specific extras (e.g. ``q_token`` for
+# flash_decode_min) and are forwarded to ``build_fp_preload`` unchanged.
+InputsBuilder = Callable[[int], dict]
+
+# Buffer-addresses parser:
+#   def parse_buffer_addrs(raw_json_dict: dict) -> dict
+# Receives the raw output of ``--dump-buffer-addrs`` (each entry has
+# ``scope``, ``address``, ``shape``, ``dtype``). Returns whatever shape
+# the per-kernel hooks find convenient.
+BufferAddrsParser = Callable[[dict], dict]
+
+# Pre-kernel ASM stub (concatenated BEFORE the compiled kernel ISA):
+#   def build_pre_kernel_stub(addrs: dict) -> str
+PreKernelStubBuilder = Callable[[dict], str]
+
+# FP preload builder:
+#   def build_fp_preload(io: dict, addrs: dict) -> torch.Tensor
+# ``io`` is the dict returned by ``build_inputs_and_golden``.
+FpPreloadBuilder = Callable[[dict, dict], Any]   # Any to avoid eager torch import
+
+# Comparison-params builder:
+#   def build_comparison_params(io: dict, addrs: dict) -> dict
+# Receives the same ``io`` (so it can read shapes off ``hbm_inputs`` /
+# ``golden_flat``) and the parsed addrs (some kernels need an O_CACHE
+# address for ``start_row_idx``).
+ComparisonParamsBuilder = Callable[[dict, dict], dict]
 
 
-def _emit_compare_staging(out_info: _BufferInfo) -> str:
-    """Build the pseudo-ISA tail that pulls the HBM output into VRAM[0..]
-    so the emulator's comparator can diff against the golden.
+@dataclass
+class TvmTestbenchSpec:
+    """Everything one ``tvm_<kernel>_test.py`` needs to declare."""
 
-    Real ISA equivalent (from runtime helper) is a sequence of
-    preload_addr_reg + preload_act + tile-by-tile DMA. We collapse it here
-    into one synthetic STAGE_OUT directive; when ISA emit becomes real this
-    function gets replaced with the actual tile-staging pass.
-    """
-    return (
-        "; ============================================\n"
-        "; compare staging (output HBM -> VRAM[0..])\n"
-        "; ============================================\n"
-        f"STAGE_OUT  buffer={out_info.name}  scope={out_info.scope}  "
-        f"shape={'x'.join(str(s) for s in out_info.shape)}  "
-        f"dtype={out_info.dtype}  bytes={_byte_size(out_info)}\n"
-    )
+    # ---- identity ----
+    asm_name: str
+    """Used for the .asm filename, log messages, and (after the helper
+    runs) ``{asm_name}_generated_asm_code.asm`` in build/."""
+
+    kernel: str
+    """Kernel spec passed to ``tilelang_tvm_compiler compile --kernel``,
+    e.g. ``"tilelang_tvm_compiler.kernels.conv2d_min:make_conv2d_min"``."""
+
+    build_inputs_and_golden: InputsBuilder
+    """See ``InputsBuilder`` above."""
+
+    build_comparison_params: ComparisonParamsBuilder
+    """See ``ComparisonParamsBuilder`` above."""
+
+    # ---- compile-time tuneables ----
+    kernel_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    """k=v pairs forwarded as ``--kernel-kwargs k1=v1,k2=v2,...``."""
+
+    mlen: int = 64
+    btmm_hlen: Optional[int] = None
+    btmm_lane_count: Optional[int] = None
+
+    stage_output: Optional[str] = None
+    """Buffer name to re-stage from HBM -> VRAM at the end of the
+    kernel for view_mem comparison (passed via ``--stage-output``)."""
+
+    artifact_prefix: Optional[str] = None
+    """Prefix for ancillary build artefacts. Defaults to ``asm_name``."""
+
+    # ---- venv / subprocess env ----
+    venv_name: str = ".venv"
+    """Subdir of the repo root containing the Python venv used to invoke
+    the compiler. ``.venv`` (Python 3.12, the new default) or the legacy
+    ``.venv-tvm`` (Python 3.11, TVM-wheel-only)."""
+
+    ld_library_path: Optional[str] = DEFAULT_LD_LIBRARY_PATH
+    """Forwarded as the subprocess's ``LD_LIBRARY_PATH``. Pass ``""`` to
+    explicitly clear it (the ``.venv-tvm`` convention) or ``None`` to
+    inherit from the parent process unchanged."""
+
+    # ---- buffer-addrs JSON ----
+    parse_buffer_addrs: Optional[BufferAddrsParser] = None
+    """If given, the helper passes ``--dump-buffer-addrs`` to the
+    compiler, then calls this function with the parsed JSON. The result
+    is forwarded to ``build_pre_kernel_stub`` /
+    ``build_fp_preload`` / ``build_comparison_params``. If omitted, the
+    helper still passes an empty dict to the hooks, so kernels that
+    don't need address introspection don't pay for it."""
+
+    # ---- optional kernel hooks ----
+    build_pre_kernel_stub: Optional[PreKernelStubBuilder] = None
+    build_fp_preload: Optional[FpPreloadBuilder] = None
+    int_preload: Any = None
+    """Static int-preload tensor (sim_env_utils takes it through). None
+    for everything we have today."""
+
+    # ---- misc ----
+    seed: int = 0
+    """Forwarded to ``build_inputs_and_golden``."""
 
 
-def emit_single_output_testbench(
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _format_kwargs(kwargs: Mapping[str, Any]) -> str:
+    return ",".join(f"{k}={v}" for k, v in kwargs.items())
+
+
+def _compile_via_subprocess(
+    spec: TvmTestbenchSpec,
     *,
-    prim_func: tir.PrimFunc,
-    out_buffer: str,
-    input_tensors: Mapping[str, Any],
-    golden_output: Any,
-    asm_name: str,
-    artifact_prefix: str,
-    build_dir: str | Path,
-    compare_atol: float = 1e-2,
-    compare_rtol: float = 1e-2,
-    target: PlenaTarget | None = None,
-    isa_mode: str = "real",  # "real" -> full ISA via pipeline; "pseudo" -> old text dump
-) -> Dict[str, Path]:
-    """Compile + bundle inputs/golden/manifest. Returns paths of written files.
+    hlir_path: Path,
+    addrs_path: Optional[Path],
+) -> str:
+    """Subprocess into the TVM venv to compile the kernel.
 
-    isa_mode == "real":   runs the 3-pass pipeline (codegen -> address alloc
-                          -> ISA emit) to produce real PLENA ISA. Default.
-    isa_mode == "pseudo": uses the original PlenaCodegen.run() text dump.
-                          Kept around for kernels that exercise op kinds
-                          not yet supported by the real pipeline.
+    Returns the kernel's ISA text (stdout). Raises ``RuntimeError``
+    with the captured stderr on failure.
     """
-    build_dir = Path(build_dir)
+    venv_python = REPO_ROOT / spec.venv_name / "bin" / "python"
+    if not venv_python.exists():
+        raise RuntimeError(
+            f"venv python not found: {venv_python}. Set "
+            f"TvmTestbenchSpec.venv_name to a venv that exists."
+        )
+    cmd = [
+        str(venv_python), "-m", "tilelang_tvm_compiler", "compile",
+        "--kernel", spec.kernel,
+        "--asm-name", spec.asm_name,
+        "--mlen", str(spec.mlen),
+    ]
+    if spec.kernel_kwargs:
+        cmd += ["--kernel-kwargs", _format_kwargs(spec.kernel_kwargs)]
+    if spec.btmm_lane_count is not None:
+        cmd += ["--btmm-lane-count", str(spec.btmm_lane_count)]
+    if spec.btmm_hlen is not None:
+        cmd += ["--btmm-hlen", str(spec.btmm_hlen)]
+    if spec.stage_output is not None:
+        cmd += ["--stage-output", spec.stage_output]
+    cmd += ["--dump-hlir", str(hlir_path)]
+    if addrs_path is not None:
+        cmd += ["--dump-buffer-addrs", str(addrs_path)]
+
+    env = os.environ.copy()
+    if spec.ld_library_path is not None:
+        env["LD_LIBRARY_PATH"] = spec.ld_library_path
+    env["PYTHONPATH"] = str(REPO_ROOT / "compiler")
+
+    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if res.returncode != 0:
+        sys.stderr.write(res.stderr)
+        raise RuntimeError(
+            f"TVM compile subprocess failed (returncode={res.returncode}). "
+            f"See stderr above. Command: {' '.join(cmd)}"
+        )
+    return res.stdout
+
+
+def _validate_io(io: dict) -> None:
+    if not isinstance(io, dict):
+        raise TypeError(
+            f"build_inputs_and_golden must return a dict; got "
+            f"{type(io).__name__}"
+        )
+    missing = {"hbm_inputs", "golden_flat"} - set(io)
+    if missing:
+        raise KeyError(
+            f"build_inputs_and_golden return dict is missing required keys: "
+            f"{sorted(missing)} (must include 'hbm_inputs' and 'golden_flat')"
+        )
+    if not isinstance(io["hbm_inputs"], dict):
+        raise TypeError(
+            f"build_inputs_and_golden['hbm_inputs'] must be a dict, got "
+            f"{type(io['hbm_inputs']).__name__}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def run(spec: TvmTestbenchSpec) -> int:
+    """Drive the full TVM testbench pipeline for ``spec``.
+
+    Writes everything ``just build-emulator-debug`` expects under
+    ``transactional_emulator/testbench/build/``. Returns 0 on success.
+    """
+    # Lazy imports — these need the testbench's venv site-packages to be
+    # on sys.path, which the testbench itself sets up before importing us.
+    from compiler.sim_env_utils import create_mem_for_sim
+    from transactional_emulator.tools.create_sim_env import create_sim_env
+
+    artifact_prefix = spec.artifact_prefix or spec.asm_name
+
+    build_dir = TESTBENCH_DIR / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 1. compile main kernel
-    if isa_mode == "real":
-        target = target or PlenaTarget()
-        compiled = compile_kernel(prim_func, target=target, name=asm_name)
-        main_isa = compiled.isa_text
-        # Use the HLIR module's buffer dict for downstream sanity checks --
-        # it's the single source of truth post-allocation.
-        bufs = {
-            name: _BufferInfo(buf.name, buf.scope, buf.shape, buf.dtype)
-            for name, buf in compiled.hlir.buffers.items()
-        }
-    elif isa_mode == "pseudo":
-        cg = PlenaCodegen(prim_func, name=asm_name)
-        main_isa = cg.run()
-        bufs = cg.buffers_by_name()
-    else:
-        raise ValueError(f"unknown isa_mode {isa_mode!r}; use 'real' or 'pseudo'")
+    # ---------- 1. compile ----------
+    print(f"[1/4] Compiling TVM {spec.asm_name} kernel ...")
+    hlir_path = build_dir / f"{spec.asm_name}.hlir.txt"
+    addrs_path: Optional[Path] = (
+        build_dir / f"{spec.asm_name}.buffer_addrs.json"
+        if spec.parse_buffer_addrs is not None else None
+    )
+    kernel_isa = _compile_via_subprocess(
+        spec, hlir_path=hlir_path, addrs_path=addrs_path,
+    )
 
-    # ---- 2. resolve out buffer + sanity checks
-    if out_buffer not in bufs:
-        raise KeyError(
-            f"out_buffer {out_buffer!r} is not a buffer in this PrimFunc. "
-            f"Known: {sorted(bufs.keys())}"
-        )
-    out_info = bufs[out_buffer]
-    if out_info.scope != _scope.HBM:
-        raise ValueError(
-            f"out_buffer {out_buffer!r} must live in HBM (final output goes to "
-            f"DRAM), but it is in scope={out_info.scope!r}"
-        )
+    addrs: dict = {}
+    if addrs_path is not None:
+        raw_addrs = json.loads(addrs_path.read_text())
+        addrs = spec.parse_buffer_addrs(raw_addrs)  # type: ignore[misc]
 
-    # ---- 3. append compare staging tail
-    staging = _emit_compare_staging(out_info)
-    full_isa = main_isa.rstrip() + "\n\n" + staging
+    # Optional pre-kernel stub (FPRAM staging -> VRAM cache, etc.).
+    stub_isa = ""
+    if spec.build_pre_kernel_stub is not None:
+        stub_isa = spec.build_pre_kernel_stub(addrs)
+    isa_text = stub_isa + kernel_isa
+    print(
+        f"      OK  ({kernel_isa.count(chr(10))} kernel lines"
+        + (f" + {stub_isa.count(chr(10))} stub lines" if stub_isa else "")
+        + f", HLIR -> {hlir_path.name})"
+    )
 
-    isa_path = build_dir / f"{artifact_prefix}.plena.s"
-    isa_path.write_text(full_isa)
+    # ---------- 2. inputs + golden + (optional) FP preload ----------
+    print(f"[2/4] Generating inputs + golden{' + FP preload' if spec.build_fp_preload else ''} ...")
+    io = spec.build_inputs_and_golden(spec.seed)
+    _validate_io(io)
+    hbm_inputs: dict = io["hbm_inputs"]
+    golden_flat = io["golden_flat"]
 
-    # ---- 4. save inputs as the (pseudo) HBM feed
-    inputs_dir = build_dir / f"{artifact_prefix}_inputs"
-    inputs_dir.mkdir(exist_ok=True)
-    saved_inputs: Dict[str, Path] = {}
-    for name, tensor in input_tensors.items():
-        if name not in bufs:
-            raise KeyError(
-                f"input tensor {name!r} does not match any PrimFunc buffer. "
-                f"Known: {sorted(bufs.keys())}"
-            )
-        info = bufs[name]
-        if info.scope != _scope.HBM:
-            raise ValueError(
-                f"input {name!r}: PrimFunc declares it in scope={info.scope!r}, "
-                f"but inputs must be HBM (DMA'd in by the kernel)"
-            )
-        arr = _to_numpy(tensor)
-        # We don't enforce dtype yet -- just shape -- because the kernel may
-        # internally cast. If shape disagrees that's almost certainly a bug.
-        if tuple(arr.shape) != tuple(int(s) for s in info.shape):
-            raise ValueError(
-                f"input {name!r}: shape {arr.shape} != PrimFunc shape {tuple(info.shape)}"
-            )
-        out = inputs_dir / f"{name}.npy"
-        np.save(out, arr.astype(np.float32, copy=False))
-        saved_inputs[name] = out
+    fp_preload = None
+    if spec.build_fp_preload is not None:
+        fp_preload = spec.build_fp_preload(io, addrs)
 
-    # ---- 5. golden
-    golden_arr = _to_numpy(golden_output).astype(np.float32, copy=False)
-    expected_shape = tuple(int(s) for s in out_info.shape)
-    if tuple(golden_arr.shape) != expected_shape:
-        # Allow flat / collapsed golden, but warn rather than fail -- attention
-        # writes its golden in (B*S, H*D) form for example. We just record both.
-        pass
-    golden_path = build_dir / f"{artifact_prefix}_golden.npy"
-    np.save(golden_path, golden_arr)
-
-    # ---- 6. manifest
-    global_symbol = "<unknown>"
-    if prim_func.attrs is not None and "global_symbol" in prim_func.attrs:
-        global_symbol = str(prim_func.attrs["global_symbol"])
-    manifest: Dict[str, Any] = {
-        "asm_name": asm_name,
-        "artifact_prefix": artifact_prefix,
-        "kernel_global_symbol": global_symbol,
-        "isa_file": isa_path.name,
-        "isa_kind": isa_mode,  # "real" (TIR -> HLIR -> ISA) or "pseudo" (text dump)
-        "inputs_dir": inputs_dir.name,
-        "inputs": {
-            name: {
-                "shape": list(bufs[name].shape),
-                "dtype": bufs[name].dtype,
-                "scope": bufs[name].scope,
-                "file": saved_inputs[name].name,
-            }
-            for name in input_tensors
-        },
-        "output": {
-            "name": out_buffer,
-            "shape": list(out_info.shape),
-            "dtype": out_info.dtype,
-            "scope": out_info.scope,
-            "bytes": _byte_size(out_info),
-            "staged_to": "vram[0..]",  # what compare staging will produce
-        },
-        "golden_file": golden_path.name,
-        "compare": {
-            "kind": "absolute_and_relative",
-            "atol": compare_atol,
-            "rtol": compare_rtol,
-        },
-        "TODO": (
-            "When codegen emits real .mem, also generate hbm_for_behave_sim.bin / "
-            "fp_sram.bin / generated_machine_code.mem here so `cargo run` can "
-            "execute this test directly."
-        ),
+    input_feed = {
+        name: t.contiguous().reshape(1, -1) for name, t in hbm_inputs.items()
     }
-    manifest_path = build_dir / f"{artifact_prefix}_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    input_order = list(input_feed)
+    summary = ", ".join(
+        f"{n}={tuple(t.shape)}" for n, t in hbm_inputs.items()
+    )
+    print(f"      OK  hbm_inputs: {summary}")
+    print(f"           golden flat: {tuple(golden_flat.shape)}")
+    if fp_preload is not None:
+        print(f"           fp_preload: {tuple(fp_preload.shape)}")
 
-    return {
-        "isa": isa_path,
-        "golden": golden_path,
-        "inputs_dir": inputs_dir,
-        "manifest": manifest_path,
-    }
+    # ---------- 3. create_sim_env (.pt + .asm + fp/int sram bins) ----------
+    print(f"[3/4] create_sim_env -> .pt + .asm + fp/int sram bins ...")
+    create_sim_env(
+        input_tensor=input_feed,
+        generated_code=isa_text,
+        golden_result={"original_output": golden_flat},
+        fp_preload=fp_preload,
+        int_preload=spec.int_preload,
+        build_dir=str(build_dir),
+    )
+    print(f"      OK  -> {build_dir}")
+
+    # ---------- 4. create_mem_for_sim (assemble + pack HBM) ----------
+    print(f"[4/4] create_mem_for_sim -> assemble .asm + pack HBM bin ...")
+    create_mem_for_sim(
+        data_size=256,
+        mode="behave_sim",
+        asm=spec.asm_name,
+        data=None,
+        specified_data_order=input_order,
+        build_path=build_dir,
+    )
+    print(f"      OK  -> generated_machine_code.mem + hbm_for_behave_sim.bin")
+
+    # ---------- comparison_params + asm snapshot ----------
+    comparison_params = spec.build_comparison_params(io, addrs)
+    cmp_path = build_dir / "comparison_params.json"
+    cmp_path.write_text(json.dumps(comparison_params, indent=2))
+    print(f"      wrote comparison_params.json -> {cmp_path}")
+
+    (build_dir / f"{artifact_prefix}_generated_asm_code.asm").write_text(isa_text)
+
+    print()
+    print("=" * 60)
+    print(f"build/ ready for: just build-emulator-debug {artifact_prefix}")
+    print("=" * 60)
+    return 0
+
+
+__all__ = [
+    "TvmTestbenchSpec",
+    "run",
+    "REPO_ROOT",
+    "TESTBENCH_DIR",
+    "DEFAULT_LD_LIBRARY_PATH",
+]

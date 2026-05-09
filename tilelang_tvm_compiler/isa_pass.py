@@ -59,6 +59,7 @@ class IsaEmitterPass:
             "v_sub": self._emit_v_sub,
             "v_mul": self._emit_v_mul,
             "fp_copy_at": self._emit_fp_copy_at,
+            "fp_zero_at": self._emit_fp_zero_at,
             "fp_add_at": self._emit_fp_add_at,
             "fp_sub_at": self._emit_fp_sub_at,
             "fp_mul_at": self._emit_fp_mul_at,
@@ -108,22 +109,14 @@ class IsaEmitterPass:
         return self.shim.compiler.generated_code
 
     @staticmethod
-    def _logical_2d(shape: Tuple[int, ...]) -> Tuple[int, int]:
-        if not shape:
-            return (1, 1)
-        if len(shape) == 1:
-            return (1, int(shape[0]))
-        if len(shape) == 2:
-            return (int(shape[0]), int(shape[1]))
-        rows = 1
-        for dim in shape[:-2]:
-            rows *= int(dim)
-        cols = int(shape[-2]) * int(shape[-1])
-        return (rows, cols)
+    def _logical_2d(
+        shape: Tuple[int, ...], layout: str = "BSHD",
+    ) -> Tuple[int, int]:
+        return _hlir.logical_2d_extents(shape, layout)
 
     def _vram_row_shape(self, buf: _hlir.Buffer, op_kind: str, role: str) -> Tuple[int, int]:
         _check_scope(buf, _scope.VRAM, op_kind, role)
-        rows, cols = self._logical_2d(buf.shape)
+        rows, cols = self._logical_2d(buf.shape, buf.layout)
         if cols != self.shim.mlen:
             raise IsaEmissionError(
                 f"{op_kind} {role} buffer {buf.name!r} must have logical row width "
@@ -546,20 +539,12 @@ class IsaEmitterPass:
                 f"slice on {parent.name!r}: extents length {len(ext)} != "
                 f"parent ndim {len(parent.shape)}"
             )
-        if len(ext) >= 3:
-            rows = 1
-            for e in ext[:-2]:
-                rows *= int(e)
-            cols = int(ext[-2]) * int(ext[-1])
-        elif len(ext) == 2:
-            rows, cols = int(ext[0]), int(ext[1])
-        else:
-            rows, cols = 1, int(ext[0])
+        rows, cols = _hlir.logical_2d_extents(ext, parent.layout)
         if rows != mlen or cols != mlen:
             raise IsaEmissionError(
-                f"slice on {parent.name!r} extents={ext} maps to logical 2D "
-                f"({rows}, {cols}); h2v/h2m input slices must fit a single "
-                f"mlen*mlen tile."
+                f"slice on {parent.name!r} extents={ext} (layout={parent.layout!r}) "
+                f"maps to logical 2D ({rows}, {cols}); h2v/h2m input slices "
+                f"must fit a single mlen*mlen tile."
             )
 
     def _iter_slice_tiles_per_head(self, parent: _hlir.Buffer, sl: _hlir.BufferSlice):
@@ -588,11 +573,13 @@ class IsaEmitterPass:
         mlen = self.shim.mlen
         if len(parent.shape) != 4:
             raise IsaEmissionError(
-                f"per-head slice tiling requires 4D BSHD parent; got "
+                f"per-head slice tiling requires 4D parent; got "
                 f"shape {parent.shape}"
             )
-        B, S, H, D = parent.shape
-        eb, es, eh, ed = sl.extents
+        # Permute parent shape and slice extents into canonical (B, S, H, D)
+        # order per parent.layout. Downstream math works in BSHD.
+        B, S, H, D = _hlir._select_axes(parent.shape, parent.layout)
+        eb, es, eh, ed = _hlir._select_axes(sl.extents, parent.layout)
         if eb != 1:
             raise IsaEmissionError(
                 f"per-head slice tiling does not support batch slicing "
@@ -610,9 +597,19 @@ class IsaEmitterPass:
             )
         if eh < 1:
             raise IsaEmissionError(f"slice has no heads to iterate (eh={eh})")
+        # Per-head HBM offset is h_idx * h_stride, where h_stride is
+        # the canonical channel-axis stride in HBM-row-major order.
+        # For BSHD (head outer of D): h_stride = D — what the legacy
+        # ``h_idx * D`` formula assumed. For NCHW (channel outer of
+        # H*W): h_stride = H*W — different by a row-count factor.
+        # ``hbm_strides_for_layout`` returns the right number for any
+        # layout we register.
+        _hb, _hs, h_stride, _hd = _hlir.hbm_strides_for_layout(
+            parent.shape, parent.layout,
+        )
         tile_elems = mlen * mlen
         for h_idx in range(eh):
-            yield h_idx, h_idx * tile_elems, h_idx * int(D)
+            yield h_idx, h_idx * tile_elems, h_idx * int(h_stride)
 
     def _slice_is_single_logical_tile(
         self, parent: _hlir.Buffer, sl: _hlir.BufferSlice,
@@ -620,15 +617,7 @@ class IsaEmitterPass:
         ext = sl.extents
         if len(ext) != len(parent.shape):
             return False
-        if len(ext) >= 3:
-            rows = 1
-            for e in ext[:-2]:
-                rows *= int(e)
-            cols = int(ext[-2]) * int(ext[-1])
-        elif len(ext) == 2:
-            rows, cols = int(ext[0]), int(ext[1])
-        else:
-            rows, cols = 1, int(ext[0])
+        rows, cols = _hlir.logical_2d_extents(ext, parent.layout)
         return rows == self.shim.mlen and cols == self.shim.mlen
 
     def _materialise_slice_offset(
@@ -669,8 +658,19 @@ class IsaEmitterPass:
         parent = mod.get_buffer(sl.parent)
         _check_scope(parent, _scope.HBM, op.kind, "src.parent")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        self._check_slice_single_tile(parent, sl)
 
+        # Multi-tile path: when dst's logical 4D BSHD shape overflows a
+        # single (MLEN, LANE_COUNT, D_INNER) inner tile, the
+        # AddressAllocationPass populated dst.tile_layout. Iterate the
+        # outer (D_TILES, S_TILES, H_GROUPS, B) grid and emit one
+        # H_LOAD_V per inner tile, with per-tile HBM and VRAM offsets.
+        if dst.tile_layout is not None:
+            self._emit_dma_h2v_slice_multi_tile(mod, op, sl, parent, dst)
+            return
+
+        # Single-tile fast path — original behaviour for kernels whose
+        # local buffers fit one (MLEN x MLEN) tile.
+        self._check_slice_single_tile(parent, sl)
         m_off, static_off = self._materialise_slice_offset(parent, sl)
         starts_s = self._format_starts(sl)
         if m_off is None:
@@ -694,6 +694,102 @@ class IsaEmitterPass:
                 hbm_start_offset_reg=m_off.register,
             )
             m_off.release()
+
+    def _emit_dma_h2v_slice_multi_tile(
+        self,
+        mod: _hlir.HLIRModule,
+        op: _hlir.Op,
+        sl: _hlir.BufferSlice,
+        parent: _hlir.Buffer,
+        dst: _hlir.Buffer,
+    ) -> None:
+        """Emit one H_LOAD_V per inner tile in dst's tile grid.
+
+        Currently supports only fully-static slice starts (every entry
+        in ``sl.starts`` is a Python int). The dynamic-start case can be
+        added by materialising one base GP register and per-tile adding
+        the static tile-offset constants — same pattern as the existing
+        ``_materialise_slice_offset`` for v2h. For now we surface a
+        clear error if a dynamic start shows up so we don't silently
+        miscompile.
+        """
+        if self._slice_has_dynamic_start(sl):
+            raise IsaEmissionError(
+                f"dma_h2v_slice: dynamic starts on a multi-tile dst "
+                f"({dst.name!r}) are not supported yet — only fully-"
+                f"static slices like Input[0,0,0,0] are. Slice starts: "
+                f"{sl.starts!r}"
+            )
+        layout = dst.tile_layout
+        assert layout is not None
+        # Static base offset = flat element offset of (b, s, h, d) starts
+        # in the HBM parent's logical row-major layout, plus the parent's
+        # own hbm_offset.
+        base_static = parent.hbm_offset + self._slice_offset_static(parent, sl)
+
+        # HBM strides per logical (B, S, H, D) dim (row-major).
+        if len(parent.shape) != 4:
+            raise IsaEmissionError(
+                f"multi-tile dma_h2v_slice currently requires a 4D HBM "
+                f"parent; got shape {parent.shape}"
+            )
+        # HBM strides per canonical (b, s, h, d) role. The numbers come
+        # from the parent's declared layout's row-major HBM order; for
+        # NCHW the row-axis (h_img) strides like W_img while the
+        # channel-axis (c) strides like H_img*W_img — so the canonical
+        # h-stride and s-stride differ from BSHD's positional order.
+        hbm_stride_b, hbm_stride_s, hbm_stride_h, _hbm_stride_d = (
+            _hlir.hbm_strides_for_layout(parent.shape, parent.layout)
+        )
+        # hbm_stride_d == 1 by construction (col is the innermost axis
+        # in every layout we currently support). Asserted via the
+        # ``hbm_strides_for_layout`` helper.
+
+        # VRAM tile-grid strides from the 7D physical layout.
+        inner_d = layout.d_inner
+        inner_lane = layout.lane_count * inner_d
+        inner_s = layout.mlen * inner_lane
+        inner_b = layout.logical_b * inner_s
+        h_grp_stride = inner_b
+        s_tile_stride = layout.h_groups * inner_b
+        d_tile_stride = layout.s_tiles * s_tile_stride
+
+        starts_s = self._format_starts(sl)
+        self.shim.compiler.generated_code += (
+            f"; dma_h2v_slice (multi-tile)  {parent.name}[{starts_s}]"
+            f"+{list(sl.extents)} -> {dst.name}  "
+            f"(grid d_tiles={layout.d_tiles}, s_tiles={layout.s_tiles}, "
+            f"h_groups={layout.h_groups}, b={layout.logical_b})\n"
+        )
+        for d_tile in range(layout.d_tiles):
+            for s_tile in range(layout.s_tiles):
+                for h_grp in range(layout.h_groups):
+                    for b in range(layout.logical_b):
+                        hbm_off = (
+                            base_static
+                            + b * hbm_stride_b
+                            + s_tile * layout.mlen * hbm_stride_s
+                            + h_grp * layout.lane_count * hbm_stride_h
+                            + d_tile * layout.mlen
+                        )
+                        vram_off = (
+                            d_tile * d_tile_stride
+                            + s_tile * s_tile_stride
+                            + h_grp * h_grp_stride
+                            + b * inner_b
+                        )
+                        self.shim.compiler.generated_code += (
+                            f";   tile (d={d_tile}, s={s_tile}, h={h_grp}, "
+                            f"b={b}): hbm_off={hbm_off}  "
+                            f"vram_off={vram_off}\n"
+                        )
+                        self.emitter.emit_load_tile_from_hbm(
+                            hbm_addr=parent.address,
+                            vram_addr=dst.address + vram_off,
+                            hbm_stride=parent.hbm_stride,
+                            hbm_scale_size=parent.hbm_scale_size,
+                            hbm_start_offset=hbm_off,
+                        )
 
     def _emit_dma_h2m_slice(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         sl = op.buffer_args[0]
@@ -763,11 +859,16 @@ class IsaEmitterPass:
         m_base, static_base = self._materialise_slice_offset(parent, sl)
         is_dyn = m_base is not None
 
+        # ``per-head tiles`` count is the slice extent along the
+        # canonical channel axis, which lives at different positions
+        # depending on the parent's layout (axes[2] in BSHD, axes[1] in
+        # NCHW). Resolve via LAYOUT_AXES rather than hard-coding [2].
+        ch_axis = _hlir.LAYOUT_AXES[parent.layout][2]
         self.shim.compiler.generated_code += (
             f"; dma_v2h_slice  {src.name} -> "
             f"{parent.name}[{starts_s}]+{list(sl.extents)}  "
             f"({'dynamic base gp' + str(m_base.register) if is_dyn else 'static base ' + str(static_base)}"
-            f", {sl.extents[2]} per-head tiles)\n"
+            f", {sl.extents[ch_axis]} per-head tiles)\n"
         )
 
         if self._slice_is_single_logical_tile(parent, sl):
@@ -1243,10 +1344,22 @@ class IsaEmitterPass:
                 lhs_addr_m.release()
 
     def _emit_zero_v(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """Zero an mlen*mlen VRAM tile in-place."""
+        """Zero a VRAM buffer in-place. Loop count = buffer size in
+        MLEN-wide rows; passing the wrong count writes past the buffer
+        and corrupts whatever sits immediately after it in the VRAM
+        address map (we hit this with a (1, MLEN) per-row accumulator
+        sitting just before a (1, MLEN, 1, MLEN) C_loc tile — the
+        legacy MLEN-row default zeroed all of C_loc on every iteration)."""
         dst = mod.get_buffer(op.buffer_args[0])
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        self.emitter.emit_zero_vram_tile(dst.address)
+        mlen = self.shim.mlen
+        if dst.num_elements % mlen != 0:
+            raise IsaEmissionError(
+                f"zero_v: {dst.name!r} has {dst.num_elements} elements, "
+                f"not a multiple of MLEN ({mlen})"
+            )
+        num_rows = dst.num_elements // mlen
+        self.emitter.emit_zero_vram_tile(dst.address, num_rows=num_rows)
 
     def _emit_v_binary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
                        *, binary_op: str) -> None:
@@ -1254,6 +1367,15 @@ class IsaEmitterPass:
 
         ``binary_op`` selects the HW opcode via emit_tile_binary's table
         ({"add": V_ADD_VV, "sub": V_SUB_VV, "mul": V_MUL_VV}).
+
+        The MLEN-wide row count is derived from each operand's actual
+        element count: a (rows, MLEN) buffer (post-expansion in
+        flash-attention's BTMM-style kernels) gives ``rows`` MLEN-rows;
+        a (1, …, MLEN) buffer gives 1 row. All three operands must
+        carry the same number of MLEN-rows — V_*_VV walks them in
+        lockstep — otherwise the inner loop would advance one operand
+        past its allocated end into the next buffer (silent VRAM
+        corruption).
         """
         lhs = mod.get_buffer(op.buffer_args[0])
         rhs = mod.get_buffer(op.buffer_args[1])
@@ -1261,12 +1383,31 @@ class IsaEmitterPass:
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.VRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
+        mlen = self.shim.mlen
+        rows_per_buf = []
+        for buf, role in ((lhs, "lhs"), (rhs, "rhs"), (dst, "dst")):
+            if buf.num_elements % mlen != 0:
+                raise IsaEmissionError(
+                    f"v_{binary_op}: {role} {buf.name!r} has "
+                    f"{buf.num_elements} elements, not a multiple of "
+                    f"MLEN ({mlen})"
+                )
+            rows_per_buf.append(buf.num_elements // mlen)
+        if len(set(rows_per_buf)) != 1:
+            raise IsaEmissionError(
+                f"v_{binary_op}: operand row counts disagree — "
+                f"lhs={rows_per_buf[0]} rhs={rows_per_buf[1]} "
+                f"dst={rows_per_buf[2]} (MLEN-wide rows). The walk "
+                f"advances all three pointers in lockstep, so they must "
+                f"share the same number of MLEN-rows."
+            )
         self.emitter.emit_tile_binary(
             lhs_vram_addr=lhs.address,
             rhs_vram_addr=rhs.address,
             dst_vram_addr=dst.address,
             op=binary_op,
             task_id=op.annotations.get("intrinsic", f"v_{binary_op}"),
+            num_rows=rows_per_buf[0],
         )
 
     def _emit_v_add(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
@@ -1283,6 +1424,31 @@ class IsaEmitterPass:
 
     def _emit_fp_copy_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="copy")
+
+    def _emit_fp_zero_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Store FP zero to one FPRAM slot via ``S_ST_FP f0, gp{dst}, 0``.
+
+        Relies on the same ``f0 == 0`` convention plena.zero_v and
+        plena.copy_v_to_v already depend on. Single scalar arg = the
+        FPRAM destination address (allowed to be a PrimExpr — the
+        materialiser folds in the fragment's allocated FPRAM base)."""
+        if len(op.scalar_args) != 1:
+            raise IsaEmissionError(
+                f"{op.kind} expects 1 scalar address arg, got {len(op.scalar_args)}"
+            )
+        dst_addr_expr = self._resolve_fp_scalar_addr_arg(
+            mod, op.scalar_args[0], op.kind, "dst",
+        )
+        m_dst = self.materializer.materialize(dst_addr_expr)
+        self.shim.compiler.generated_code += m_dst.isa
+        try:
+            lines = [
+                f"; fp scalar task {op.annotations.get('intrinsic', op.kind)} op=zero",
+                f"S_ST_FP f0, gp{m_dst.register}, 0",
+            ]
+            self.shim.compiler.generated_code += "\n".join(lines) + "\n"
+        finally:
+            m_dst.release()
 
     def _emit_fp_add_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="add")
@@ -1546,7 +1712,12 @@ class IsaEmitterPass:
 
 
 def _check_scope(buf: _hlir.Buffer, expected: str, op_kind: str, role: str) -> None:
-    if buf.scope != expected:
+    # `global.<phys>` is treated as `<phys>` for ISA-level scope checks —
+    # the user-declared global flag changes lane-fusion behaviour but the
+    # buffer's physical residency (and therefore the legal operand-scope
+    # rules for each instruction) is identical. Keep `buf.scope` as the
+    # original string so JSON dumps / debug output retain the global flag.
+    if _scope.physical_scope(buf.scope) != expected:
         raise IsaEmissionError(
             f"{op_kind} {role} buffer {buf.name!r} must be in scope {expected!r}, "
             f"got {buf.scope!r}"

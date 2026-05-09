@@ -1,30 +1,29 @@
-"""Lower the fully-annotated tilelang IR to the plena.* extern-call form
-that ``codegen.PlenaCodegen`` consumes.
+"""Helpers used by the graph back end (`graph_pipeline.py`) to lower
+individual tile-DSL ops to ``plena.*`` extern calls.
 
-Responsibilities:
+This module used to host a top-level `run()` walker that wove tile→plena
+translation together with lane-fusion segmentation in one recursive
+stmt rewrite. That walker has been replaced by `graph_pipeline.run`,
+which operates on the lifted block IR and treats lane-fusion segmentation
+as a list partition rather than a stmt rewrite. What remains here are
+the per-op lowering helpers that `graph_pipeline` calls:
 
-  * Rewrite shared.dyn / local.fragment buffer scopes to vram / mram per
-    the ``BufferScopeMap`` returned by ``scope_inference``.
-  * Translate ``tl.tileop.copy`` to ``plena.dma_h2v_slice`` /
-    ``plena.dma_h2m_slice`` / ``plena.dma_v2h_slice``.
-  * Translate ``tl.tileop.gemm_py`` to ``plena.matmul`` (kind=overwrite) or
-    ``plena.btmm`` (kind=btmm).
-  * **Sync-driven multi-lane fusion**: when a ``tl.tileop.copy`` sits
-    inside a ``plena.sync`` AttrStmt that itself sits inside a
-    ``plena.group(extent=lane_count)``, we collapse the surrounding
-    serial for-loop and emit ONE multi-lane DMA: the lane-var is
-    substituted to ``0`` in the start expressions, and the extent at the
-    position the lane-var indexed into is set to ``lane_count``. The
-    ``plena.btmm`` gemm path collapses similarly — the for-loop wrapper
-    is dropped and the gemm is emitted exactly once (the HW BTMM op is
-    naturally multi-lane).
-  * Pass through ``plena.v_add`` and other already-lowered plena.* calls.
-  * Drop ``plena.group`` / ``plena.sync`` / ``plena.gemm_kind`` AttrStmts
-    once their information has been consumed.
+  * ``_lower_copy(call, scopes, ...)`` — translate ``tl.tileop.copy`` to
+    ``plena.dma_h2v_slice`` / ``dma_h2m_slice`` / ``dma_v2h_slice`` /
+    ``copy_v_to_v`` / ``row_load_v_to_fp`` / ``row_store_fp_to_v``,
+    folding the lane var into a multi-lane DMA when ``in_sync`` is set.
+  * ``_lower_gemm(call, scopes, kind, ...)`` — translate
+    ``tl.tileop.gemm_py`` to ``plena.matmul`` (kind=overwrite) or
+    ``plena.btmm`` / ``plena.btmv`` (kind=btmm), with auto-injected
+    per-lane offsets.
+  * ``_rewrite_buffer_scopes(stmt, scopes)`` — replace declared
+    ``shared.dyn`` / ``local.fragment`` scopes on alloc'd buffers with
+    the resolved PLENA scopes (vram / mram / fpram / global.*).
 
 Pre-conditions: ``annotate_gemm_kind``, ``annotate_group``,
 ``annotate_sync``, ``split_lane_groups``, ``scope_inference``,
-``allocate_group_memory``, ``fuse_elementwise`` have all run.
+``allocate_group_memory``, ``fuse_elementwise``, and ``lift_to_blocks``
+have all run.
 """
 
 from __future__ import annotations
@@ -34,10 +33,9 @@ from typing import Dict, List, Optional, Tuple
 import tvm
 from tvm import tir
 
-from .annotate_group import GROUP_KEY
-from .annotate_gemm_kind import KIND_KEY
-from .annotate_sync import SYNC_KEY
-from .scope_inference import BufferScopeMap
+from .graph_passes.scope_inference import BufferScopeMap
+from ... import scope as _scope
+from ...hlir import LAYOUT_AXES, TileLayout, make_tile_layout
 
 
 _TILEOP_COPY = "tl.tileop.copy"
@@ -47,6 +45,143 @@ _TILEOP_REGION = "tl.tileop.region"
 
 class LowerToHLIRError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Tile-aware layout helpers — see hlir.TileLayout for the 7D physical
+# layout that VRAM/MRAM buffers use when their (B, S, H, D) overflows
+# one inner tile. These helpers compute the (s_tile, s_inner, ...)
+# decomposition and the resulting flat physical offset using only
+# shift+sub TIR ops (PLENA has no integer divide and no bitwise AND, but
+# expr_materializer lowers ``tir.shift_right`` / ``tir.shift_left`` to
+# the corresponding ``S_SR(L)I_INT`` / ``S_SLLI_INT`` instructions, and
+# ``x % 2^k`` is materialized as ``x - (x >> k) << k``).
+#
+# Simplifying assumption (per kernel-author feedback): all // and %
+# divisors are powers of two. That covers MLEN, HLEN, LANE_COUNT, and
+# the per-tile strides we generate, which is enough for the conv /
+# attention / decode kernels we have today.
+# ---------------------------------------------------------------------------
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _log2_pow2(n: int) -> int:
+    """log2 of a strictly positive power of two."""
+    if not _is_pow2(n):
+        raise LowerToHLIRError(f"expected power of 2, got {n}")
+    return n.bit_length() - 1
+
+
+def _shr(expr: tir.PrimExpr, amount: int) -> tir.PrimExpr:
+    """``expr >> amount`` (TIR ``tir.shift_right`` Call)."""
+    if amount == 0:
+        return expr
+    return tir.Call(expr.dtype, tir.op.Op.get("tir.shift_right"),
+                    [expr, tir.IntImm(expr.dtype, amount)])
+
+
+def _shl(expr: tir.PrimExpr, amount: int) -> tir.PrimExpr:
+    """``expr << amount`` (TIR ``tir.shift_left`` Call)."""
+    if amount == 0:
+        return expr
+    return tir.Call(expr.dtype, tir.op.Op.get("tir.shift_left"),
+                    [expr, tir.IntImm(expr.dtype, amount)])
+
+
+def _try_tile_layout_for_buf(
+    buf: tir.Buffer, *, mlen: int, hlen: int, buf_layout: str = "BSHD",
+) -> Optional[TileLayout]:
+    """Compute a TileLayout for ``buf`` if its 4D shape needs multi-tile
+    storage. Returns ``None`` for non-4D shapes or shapes that fit one
+    inner tile (caller falls back to the existing row-major path).
+
+    ``buf_layout`` names how to interpret the 4D shape's axes. Default
+    ``"BSHD"`` matches the original convention: axes[1] is the row dim,
+    axes[2] is the channel dim. ``"NCHW"`` swaps those two — axes[1] is
+    channel, axes[2] is row. The downstream TileLayout / 7D physical
+    layout always works in canonical BSHD terms; this function's only
+    job is to permute axes before handing them off.
+    """
+    shape = tuple(int(s) for s in buf.shape)
+    if len(shape) != 4:
+        return None
+    return make_tile_layout(
+        shape=shape, layout=buf_layout, mlen=mlen, hlen=hlen,
+    )
+
+
+def _flatten_starts_tiled(
+    layout: TileLayout, starts, *, mlen: int, buf_layout: str = "BSHD",
+) -> tir.PrimExpr:
+    """Compute the physical flat offset of ``starts`` in a tile-laid-out
+    buffer. ``starts`` is a 4D index tuple (4 PrimExprs / ints). The 7D
+    physical layout is the same regardless of source layout — we just
+    permute ``starts`` to canonical (b, s, h, d) order via
+    ``LAYOUT_AXES[buf_layout]`` before the offset math.
+
+    All // and % use power-of-2 divisors (``mlen``, ``layout.lane_count``,
+    ``layout.d_inner``), and every stride below is a power of 2 too in
+    the cases we support. Each piece is one shift-left / shift-right /
+    add / sub TIR op.
+    """
+    if len(starts) != 4:
+        raise LowerToHLIRError(
+            f"_flatten_starts_tiled expects 4D starts; got {len(starts)}-D"
+        )
+    if buf_layout not in LAYOUT_AXES:
+        raise LowerToHLIRError(
+            f"unknown buf_layout {buf_layout!r}; known: {sorted(LAYOUT_AXES)}"
+        )
+    bi, ri, ci, di = LAYOUT_AXES[buf_layout]
+    b_start = starts[bi]
+    s_start = starts[ri]   # row-tile dim
+    h_start = starts[ci]   # channel-group / lane dim
+    d_start = starts[di]   # col-tile dim
+
+    # Decompose s and d via shift-right (// MLEN) and shift-left+sub
+    # (% MLEN = x - (x >> log2_mlen) << log2_mlen).
+    log2_mlen = _log2_pow2(mlen)
+    s_tile = _shr(s_start, log2_mlen)
+    s_inner = tir.Sub(s_start, _shl(s_tile, log2_mlen))
+    d_tile = _shr(d_start, log2_mlen)
+    d_inner = tir.Sub(d_start, _shl(d_tile, log2_mlen))
+
+    # H dim splits into (h_grp, lane) only when LANE_COUNT > 1.
+    if layout.lane_count > 1:
+        log2_lane = _log2_pow2(layout.lane_count)
+        h_grp = _shr(h_start, log2_lane)
+        lane = tir.Sub(h_start, _shl(h_grp, log2_lane))
+    else:
+        h_grp = h_start
+        lane = tir.IntImm(b_start.dtype, 0)
+
+    # Per-axis strides in the 7D physical layout (must all be pow2).
+    inner_d = layout.d_inner
+    inner_lane = layout.lane_count * inner_d
+    inner_s = mlen * inner_lane
+    inner_b = layout.logical_b * inner_s
+    h_grp_stride = inner_b
+    s_tile_stride = layout.h_groups * inner_b
+    d_tile_stride = layout.s_tiles * s_tile_stride
+
+    offset: tir.PrimExpr = tir.IntImm(b_start.dtype, 0)
+    if layout.d_tiles > 1:
+        offset = tir.Add(offset, _shl(d_tile, _log2_pow2(d_tile_stride)))
+    if layout.s_tiles > 1:
+        offset = tir.Add(offset, _shl(s_tile, _log2_pow2(s_tile_stride)))
+    if layout.h_groups > 1:
+        offset = tir.Add(offset, _shl(h_grp, _log2_pow2(h_grp_stride)))
+    if layout.logical_b > 1:
+        offset = tir.Add(offset, _shl(b_start, _log2_pow2(inner_b)))
+    if mlen > 1:
+        offset = tir.Add(offset, _shl(s_inner, _log2_pow2(inner_lane)))
+    if layout.lane_count > 1:
+        offset = tir.Add(offset, _shl(lane, _log2_pow2(inner_d)))
+    offset = tir.Add(offset, d_inner)
+    return offset
 
 
 # ---------------------------------------------------------------------------
@@ -128,67 +263,6 @@ def _substitute_var(expr, var_name: str, replacement) -> object:
             _substitute_var(expr.b, var_name, replacement),
         )
     return expr
-
-
-def _stmt_uses_var(stmt, var_name: str) -> bool:
-    """Walk a Stmt + Exprs for any reference to a Var named `var_name`."""
-    if isinstance(stmt, tir.SeqStmt):
-        return any(_stmt_uses_var(c, var_name) for c in stmt.seq)
-    if isinstance(stmt, tir.BlockRealize):
-        return _stmt_uses_var(stmt.block, var_name)
-    if isinstance(stmt, tir.Block):
-        if _stmt_uses_var(stmt.body, var_name):
-            return True
-        return stmt.init is not None and _stmt_uses_var(stmt.init, var_name)
-    if isinstance(stmt, tir.AttrStmt):
-        return _expr_uses_var(stmt.value, var_name) or _stmt_uses_var(stmt.body, var_name)
-    if isinstance(stmt, tir.For):
-        return (_expr_uses_var(stmt.min, var_name)
-                or _expr_uses_var(stmt.extent, var_name)
-                or _stmt_uses_var(stmt.body, var_name))
-    if isinstance(stmt, tir.LetStmt):
-        return _expr_uses_var(stmt.value, var_name) or _stmt_uses_var(stmt.body, var_name)
-    if isinstance(stmt, tir.IfThenElse):
-        if _expr_uses_var(stmt.condition, var_name):
-            return True
-        if _stmt_uses_var(stmt.then_case, var_name):
-            return True
-        return stmt.else_case is not None and _stmt_uses_var(stmt.else_case, var_name)
-    if isinstance(stmt, tir.Evaluate):
-        return _expr_uses_var(stmt.value, var_name)
-    return False
-
-
-def _stmt_contains_extern(stmt, extern_name: str) -> bool:
-    if isinstance(stmt, tir.SeqStmt):
-        return any(_stmt_contains_extern(c, extern_name) for c in stmt.seq)
-    if isinstance(stmt, tir.BlockRealize):
-        return _stmt_contains_extern(stmt.block, extern_name)
-    if isinstance(stmt, tir.Block):
-        return _stmt_contains_extern(stmt.body, extern_name)
-    if isinstance(stmt, tir.AttrStmt):
-        return _stmt_contains_extern(stmt.body, extern_name)
-    if isinstance(stmt, tir.For):
-        return _stmt_contains_extern(stmt.body, extern_name)
-    if isinstance(stmt, tir.LetStmt):
-        return _stmt_contains_extern(stmt.body, extern_name)
-    if isinstance(stmt, tir.IfThenElse):
-        return (
-            _stmt_contains_extern(stmt.then_case, extern_name)
-            or (
-                stmt.else_case is not None
-                and _stmt_contains_extern(stmt.else_case, extern_name)
-            )
-        )
-    if isinstance(stmt, tir.Evaluate):
-        v = stmt.value
-        if not (isinstance(v, tir.Call)
-                and getattr(v.op, "name", None) == "tir.call_extern"
-                and v.args
-                and isinstance(v.args[0], tir.StringImm)):
-            return False
-        return v.args[0].value == extern_name
-    return False
 
 
 def _expr_uses_var(expr, var_name: str) -> bool:
@@ -330,7 +404,10 @@ def _flatten_starts(buf: tir.Buffer, starts) -> tir.PrimExpr:
 
 def _lower_row_v_fp_copy(*, vram_buf, vram_starts, fp_buf, fp_starts,
                          direction: str, lane_var: Optional[str],
-                         in_sync: bool) -> tir.Stmt:
+                         in_sync: bool,
+                         target_mlen: int,
+                         target_hlen: int,
+                         target_layout: str = "BSHD") -> tir.Stmt:
     """Lower one ``T.copy`` between VRAM and FPRAM to a row-wide MAP transfer.
 
     The HW op (S_MAP_V_FP / S_MAP_FP_V) moves VLEN=MLEN elements per
@@ -338,13 +415,31 @@ def _lower_row_v_fp_copy(*, vram_buf, vram_starts, fp_buf, fp_starts,
     therefore implicit — when in_sync, we just substitute lane_var to 0
     in both index sides; we do NOT multiply any extent (HW op size is
     fixed).
+
+    Tile-aware VRAM offset: same rule as ``_lower_v_to_v_copy`` — when
+    the VRAM buffer's 4D BSHD shape overflows one inner tile, use the
+    7D physical-layout offset (``_flatten_starts_tiled``) instead of
+    the row-major ``_flatten_starts``. The S_MAP_V_FP / S_MAP_FP_V
+    instruction itself still wants the resulting flat offset to be
+    MLEN-aligned (it copies VLEN=MLEN at a time); the tiled-layout
+    offset is naturally MLEN-aligned for ``d_inner == 0`` access
+    patterns (which is what tile-row-aligned reads use).
     """
     if in_sync and lane_var is not None:
         zero = tir.IntImm("int32", 0)
         vram_starts = [_substitute_var(s, lane_var, zero) for s in vram_starts]
         fp_starts = [_substitute_var(s, lane_var, zero) for s in fp_starts]
 
-    vram_offset_expr = _flatten_starts(vram_buf, vram_starts)
+    vram_layout = _try_tile_layout_for_buf(
+        vram_buf, mlen=target_mlen, hlen=target_hlen, buf_layout=target_layout,
+    )
+    if vram_layout is not None:
+        vram_offset_expr = _flatten_starts_tiled(
+            vram_layout, vram_starts, mlen=target_mlen,
+            buf_layout=target_layout,
+        )
+    else:
+        vram_offset_expr = _flatten_starts(vram_buf, vram_starts)
     # Pass fp side as a BufferLoad so isa_pass._resolve_fp_scalar_addr_arg
     # can fold in the fragment's allocated FPRAM base address (same path
     # used by the plena.fp_*_at family).
@@ -363,21 +458,51 @@ def _lower_row_v_fp_copy(*, vram_buf, vram_starts, fp_buf, fp_starts,
 
 
 def _lower_v_to_v_copy(*, src_buf, src_starts, dst_buf, dst_starts,
-                       lane_var: Optional[str], in_sync: bool) -> tir.Stmt:
+                       lane_var: Optional[str], in_sync: bool,
+                       target_mlen: int, target_hlen: int,
+                       target_layout: str = "BSHD") -> tir.Stmt:
     """Lower a vram→vram T.copy to one V_ADD_VF row transfer.
 
     Lane fusion handling mirrors _lower_row_v_fp_copy: when in_sync, the
     lane_var is substituted to 0 in both index sides (the HW V_ADD_VF
     processes one full MLEN-wide vector per call, naturally covering all
     lanes — no extent multiplication needed).
+
+    Tile-aware offset: if either side's buffer has a 4D BSHD shape that
+    overflows one inner tile (see ``hlir.TileLayout``), the flat offset
+    is computed via the 7D physical layout — using shift+sub TIR ops
+    (PLENA has no integer divide and no AND, but expr_materializer
+    lowers ``tir.shift_left/right`` to ``S_S(L|R)LI_INT`` and ``x % 2^k``
+    becomes ``x - (x >> k) << k``). Otherwise fall back to the
+    row-major ``_flatten_starts``.
     """
     if in_sync and lane_var is not None:
         zero = tir.IntImm("int32", 0)
         src_starts = [_substitute_var(s, lane_var, zero) for s in src_starts]
         dst_starts = [_substitute_var(s, lane_var, zero) for s in dst_starts]
 
-    src_offset_expr = _flatten_starts(src_buf, src_starts)
-    dst_offset_expr = _flatten_starts(dst_buf, dst_starts)
+    src_layout = _try_tile_layout_for_buf(
+        src_buf, mlen=target_mlen, hlen=target_hlen, buf_layout=target_layout,
+    )
+    dst_layout = _try_tile_layout_for_buf(
+        dst_buf, mlen=target_mlen, hlen=target_hlen, buf_layout=target_layout,
+    )
+
+    if src_layout is not None:
+        src_offset_expr = _flatten_starts_tiled(
+            src_layout, src_starts, mlen=target_mlen,
+            buf_layout=target_layout,
+        )
+    else:
+        src_offset_expr = _flatten_starts(src_buf, src_starts)
+
+    if dst_layout is not None:
+        dst_offset_expr = _flatten_starts_tiled(
+            dst_layout, dst_starts, mlen=target_mlen,
+            buf_layout=target_layout,
+        )
+    else:
+        dst_offset_expr = _flatten_starts(dst_buf, dst_starts)
 
     return _evaluate(_make_call_extern(
         "plena.copy_v_to_v",
@@ -389,15 +514,23 @@ def _lower_copy(call: tir.Call,
                 scopes: BufferScopeMap,
                 lane_count: int,
                 lane_var: Optional[str],
-                in_sync: bool) -> tir.Stmt:
+                in_sync: bool,
+                *,
+                target_mlen: int,
+                target_hlen: int,
+                target_layout: str = "BSHD") -> tir.Stmt:
     """Lower a tl.tileop.copy to plena.dma_h2v_slice / dma_h2m_slice /
     dma_v2h_slice. When `in_sync` is True and `lane_var` is set, substitute
     the lane var to 0 and multiply the lane-position extent by lane_count
     to fold all per-lane iterations into one multi-lane DMA."""
     src_buf, src_starts, _src_exts = _region_components(call.args[0])
     dst_buf, dst_starts, _dst_exts = _region_components(call.args[1])
-    src_scope = scopes.get(src_buf.name)
-    dst_scope = scopes.get(dst_buf.name)
+    # Collapse `global.<phys>` to `<phys>` for routing — a DMA into a
+    # `global.vram` buffer takes the same plena.dma_h2v_slice path as
+    # one into a regular `vram` buffer; the user-declared global flag
+    # only suppressed lane-fusion expansion (already handled upstream).
+    src_scope = _scope.physical_scope(scopes.get(src_buf.name) or "")
+    dst_scope = _scope.physical_scope(scopes.get(dst_buf.name) or "")
 
     if src_scope == "hbm" and dst_scope in ("vram", "mram"):
         intrin = "plena.dma_h2v_slice" if dst_scope == "vram" else "plena.dma_h2m_slice"
@@ -414,6 +547,8 @@ def _lower_copy(call: tir.Call,
             fp_buf=dst_buf, fp_starts=dst_starts,
             direction="v_to_fp",
             lane_var=lane_var, in_sync=in_sync,
+            target_mlen=target_mlen, target_hlen=target_hlen,
+            target_layout=target_layout,
         )
     elif src_scope == "fpram" and dst_scope == "vram":
         return _lower_row_v_fp_copy(
@@ -421,6 +556,8 @@ def _lower_copy(call: tir.Call,
             fp_buf=src_buf, fp_starts=src_starts,
             direction="fp_to_v",
             lane_var=lane_var, in_sync=in_sync,
+            target_mlen=target_mlen, target_hlen=target_hlen,
+            target_layout=target_layout,
         )
     elif src_scope == "vram" and dst_scope == "vram":
         # In-VRAM copy ("tensor cache" path). Lowers to one V_ADD_VF row
@@ -431,6 +568,8 @@ def _lower_copy(call: tir.Call,
             src_buf=src_buf, src_starts=src_starts,
             dst_buf=dst_buf, dst_starts=dst_starts,
             lane_var=lane_var, in_sync=in_sync,
+            target_mlen=target_mlen, target_hlen=target_hlen,
+            target_layout=target_layout,
         )
     else:
         raise LowerToHLIRError(
@@ -706,9 +845,12 @@ def _lower_gemm(call: tir.Call,
     b_buf, b_starts, _b_exts = _region_components(call.args[1])
     c_buf, c_starts, c_exts = _region_components(call.args[2])
 
-    a_scope = scopes.get(a_buf.name)
-    b_scope = scopes.get(b_buf.name)
-    c_scope = scopes.get(c_buf.name)
+    # `global.<phys>` operands satisfy the gemm scope rule the same as
+    # plain `<phys>` — the user-declared global flag only affects
+    # lane-fusion expansion, not which physical RAM the operand sits in.
+    a_scope = _scope.physical_scope(scopes.get(a_buf.name) or "")
+    b_scope = _scope.physical_scope(scopes.get(b_buf.name) or "")
+    c_scope = _scope.physical_scope(scopes.get(c_buf.name) or "")
     if (a_scope, b_scope, c_scope) != ("vram", "mram", "vram"):
         raise LowerToHLIRError(
             f"gemm operand scopes must be (vram, mram, vram); got "
@@ -864,262 +1006,6 @@ def _lhs_rows_dim(a_buf: tir.Buffer, lane_count: int) -> int:
     return -1
 
 
-# ---------------------------------------------------------------------------
-# Lane-for segmentation
-# ---------------------------------------------------------------------------
-
-def _flatten_seq(stmt) -> List[tir.Stmt]:
-    """Flatten a (possibly nested) SeqStmt into a flat list of stmts."""
-    if isinstance(stmt, tir.SeqStmt):
-        out: List[tir.Stmt] = []
-        for c in stmt.seq:
-            out.extend(_flatten_seq(c))
-        return out
-    return [stmt]
-
-
-def _segment_lane_for(for_stmt: tir.For, lowered_body) -> tir.Stmt:
-    """Split a lane-fused for-loop's body into runs separated by sync
-    points and re-emit so that:
-
-      * every sync-fused op (no longer references the lane var) runs
-        EXACTLY ONCE — outside any for-by — as a multi-lane HW op;
-      * every contiguous run of per-lane ops (still references the lane
-        var) is wrapped in its own for-by(0..lane_count) loop.
-
-    The lane_var var is *itself* not by-dependent so we descend through
-    any wrapping ``BlockRealize`` / ``Block`` (which hold cross-lane
-    state like ``alloc_buffers``) and segment the *innermost* op
-    sequence — the wrappers stay outside, hoisted above the segments.
-    """
-
-    def descend(stmt):
-        # Walk through wrappers that aren't lane-iteration boundaries.
-        # The wrappers stay around the segmented body; only the inner
-        # statement sequence is split.
-        if isinstance(stmt, tir.BlockRealize):
-            return tir.BlockRealize(
-                stmt.iter_values, stmt.predicate, descend(stmt.block),
-            )
-        if isinstance(stmt, tir.Block):
-            return tir.Block(
-                iter_vars=stmt.iter_vars, reads=stmt.reads, writes=stmt.writes,
-                name_hint=stmt.name_hint, body=descend(stmt.body),
-                init=stmt.init, alloc_buffers=stmt.alloc_buffers,
-                match_buffers=stmt.match_buffers, annotations=stmt.annotations,
-            )
-        return _do_segment(for_stmt, stmt)
-
-    return descend(lowered_body)
-
-
-def _do_segment(for_stmt: tir.For, body) -> tir.Stmt:
-    """Segment a flattened body relative to the lane var.
-
-    The traversal is *recursive* on inner for-loops: any nested loop's
-    body is itself segmented w.r.t. the lane var, which is equivalent to
-    loop-interchange followed by per-segment lane wrapping. This handles
-    patterns like ``for kv_block: { sync DMA, FP using by, sync v_add }``
-    correctly — the sync ops hoist outside the for-by, the FP body wraps
-    in an inner for-by, all sitting inside the original for-kv-block.
-    """
-    flat = _flatten_seq(body)
-    lane_var_name = for_stmt.loop_var.name
-
-    out: List[tir.Stmt] = []
-    cur_lane_run: List[tir.Stmt] = []
-
-    def is_pure_lane_run(stmt) -> bool:
-        """True when an inner statement can stay inside the current
-        per-lane run. This preserves `for by { for row { ... }; matmul }`
-        for per-lane row loops, while still recursively segmenting loops
-        that contain sync-fused ops."""
-        parts = _flatten_seq(stmt)
-        return bool(parts) and all(_stmt_uses_var(p, lane_var_name) for p in parts)
-
-    def flush_lane_run():
-        if not cur_lane_run:
-            return
-        run_body = (
-            cur_lane_run[0] if len(cur_lane_run) == 1
-            else tir.SeqStmt(list(cur_lane_run))
-        )
-        kind = (
-            tir.ForKind.UNROLLED
-            if _stmt_contains_extern(run_body, "plena.matmul")
-            else for_stmt.kind
-        )
-        out.append(tir.For(
-            for_stmt.loop_var, for_stmt.min, for_stmt.extent, kind,
-            run_body, for_stmt.thread_binding, for_stmt.annotations,
-        ))
-        cur_lane_run.clear()
-
-    for s in flat:
-        if isinstance(s, tir.For):
-            if is_pure_lane_run(s.body):
-                cur_lane_run.append(s)
-                continue
-            # Inner for-loop: recursively segment its body. The result no
-            # longer needs the outer for-by wrapper because the recursion
-            # already places per-lane runs inside the inner body. So we
-            # hoist the (transformed) inner for-loop out of the outer
-            # for-by entirely.
-            new_inner = _segment_lane_for(for_stmt, s.body)
-            new_for = tir.For(
-                s.loop_var, s.min, s.extent, s.kind,
-                new_inner, s.thread_binding, s.annotations,
-            )
-            flush_lane_run()
-            out.append(new_for)
-        elif _stmt_uses_var(s, lane_var_name):
-            cur_lane_run.append(s)
-        else:
-            flush_lane_run()
-            out.append(s)
-    flush_lane_run()
-
-    if not out:
-        return tir.Evaluate(tir.IntImm("int32", 0))
-    return out[0] if len(out) == 1 else tir.SeqStmt(out)
-
-
-# ---------------------------------------------------------------------------
-# Body walker
-# ---------------------------------------------------------------------------
-
-def _lower_body(stmt,
-                scopes: BufferScopeMap,
-                lane_count: int,
-                target_mlen: int,
-                target_hlen: int,
-                gemm_kind: Optional[str] = None,
-                in_sync: bool = False,
-                lane_var: Optional[str] = None,
-                drop_outer_for: bool = False) -> Optional[tir.Stmt]:
-    """Recurse and rewrite. Returns None when the input was an Evaluate
-    that has been completely consumed by a fusion (caller should drop)."""
-    if isinstance(stmt, tir.AttrStmt):
-        # Strip plena.* annotations — they've served their purpose.
-        if stmt.attr_key in (KIND_KEY, GROUP_KEY, SYNC_KEY):
-            new_kind = gemm_kind
-            new_in_sync = in_sync
-            new_lane_var = lane_var
-            new_drop = drop_outer_for
-            if stmt.attr_key == KIND_KEY and isinstance(stmt.value, tir.StringImm):
-                new_kind = stmt.value.value
-            elif stmt.attr_key == SYNC_KEY:
-                new_in_sync = True
-                # If we're already inside a lane group, syncing means the
-                # surrounding for-loop will be dropped (the op fuses across
-                # all lanes into one multi-lane HW op).
-                if lane_var is not None:
-                    new_drop = True
-            elif stmt.attr_key == GROUP_KEY:
-                if (isinstance(stmt.value, tir.IntImm)
-                        and int(stmt.value.value) == lane_count):
-                    # Mark that the surrounding For's loop_var is the lane
-                    # var. The for-loop itself has set lane_var already
-                    # (see tir.For handling below); nothing to do here.
-                    pass
-            return _lower_body(stmt.body, scopes, lane_count, target_mlen,
-                               target_hlen, new_kind, new_in_sync,
-                               new_lane_var, new_drop)
-        return _passthrough_attr(stmt, scopes, lane_count, target_mlen,
-                                  target_hlen, gemm_kind, in_sync, lane_var,
-                                  drop_outer_for)
-
-    if isinstance(stmt, tir.For):
-        # Detect "this For wraps a plena.group(extent=lane_count)" — that
-        # makes its loop_var the lane var.
-        is_lane_for = (
-            isinstance(stmt.body, tir.AttrStmt)
-            and stmt.body.attr_key == GROUP_KEY
-            and isinstance(stmt.body.value, tir.IntImm)
-            and int(stmt.body.value.value) == lane_count
-        )
-        new_lane_var = stmt.loop_var.name if is_lane_for else lane_var
-        new_body = _lower_body(stmt.body, scopes, lane_count, target_mlen,
-                                target_hlen, gemm_kind, in_sync,
-                                new_lane_var, drop_outer_for=False)
-        if new_body is None:
-            return None
-        if not is_lane_for:
-            return tir.For(
-                stmt.loop_var, stmt.min, stmt.extent, stmt.kind,
-                new_body, stmt.thread_binding, stmt.annotations,
-            )
-        # Lane-fused for: segment body at sync boundaries.
-        # Each statement is either:
-        #   * a sync-fused op (multi-lane HW op, body no longer references
-        #     the lane var) — emitted ONCE outside any per-lane for-loop;
-        #   * a per-lane op (still references the lane var) — wrapped in a
-        #     for-by loop to run lane_count times.
-        # Order is preserved.
-        return _segment_lane_for(stmt, new_body)
-
-    if isinstance(stmt, tir.SeqStmt):
-        out = []
-        for c in stmt.seq:
-            r = _lower_body(c, scopes, lane_count, target_mlen, target_hlen,
-                            gemm_kind, in_sync, lane_var, drop_outer_for)
-            if r is not None:
-                out.append(r)
-        if not out:
-            return tir.Evaluate(tir.IntImm("int32", 0))
-        return tir.SeqStmt(out) if len(out) > 1 else out[0]
-
-    if isinstance(stmt, tir.BlockRealize):
-        return tir.BlockRealize(
-            iter_values=stmt.iter_values, predicate=stmt.predicate,
-            block=_lower_body(stmt.block, scopes, lane_count, target_mlen,
-                               target_hlen, gemm_kind, in_sync, lane_var,
-                               drop_outer_for),
-        )
-    if isinstance(stmt, tir.Block):
-        return _rewrite_block(stmt, scopes, lane_count, target_mlen,
-                               target_hlen, gemm_kind, in_sync, lane_var,
-                               drop_outer_for)
-
-    if isinstance(stmt, tir.Evaluate):
-        v = stmt.value
-        if isinstance(v, tir.Call):
-            op_name = v.op.name
-            if op_name == _TILEOP_COPY:
-                return _lower_copy(v, scopes, lane_count, lane_var, in_sync)
-            if op_name == _TILEOP_GEMM:
-                kind = gemm_kind or "overwrite"
-                return _lower_gemm(v, scopes, kind, lane_count, target_mlen,
-                                   target_hlen, lane_var=lane_var)
-            # Already-lowered plena.* extern calls — pass through.
-            if op_name == "tir.call_extern":
-                return _project_matmul_offsets_to_lane(stmt, lane_var)
-        return stmt
-
-    return stmt
-
-
-def _passthrough_attr(stmt, scopes, lane_count, target_mlen, target_hlen,
-                      gemm_kind, in_sync, lane_var, drop_outer_for):
-    new_body = _lower_body(stmt.body, scopes, lane_count, target_mlen,
-                            target_hlen, gemm_kind, in_sync, lane_var,
-                            drop_outer_for)
-    if new_body is None:
-        return None
-    return tir.AttrStmt(stmt.node, stmt.attr_key, stmt.value, new_body)
-
-
-def _rewrite_block(block, scopes, lane_count, target_mlen, target_hlen,
-                   gemm_kind, in_sync, lane_var, drop_outer_for):
-    new_body = _lower_body(block.body, scopes, lane_count, target_mlen,
-                            target_hlen, gemm_kind, in_sync, lane_var,
-                            drop_outer_for)
-    return tir.Block(
-        iter_vars=block.iter_vars, reads=block.reads, writes=block.writes,
-        name_hint=block.name_hint, body=new_body, init=block.init,
-        alloc_buffers=block.alloc_buffers, match_buffers=block.match_buffers,
-        annotations=block.annotations,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1222,25 +1108,8 @@ def _rewrite_buffer_scopes(stmt, scopes: BufferScopeMap):
 
 
 # ---------------------------------------------------------------------------
-# Public entry
+# Public exports
 # ---------------------------------------------------------------------------
 
-def run(func: tir.PrimFunc,
-        scopes: BufferScopeMap,
-        lane_count: int = 4,
-        target_mlen: int = 64,
-        target_hlen: int = 16) -> tir.PrimFunc:
-    rewritten = _rewrite_buffer_scopes(func.body, scopes)
-    lowered = _lower_body(rewritten, scopes, lane_count, target_mlen, target_hlen)
-    if lowered is None:
-        lowered = tir.Evaluate(tir.IntImm("int32", 0))
-    return tir.PrimFunc(
-        params=func.params,
-        body=lowered,
-        ret_type=func.ret_type,
-        buffer_map=func.buffer_map,
-        attrs=func.attrs,
-    )
-
-
-__all__ = ["run", "LowerToHLIRError"]
+__all__ = ["LowerToHLIRError",
+           "_lower_copy", "_lower_gemm", "_rewrite_buffer_scopes"]

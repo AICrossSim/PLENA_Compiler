@@ -310,15 +310,27 @@ class ISAEmitter:
         self.program.compiler.register_allocator.free_gp(gp_store)
         self.program.compiler.register_allocator.free_addr([addr_reg])
 
-    def emit_zero_vram_tile(self, vram_addr: int) -> None:
+    def emit_zero_vram_tile(self, vram_addr: int, num_rows: Optional[int] = None) -> None:
+        # `num_rows` is how many MLEN-wide rows to zero. Defaults to MLEN
+        # for legacy callers that always zero a full MLEN*MLEN tile.
+        # Buffers smaller than that (e.g. a (1, MLEN) accumulator) MUST
+        # pass the actual row count or the loop will write past the
+        # buffer's end into adjacent VRAM (silent corruption of whatever
+        # follows in the address map).
+        loop_count = self.program.mlen if num_rows is None else int(num_rows)
+        if loop_count < 1:
+            raise ValueError(f"num_rows must be >= 1, got {loop_count}")
         gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
         gp, gp_loop = gp_regs
-        lines = [f"; zero tile vram[{vram_addr}]"]
+        lines = [f"; zero tile vram[{vram_addr}] rows={loop_count}"]
         lines.append(f"S_ADDI_INT gp{gp}, gp0, {vram_addr}")
-        lines.append(f"C_LOOP_START gp{gp_loop}, {self.program.mlen}")
-        lines.append(f"V_MUL_VF gp{gp}, gp{gp}, f0, 0")
-        lines.append(f"S_ADDI_INT gp{gp}, gp{gp}, {self.program.mlen}")
-        lines.append(f"C_LOOP_END gp{gp_loop}")
+        if loop_count == 1:
+            lines.append(f"V_MUL_VF gp{gp}, gp{gp}, f0, 0")
+        else:
+            lines.append(f"C_LOOP_START gp{gp_loop}, {loop_count}")
+            lines.append(f"V_MUL_VF gp{gp}, gp{gp}, f0, 0")
+            lines.append(f"S_ADDI_INT gp{gp}, gp{gp}, {self.program.mlen}")
+            lines.append(f"C_LOOP_END gp{gp_loop}")
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
@@ -955,7 +967,19 @@ class ISAEmitter:
         dst_vram_addr: int,
         op: str = "add",
         task_id: str = "tile_binary",
+        num_rows: Optional[int] = None,
     ) -> None:
+        """One ``V_*_VV`` per MLEN-wide row, looped ``num_rows`` times.
+
+        ``num_rows`` defaults to MLEN (legacy behavior — assumes a full
+        MLEN×MLEN tile per operand, which is what flash_attention /
+        BTMM-style kernels with lane-fused (rows, hlen) post-expansion
+        buffers want). Callers with smaller operands (e.g. one
+        MLEN-wide row, or any (1, …, MLEN) BSHD buffer where the
+        flattened element count is below MLEN²) must pass the actual
+        row count or the loop will over-iterate past the operand's end
+        and corrupt whatever VRAM follows it.
+        """
         op_to_insn = {
             "add": "V_ADD_VV",
             "sub": "V_SUB_VV",
@@ -963,13 +987,18 @@ class ISAEmitter:
         }
         if op not in op_to_insn:
             raise ValueError(f"Unsupported tile binary op={op!r}")
+        loop_count = self.program.mlen if num_rows is None else int(num_rows)
+        if loop_count < 1:
+            raise ValueError(f"num_rows must be >= 1, got {loop_count}")
         gp_regs = self.program.compiler.register_allocator.allocate_gp(4)
         gp_dst, gp_lhs, gp_rhs, gp_loop = gp_regs
-        lines = [f"; tile binary task {task_id} op={op}"]
+        lines = [
+            f"; tile binary task {task_id} op={op} rows={loop_count}",
+        ]
         lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_vram_addr}")
         lines.append(f"S_ADDI_INT gp{gp_lhs}, gp0, {lhs_vram_addr}")
         lines.append(f"S_ADDI_INT gp{gp_rhs}, gp0, {rhs_vram_addr}")
-        lines.append(f"C_LOOP_START gp{gp_loop}, {self.program.mlen}")
+        lines.append(f"C_LOOP_START gp{gp_loop}, {loop_count}")
         if op == "sub":
             lines.append(f"{op_to_insn[op]} gp{gp_dst}, gp{gp_rhs}, gp{gp_lhs}, 0")
         else:

@@ -68,14 +68,15 @@ except ImportError:
     pass
 
 from .codegen import PlenaCodegen, compile_module
-from .test_helper import emit_single_output_testbench
+from .test_helper import TvmTestbenchSpec, run as run_testbench
 from . import scope
 from . import intrinsics
 
 __all__ = [
     "PlenaCodegen",
     "compile_module",
-    "emit_single_output_testbench",
+    "TvmTestbenchSpec",
+    "run_testbench",
     "scope",
     "intrinsics",
 ]

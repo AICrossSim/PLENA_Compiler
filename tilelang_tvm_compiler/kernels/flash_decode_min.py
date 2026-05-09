@@ -86,16 +86,21 @@ def make_flash_decode_min(
         V_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
     ):
         with T.Kernel(1, head_count, threads=128) as (_, by):
-            # Q lives in a VRAM "tensor cache" region — a regular shared
-            # buffer that the testbench-side pre-kernel stub populates
-            # via S_MAP_V_FP from FPRAM. Layout is head-major
-            # (head_count rows, hlen cols), so by-indexed reads naturally
-            # select per-by_o slices of MLEN = lane_count * hlen.
-            Q_cache = T.alloc_shared((head_count, hlen), "float16")
+            # Q lives in a VRAM "tensor cache" region — a global tensor
+            # populated by the testbench pre-kernel stub via S_MAP_V_FP
+            # from FPRAM. Layout is head-major (head_count rows, hlen
+            # cols), so by-indexed reads naturally select per-by_o slices
+            # of MLEN = lane_count * hlen. Marked global.vram so
+            # allocate_group_memory does not try to re-expand its head
+            # axis (the head dim is already explicit in the shape).
+            Q_cache = T.alloc_shared((head_count, hlen), "float16",
+                                      scope="global.vram")
             # Symmetric output cache. Kernel writes O_loc -> O_cache[by, 0]
             # via vram→vram T.copy (V_ADD_VF f0=0). Testbench compares the
-            # VRAM region directly — no FPRAM round-trip needed.
-            O_cache = T.alloc_shared((head_count, hlen), "float16")
+            # VRAM region directly — no FPRAM round-trip needed. Same
+            # global.vram rationale as Q_cache.
+            O_cache = T.alloc_shared((head_count, hlen), "float16",
+                                      scope="global.vram")
             # VRAM staging so BTMV can read Q from VRAM.
             # 2D rows=1 → col-packed to (1, 1, lane_count, hlen).
             Q_sh   = T.alloc_shared((1, hlen), "float16")

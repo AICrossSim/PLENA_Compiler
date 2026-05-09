@@ -81,6 +81,13 @@ class PlenaCodegen:
         self._collect_param_buffers()
         self._collect_alloc_buffers()
 
+        # Read kernel-wide layout from ``T.func_attr({"plena.layout":
+        # "NCHW"})``. Defaults to BSHD — every kernel written before
+        # the layout migration relied on that. Stamp it onto every 4D
+        # HLIR Buffer so address_alloc can pick the right axis for
+        # row-tile / channel-group / col-tile.
+        kernel_layout = self._kernel_layout()
+
         # Construct HLIR buffers (preserving param order).
         hlir_buffers: Dict[str, _hlir.Buffer] = {}
         param_names: List[str] = []
@@ -89,11 +96,11 @@ class PlenaCodegen:
             if buf is None:
                 continue
             info = self._buffers_by_name[buf.name]
-            hlir_buffers[info.name] = self._buf_info_to_hlir(info)
+            hlir_buffers[info.name] = self._buf_info_to_hlir(info, kernel_layout)
             param_names.append(info.name)
         for name, info in self._buffers_by_name.items():
             if name not in hlir_buffers:
-                hlir_buffers[name] = self._buf_info_to_hlir(info)
+                hlir_buffers[name] = self._buf_info_to_hlir(info, kernel_layout)
 
         # Walk the body and collect Op stream.
         ops: List[_hlir.Op] = []
@@ -106,13 +113,26 @@ class PlenaCodegen:
             param_names=param_names,
         )
 
+    def _kernel_layout(self) -> str:
+        """Read ``T.func_attr({"plena.layout": ...})``. Defaults to BSHD."""
+        attrs = self.func.attrs
+        if attrs is None or "plena.layout" not in attrs:
+            return "BSHD"
+        val = attrs["plena.layout"]
+        if isinstance(val, tir.StringImm):
+            return str(val.value)
+        return str(val)
+
     @staticmethod
-    def _buf_info_to_hlir(info: "_BufferInfo") -> _hlir.Buffer:
+    def _buf_info_to_hlir(
+        info: "_BufferInfo", kernel_layout: str = "BSHD",
+    ) -> _hlir.Buffer:
         return _hlir.Buffer(
             name=info.name,
             scope=info.scope,
             shape=tuple(int(s) for s in info.shape),
             dtype=info.dtype,
+            layout=kernel_layout,
         )
 
     def _collect_ops(self, stmt, ops: List[_hlir.Op]) -> None:
@@ -303,7 +323,7 @@ class PlenaCodegen:
                 continue
             if isinstance(a, tir.BufferLoad) and a.buffer.data in self._buffers:
                 info = self._buffers[a.buffer.data]
-                if info.scope == _scope.FPRAM:
+                if _scope.physical_scope(info.scope) == _scope.FPRAM:
                     scalar_args.append(_hlir.BufferElement(
                         buffer=info.name,
                         indices=tuple(self._normalize_scalar_expr(i) for i in a.indices),
@@ -448,7 +468,7 @@ class PlenaCodegen:
                 scopes.append(info.scope)
             elif isinstance(a, tir.BufferLoad) and a.buffer.data in self._buffers:
                 info = self._buffers[a.buffer.data]
-                if info.scope == _scope.FPRAM:
+                if _scope.physical_scope(info.scope) == _scope.FPRAM:
                     idx = ", ".join(str(self._normalize_scalar_expr(i)) for i in a.indices)
                     resolved.append(f"{info.name}[{idx}]")
                     scopes.append(None)
@@ -496,7 +516,10 @@ class PlenaCodegen:
                     f"{name}: operand {i} must be a buffer in scope {want!r}, "
                     f"got non-buffer value"
                 )
-            if got != want:
+            # `global.<phys>` operands satisfy a `<phys>` operand spec —
+            # the user-declared global flag only changes lane-fusion
+            # behaviour, not which physical RAM the operand reads/writes.
+            if _scope.physical_scope(got) != want:
                 raise CodegenError(
                     f"{name}: operand {i} must be in scope {want!r}, "
                     f"but found {got!r}"
@@ -537,7 +560,7 @@ class PlenaCodegen:
                 _scope.VRAM: "ALLOC_VRAM",
                 _scope.MRAM: "ALLOC_MRAM",
                 _scope.FPRAM: "ALLOC_FPRAM",
-            }[info.scope]
+            }[_scope.physical_scope(info.scope)]
             self._isa_lines.append(
                 f"{scope_token}  {info.name}  shape={shape_str}  dtype={info.dtype}"
             )

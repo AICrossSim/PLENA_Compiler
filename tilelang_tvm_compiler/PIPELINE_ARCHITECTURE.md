@@ -11,14 +11,16 @@ inter-pass dependencies, and known structural gaps.
 ```
 @T.prim_func (user's tilelang kernel)
         │
-        │  Frontend pipeline (11 passes, all operate on TIR)
+        │  Frontend pipeline (10 stmt-rewriting passes + lift_to_blocks
+        │                     + graph_pipeline back end, all operate on TIR)
         ▼
 TIR with plena.* extern calls
 (plena.matmul / plena.mv / plena.btmm / plena.zero_v / plena.v_add /
  plena.dma_h2v_slice / plena.copy_v_to_v / plena.row_load_v_to_fp / …)
         │
         │  PlenaCodegen.lower_to_hlir()
-        │  (NOTE: distinct from the frontend pass also called lower_to_hlir)
+        │  (NOTE: a method on PlenaCodegen — does NOT relate to the
+        │   deleted frontend pass that used to share this name.)
         ▼
 HLIRModule (buffers + linear ops list)
         │
@@ -51,7 +53,7 @@ ISA text (the final .asm)
 
 ---
 
-## 2. Frontend pipeline — 11 passes
+## 2. Frontend pipeline — 12 passes
 
 Listed in execution order from `frontend/pipeline.py`.
 
@@ -86,7 +88,7 @@ Listed in execution order from `frontend/pipeline.py`.
   `tir.AttrStmt(plena.group, value=N)`. The `value=N` is the axis's
   logical width.
 - **Role:** this attr is the "signpost" for lane fusion — it tells
-  `split_lane_groups` and the eventual `lower_to_hlir` walker which
+  `split_lane_groups` and the eventual `graph_pipeline` back end which
   for-loops are lane candidates.
 
 ### 2.5 `annotate_sync` — mark sync sites
@@ -99,7 +101,7 @@ Listed in execution order from `frontend/pipeline.py`.
   - already-fused `plena.zero_v` / `plena.v_*` extern calls
 - **Sync site semantics:** "one HW instruction that fires across all
   lanes simultaneously." Downstream passes (`split_lane_groups`,
-  `lower_to_hlir`) use this to decide which ops hoist OUTSIDE the
+  `graph_pipeline`) use this to decide which ops hoist OUTSIDE the
   per-lane for-loop (one multi-lane invocation) and which stay INSIDE
   (per-lane serial loop).
 
@@ -125,8 +127,9 @@ Listed in execution order from `frontend/pipeline.py`.
   - Body uses of the original `v` are substituted with the compound
     `v_outer * lane_count + v_inner` (`_VarSubst`).
   - The inner `plena.group(lane_count)` AttrStmt is what
-    `lower_to_hlir` later uses to identify the lane for. **It gets
-    consumed by segmentation — see § 5.1.**
+    `graph_pipeline` later uses to identify the lane for. (It used to
+    get consumed mid-walk by the old segmenter; the graph back end reads
+    it once during lane-group extraction and never mutates it.)
   - The inner `Var`'s name is `f"{original_name}_i"` (e.g. `by_i`).
 
 ### 2.7 `fuse_elementwise` — `T.Parallel` patterns → `plena.v_*`
@@ -156,7 +159,8 @@ Listed in execution order from `frontend/pipeline.py`.
   usage context, assigns one of `hbm` / `vram` / `mram` / `fpram`.
 - **Output:** `BufferScopeMap` (dict: buffer name → scope).
 - **Used by:** `allocate_group_memory` (lane-axis labelling) and
-  `lower_to_hlir` (T.copy variant selection).
+  `graph_pipeline` (T.copy variant selection via the helpers in
+  `frontend/passes/lower_to_hlir.py`).
 
 ### 2.9 `allocate_group_memory` — expand buffer shapes with a lane axis
 - **What it does:** walks lane-group bodies, decides each buffer's
@@ -190,59 +194,131 @@ Listed in execution order from `frontend/pipeline.py`.
 - **What it does:** detects specific FPRAM↔VRAM row-element transfer
   patterns (`for i: vram[..., i] = fpram[i]` and friends) and lowers
   them to `plena.row_load_v_to_fp` / `plena.row_store_fp_to_v`.
-- **Relationship to `lower_to_hlir`:** the latter handles
-  buffer-to-buffer wholesale transfers; this pass complements it by
-  catching row-element-level rewrite patterns.
+- **Relationship to `graph_pipeline`'s `_lower_copy` helper:** the
+  helper handles buffer-to-buffer wholesale transfers; this pass
+  complements it by catching row-element-level rewrite patterns
+  upstream so they reach the back end as already-lowered
+  `plena.row_*` extern calls.
 
-### 2.11 `lower_to_hlir` — `T.copy` / `T.gemm` → `plena.*` + lane-fusion segmentation
+### 2.11 `lift_to_blocks` — wrap each op as its own BlockRealize
 
-**One pass doing two distinct jobs (v2 tried to split them; see § 5.1).**
+The post-rewrite IR has `tilelang_root` as a single coarse block holding
+a flat SeqStmt of all ops (see § 1 overview). `lift_to_blocks` walks
+this SeqStmt and wraps each op stmt in its own ``BlockRealize`` with
+explicit ``reads`` / ``writes`` extracted from the op's region
+arguments. ``plena.sync`` / ``plena.gemm_kind`` AttrStmt wrappers around
+each op move INTO the new inner block as ``block.annotations[key] = value``.
 
-#### Job A — tile DSL → `plena.*` extern
+Non-op stmts (For loops, nested SeqStmts, raw AttrStmts that aren't
+plena.*) pass through unchanged — they're structural wrappers, not
+graph nodes. After this pass, lane-group bodies look like:
+
+```
+For by in range(4):
+  AttrStmt(plena.group, 4):
+    BlockRealize "tilelang_root":
+      alloc_buffers: [...]
+      SeqStmt:
+        BlockRealize "op_0" annotations={plena.sync: "..."}:
+          reads(...) writes(...)
+          body: Evaluate(Call(tl.tileop.copy, ...))
+        BlockRealize "op_1" annotations={plena.gemm_kind: "btmm",
+                                          plena.sync: "..."}:
+          ...
+```
+
+The lifted IR is well-formed TIR (`verify_well_formed = True`) and TVM's
+`tir.Schedule` API can `get_block` / `get_consumers` on it. The graph
+back end consumes this form.
+
+### 2.12 `graph_pipeline` — graph-IR back end
+
+Replaces what used to be a recursive stmt walker (`lower_to_hlir._lower_body`
++ `_segment_lane_for` + `_do_segment` trio). The graph back end:
+
+#### Step 1 — extract a graph
+
+Walk the lifted IR. For each lane-group nest
+``For(lane_var) → AttrStmt(plena.group, lane_count) → BlockRealize("tilelang_root")``,
+extract a ``LaneGroup``:
+
+```python
+@dataclass
+class LaneGroup:
+    lane_var: tir.Var
+    lane_count: int
+    nodes: List[GraphNode | tir.Stmt]   # mixed list
+    alloc_buffers: List[tir.Buffer]
+```
+
+Lifted op-blocks become ``GraphNode`` (kind, op_call, annotations);
+non-op stmts (nested For loops, etc.) pass through as raw ``tir.Stmt``
+elements — they participate in per-lane wrapping but carry no
+graph-level metadata.
+
+#### Step 2 — partition by sync barrier + per-lane affinity
+
+Walk ``LaneGroup.nodes`` linearly:
+- A ``GraphNode`` is **sync** if it has a ``plena.sync`` annotation OR
+  its op-call is one of the inherently-sync externs (``plena.dma_*`` /
+  ``plena.btmm`` / ``plena.btmv`` / ``plena.zero_v`` / ``plena.v_*`` /
+  ``plena.copy_v_to_v`` / ``plena.row_*_v_to_fp`` /
+  ``plena.row_store_fp_to_v``). Sync nodes emit ONCE outside any for-by,
+  with the lane var substituted to 0 (``in_sync=True``) so the op
+  becomes a single multi-lane HW instruction.
+- Everything else is **per-lane**: it accumulates into a contiguous
+  run, which gets wrapped in a ``for-by(0..lane_count)`` loop. The
+  for-by uses ``UNROLLED`` if any node in the run is a ``plena.matmul``
+  (mirrors the rule in the old segmenter), else ``SERIAL``.
+
+#### Step 3 — emit plena.* extern stmts
+
+Each ``GraphNode`` lowers via the helper functions kept in
+``frontend/passes/lower_to_hlir.py``:
 
 | Input | Selector | Output |
 |-------|----------|--------|
-| `T.copy(src, dst)` | scope HBM→vram | `plena.dma_h2v_slice` |
-| `T.copy(src, dst)` | scope HBM→mram | `plena.dma_h2m_slice` |
-| `T.copy(src, dst)` | scope vram→HBM | `plena.dma_v2h_slice` |
-| `T.copy(src, dst)` | scope vram↔vram | `plena.copy_v_to_v` |
-| `T.copy(src, dst)` | scope vram↔fpram | `plena.row_load_v_to_fp` / `plena.row_store_fp_to_v` |
-| `T.gemm` | KIND=btmm, LHS rows=1 | `plena.btmv` |
-| `T.gemm` | KIND=btmm, LHS rows>1 | `plena.btmm` |
-| `T.gemm` | KIND=overwrite, LHS rows=1 | `plena.mv` |
-| `T.gemm` | KIND=overwrite, LHS rows>1 | `plena.matmul` |
+| `tl.tileop.copy(src, dst)` | scope HBM→vram | `plena.dma_h2v_slice` |
+| `tl.tileop.copy(src, dst)` | scope HBM→mram | `plena.dma_h2m_slice` |
+| `tl.tileop.copy(src, dst)` | scope vram→HBM | `plena.dma_v2h_slice` |
+| `tl.tileop.copy(src, dst)` | scope vram↔vram | `plena.copy_v_to_v` |
+| `tl.tileop.copy(src, dst)` | scope vram↔fpram | `plena.row_load_v_to_fp` / `plena.row_store_fp_to_v` |
+| `tl.tileop.gemm_py` | KIND=btmm, LHS rows=1 | `plena.btmv` |
+| `tl.tileop.gemm_py` | KIND=btmm, LHS rows>1 | `plena.btmm` |
+| `tl.tileop.gemm_py` | KIND=overwrite, LHS rows=1 | `plena.mv` |
+| `tl.tileop.gemm_py` | KIND=overwrite, LHS rows>1 | `plena.matmul` |
+| Already-lowered `tir.call_extern("plena.*")` | — | passthrough |
 
-- Per-lane offsets are auto-injected (`_auto_lane_offset`) from each
-  buffer's lane-axis stride. The kernel author writes whole buffers, no
-  offset literals.
-- `dst_row_stride` is computed automatically (`_dst_row_stride`):
-  COL_PACK ⇒ `lane_count * last_dim`, ROW_STACK / unexpanded ⇒
-  `last_dim`.
+Per-lane offsets are auto-injected (`_auto_lane_offset`) from each
+buffer's lane-axis stride. `dst_row_stride` is auto-computed:
+COL_PACK ⇒ `lane_count * last_dim`, ROW_STACK / unexpanded ⇒ `last_dim`.
 
-#### Job B — lane-fusion segmentation + offset projection
+The lane-offset projection that used to be a separate stmt-rewrite
+(`_project_matmul_offsets_to_lane`) is folded into per-lane node
+lowering: when ``in_sync=True``, lane-var occurrences in offset
+expressions get substituted with 0; per-lane lowering keeps them
+referencing the lane var directly so the surrounding for-by drives the
+iteration.
 
-When the walker enters a for-loop whose body is
-`AttrStmt(plena.group(lane_count), …)` ("the lane for"),
-`_segment_lane_for` partitions the loop body across sync boundaries:
+#### Why this is better than the old walker
 
-- **Sync ops** (`plena.dma_*`, `plena.btmm`, `plena.v_*`,
-  `plena.zero_v`): hoisted **outside** the for-by — single multi-lane HW
-  instruction.
-- **Per-lane ops** (`plena.matmul`, `plena.mv`, `plena.fp_*_at`,
-  `plena.row_*_at`): kept **inside** the for-by — serial loop running
-  `lane_count` times.
+The old `lower_to_hlir._lower_body` interleaved four concerns: (A) tile
+DSL → plena translation, (B) lane-fusion segmentation, (C) lane-offset
+projection, (D) attribute stripping. Adding a new op kind required
+changes in scattered call paths; the order in which AttrStmts were
+stripped was load-bearing (and consumed `plena.group` mid-walk, which
+is why a v2 attempt to extract concern (B) into its own pass failed).
 
-Concurrently, `_project_matmul_offsets_to_lane` rewrites
-`plena.matmul` / `plena.mv` offset args by replacing the full
-`by_outer * lane_count + by_inner` expression with just `by_inner` —
-since multi-lane execution covers all `by_inner` values in one shot, the
-outer `by_outer` portion is the responsibility of the surrounding
-serial outer for.
+The graph back end separates these:
+- ``lift_to_blocks`` is the ONLY place that sees raw stmt structure
+- the graph back end works on a list of ``GraphNode``s, each carrying
+  its op-call and a metadata dict
+- (B) becomes a list partition; (C) is per-lane vs. in_sync lowering;
+  (D) is reading ``block.annotations``
 
-> **`_segment_lane_for` consumes the `plena.group` AttrStmt while
-> rebuilding the for-loop body.** This is why v2's attempt to extract
-> Job B into its own post-`lower_to_hlir` pass failed — by the time the
-> separate pass would run, the lane marker is gone.
+Adding a new sync/per-lane plena op = registering it in
+``INHERENTLY_SYNC_EXTERNS`` (or `PER_LANE_UNROLLED_EXTERNS`) + adding
+a lower function. No change to the partitioner or walker.
 
 ---
 
@@ -294,40 +370,56 @@ with T.Kernel(1, head_count) as (_, by):
 | 4 | `split_lane_groups` | If `head_count > lane_count`, split into `by_outer × by_inner`. |
 | 5 | `scope_inference` | Resolve `S_loc` / `V_sh` / `PV_loc` scopes. |
 | 6 | `allocate_group_memory` | `S_loc` → ROW_STACK `(1, lane_count, 1, MLEN)`; `V_sh` / `PV_loc` → COL_PACK. |
-| 7 | `lower_to_hlir._lower_gemm` | KIND=overwrite + LHS rows=1 ⇒ pick `plena.mv`; auto-inject lane offsets. |
-| 8 | `lower_to_hlir._segment_lane_for` | mv stays inside the for-by (per-lane); the surrounding `v_add` hoists out (sync). |
-| 9 | `_project_matmul_offsets_to_lane` | Project offsets down to `by_inner`. |
-| 10 | `PlenaCodegen` | `plena.mv` → `Op(kind="mv", scalar_args=[by_inner*64, by_inner*16, by_inner*16])`. |
-| 11 | `AddressAllocationPass` | Concrete addresses for `S_loc` / `V_sh` / `PV_loc`. |
-| 12 | `IsaEmitterPass` | Emit `M_MV` × tile_count + `M_MV_WO` writeback. |
+| 7 | `lift_to_blocks` | Wrap the gemm Evaluate in its own BlockRealize, hoist `plena.gemm_kind` annotation onto `block.annotations`. |
+| 8 | `graph_pipeline` (extract) | Recognise the surrounding `for by` + `plena.group(4)` + `tilelang_root` as a LaneGroup; the gemm becomes a non-sync GraphNode. |
+| 9 | `graph_pipeline` (partition) | mv is per-lane (no `plena.sync` annotation, op is `tl.tileop.gemm_py` not in INHERENTLY_SYNC_EXTERNS); accumulates into a per-lane run; surrounding `plena.v_add` is sync and hoists out. |
+| 10 | `graph_pipeline` (lower) | Calls `_lower_gemm`: KIND=overwrite + LHS rows=1 ⇒ pick `plena.mv`; per-lane `_auto_lane_offset` from `by`; per-lane run wrapped in `for by in range(lane_count)`. |
+| 11 | `PlenaCodegen` | `plena.mv` → `Op(kind="mv", scalar_args=[by*64, by*16, by*16])`. |
+| 12 | `AddressAllocationPass` | Concrete addresses for `S_loc` / `V_sh` / `PV_loc`. |
+| 13 | `IsaEmitterPass` | Emit `M_MV` × tile_count + `M_MV_WO` writeback. |
 
 ---
 
 ## 5. Known gaps (ranked by severity)
 
-### 5.1 `lower_to_hlir` couples three concerns ★★
-A single pass handles (A) tile→plena translation, (B) lane-fusion
-segmentation, and (C) lane-offset projection. `_segment_lane_for`
-consumes the `plena.group(lane_count)` AttrStmt during step B, which
-means any later pass that wants lane info won't find a marker.
+### 5.1 ~~`lower_to_hlir` couples three concerns~~ — RESOLVED
+The old `lower_to_hlir.run` interleaved (A) tile→plena translation,
+(B) lane-fusion segmentation, (C) lane-offset projection, and (D)
+attribute stripping in one recursive stmt walker. Adding a new op
+required changes scattered across the call paths; `_segment_lane_for`
+consumed the `plena.group(lane_count)` AttrStmt mid-walk, which is why
+v2's attempt to factor (C) into a standalone post-pass failed.
 
-**Symptom:** v2 attempted to extract C into a standalone post-pass and
-hit a wall — by the time the separate pass ran, the lane marker had
-been consumed. Adding new op types is also risky on this code path.
+**Resolution:** the back end has been replaced by `lift_to_blocks` +
+`graph_pipeline` (see § 2.11–2.12). Each concern now has a clear home:
 
-**Fix:** make `_segment_lane_for` migrate the lane info into the
-For's `annotations` dict (`{"plena.lane_var": loop_var.name}`); have
-downstream passes read that annotation instead of relying on the attr.
-~50 LoC plus broad regression coverage.
+  * `lift_to_blocks` is the only pass that sees raw stmt structure;
+    it wraps each op as its own BlockRealize, pulling plena.* AttrStmts
+    into `block.annotations`.
+  * `graph_pipeline` extracts a list of `GraphNode | tir.Stmt` from
+    each lane group, partitions it on sync boundaries (concern B), and
+    emits stmts via per-op `_lower_copy` / `_lower_gemm` helpers
+    (concern A); per-lane vs. in_sync lowering naturally handles
+    concern C; reading `block.annotations` handles D.
+  * The `plena.group` AttrStmt is read once during lane-group extraction
+    and never mutated, so it stays available for any future pass that
+    wants to reason about lane structure.
 
-### 5.2 `annotate_sync` straddles two IR levels (dual handling) ★★
-The pass identifies sync sites by inspecting both tile-DSL forms
-(`T.copy` / `T.gemm`) and lowered `plena.*` extern calls. Adding a new
-op requires updating both branches; missing one is a silent bug source.
+Adding a new sync/per-lane plena op is now: add a lower fn + register
+the op name in `INHERENTLY_SYNC_EXTERNS` (or
+`PER_LANE_UNROLLED_EXTERNS`). No partitioner / walker changes.
 
-**Fix:** can only happen after § 5.1 is fixed — once `lower_to_hlir`
-moves to before `annotate_sync`, this pass needs to look at `plena.*`
-names only.
+### 5.2 ~~`annotate_sync` straddles two IR levels (dual handling)~~ — DOWNGRADED
+The pass still inspects both tile-DSL forms (`T.copy` / `T.gemm`) and
+lowered `plena.*` extern calls. The dual handling continues to be a
+small papercut for adding new ops, but it's no longer load-bearing for
+correctness now that the back end is decoupled — the graph back end
+treats `plena.sync` annotations and `INHERENTLY_SYNC_EXTERNS` as a
+unified "is this node a sync barrier?" predicate.
+
+**Possible cleanup (optional):** narrow `annotate_sync` to look only at
+tile-DSL forms (since pre-lowered plena.* externs are now classified by
+the back end's intrinsic table). ~30 LoC, no urgency.
 
 ### 5.3 `fuse_elementwise` only supports `+`, `-`, `*`, `0` ★
 Division and other ops (`/`, `exp`, `relu`, …) and non-zero constant
@@ -480,8 +572,12 @@ push back on the frontend to never produce compound stores.
 1. **§ 5.4 — finish KIND="add" lowering** — interface and scratch-attr
    key are reserved; ~30 LoC in `_lower_gemm` to wire it through.
 2. **§ 5.8 — e2e tests** — cheapest insurance per LoC.
-3. **§ 5.1 / 5.2 — internal architecture cleanup** — most expensive,
-   user-invisible; defer until a new op category genuinely demands it.
+3. **§ 5.2 — narrow `annotate_sync` to tile-DSL only** — minor
+   cleanup, ~30 LoC, no longer load-bearing now that the graph back
+   end has its own sync classification table.
 4. **§ 5.7 / 5.9** — minor cleanup, do as time allows.
 
+(§ 5.1 closed: graph back end (`lift_to_blocks` + `graph_pipeline`)
+now separates the four concerns the old walker conflated.)
 (§ 5.5 closed: blocked at TIR layer, not actionable.)
+(§ 5.6 closed: addresses single-source-of-truth via `--dump-buffer-addrs`.)

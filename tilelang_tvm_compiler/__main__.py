@@ -116,22 +116,26 @@ def _emit_output_staging(
     first, then row-blocks (matches the runtime helper's "stage_order:
     col_major"), and emit one emit_load_tile_from_hbm per tile.
     """
+    from tilelang_tvm_compiler.hlir import (
+        hbm_strides_for_layout,
+        make_tile_layout,
+    )
+
     buf = compiled.hlir.get_buffer(out_buffer_name)
     if buf.scope != _scope.HBM:
         raise SystemExit(
             f"--stage-output buffer {out_buffer_name!r} must be in HBM, "
             f"got {buf.scope!r}"
         )
-    rows, cols = _logical_2d(buf.shape)
+    rows, cols = _logical_2d(buf.shape, buf.layout)
     mlen = target.mlen
     if rows % mlen or cols % mlen:
         raise SystemExit(
             f"staging only supports mlen-aligned shapes for now, got "
             f"rows={rows} cols={cols} mlen={mlen}"
         )
-    row_blocks = rows // mlen
-    col_blocks = cols // mlen
     tile_elems = mlen * mlen
+    full_tensor_size = rows * cols
 
     shim = make_shim(
         mlen=target.mlen,
@@ -142,19 +146,83 @@ def _emit_output_staging(
     )
     emitter = ISAEmitter(shim)
 
+    # Per-tile DMA stride between successive rows of one inner tile.
+    # For BSHD this equals cols (legacy behaviour); for NCHW it is
+    # the row-axis HBM stride (= W), NOT the cross-channel cols.
+    # ``buf.hbm_stride`` was already set to the right value by
+    # AddressAllocationPass (via _row_stride_for_layout).
+    inner_tile_stride = buf.hbm_stride if buf.hbm_stride is not None else cols
+
+    # ----- Multi-tile path: when the buffer's 4D logical shape needs
+    # the 7D physical layout (e.g. NCHW with C_OUT > 1), iterate the
+    # tile grid in canonical (D_TILES, S_TILES, H_GROUPS, B) order
+    # and emit one DMA per inner tile. HBM offsets per tile come from
+    # ``hbm_strides_for_layout`` so they correctly account for
+    # NCHW's channel-major HBM layout.
+    if len(buf.shape) == 4:
+        layout = make_tile_layout(
+            shape=tuple(int(x) for x in buf.shape), layout=buf.layout,
+            mlen=mlen, hlen=target.btmm_hlen,
+        )
+    else:
+        layout = None
+
     shim.compiler.generated_code = (
         "\n; ============================================================\n"
         f"; compare staging: {out_buffer_name} (HBM @ {buf.address}) -> VRAM[0..]\n"
+    )
+
+    if layout is not None:
+        hbm_b, hbm_s, hbm_h, _hbm_d = hbm_strides_for_layout(
+            buf.shape, buf.layout,
+        )
+        shim.compiler.generated_code += (
+            f"; tile_layout: d_tiles={layout.d_tiles} s_tiles={layout.s_tiles} "
+            f"h_groups={layout.h_groups} b={layout.logical_b}\n"
+            f"; ({mlen}x{mlen} per inner tile, layout={buf.layout})\n"
+            "; ============================================================\n"
+        )
+        # Iteration order matches the legacy col-major-block-major
+        # ``for j in col_blocks: for i in row_blocks`` walk: outer is
+        # the col-axis tile (d_tile, then h_grp), inner is the
+        # row-axis tile (s_tile, then b). This keeps the per-tile
+        # VRAM landing position byte-identical to what the
+        # comparator's stride-mode reassembler assumes.
+        vram_addr = 0
+        for d_tile in range(layout.d_tiles):
+            for h_grp in range(layout.h_groups):
+                for s_tile in range(layout.s_tiles):
+                    for b in range(layout.logical_b):
+                        hbm_off = (
+                            b * hbm_b
+                            + s_tile * mlen * hbm_s
+                            + h_grp * layout.lane_count * hbm_h
+                            + d_tile * mlen
+                        )
+                        shim.compiler.generated_code += (
+                            f"; stage tile (d={d_tile}, h={h_grp}, "
+                            f"s={s_tile}, b={b}) hbm_off={hbm_off}  "
+                            f"-> vram[{vram_addr}]\n"
+                        )
+                        emitter.emit_load_tile_from_hbm(
+                            hbm_addr=buf.address,
+                            vram_addr=vram_addr,
+                            hbm_stride=inner_tile_stride,
+                            hbm_scale_size=full_tensor_size,
+                            hbm_start_offset=hbm_off,
+                        )
+                        vram_addr += tile_elems
+        return shim.compiler.generated_code
+
+    # ----- Single-tile fast path (non-4D, or 4D buffers that fit
+    # exactly one MLEN×MLEN tile) — same iteration as before.
+    row_blocks = rows // mlen
+    col_blocks = cols // mlen
+    shim.compiler.generated_code += (
         f"; layout: rows={rows} cols={cols} -> {row_blocks}x{col_blocks} tiles "
         f"({mlen}x{mlen} each), col-block-major\n"
         "; ============================================================\n"
     )
-
-    # SCALE register must be set to the FULL HBM tensor size (rows*cols),
-    # not to a single tile. This matches the spec: "scale offset specifies
-    # the distance between data blocks and their scale factors in HBM",
-    # which is keyed off the tensor's total element count.
-    full_tensor_size = rows * cols
     vram_addr = 0
     for j in range(col_blocks):
         for i in range(row_blocks):
@@ -166,8 +234,8 @@ def _emit_output_staging(
             emitter.emit_load_tile_from_hbm(
                 hbm_addr=buf.address,
                 vram_addr=vram_addr,
-                hbm_stride=cols,                 # full row stride
-                hbm_scale_size=full_tensor_size,  # full tensor, NOT one tile
+                hbm_stride=inner_tile_stride,
+                hbm_scale_size=full_tensor_size,
                 hbm_start_offset=hbm_offset_elems,
             )
             vram_addr += tile_elems
@@ -175,20 +243,12 @@ def _emit_output_staging(
     return shim.compiler.generated_code
 
 
-def _logical_2d(shape) -> tuple[int, int]:
-    """Same BSHD-aware collapse as address_alloc._logical_2d. Kept inline
-    here so the CLI doesn't take a hard dep on the address pass module."""
-    if len(shape) == 0:
-        return (1, 1)
-    if len(shape) == 1:
-        return (1, int(shape[0]))
-    if len(shape) == 2:
-        return (int(shape[0]), int(shape[1]))
-    rows = 1
-    for s in shape[:-2]:
-        rows *= int(s)
-    cols = int(shape[-2]) * int(shape[-1])
-    return (rows, cols)
+def _logical_2d(shape, layout: str = "BSHD") -> tuple[int, int]:
+    """Layout-aware (rows, cols) projection. Delegates to the shared
+    helper so __main__'s stage-output staging picks the same axes as
+    address_alloc / isa_pass."""
+    from tilelang_tvm_compiler.hlir import logical_2d_extents
+    return logical_2d_extents(shape, layout)
 
 
 def _cmd_compile(args: argparse.Namespace) -> int:

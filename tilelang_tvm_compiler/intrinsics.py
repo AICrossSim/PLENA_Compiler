@@ -199,6 +199,12 @@ register(IntrinsicSpec(
 ))
 
 register(IntrinsicSpec(
+    name="plena.fp_zero_at",
+    operand_scopes=(None,),  # dst_addr (single FPRAM scalar)
+    emit=lambda a: f"FP_ZERO_AT  dst={a[0]}",
+))
+
+register(IntrinsicSpec(
     name="plena.fp_add_at",
     operand_scopes=(None, None, None),  # lhs_addr, rhs_addr, dst_addr
     emit=lambda a: f"FP_ADD_AT   lhs={a[0]} rhs={a[1]} dst={a[2]}",

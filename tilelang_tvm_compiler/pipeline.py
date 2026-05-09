@@ -64,6 +64,7 @@ def compile_kernel(
     addr_pass = AddressAllocationPass(AddressAllocConfig(
         mlen=target.mlen,
         blen=target.blen,
+        hlen=target.btmm_hlen,
     ))
     addr_pass.run(mod)
 

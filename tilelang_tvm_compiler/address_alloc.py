@@ -29,35 +29,44 @@ from . import hlir as _hlir
 from . import scope as _scope
 
 
-def _logical_2d(shape: Tuple[int, ...]) -> Tuple[int, int]:
-    """Collapse N-D shape -> (rows, cols) using the BSHD convention.
+def _row_stride_for_layout(
+    shape: Tuple[int, ...], layout: str, *, fallback: int,
+) -> int:
+    """Element distance between row r and row r+1 *within the same
+    channel* of a 4D buffer laid out row-major in HBM under ``layout``.
 
-    For 3D+ shapes we treat the LAST TWO dims as (heads, head_dim) and
-    merge them into the col dimension; everything before them folds into
-    rows. This is the "head merging" the runtime compiler does for BTMM
-    inputs:
-        (B, S, H, D)  -> (B*S, H*D)
-        (S, H, D)     -> (S, H*D)
-        (rows, cols)  -> (rows, cols)
-        (n,)          -> (1, n)
+    For BSHD (B, S, H, D): S → S+1 advances H*D elements (same as cols
+    in the logical 2D collapse).
+    For NCHW (N, C, H, W): H → H+1 advances W elements (NOT C*W).
 
-    The whole point: for BTMM, GROUP_HEADS narrow heads of width HLEN
-    pack into a single mlen-wide tile (GROUP_HEADS*HLEN == mlen). The
-    HBM layout already has them physically contiguous (innermost dims),
-    so this merge is a free reinterpretation -- no data movement.
+    Falls back to ``fallback`` for non-4D shapes (where there's no
+    layout-specific notion of "row stride within a channel").
     """
-    if not shape:
-        return (1, 1)
-    if len(shape) == 1:
-        return (1, int(shape[0]))
-    if len(shape) == 2:
-        return (int(shape[0]), int(shape[1]))
-    # 3D and 4D: merge last two dims into cols.
-    rows = 1
-    for s in shape[:-2]:
-        rows *= int(s)
-    cols = int(shape[-2]) * int(shape[-1])
-    return (rows, cols)
+    if len(shape) != 4:
+        return fallback
+    # The row dim's stride is just the product of every dim that lies
+    # AFTER it in the source layout's row-major order.
+    bi, ri, _ci, _di = _hlir.LAYOUT_AXES[layout]
+    stride = 1
+    for i in range(ri + 1, len(shape)):
+        stride *= int(shape[i])
+    return stride
+
+
+def _logical_2d(shape: Tuple[int, ...], layout: str = "BSHD") -> Tuple[int, int]:
+    """Collapse N-D shape -> (rows, cols) using ``layout``.
+
+    Thin wrapper around ``hlir.logical_2d_extents``. For BSHD the legacy
+    "merge last two as cols, fold the rest into rows" heuristic matches
+    (and is used directly for non-4D shapes). For 4D NCHW the row dim
+    is axis 2 (not 1), so we permute via ``LAYOUT_AXES``.
+
+    For BTMM, GROUP_HEADS narrow heads of width HLEN pack into one
+    mlen-wide tile (GROUP_HEADS*HLEN == mlen). HBM has them contiguous
+    on the innermost dims so the merge is a free reinterpretation —
+    no data movement.
+    """
+    return _hlir.logical_2d_extents(shape, layout)
 
 
 # Conservative defaults. Pick non-zero HBM base so address-zero stays
@@ -77,6 +86,9 @@ _FPRAM_BASE = FPRAM_USER_BASE
 class AddressAllocConfig:
     mlen: int
     blen: int
+    hlen: int = 16        # narrow head dim — typically MLEN/4. Used for
+                          # tile_layout detection on 4D BSHD-shaped local
+                          # buffers. Default matches PlenaTarget.btmm_hlen.
     hbm_base: int = _HBM_BASE
     vram_base: int = _VRAM_BASE
     mram_base: int = _MRAM_BASE
@@ -131,7 +143,12 @@ class AddressAllocationPass:
         fpram_cur = self.cfg.fpram_base
 
         for buf in mod.buffers.values():
-            if buf.scope == _scope.HBM:
+            # Collapse `global.<phys>` to `<phys>` for residency decisions —
+            # a `global.vram` buffer allocates from the same VRAM pool as a
+            # regular `vram` buffer; the user-declared global flag only
+            # affects lane-fusion expansion (in allocate_group_memory).
+            phys = _scope.physical_scope(buf.scope)
+            if phys == _scope.HBM:
                 buf.address = hbm_cur
                 # IMPORTANT: increment by the MXFP-packed byte size, not by
                 # the raw fp16 buf.byte_size. `create_mem_for_sim` packs
@@ -140,12 +157,24 @@ class AddressAllocationPass:
                 # If we use buf.byte_size here our HBM addresses won't match
                 # what's actually on disk and H_PREFETCH_M reads garbage.
                 hbm_cur += _hbm_packed_byte_size(buf.num_elements, self.cfg)
-                rows, cols = _logical_2d(buf.shape)
-                # stride = logical 2D cols (full row width). Per-tile DMAs
-                # in the ISA pass walk the buffer with this stride so each
-                # loaded mlen-wide tile contains adjacent rows.
+                rows, cols = _logical_2d(buf.shape, buf.layout)
+                # stride = HBM-row-major distance from canonical row r
+                # to row r+1 of the same channel (NOT cols, when those
+                # differ).
+                #
+                # For BSHD (B, S, H, D) the row dim S is the outer of
+                # the row/col pair, so stride = H*D = cols. ✓
+                #
+                # For NCHW (N, C, H, W) the row dim H sits BETWEEN the
+                # channel C and the col W. Going H → H+1 within the
+                # same channel is W elements; cols = C*W is the
+                # cross-channel collapse. Using cols here would jump a
+                # full channel-width worth of elements per row → wrong
+                # data on every per-tile DMA stride between rows.
                 if buf.hbm_stride is None:
-                    buf.hbm_stride = cols
+                    buf.hbm_stride = _row_stride_for_layout(
+                        buf.shape, buf.layout, fallback=cols,
+                    )
                 # scale_size = total elements of the HBM region (rows*cols),
                 # NOT one tile. The runtime ValueManager always uses the HBM
                 # backing object's full shape product; defaulting to
@@ -161,13 +190,33 @@ class AddressAllocationPass:
                 buf.annotations["logical_cols"] = cols
                 buf.annotations["row_blocks"] = max(1, rows // self.cfg.mlen)
                 buf.annotations["col_blocks"] = max(1, cols // self.cfg.mlen)
-            elif buf.scope == _scope.VRAM:
+            elif phys == _scope.VRAM:
                 buf.address = vram_cur
                 vram_cur += buf.num_elements
-            elif buf.scope == _scope.MRAM:
+                # Detect 4D buffers that need multi-tile physical
+                # storage. None for 2D/1D shapes or single-tile-fitting
+                # shapes — caller falls back to row-major (existing
+                # kernels' single-tile case is unaffected). The buffer's
+                # ``layout`` attribute (set by codegen from
+                # ``T.func_attr({"plena.layout": ...})``) controls how
+                # the 4D axes map to the canonical (B, S, H, D) tile
+                # roles.
+                if len(buf.shape) == 4:
+                    buf.tile_layout = _hlir.make_tile_layout(
+                        shape=tuple(int(x) for x in buf.shape),
+                        layout=buf.layout,
+                        mlen=self.cfg.mlen, hlen=self.cfg.hlen,
+                    )
+            elif phys == _scope.MRAM:
                 buf.address = mram_cur
                 mram_cur += buf.num_elements
-            elif buf.scope == _scope.FPRAM:
+                if len(buf.shape) == 4:
+                    buf.tile_layout = _hlir.make_tile_layout(
+                        shape=tuple(int(x) for x in buf.shape),
+                        layout=buf.layout,
+                        mlen=self.cfg.mlen, hlen=self.cfg.hlen,
+                    )
+            elif phys == _scope.FPRAM:
                 # FPRAM stores scalar FP values; address them in element units
                 # to match S_LD_FP / S_ST_FP and the emulator's fpsram indexing.
                 buf.address = fpram_cur
