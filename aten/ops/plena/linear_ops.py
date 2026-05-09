@@ -54,8 +54,11 @@ def linear_plena(prog, input_var, weight_var):
             k_chunks.append((k_start, k_end - k_start))
             k_start = k_end
 
-        # Temp buffer for partial sums (same shape as output)
-        temp = prog.alloc("linear_out_temp", rows, out_features, strict=output_strict)
+        # Temp buffer for partial sums — only needs one (mlen, mlen) tile since
+        # each sub_projection_to writes a single tile before accumulating.
+        # Using the full output shape would cause VRAM overlap with the output
+        # when out_features > mlen (column-block-major layout).
+        temp = prog.alloc("linear_out_temp", mlen, mlen)
 
         for k_chunk_idx, (k_block_start, k_block_count) in enumerate(k_chunks):
             for col_idx in range(num_col_blocks):
@@ -74,15 +77,17 @@ def linear_plena(prog, input_var, weight_var):
                             k_block_count=k_block_count,
                         )
                     else:
-                        # Subsequent chunks: write to temp, then accumulate into output
+                        # Subsequent chunks: write to temp tile, then accumulate into output.
+                        # temp is a single (mlen, mlen) tile to avoid VRAM overlap
+                        # with the output buffer in column-block-major layout.
                         prog.vram_sub_projection_to(
                             input_var,
                             row_idx,
                             weight_var,
                             col_idx,
                             temp,
-                            row_idx,
-                            col_idx,
+                            0,
+                            0,
                             k_block_start=k_block_start,
                             k_block_count=k_block_count,
                         )
@@ -91,8 +96,8 @@ def linear_plena(prog, input_var, weight_var):
                             row_idx,
                             col_idx,
                             temp,
-                            row_idx,
-                            col_idx,
+                            0,
+                            0,
                             output,
                             row_idx,
                             col_idx,
