@@ -13,26 +13,47 @@ If you discover something the next agent will trip on, append it here.
 ## 1. Pipeline at a glance
 
 ```
-  TIR PrimFunc
-     │  (PlenaCodegen.lower_to_hlir, codegen.py)
+  @T.prim_func (tilelang DSL)
+     │  Frontend (frontend/pipeline.py: compile_func)
+     │   1. stmt prep (inline_let_stmts, lower_compound_fp_stores)
+     │   2. lift_from_raw_primfunc → graph_ir.Graph
+     │   3. graph passes (annotate_grid / annotate_sync /
+     │      split_lane_groups / lift_lane_groups / fuse_elementwise /
+     │      scope_inference)
+     │   4. materialize_to_primfunc(expand_lane_buffers=True)
+     │      runs allocate_group_memory.analyze + expand_buffers.expand
+     │      + lower_fp_row_patterns + curtain-bundle partition
+     │   5. _rewrite_buffer_scopes (shared.dyn → vram, etc.)
      ▼
-  HLIR Module                 ← buffers + Op stream, no addresses
-     │  (AddressAllocationPass, address_alloc.py)
+  TIR PrimFunc with plena.* externs only
+     │  Backend (compile_kernel, pipeline.py)
+     │   PlenaCodegen.lower_to_hlir (codegen.py)
      ▼
-  HLIR Module + addresses     ← per-buffer base address resolved
-     │  (IsaEmitterPass.run, isa_pass.py)
+  HLIRModule                 ← buffers + Op stream, no addresses
+     │  AddressAllocationPass (address_alloc.py)
      ▼
-  ISA text  (printed to stdout / `*_generated_asm_code.asm`)
+  HLIRModule + addresses     ← per-buffer base address resolved
+     │  IsaEmitterPass.run (isa_pass.py)
+     ▼
+  ISA text  (`*_generated_asm_code.asm`)
 ```
 
+- **Frontend is graph-IR-centric.** All semantic analysis, sync /
+  layout / scope inference, pattern fusion, and lane buffer expansion
+  happen on `graph_ir.Graph` (a typed dataclass tree), not on TIR
+  trees. Passes are pure `Graph → Graph` functions. The only stmt
+  walkers left are pre-graph (`inline_let_stmts`,
+  `lower_compound_fp_stores`) and post-graph (`_rewrite_buffer_scopes`).
+  See [`PIPELINE_ARCHITECTURE.md`](../PIPELINE_ARCHITECTURE.md) for the
+  full walkthrough.
 - The compiler is invoked as a subprocess (`python -m tilelang_tvm_compiler
   compile ...`) from a Python 3.11 venv (`.venv-tvm`) because TVM is only
   installed there. The main project venv (`.venv`, 3.12) is for testbench
   inputs/golden via PyTorch.
-- `--dump-hlir <path>` writes the post-pass-2 HLIR — extremely useful for
-  debugging op ordering and scalar-expression rendering. **It is only
-  written if compile_kernel returns successfully**; on a pass-3 failure the
-  HLIR file you see may be stale from a previous run.
+- `--dump-hlir <path>` writes the HLIR after `PlenaCodegen.lower_to_hlir`
+  — useful for debugging op ordering and scalar-expression rendering.
+  **Only written if compile_kernel returns successfully**; on a pass-3
+  failure the HLIR file may be stale from a previous run.
 
 ---
 

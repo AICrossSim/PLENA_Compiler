@@ -1,16 +1,25 @@
 # Migration Plan: All-Graph-Layer Frontend
 
-This document captures the target architecture for the frontend after
-fully migrating from the current "stmt-walker chain + thin graph layer"
+This document captured the target architecture for the frontend after
+fully migrating from the original "stmt-walker chain + thin graph layer"
 to "minimal stmt prep + full graph layer". Each section below describes
 the target form, the migration steps, and the rationale for the design
 choices.
 
-Status as of this writing: **Phase A complete** (graph IR extended,
-graph_walker helpers, `lift_from_raw_primfunc` exists but is not wired
-into the pipeline). **Phase B partial** (`annotate_gemm_kind` removed
-from stmt walker; `graph_passes/scope_inference.py` exists and is
-verified equivalent but not wired). **Phase C-D not started.**
+**Status: Phases A / B / C.1 / C.2 complete.** The all-graph-layer
+pipeline is the only path; legacy stmt-walker passes and
+`frontend_legacy/` have been deleted. See `PIPELINE_ARCHITECTURE.md`
+for the architecture as it stands. **Phase D (loop scheduling — DMA
+merge, prefetch / double-buffer) is the next milestone, not started**;
+it depends on hardware capability data that is still TBD (see § Open
+questions).
+
+> **Reading guide.** This document is now mostly retrospective — the
+> "current pipeline" / "stmt walker" passages below describe the
+> pre-migration state for context. For what the pipeline *currently*
+> does, read `PIPELINE_ARCHITECTURE.md`. The Phase-D plan and the
+> still-relevant Open Questions at the bottom are the only forward-
+> looking parts.
 
 ---
 
@@ -291,35 +300,72 @@ scripts that do the diff. Keep them through migration.
 ## Phases
 
 * **A** ✅ — graph_ir extended, lift_from_raw exists, walker helpers exist.
-* **B** partial — annotate_gemm_kind removed; graph scope_inference and
-  annotate_sync exist but stmt-walker versions still run.
-* **C.1** (next) — write graph passes for annotate_group / split_lane_groups
-  / fuse_elementwise / lower_fp_row_patterns. Move allocate_group_memory
-  into materialize. Pipeline becomes: stmt prep → lift_from_raw →
-  graph passes → materialize. **Keep old pipeline as a fallback flag.**
-* **C.2** — once C.1 is byte-identical across all kernels + e2e, delete
-  old stmt-walker passes and the fallback flag.
-* **D** — real new fusion (DMA merge per HW capabilities). Requires:
-  * confirmed maximum single-DMA element count;
-  * confirmed buffer capacity headroom for any K_sh / V_sh size
-    increase from cross-iter merge.
+* **B** ✅ — annotate_gemm_kind absorbed by lift; graph scope_inference and
+  graph annotate_sync written and used.
+* **C.1** ✅ — graph passes for annotate_grid / split_lane_groups /
+  lift_lane_groups / fuse_elementwise / lower_fp_row_patterns written.
+  allocate_group_memory split into `analyze` (graph pass) +
+  `expand_buffers.expand` (run inside materialize). Pipeline rewired
+  to graph-only path with a temporary fallback flag.
+* **C.2** ✅ — fallback flag and legacy stmt-walker pipeline deleted.
+  All 9 stmt-walker passes (annotate_group, annotate_sync,
+  annotate_gemm_kind, split_lane_groups, fuse_elementwise,
+  scope_inference, allocate_group_memory, lower_fp_row_patterns) +
+  lift_to_blocks + lift_to_graph removed. `frontend_legacy/`
+  directory removed. 6 stmt-walker test files removed.
+* **D** ⏳ — loop-scheduling layer (NOT STARTED). Real new fusion:
+  * **DMA merge** across iterations: combine consecutive K/V DMAs into
+    one bigger transfer.
+  * **Prefetch / double-buffer**: alloc `K_sh_alt`, prefetch tile k+1
+    while computing on k.
+
+  Requires confirmed answers to the HW capability questions below.
 
 ---
 
 ## Open questions
 
-1. **HW capabilities for Phase D**:
-   * Maximum single H_PREFETCH_V / H_PREFETCH_M element count?
-   * Total MRAM / VRAM capacity (so we know how much we can grow K_sh /
-     V_sh for cross-kv_block merge)?
-   * Are H_PREFETCH variants stride-aware? (Affects whether N rows of
-     K from `K_hbm[kv*64..(kv+1)*64]` can fold into one DMA.)
-2. **Should `Graph.buffer_nodes` index by `tir.Var` (data) or by
-   string name?** Today reads/writes carry a `tir.BufferRegion` whose
-   buffer is a `tir.Buffer` — moving to BufferNode reference must
-   maintain identity across passes that mutate. Probably index by
-   `tir.Var` to be unique even if names collide, with a name field for
-   debug.
-3. **NestedForGroup vs ForNode unification?** They overlap — current
-   NestedForGroup has loop_var/min/extent/kind/items but no attrs;
-   ForNode has the same plus attrs. Consolidate.
+### Still relevant
+
+**HW capabilities for Phase D**:
+* Maximum single H_PREFETCH_V / H_PREFETCH_M element count?
+* Total MRAM / VRAM capacity (so we know how much we can grow K_sh /
+  V_sh for cross-kv_block merge)?
+* Are H_PREFETCH variants stride-aware? (Affects whether N rows of
+  K from `K_hbm[kv*64..(kv+1)*64]` can fold into one DMA.)
+
+### Resolved during C.1 / C.2
+
+* ~~Should `Graph.buffer_nodes` index by `tir.Var` (data) or by
+  string name?~~ — **By name.** `BufferAccess(buffer_name, starts,
+  extents)` references it; works across pass boundaries even if
+  underlying `tir.Var` identity churns.
+* ~~NestedForGroup vs ForNode unification?~~ — **Not done; not needed.**
+  We added `attrs: dict` to NestedForGroup and ForRoot directly. The
+  separate ForNode dataclass in graph_ir.py is now unused
+  forward-looking infrastructure (no consumer). Can be removed in a
+  later cleanup or repurposed if Phase D wants a different
+  NestedForGroup shape.
+
+---
+
+## Phase C.2 cleanup notes (for future archaeologists)
+
+What was deleted vs. inlined into graph_passes:
+
+| Old stmt-walker | Replaced by |
+|---|---|
+| `annotate_group.py` | `graph_passes/annotate_grid.py` (+ `_VarSubst` inlined into `graph_passes/split_lane_groups.py` as `_StmtVarSubst`) |
+| `annotate_sync.py` | `graph_passes/annotate_sync.py` |
+| `annotate_gemm_kind.py` | absorbed by `lift_from_raw` (KIND_KEY constant inlined there) |
+| `split_lane_groups.py` | `graph_passes/split_lane_groups.py` (operates on graph items + does the var substitution there) |
+| `fuse_elementwise.py` | `graph_passes/fuse_elementwise.py` (sets ATTR_IS_SYNC on created nodes — see PIPELINE_ARCHITECTURE.md § Bug history) |
+| `scope_inference.py` | `graph_passes/scope_inference.py` (also owns `BufferScopeMap` / `ScopeInferenceError` types) |
+| `allocate_group_memory.py` | split into `graph_passes/allocate_group_memory.py:analyze` (pure analysis) + `graph_passes/expand_buffers.py:expand` (the rewriter; runs inside materialize). `_expand_buffer` and `_Rewriter` inlined into expand_buffers as `_StmtRewriter`. |
+| `lower_fp_row_patterns.py` | `graph_passes/lower_fp_row_patterns.py` (runs inside materialize, AFTER expand_buffers, because pattern matchers need the 4D-expanded shape) |
+| `lift_to_blocks.py` + `lift_to_graph.py` | `lift_from_raw.py` (single-shot; no intermediate block form needed) |
+
+`graph_pipeline.run()` (the backwards-compat wrapper) deleted; only
+`materialize_to_primfunc(graph, scopes, expand_lane_buffers=True)`
+remains. `frontend/pipeline.py:compile_func` is now a single
+straight-line call sequence with no fallback.
