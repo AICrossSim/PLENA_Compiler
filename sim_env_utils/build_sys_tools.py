@@ -75,8 +75,8 @@ def env_setup(memory_data_manager, build_path: str, data_config, quant_config, h
         hbm_row_width: HBM row width
         test_file_name: Optional test file name
     """
-    isa_file_path = _PROJECT_ROOT / "PLENA_Compiler" / "doc" / "operation.svh"
-    config_file_path = _PROJECT_ROOT / "PLENA_Compiler" / "doc" / "configuration.svh"
+    isa_file_path = _PROJECT_ROOT / "compiler" / "doc" / "operation.svh"
+    config_file_path = _PROJECT_ROOT / "compiler" / "doc" / "configuration.svh"
 
     if test_file_name is None:
         assembler = AssemblyToBinary(str(isa_file_path), str(config_file_path))
