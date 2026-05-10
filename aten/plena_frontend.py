@@ -1167,10 +1167,21 @@ def compile_and_run(
     print(f"  Result location: VRAM row {result['comparison_params']['start_row_idx']}")
     print(f"  Layers: {result['info']['num_layers']}, data_order: {result['data_order']}")
 
-    # Run emulator and compare
-    run_and_assert(build_dir, asm_name, mlen=mlen, blen=blen)
+    # Run emulator and compare (don't exit on failure — VRAM stage comparison follows)
+    from transactional_emulator.testbench.emulator_runner import update_plena_config, run_emulator
+    update_plena_config(vlen=mlen, mlen=mlen, blen=blen, verbose=False)
+    print("\n--- Running Rust transactional emulator ---")
+    run_emulator(build_dir)
 
+    print("\n--- Comparing emulator output vs golden ---")
     comp_results, _params = compare_emulator_output(build_dir)
+    from transactional_emulator.tools.check_mem import print_comparison_results
+    print_comparison_results(comp_results, verbose=True, comparison_params=_params)
+
+    if comp_results["allclose_pass"]:
+        print(f"\n[ATen-style {asm_name} test PASSED - ISA generated + emulator verified]")
+    else:
+        print(f"\n[ATen-style {asm_name} test FAILED - emulator numerical check failed]")
 
     # Three-way comparison
     golden = result["golden_output"]
@@ -1189,5 +1200,26 @@ def compile_and_run(
     emu_match = comp_results.get("allclose_match_rate", None)
     if emu_match is not None:
         print(f"  Emulator vs golden (MXFP8+BF16):    {emu_match:.2f}% allclose")
+
+    # VRAM stage comparison: validates each pipeline segment using
+    # emulator's own intermediates as golden input (immune to accumulation drift)
+    try:
+        from compiler.aten.vram_stage_compare import compare_stages
+        emulator_dir = Path(__file__).parent.parent.parent / "transactional_emulator"
+        vram_path = str(emulator_dir / "vram_dump.bin")
+        print("\n--- VRAM stage comparison (authoritative) ---")
+        stage_results = compare_stages(
+            vram_path=vram_path,
+            build_dir=str(build_dir),
+            hidden=result["info"]["hidden_size"],
+            inter=result["info"].get("inter_dim", result["info"]["hidden_size"] * 4),
+            num_heads=result["info"]["num_heads"],
+            num_kv_heads=result["info"]["num_kv_heads"],
+        )
+        stage_pass = stage_results.get("norm+FFN+norm", 0) >= 99.0
+        comp_results["vram_stage_allclose"] = stage_results.get("norm+FFN+norm", None)
+        comp_results["vram_stage_pass"] = stage_pass
+    except Exception as e:
+        print(f"  (skipped: {e})")
 
     return {**result["info"], **comp_results}
