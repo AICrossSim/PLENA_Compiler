@@ -1,12 +1,18 @@
-"""PlenaCompiler — unified single-class PLENA ISA compiler.
+"""PlenaCompiler -- ATen Pipeline (Pipeline 1) compilation backend.
 
-Contains the full inheritance chain: TileCompiler (memory bookkeeping) →
-DeveloperCompiler (ISA emission, FP/FPRAM ops, interrupts) → PlenaCompiler
+Manages VRAM/MRAM/FPRAM allocation, HBM weight layout, and address
+register initialization (C_SET_ADDR_REG). Produces numerically verified
+ISA (98-100% allclose against PyTorch golden reference).
+
+Contains the full inheritance chain: TileCompiler (memory bookkeeping) ->
+DeveloperCompiler (ISA emission, FP/FPRAM ops, interrupts) -> PlenaCompiler
 (user-facing DSL). Tensor proxy classes (TensorVar, InputVar, VRAMMatrixVar,
 FPVar) and the unified Tensor type union / TensorKind enum are re-exported
 from the same module.
 
 Previously aliased as ``PLENAProgram``; that alias has been retired.
+
+See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
 
 from __future__ import annotations
@@ -4517,6 +4523,37 @@ class PlenaCompiler(DeveloperCompiler):
         self._tensors[internal_name] = var
         return var
 
+    def alloc_at(self, name: str, rows: int, cols: int, vram_addr: int) -> VRAMMatrixVar:
+        """Allocate a VRAM matrix view at a specific address.
+
+        Used to create views into existing VRAM matrices (e.g., per-head
+        slices of a multi-head Q projection output). Does NOT bump the
+        VRAM allocator -- the caller is responsible for ensuring the region
+        is valid.
+
+        Args:
+            name: matrix name (user-visible)
+            rows: number of rows
+            cols: number of columns
+            vram_addr: absolute VRAM address for this view
+
+        Returns:
+            VRAMMatrixVar proxy object
+        """
+        display_name = name
+        internal_name = self._scoped_name(name)
+        self._compiler.add_vram_object(
+            name=internal_name,
+            shape=(rows, cols),
+            vram_addr=vram_addr,
+            allocate_if_none=False,
+        )
+        isa_code = f"; VRAM View {name}: ({rows}, {cols}) at VRAM[{vram_addr}]\n"
+        self._compiler.generated_code += isa_code
+        var = VRAMMatrixVar(self, internal_name, (rows, cols), display_name=display_name)
+        self._tensors[internal_name] = var
+        return var
+
     def free_tensor(self, tensor_var: TensorVar):
         """
         Free a tensor in VRAM, reclaiming space for subsequent allocations.
@@ -5175,7 +5212,18 @@ class PlenaCompiler(DeveloperCompiler):
         """
         if rows is None:
             rows = list(range(matrix.shape[0]))
-        super().vram_fill_zero(matrix.name, rows)
+        else:
+            rows = list(rows)
+
+        total_rows, cols = matrix.shape
+        if any(row < 0 or row >= total_rows for row in rows):
+            raise ValueError(f"vram_fill_zero rows out of bounds for {matrix.name}: shape={matrix.shape}, rows={rows}")
+
+        # VRAM matrices are column-block-major. The low-level tile helper zeros
+        # one 64-column tile, so walk every column block for wide matrices.
+        num_col_blocks = (cols + self.mlen - 1) // self.mlen
+        for col_block in range(num_col_blocks):
+            super().vram_fill_zero(matrix.name, rows, tile_col_idx=col_block)
 
     def _ensure_hbm_sub_matrix_registered(self, input_var: InputVar):
         """Ensure an HBM input is registered in compiler sub-matrix manager."""

@@ -299,6 +299,7 @@ def test_model():
         "layer_1_mlp",
         "layer_1_ffn_residual",
         "final_layernorm",
+        "lm_head",
     ]
 
     if execution_order == expected_sequence:

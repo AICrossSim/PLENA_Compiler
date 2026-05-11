@@ -26,6 +26,9 @@ def flash_attn_asm(
     fp_sram_start_address: int,
     k_base_hbm_offset_reg: int,
     v_base_hbm_offset_reg: int,
+    attn_scale_fp_address: int = 5,
+    inf_fp_address: int = 0,
+    causal_mask: bool = True,
 ) -> str:
     """
     Args:
@@ -33,6 +36,17 @@ def flash_attn_asm(
     fp_sram_start_address: the start address of the fp SRAM
     k_base_hbm_offset_reg: the offset register of the k base address in HBM
     v_base_hbm_offset_reg: the offset register of the v base address in HBM
+    attn_scale_fp_address: FP SRAM slot holding 1/sqrt(head_dim) for QK
+        scaling. Defaults to 5 to match
+        ``mem_layout_lib.json::fp_sram::attn_scale``. The scheduler-provided
+        slot is forwarded by the caller; previously this was hardcoded to 1
+        (the eps slot) and produced catastrophically mis-scaled attention
+        logits once fp_sram.bin was seeded per the JSON convention.
+    inf_fp_address: FP SRAM slot holding the -inf sentinel used to seed the
+        running-max state at the start of each kv tile. Defaults to 0 to match
+        ``mem_layout_lib.json::fp_sram::infinity``. Previously hardcoded to 2
+        (the hid_reciprocal slot ~= 0.016), which made the running-max start
+        at a positive value and corrupted the entire flash softmax accumulation.
     Description:
         This part of asm takes the multi-loops, looping over kv head, then two loops for the flash atten, with small loops over q head per kv head within the inner loop.
     """
@@ -45,31 +59,39 @@ def flash_attn_asm(
     br = min(mlen, q_len)
     bc = min(mlen, kv_len)
 
-    # Assemptions
-    # In current Version (Not Complete)
-    assert blen == q_index_2_kv_index_ratio, "Blen must be equal to q_index_2_kv_index_ratio in current version"
+    # Batched path (M_BTMM) when ratio == blen — maximum throughput.
+    # Per-head path (M_TMM) for all other ratios — avoids M_BTMM over-read
+    # panic when ratio < blen (the extra blen-ratio "dummy" heads would read
+    # Q past the kv-group allocation).
+    use_batched = q_index_2_kv_index_ratio == blen
 
     # Memory Layout:
     # -- FP SRAM --
-    # Defalt 0 - zero
-    # 1 - infinity
-    # fp_sram_start_address - 1 - qk_scale
-    # per head dimension * q_index_2_kv_index_ratio level {
-    # - m old (MLEN) - 0
-    # - m res (MLEN) - 1
-    # - l old (MLEN) - 2
-    # }
+    # ``inf_fp_address`` (default 0) - infinity sentinel for running-max init.
+    # ``attn_scale_fp_address`` (default 5) - 1/sqrt(head_dim) (QK scale).
+    # Both slot indices are forwarded by the caller from
+    # ``scheduler["memory_layout"]["fp_sram"]`` so mem_layout_lib.json is the
+    # single source of truth for FPRAM constant placement; this template no
+    # longer hardcodes addresses 1 and 2.
+    # ``fp_sram_start_address`` onwards holds, for each q head in the kv-group:
+    # - m old (br)
+    # - m res (br)
+    # - l old (br)
 
     print("=" * 5, "VSRAM Memory Layout", "=" * 5)
     # -- Vector SRAM --
     # Q  (q_len, hq, d) - Q is stored with shape [seq_len, num_q_heads, head_dim]
     q_base_address = vector_sram_base_address
     print(f"Q Base Address: {q_base_address}")
-    # tmp S (MLEN, MLEN, blen) and also tmp P.
+    # tmp S (MLEN, MLEN, s_tile_count) and also tmp P.
+    # Batched path: M_BMM_WO writes blen tiles; allocate blen tiles even though
+    # only ratio are consumed by softmax/PV (harmless dead writes).
+    # Per-head path: only 1 S tile needed at a time (reused per head).
+    s_tile_count = blen if use_batched else 1
     s_base_address = q_base_address + q_len * hq * d  # Q size = seq_len * num_q_heads * head_dim
     print(f"S Base Address: {s_base_address}")
     # PV (q_index_2_kv_index_ratio, mlen, mlen)
-    pv_base_address = s_base_address + mlen * mlen * q_index_2_kv_index_ratio
+    pv_base_address = s_base_address + mlen * mlen * s_tile_count
     print(f"PV Base Address: {pv_base_address}")
     # O_Old (q_len, HEAD_DIM * Hq * batch)
     o_old_base_address = pv_base_address + mlen * mlen * q_index_2_kv_index_ratio
@@ -94,18 +116,23 @@ def flash_attn_asm(
             # Reset m_fp_sram_start_address for each iteration
             m_fp_sram_start_address = fp_sram_start_address
 
-            # Reset m old for every q_index_2_kv_index_ratio q heads with -inf
+            # Reset m old for every q_index_2_kv_index_ratio q heads with -inf.
+            # ``inf_fp_address`` is forwarded by the caller from
+            # ``scheduler["memory_layout"]["fp_sram"]["infinity"]`` (default 0
+            # per mem_layout_lib.json).  The previous hardcoded value 2 was
+            # the hid_reciprocal slot (~ 0.016 once seeded), which left the
+            # running-max init positive and broke flash-softmax accumulation.
             generated_code += reset_fpsram_code(
                 reset_start_address=m_fp_sram_start_address,
                 per_stride_dim=br,
                 stride_dist=3 * br,
                 reset_amount=q_index_2_kv_index_ratio,
-                reset_val_address=2,
+                reset_val_address=inf_fp_address,
                 alive_registers_fp=alive_registers_fp[0:1],
                 alive_registers_int=alive_registers_int[0:4],
             )
 
-            # Reset l with zeros
+            # Reset l_old to zero (use hardware f0, not FP SRAM slot 0 which is -inf)
             generated_code += reset_fpsram_code(
                 reset_start_address=m_fp_sram_start_address + 2 * br,
                 per_stride_dim=br,
@@ -114,6 +141,7 @@ def flash_attn_asm(
                 reset_val_address=0,
                 alive_registers_fp=alive_registers_fp[0:1],
                 alive_registers_int=alive_registers_int[0:4],
+                use_zero_reg=True,
             )
 
             # Reset O_old with zeros
@@ -128,37 +156,70 @@ def flash_attn_asm(
 
             # # loop over per q_index_2_kv_index_ratio q heads (q_len // MLEN), compute q_index_2_kv_index_ratio heads in parallel.
             for _ in range(q_seq_iteration_number):
-                # Compute S = QKT result for this Q head
-                # Q layout: (batch, s_q, num_q_heads, h_qkv) -> qkt_multiply adds q_head_index * d internally
-                # Q row stride = (hq * d) / mlen = total elements per token / mlen
                 stored_m_fp_res_address = m_fp_sram_start_address + br
-                generated_code += qkt_multiply(
-                    d=d,
-                    mlen=mlen,
-                    stage=stage,
-                    alive_registers=alive_registers_int[0:2],
-                    q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
-                    k_base_hbm_offset_reg=k_base_hbm_offset_reg,
-                    q_head_index=kv_head_index * q_index_2_kv_index_ratio,
-                    k_head_index=kv_head_index,
-                    s_base_address=s_base_address + kv_head_index * br * bc,
-                )
-                generated_code += reset_reg_asm(alive_registers_int[0:2])
 
-                # Now the S is in expected to stored in (blen, br, bc) in vsram
+                if use_batched:
+                    # --- Batched path: M_BTMM computes all ratio heads at once ---
+                    # Q layout: (batch, s_q, num_q_heads, h_qkv)
+                    generated_code += qkt_multiply(
+                        d=d,
+                        mlen=mlen,
+                        stage=stage,
+                        alive_registers=alive_registers_int[0:2],
+                        q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                        k_base_hbm_offset_reg=k_base_hbm_offset_reg,
+                        q_head_index=kv_head_index * q_index_2_kv_index_ratio,
+                        k_head_index=kv_head_index,
+                        s_base_address=s_base_address,
+                        s_head_offset=0,
+                        use_batched=True,
+                        blen=blen,
+                    )
+                    generated_code += reset_reg_asm(alive_registers_int[0:2])
 
                 for inner_q_head_index in range(q_index_2_kv_index_ratio):
-                    # Per Q head level online softmax
+                    if not use_batched:
+                        # --- Per-head path: M_TMM computes one head's QKT ---
+                        # K prefetch is inside qkt_multiply (one H_PREFETCH_M
+                        # per head).  Since MSRAM tile 0 is reloaded each time,
+                        # the K data is always fresh.
+                        abs_q_head = kv_head_index * q_index_2_kv_index_ratio + inner_q_head_index
+                        generated_code += qkt_multiply(
+                            d=d,
+                            mlen=mlen,
+                            stage=stage,
+                            alive_registers=alive_registers_int[0:9],
+                            q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                            k_base_hbm_offset_reg=k_base_hbm_offset_reg,
+                            q_head_index=abs_q_head,
+                            k_head_index=kv_head_index,
+                            s_base_address=s_base_address,
+                            s_head_offset=0,  # single S tile, always at offset 0
+                            use_batched=False,
+                            blen=blen,
+                        )
+                        generated_code += reset_reg_asm(alive_registers_int[0:9])
+
+                    # Per Q head level online softmax.  ``attn_scale_fp_address``
+                    # is forwarded by the caller from
+                    # ``scheduler["memory_layout"]["fp_sram"]["attn_scale"]``
+                    # so this template no longer hardcodes the QK-scale slot.
+                    #
+                    # For batched path: S tiles are at s_base + head * br * bc.
+                    # For per-head path: S tile is always at s_base (offset 0).
+                    s_softmax_addr = s_base_address + (inner_q_head_index * br * bc if use_batched else 0)
                     generated_code += online_softmax_code(
                         mlen=mlen,
                         stage=stage,
                         alive_registers_int=alive_registers_int[0:5],
                         alive_registers_fp=alive_registers_fp[0:5],
-                        s_address=s_base_address + inner_q_head_index * br * bc,
+                        s_address=s_softmax_addr,
                         m_start_address=m_fp_sram_start_address,
-                        qk_scale_address=1,  # qk_scale preloaded at FP SRAM address 1
+                        qk_scale_address=attn_scale_fp_address,
+                        causal_mask=causal_mask,
                     )
-                    # P is stored in s_base_address + inner_q_head_index * mlen * mlen, taking (blen, mlen, mlen) as a block
+                    # P is stored in s_base_address (per-head) or
+                    # s_base_address + inner_q_head_index * mlen * mlen (batched)
                     m_fp_sram_start_address += br * 3
                     generated_code += reset_fpreg_asm(alive_registers_fp[0:6])
                     generated_code += reset_reg_asm(alive_registers_int[0:6])

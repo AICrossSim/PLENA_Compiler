@@ -1,6 +1,11 @@
 import re
 from pathlib import Path
 
+try:
+    import toml
+except ImportError:
+    toml = None
+
 
 _PARAM_PATTERN = re.compile(r"\s*(?:localparam|parameter)\s+(?:\w+\s+)?(\w+)\s*=\s*([^;]+);")
 
@@ -32,3 +37,12 @@ def load_svh_settings(file_path: str | Path) -> dict[str, int]:
             hardware_settings[name] = value
 
     return hardware_settings
+
+
+def load_toml_config(file_path, section_to_load=None, mode="BEHAVIOR"):
+    if toml is None:
+        raise ImportError("'toml' package required for load_toml_config. Install with: pip install toml")
+    with open(file_path) as f:
+        full_toml = toml.load(f)
+    mode_section = full_toml.get(mode, {})
+    return mode_section.get(section_to_load, {})
