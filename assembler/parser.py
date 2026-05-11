@@ -210,6 +210,8 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                     rstride = int(operand_3)
                 except ValueError:
                     rstride = None
+                if opcode == "H_STORE_V":
+                    funct1 = 0
             elif len(operands) == 5:
                 operand_0, operand_1, operand_2, operand_3, operand_4 = operands
                 rd = parse_reg_or_int(operand_0)
