@@ -156,11 +156,33 @@ def _try_reci_source(expr, scopes: BufferScopeMap) -> Optional[tir.BufferLoad]:
 
 
 def _row_dims_from_indices(buf: tir.Buffer, indices, loop_var: tir.Var):
+    """Extract the logical (row, head) coordinates from a 4D BSHD access.
+
+    The buffer's shape is always BSHD ``(B, S, H, D)`` post-expand_buffers.
+    Which axis carries the lane depends on the expansion mode:
+
+      * COL_PACK ``(1, S, lane, narrow_D)`` — lane in H axis at indices[2]
+      * ROW_STACK ``(lane, S, 1, MLEN)``    — lane in B axis at indices[0]
+      * Single tile / wide-D ``(1, S, 1, *)`` — no lane, head defaults to 0
+
+    Returns the layout-agnostic (row, head) pair so downstream
+    ``_resolve_row_at_coords`` can translate it back to physical coords
+    via ``buf.layout`` + ``buf.tile_layout``.
+    """
     if len(buf.shape) != 4 or len(indices) != 4:
         return None
     if not isinstance(indices[-1], tir.Var) or indices[-1].name != loop_var.name:
         return None
-    return indices[1], indices[2]
+    b_dim = int(buf.shape[0])
+    h_dim = int(buf.shape[2])
+    row = indices[1]
+    if h_dim > 1 and b_dim == 1:
+        head = indices[2]      # COL_PACK
+    elif b_dim > 1 and h_dim == 1:
+        head = indices[0]      # ROW_STACK
+    else:
+        head = indices[2]      # single-tile / wide-D — head is 0 anyway
+    return row, head
 
 
 def _region_components(call: tir.Call):
@@ -373,14 +395,25 @@ def _try_lower_reduce(node: GraphNode,
     row = tir.Var("row", "int32")
     dst_elem = tir.BufferLoad(dst_buf, [lane_expr, _add(row_base, row)])
 
-    if int(src_buf.shape[-1]) == 64:
-        dim2 = src_starts[1]
-        dim3 = _add(src_starts[2], row)
+    # Layout-agnostic (row, head) emission. The src buffer is 4D BSHD
+    # but the lane axis differs by expansion mode:
+    #   COL_PACK  (1, S, lane, narrow_D)  → head = src_starts[2]
+    #   ROW_STACK (lane, S, 1, MLEN)      → head = src_starts[0]
+    #   single tile / wide-D (1, S, 1, *) → head = 0 (unused downstream)
+    # isa_pass._resolve_row_at_coords translates (row, head) back to
+    # physical (B, S, H, D) using buf.layout/tile_layout.
+    b_dim = int(src_buf.shape[0])
+    h_dim = int(src_buf.shape[2])
+    s_base = src_starts[1]
+    if h_dim > 1 and b_dim == 1:
+        head_expr = src_starts[2]      # COL_PACK
+    elif b_dim > 1 and h_dim == 1:
+        head_expr = src_starts[0]      # ROW_STACK
     else:
-        dim2 = _add(src_starts[1], row)
-        dim3 = src_starts[2]
+        head_expr = tir.IntImm("int32", 0)
+    row_expr = _add(s_base, row)
 
-    body = tir.Evaluate(_make_call(intrin, [src_buf.data, dst_elem, dim2, dim3]))
+    body = tir.Evaluate(_make_call(intrin, [src_buf.data, dst_elem, row_expr, head_expr]))
     for_stmt = tir.For(
         row, tir.IntImm("int32", 0), tir.IntImm("int32", rows),
         tir.ForKind.SERIAL, body,

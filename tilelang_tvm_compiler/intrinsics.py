@@ -248,48 +248,58 @@ register(IntrinsicSpec(
 
 
 # ---------------------------------------------------------------------------
-# Row ops (`_at` only). VRAM-side dim2/dim3 select the row to operate on
-# and synthesize any packed-head V_MASK; FP-side operand is a SCALAR
-# address, identical to the FP `_at` family above.
+# Row ops (`_at` only). VRAM-side trailing scalars (row_idx, head_idx) are
+# the buffer's *logical* (S, H) BSHD coordinates of the row to operate on:
+#
+#   * row_idx  — index along the logical S axis (which mlen-row).
+#   * head_idx — index along the logical H axis (which head/lane).
+#
+# These two are layout-agnostic at the graph-IR layer (i.e. the same
+# whether the buffer is COL_PACK, ROW_STACK, or single-tile). isa_pass's
+# ``_resolve_row_at_coords`` is the single point that consults
+# ``buf.layout`` + ``buf.tile_layout`` to turn (row, head) into the
+# physical (B, S, H, D) 7D coordinates and finally a VRAM row address
+# plus optional lane V_MASK. FP-side operand is a SCALAR address,
+# identical to the FP `_at` family above.
 # ---------------------------------------------------------------------------
 
 register(IntrinsicSpec(
     name="plena.row_reduce_max_at",
-    # vram_src, fp_dst_addr, dim2, dim3
+    # vram_src, fp_dst_addr, row, head
     operand_scopes=(_scope.VRAM, None, None, None),
-    emit=lambda a: f"ROW_REDUCE_MAX_AT src={a[0]} dst={a[1]} dim2={a[2]} dim3={a[3]}",
+    emit=lambda a: f"ROW_REDUCE_MAX_AT src={a[0]} dst={a[1]} row={a[2]} head={a[3]}",
 ))
 
 register(IntrinsicSpec(
     name="plena.row_reduce_sum_at",
     operand_scopes=(_scope.VRAM, None, None, None),
-    emit=lambda a: f"ROW_REDUCE_SUM_AT src={a[0]} dst={a[1]} dim2={a[2]} dim3={a[3]}",
+    emit=lambda a: f"ROW_REDUCE_SUM_AT src={a[0]} dst={a[1]} row={a[2]} head={a[3]}",
 ))
 
 register(IntrinsicSpec(
     name="plena.row_exp_at",
-    # vram_src, vram_dst, dim2, dim3 (no FP operand)
+    # vram_src, vram_dst, row, head (no FP operand)
     operand_scopes=(_scope.VRAM, _scope.VRAM, None, None),
-    emit=lambda a: f"ROW_EXP_AT src={a[0]} dst={a[1]} dim2={a[2]} dim3={a[3]}",
+    emit=lambda a: f"ROW_EXP_AT src={a[0]} dst={a[1]} row={a[2]} head={a[3]}",
 ))
 
 register(IntrinsicSpec(
     name="plena.row_sub_fp_at",
-    # vram_src, fp_addr, vram_dst, dim2, dim3
+    # vram_src, fp_addr, vram_dst, row, head
     operand_scopes=(_scope.VRAM, None, _scope.VRAM, None, None),
-    emit=lambda a: f"ROW_SUB_FP_AT src={a[0]} rhs={a[1]} dst={a[2]} dim2={a[3]} dim3={a[4]}",
+    emit=lambda a: f"ROW_SUB_FP_AT src={a[0]} rhs={a[1]} dst={a[2]} row={a[3]} head={a[4]}",
 ))
 
 register(IntrinsicSpec(
     name="plena.row_mul_fp_at",
     operand_scopes=(_scope.VRAM, None, _scope.VRAM, None, None),
-    emit=lambda a: f"ROW_MUL_FP_AT src={a[0]} rhs={a[1]} dst={a[2]} dim2={a[3]} dim3={a[4]}",
+    emit=lambda a: f"ROW_MUL_FP_AT src={a[0]} rhs={a[1]} dst={a[2]} row={a[3]} head={a[4]}",
 ))
 
 register(IntrinsicSpec(
     name="plena.row_add_fp_at",
     operand_scopes=(_scope.VRAM, None, _scope.VRAM, None, None),
-    emit=lambda a: f"ROW_ADD_FP_AT src={a[0]} rhs={a[1]} dst={a[2]} dim2={a[3]} dim3={a[4]}",
+    emit=lambda a: f"ROW_ADD_FP_AT src={a[0]} rhs={a[1]} dst={a[2]} row={a[3]} head={a[4]}",
 ))
 
 

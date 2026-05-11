@@ -129,41 +129,65 @@ class IsaEmitterPass:
         buf: _hlir.Buffer,
         op_kind: str,
         role: str,
-        dim2_expr,
-        dim3_expr,
+        row_expr,
+        head_expr,
     ) -> Tuple[tir.PrimExpr, tir.PrimExpr | None]:
+        """Translate the logical (row, head) coordinates carried by a
+        ``plena.row_*_at`` call into a physical VRAM mlen-row index plus
+        an optional lane V_MASK, by consulting the buffer's BSHD shape.
+
+        Buffers post-expand_buffers are always 4D BSHD ``(B, S, H, D)``:
+
+          * COL_PACK   ``(1, S, H, narrow_D)`` with ``H*D == MLEN``:
+              head → H axis (lane within an mlen-row).
+              physical row = S coord; mask = ``1 << head``.
+          * ROW_STACK  ``(lane, S, 1, MLEN)``:
+              head → B axis (which stacked tile).
+              physical row = ``B*S_per_tile + s``; no mask.
+          * Single-tile / wide-D ``(1, S, 1, D)`` with D >= MLEN:
+              head unused (kernel passes 0). For wide-D this resolver
+              returns the row within the d_tile==0 block; the d_tile
+              loop / unroll lives in the emission helper.
+        """
         _check_scope(buf, _scope.VRAM, op_kind, role)
         if len(buf.shape) != 4:
             raise IsaEmissionError(
-                f"{op_kind} {role} buffer {buf.name!r} must be 4D for logical (dim2, dim3) addressing; "
-                f"got shape={buf.shape}"
+                f"{op_kind} {role} buffer {buf.name!r} must be 4D BSHD for "
+                f"logical (row, head) addressing; got shape={buf.shape}"
             )
-        if int(buf.shape[0]) != 1:
-            raise IsaEmissionError(
-                f"{op_kind} {role} buffer {buf.name!r} currently requires batch dimension 1; "
-                f"got shape={buf.shape}"
+        mlen = int(self.shim.mlen)
+        b_dim = int(buf.shape[0])
+        s_dim = int(buf.shape[1])
+        h_dim = int(buf.shape[2])
+        d_dim = int(buf.shape[3])
+
+        # COL_PACK packed-narrow: head is the lane slot within an mlen-row.
+        if b_dim == 1 and h_dim > 1 and h_dim * d_dim == mlen:
+            return row_expr, tir.shift_left(
+                tir.IntImm("int32", 1), head_expr,
             )
 
-        if int(buf.shape[-1]) == int(self.shim.mlen):
-            # Full-width rows: each logical (dim2, dim3) pair names one mlen-wide
-            # vector directly, with dim2 selecting the head-like outer group.
-            row_stride = tir.IntImm("int32", int(buf.shape[2]))
-            vram_row_expr = tir.Add(tir.Mul(dim2_expr, row_stride), dim3_expr)
-            mask_expr = None
-        else:
-            packed_heads = int(buf.shape[2])
-            packed_width = int(buf.shape[3])
-            if packed_heads * packed_width != int(self.shim.mlen):
-                raise IsaEmissionError(
-                    f"{op_kind} {role} buffer {buf.name!r} has narrow D={packed_width} but does not pack "
-                    f"one full mlen row across dim3; shape={buf.shape}, mlen={self.shim.mlen}"
-                )
-            # Packed narrow rows: dim2 selects the physical row, dim3 selects the
-            # head slot within that row. Emit a V_MASK for that slot.
-            vram_row_expr = dim2_expr
-            mask_expr = tir.shift_left(tir.IntImm("int32", 1), dim3_expr)
+        # ROW_STACK: lane is stacked along B; head picks the B slot.
+        if b_dim > 1 and h_dim == 1 and d_dim == mlen:
+            stride = tir.IntImm("int32", s_dim)
+            vram_row_expr = tir.Add(tir.Mul(head_expr, stride), row_expr)
+            return vram_row_expr, None
 
-        return vram_row_expr, mask_expr
+        # Single full-width tile (B=1, H=1, D == MLEN): head ignored.
+        if b_dim == 1 and h_dim == 1 and d_dim == mlen:
+            return row_expr, None
+
+        # Wide-D (B=1, H=1, D > MLEN, D % MLEN == 0): head ignored; the
+        # d_tile dim is driven by the wide-D unroll in the emit helper
+        # (not this resolver). vram_row is the row within d_tile==0.
+        if b_dim == 1 and h_dim == 1 and d_dim > mlen and d_dim % mlen == 0:
+            return row_expr, None
+
+        raise IsaEmissionError(
+            f"{op_kind} {role} buffer {buf.name!r}: BSHD shape {buf.shape} "
+            f"does not match any supported row_*_at addressing mode "
+            f"(COL_PACK / ROW_STACK / single-tile / wide-D) for mlen={mlen}"
+        )
 
     def _resolve_fp_scalar_addr_arg(
         self,
@@ -266,31 +290,34 @@ class IsaEmitterPass:
         src = mod.get_buffer(op.buffer_args[0])
         _check_scope(src, _scope.VRAM, op.kind, "src")
         # `reduce` always has an FP destination; otherwise has_fp is set by
-        # the per-op dispatcher to distinguish (vram, vram, dim2, dim3) from
-        # (vram, fp_addr, vram, dim2, dim3) at the HLIR level.
+        # the per-op dispatcher to distinguish (vram, vram, row, head) from
+        # (vram, fp_addr, vram, row, head) at the HLIR level.
         has_fp = has_fp or reduce
         # Scalar layout (positional, after the buffer args):
-        #   reduce / has-fp non-reduce: [fp_addr, dim2, dim3]
-        #   exp / no-fp:                [dim2, dim3]
+        #   reduce / has-fp non-reduce: [fp_addr, row, head]
+        #   exp / no-fp:                [row, head]
+        # row, head are layout-agnostic logical S/H coords (see
+        # intrinsics.py row_*_at spec); _resolve_row_at_coords folds
+        # them into physical (vram_row, mask) via buf.shape.
         if has_fp:
             if len(op.scalar_args) != 3:
                 raise IsaEmissionError(
-                    f"{op.kind} expects 3 scalar args (fp_addr, dim2, dim3); got {len(op.scalar_args)}"
+                    f"{op.kind} expects 3 scalar args (fp_addr, row, head); got {len(op.scalar_args)}"
                 )
             fp_addr_expr = self._resolve_fp_scalar_addr_arg(
                 mod, op.scalar_args[0], op.kind, "fp",
             )
-            dim2_expr, dim3_expr = op.scalar_args[1], op.scalar_args[2]
+            row_expr, head_expr = op.scalar_args[1], op.scalar_args[2]
         else:
             if len(op.scalar_args) != 2:
                 raise IsaEmissionError(
-                    f"{op.kind} expects 2 scalar args (dim2, dim3); got {len(op.scalar_args)}"
+                    f"{op.kind} expects 2 scalar args (row, head); got {len(op.scalar_args)}"
                 )
             fp_addr_expr = None
-            dim2_expr, dim3_expr = op.scalar_args[0], op.scalar_args[1]
+            row_expr, head_expr = op.scalar_args[0], op.scalar_args[1]
 
         src_row_expr, mask_expr = self._resolve_row_at_coords(
-            src, op.kind, "src", dim2_expr, dim3_expr
+            src, op.kind, "src", row_expr, head_expr
         )
         mats = []
 
@@ -330,7 +357,7 @@ class IsaEmitterPass:
                 dst = mod.get_buffer(op.buffer_args[1])
                 _check_scope(dst, _scope.VRAM, op.kind, "dst")
                 dst_row_expr, dst_mask_expr = self._resolve_row_at_coords(
-                    dst, op.kind, "dst", dim2_expr, dim3_expr
+                    dst, op.kind, "dst", row_expr, head_expr
                 )
                 if emit_v_mask and dst_mask_expr is None:
                     raise IsaEmissionError(
@@ -350,7 +377,7 @@ class IsaEmitterPass:
                 dst = mod.get_buffer(op.buffer_args[1])
                 _check_scope(dst, _scope.VRAM, op.kind, "dst")
                 dst_row_expr, dst_mask_expr = self._resolve_row_at_coords(
-                    dst, op.kind, "dst", dim2_expr, dim3_expr
+                    dst, op.kind, "dst", row_expr, head_expr
                 )
                 if emit_v_mask and dst_mask_expr is None:
                     raise IsaEmissionError(
@@ -713,19 +740,15 @@ class IsaEmitterPass:
         clear error if a dynamic start shows up so we don't silently
         miscompile.
         """
-        if self._slice_has_dynamic_start(sl):
-            raise IsaEmissionError(
-                f"dma_h2v_slice: dynamic starts on a multi-tile dst "
-                f"({dst.name!r}) are not supported yet — only fully-"
-                f"static slices like Input[0,0,0,0] are. Slice starts: "
-                f"{sl.starts!r}"
-            )
         layout = dst.tile_layout
         assert layout is not None
-        # Static base offset = flat element offset of (b, s, h, d) starts
-        # in the HBM parent's logical row-major layout, plus the parent's
-        # own hbm_offset.
-        base_static = parent.hbm_offset + self._slice_offset_static(parent, sl)
+        # Slice base offset: dynamic + static contribution. The dynamic
+        # piece is materialised into a GP register once; the static
+        # residual is folded into each per-tile constant offset below.
+        m_off, slice_static = self._materialise_slice_offset(parent, sl)
+        base_static = parent.hbm_offset + (
+            slice_static if slice_static is not None else 0
+        )
 
         # HBM strides per logical (B, S, H, D) dim (row-major).
         if len(parent.shape) != 4:
@@ -745,10 +768,15 @@ class IsaEmitterPass:
         # in every layout we currently support). Asserted via the
         # ``hbm_strides_for_layout`` helper.
 
-        # VRAM tile-grid strides from the 7D physical layout.
+        # VRAM tile-grid strides from the 7D physical layout. Match the
+        # convention used by ``_flatten_starts_tiled`` in lower_to_hlir:
+        # B's own stride is one inner tile (``inner_s``); ``inner_b`` is
+        # B's total volume and is the stride of the next-outer axis
+        # (H_GROUPS), not of B itself.
         inner_d = layout.d_inner
         inner_lane = layout.lane_count * inner_d
         inner_s = layout.mlen * inner_lane
+        b_stride = inner_s
         inner_b = layout.logical_b * inner_s
         h_grp_stride = inner_b
         s_tile_stride = layout.h_groups * inner_b
@@ -776,20 +804,33 @@ class IsaEmitterPass:
                             d_tile * d_tile_stride
                             + s_tile * s_tile_stride
                             + h_grp * h_grp_stride
-                            + b * inner_b
+                            + b * b_stride
                         )
                         self.shim.compiler.generated_code += (
                             f";   tile (d={d_tile}, s={s_tile}, h={h_grp}, "
                             f"b={b}): hbm_off={hbm_off}  "
-                            f"vram_off={vram_off}\n"
+                            f"vram_off={vram_off}"
+                            f"{' +dyn' if m_off is not None else ''}\n"
                         )
-                        self.emitter.emit_load_tile_from_hbm(
-                            hbm_addr=parent.address,
-                            vram_addr=dst.address + vram_off,
-                            hbm_stride=parent.hbm_stride,
-                            hbm_scale_size=parent.hbm_scale_size,
-                            hbm_start_offset=hbm_off,
-                        )
+                        if m_off is not None:
+                            self.emitter.emit_load_tile_from_hbm(
+                                hbm_addr=parent.address,
+                                vram_addr=dst.address + vram_off,
+                                hbm_stride=parent.hbm_stride,
+                                hbm_scale_size=parent.hbm_scale_size,
+                                hbm_start_offset=hbm_off,
+                                hbm_start_offset_reg=m_off.register,
+                            )
+                        else:
+                            self.emitter.emit_load_tile_from_hbm(
+                                hbm_addr=parent.address,
+                                vram_addr=dst.address + vram_off,
+                                hbm_stride=parent.hbm_stride,
+                                hbm_scale_size=parent.hbm_scale_size,
+                                hbm_start_offset=hbm_off,
+                            )
+        if m_off is not None:
+            m_off.release()
 
     def _emit_dma_h2m_slice(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         sl = op.buffer_args[0]

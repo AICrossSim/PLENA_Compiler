@@ -78,10 +78,12 @@ class ISAEmitter:
         generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {scale_len} \n"
         generated_code += f"C_SET_SCALE_REG gp{a_actual_register} \n"
         if hbm_start_offset_reg is not None:
-            # Copy the dynamic offset register into our scratch so the
-            # rest of the template can keep using `a_actual_register`.
+            # Dynamic base + static residual: ``a = dyn_reg + static``.
+            # The static piece carries per-tile constant offsets (one
+            # invocation per inner tile in the multi-tile DMA grid).
             generated_code += (
-                f"S_ADDI_INT gp{a_actual_register}, gp{hbm_start_offset_reg}, 0 \n"
+                f"S_ADDI_INT gp{a_actual_register}, gp{hbm_start_offset_reg}, "
+                f"{int(hbm_start_offset)} \n"
             )
         else:
             generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {int(hbm_start_offset)} \n"
@@ -152,8 +154,10 @@ class ISAEmitter:
         generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {scale_len}\n"
         generated_code += f"C_SET_SCALE_REG gp{hbm_offset_reg}\n"
         if hbm_start_offset_reg is not None:
+            # Dynamic base + static residual (see _emit_preload_tile_isa).
             generated_code += (
-                f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_start_offset_reg}, 0\n"
+                f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_start_offset_reg}, "
+                f"{int(hbm_start_offset)}\n"
             )
         else:
             generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {int(hbm_start_offset)}\n"
@@ -213,7 +217,8 @@ class ISAEmitter:
         isa += f"C_SET_STRIDE_REG gp{gp_stride}\n"
         isa += f"S_ADDI_INT gp{gp_mram}, gp0, {mram_addr}\n"
         if hbm_offset_reg is not None:
-            isa += f"S_ADDI_INT gp{gp_scale}, gp{hbm_offset_reg}, 0\n"
+            # Dynamic base + static residual.
+            isa += f"S_ADDI_INT gp{gp_scale}, gp{hbm_offset_reg}, {hbm_offset}\n"
         else:
             isa += f"S_ADDI_INT gp{gp_scale}, gp0, {hbm_offset}\n"
         isa += f"H_PREFETCH_M gp{gp_mram}, gp{gp_scale}, a{addr_reg}, 1, 0\n"
@@ -999,10 +1004,7 @@ class ISAEmitter:
         lines.append(f"S_ADDI_INT gp{gp_lhs}, gp0, {lhs_vram_addr}")
         lines.append(f"S_ADDI_INT gp{gp_rhs}, gp0, {rhs_vram_addr}")
         lines.append(f"C_LOOP_START gp{gp_loop}, {loop_count}")
-        if op == "sub":
-            lines.append(f"{op_to_insn[op]} gp{gp_dst}, gp{gp_rhs}, gp{gp_lhs}, 0")
-        else:
-            lines.append(f"{op_to_insn[op]} gp{gp_dst}, gp{gp_lhs}, gp{gp_rhs}, 0")
+        lines.append(f"{op_to_insn[op]} gp{gp_dst}, gp{gp_lhs}, gp{gp_rhs}, 0")
         lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.program.mlen}")
         lines.append(f"S_ADDI_INT gp{gp_lhs}, gp{gp_lhs}, {self.program.mlen}")
         lines.append(f"S_ADDI_INT gp{gp_rhs}, gp{gp_rhs}, {self.program.mlen}")

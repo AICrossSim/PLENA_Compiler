@@ -159,9 +159,20 @@ def _flatten_starts_tiled(
         lane = tir.IntImm(b_start.dtype, 0)
 
     # Per-axis strides in the 7D physical layout (must all be pow2).
+    # 7D layout order: (D_TILES, S_TILES, H_GROUPS, B, MLEN, LANE_COUNT, D_INNER).
+    # Each stride is the total elem count of everything inner-of it:
+    #   inner_d          = D_INNER
+    #   inner_lane       = LANE_COUNT * D_INNER
+    #   inner_s          = MLEN * inner_lane          (one inner tile = inner-of B)
+    #   b_stride         = inner_s                    (B is inner-of H_GROUPS)
+    #   inner_b          = logical_b * inner_s        (volume of B axis)
+    #   h_grp_stride     = inner_b
+    #   s_tile_stride    = h_groups * inner_b
+    #   d_tile_stride    = s_tiles  * s_tile_stride
     inner_d = layout.d_inner
     inner_lane = layout.lane_count * inner_d
     inner_s = mlen * inner_lane
+    b_stride = inner_s
     inner_b = layout.logical_b * inner_s
     h_grp_stride = inner_b
     s_tile_stride = layout.h_groups * inner_b
@@ -175,7 +186,7 @@ def _flatten_starts_tiled(
     if layout.h_groups > 1:
         offset = tir.Add(offset, _shl(h_grp, _log2_pow2(h_grp_stride)))
     if layout.logical_b > 1:
-        offset = tir.Add(offset, _shl(b_start, _log2_pow2(inner_b)))
+        offset = tir.Add(offset, _shl(b_start, _log2_pow2(b_stride)))
     if mlen > 1:
         offset = tir.Add(offset, _shl(s_inner, _log2_pow2(inner_lane)))
     if layout.lane_count > 1:

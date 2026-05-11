@@ -444,7 +444,7 @@ def materialize_to_primfunc(graph: Graph,
         from .graph_passes import expand_buffers as g_expand
         from .graph_passes import lower_fp_row_patterns as g_lower_fp
         graph = g_alloc.analyze(graph, scopes, lane_count=lane_count)
-        graph = g_expand.expand(graph, lane_count=lane_count)
+        graph = g_expand.expand(graph, lane_count=lane_count, scopes=scopes)
         # lower_fp_row_patterns must run AFTER expand because the
         # row-parallel pattern matcher requires the 4D-expanded
         # buffer shape (matches legacy stmt-walker ordering).

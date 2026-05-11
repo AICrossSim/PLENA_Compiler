@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Tuple
 import tvm
 from tvm import tir
 
+from .... import scope as _scope
 from ..graph_ir import (
     Graph, GraphNode, LaneGroup, NestedForGroup, NodeRoot, ForRoot, RootItem,
     RawStmt, BufferAccess, BufferNode,
@@ -63,6 +64,13 @@ from ..graph_ir import (
 COL_PACK = "col_pack"
 ROW_STACK = "row_stack"
 FP_LANE = "fp_lane"
+# Non-lane-fused 2D VRAM/MRAM buffer that still needs canonical 4D BSHD
+# shape so downstream passes see one shape rank. This is the catch-all
+# mode for buffers that aren't touched by a sync op (BTMM / lane-fused
+# T.copy) but whose users (row_*_at, fp_at, DMA slice) expect 4D BSHD.
+# Shape transformation: ``(rows, cols) → (1, rows, 1, cols)``;
+# index fold: ``[r, c] → [0, r, 0, c]``.
+BSHD_LIFT = "bshd_lift"
 
 
 class _ExpandBuffersError(RuntimeError):
@@ -70,15 +78,18 @@ class _ExpandBuffersError(RuntimeError):
 
 
 def _expand_buffer(buf: tir.Buffer, factor: int, mode: str) -> tir.Buffer:
-    """Expand a per-lane buffer to a multi-lane buffer.
+    """Expand a per-lane buffer to a multi-lane buffer, in canonical BSHD.
 
-      * COL_PACK: ``(rows, last) → (1, rows, lane_count, last)`` — BSHD
-        packed-narrow; head h's data occupies cols [h*last, (h+1)*last)
-        within an mlen-wide row.
-      * ROW_STACK: ``(rows, mlen) → (1, lane_count, rows, mlen)`` —
-        BHSD-stacked; head h's tile starts at row h*rows in the flat
-        memory view.
-      * FP_LANE: ``(N,) → (lane_count, N)``.
+      * COL_PACK:  ``(rows, last) → (1, rows, lane_count, last)`` — H axis
+        carries the lane (narrow-D packing within an mlen-row).
+      * ROW_STACK: ``(rows, mlen) → (lane_count, rows, 1, mlen)`` — B axis
+        carries the lane (each lane's full tile stacked vertically in
+        VRAM, matching the BMM_WO write pattern
+        ``base + (j*mlen + i)*mlen``).
+      * FP_LANE:   ``(N,) → (lane_count, N)``.
+
+    Both VRAM/MRAM modes produce a 4D BSHD shape — isa_pass / address_alloc
+    / lower_fp_row_patterns only ever see one layout family.
     """
     shape = list(buf.shape)
     one = tir.IntImm("int32", 1)
@@ -100,7 +111,12 @@ def _expand_buffer(buf: tir.Buffer, factor: int, mode: str) -> tir.Buffer:
         if mode == COL_PACK:
             new_shape = [one, rows, lane_imm, last]
         elif mode == ROW_STACK:
-            new_shape = [one, lane_imm, rows, last]
+            new_shape = [lane_imm, rows, one, last]
+        elif mode == BSHD_LIFT:
+            # No lane fusion — just lift 2D (rows, cols) into the
+            # canonical (B=1, S=rows, H=1, D=cols) BSHD slot. Downstream
+            # passes (address_alloc, isa_pass) only see 4D BSHD.
+            new_shape = [one, rows, one, last]
         else:
             raise _ExpandBuffersError(f"unknown mode {mode!r}")
     declared_scope = buf.scope() if callable(getattr(buf, "scope", None)) else "global"
@@ -171,10 +187,10 @@ class _StmtRewriter:
         return n
 
     def _fold_lane(self, indices, buf_name):
-        """Lift 2D per-lane indices to 4D, inserting the lane axis.
+        """Lift 2D per-lane indices to 4D BSHD, inserting the lane axis.
 
-          COL_PACK  2D [r, c] → 4D [0, r, by, c]
-          ROW_STACK 2D [r, c] → 4D [0, by, r, c]
+          COL_PACK  2D [r, c] → 4D [0,  r,  by, c]   (H carries lane)
+          ROW_STACK 2D [r, c] → 4D [by, r,  0,  c]   (B carries lane)
           FP_LANE   1D [r]    → 2D [by, r]
 
         Already-folded indices (idempotent re-walk) are left untouched.
@@ -203,7 +219,11 @@ class _StmtRewriter:
         r, c = indices
         if mode == COL_PACK:
             return [zero, r, lane_expr, c]
-        return [zero, lane_expr, r, c]
+        if mode == BSHD_LIFT:
+            # No lane axis to fold — just insert unit B and H dims.
+            return [zero, r, zero, c]
+        # ROW_STACK: lane lives in B axis.
+        return [lane_expr, r, zero, c]
 
     def visit_expr(self, e):
         if isinstance(e, tir.Var):
@@ -302,10 +322,29 @@ def _collect_lane_vars(graph: Graph) -> Dict[str, tir.Var]:
 
 
 def _build_expansion(graph: Graph,
-                     lane_count: int
+                     lane_count: int,
+                     scopes: Optional[Dict[str, str]] = None,
                      ) -> Tuple[Dict[str, tir.Buffer], Dict[str, tuple]]:
     """Return (name → expanded tir.Buffer, name → (lane_expr, factor, mode))
-    suitable for feeding into the legacy ``_Rewriter``."""
+    suitable for feeding into the legacy ``_Rewriter``.
+
+    Two passes over the buffers:
+
+      1. **lane-fused** — every BufferNode that ``g_alloc.analyze`` tagged
+         with ``ATTR_LANE_LAYOUT`` (COL_PACK / ROW_STACK / FP_LANE). Mode
+         comes from the layout tag, lane var from ``ATTR_LANE_VAR``.
+
+      2. **non-lane-fused 2D BSHD lift** — every remaining 2D VRAM/MRAM
+         alloc that wasn't picked up above. These buffers don't carry a
+         lane axis but still need their shape promoted to 4D BSHD so the
+         backend (address_alloc, isa_pass) sees one shape rank. Falls
+         under :data:`BSHD_LIFT` mode; index fold inserts unit B/H dims.
+
+    ``global.*`` scoped buffers are skipped from BSHD_LIFT — those are a
+    user-facing escape hatch where the kernel author chose the explicit
+    2D semantic (e.g. ``Q_cache(head_count, hlen)`` in flash_decode_min);
+    auto-lifting them would assign the wrong layout role.
+    """
     name_to_buf = _collect_alloc_buffers_with_buffers(graph)
     expanded: Dict[str, tir.Buffer] = {}
     info: Dict[str, tuple] = {}
@@ -330,6 +369,42 @@ def _build_expansion(graph: Graph,
         new_buf = _expand_buffer(old_buf, lane_count, mode)
         expanded[name] = new_buf
         info[name] = (lane_expr, lane_count, mode)
+
+    # Second pass: BSHD-lift remaining 2D VRAM/MRAM allocs that weren't
+    # picked up by the lane-fusion pass above. Buffer scopes at this
+    # point are still the user-facing ``shared.dyn`` / ``local.fragment``
+    # tags (the final scope rewrite to ``vram`` / ``mram`` happens after
+    # materialize), so we consult ``scopes`` (the result of
+    # scope_inference) to decide eligibility.
+    for name, old_buf in name_to_buf.items():
+        if name in expanded:
+            continue
+        if len(old_buf.shape) != 2:
+            continue
+        declared_scope = (
+            old_buf.scope() if callable(getattr(old_buf, "scope", None))
+            else "global"
+        )
+        if _scope.is_global_scope(declared_scope):
+            continue
+        resolved_scope = None
+        if scopes is not None:
+            resolved_scope = scopes.get(name)
+        if resolved_scope is None:
+            continue
+        if _scope.is_global_scope(resolved_scope):
+            continue
+        phys = _scope.physical_scope(resolved_scope)
+        if phys not in (_scope.VRAM, _scope.MRAM):
+            continue
+        # BSHD_LIFT mode: no lane var needed. Pass a constant 0 so the
+        # _fold_lane path's BSHD_LIFT branch can still read the lane_expr
+        # without raising.
+        zero_expr = tir.IntImm("int32", 0)
+        new_buf = _expand_buffer(old_buf, 1, BSHD_LIFT)
+        expanded[name] = new_buf
+        info[name] = (zero_expr, 1, BSHD_LIFT)
+
     return expanded, info
 
 
@@ -393,6 +468,9 @@ def _fold_extents(extents, buf_name: str, rw: _StmtRewriter):
         return list(extents)
     r, c = extents
     if mode == COL_PACK:
+        return [one, r, one, c]
+    if mode == BSHD_LIFT:
+        # No lane axis — extents are just (rows, cols) in the S+D slot.
         return [one, r, one, c]
     return [one, one, r, c]
 
@@ -496,14 +574,20 @@ def _rewrite_buffer_map(buffer_map: Dict[tir.Var, tir.Buffer],
 # Public entry
 # ---------------------------------------------------------------------------
 
-def expand(graph: Graph, lane_count: int = 4) -> Graph:
+def expand(graph: Graph,
+           lane_count: int = 4,
+           scopes: Optional[Dict[str, str]] = None) -> Graph:
     """Expand every BufferNode tagged with ``ATTR_LANE_LAYOUT`` and
     rewrite the graph to use the expanded buffers.
+
+    When ``scopes`` is provided, additionally BSHD-lift any remaining 2D
+    VRAM/MRAM allocs that the lane-fusion pass didn't touch — see
+    :func:`_build_expansion`.
 
     Returns a NEW Graph. ``buffer_nodes`` is preserved as-is (passes
     that consumed ATTR_LANE_LAYOUT may want to read it).
     """
-    expanded, info = _build_expansion(graph, lane_count)
+    expanded, info = _build_expansion(graph, lane_count, scopes=scopes)
     if not expanded:
         return graph
 
