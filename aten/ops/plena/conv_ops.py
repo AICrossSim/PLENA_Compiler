@@ -146,7 +146,7 @@ def conv2d_plena(
         setup_lines.append(f"S_LUI_INT gp{setup_gp}, {hbm_base >> 12}")
         setup_lines.append(f"S_ADDI_INT gp{setup_gp}, gp{setup_gp}, {hbm_base & 0xFFF}")
     setup_lines.append(f"C_SET_ADDR_REG a{addr_reg_idx}, gp0, gp{setup_gp}")
-    prog._compiler.generated_code += "\n".join(setup_lines) + "\n"
+    prog._compiler.emit("\n".join(setup_lines) + "\n")
 
     # ------------------------------------------------------------------
     # Emit: im2col assembly
@@ -191,7 +191,7 @@ def conv2d_plena(
             fp_one_reg=fp_one_reg,  # f1 = 1.0 by default (must be in fp_preload[fp_one_reg])
             fp_ex_reg=2,  # f2 = V_RED_SUM accumulator
         )
-    prog._compiler.generated_code += asm_code
+    prog._compiler.emit(asm_code)
 
     # ------------------------------------------------------------------
     # Systolic matmul: im2col_out @ weight_2d  -> (M, C_out)

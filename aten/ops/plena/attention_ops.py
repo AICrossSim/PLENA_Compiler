@@ -135,7 +135,7 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
         addr_reg_val=[K.hbm_addr, V.hbm_addr],
     )
     alloc.free_gp(gp_for_preload)
-    prog._compiler.generated_code += setup
+    prog._compiler.emit(setup)
 
     # Allocate VRAM buffers mirroring main's layout.
     #   S, PV each require mlen*mlen*ratio elements; O is s_q * (hq*h_qkv).
@@ -185,7 +185,7 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
         k_base_hbm_offset_reg=k_addr,
         v_base_hbm_offset_reg=v_addr,
     )
-    prog._compiler.generated_code += asm
+    prog._compiler.emit(asm)
 
     # Release HBM addr regs (they're only needed during the call)
     alloc.free_addr([k_addr, v_addr])

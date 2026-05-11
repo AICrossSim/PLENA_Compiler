@@ -1,12 +1,4 @@
-"""Compatibility facade for the ATen PLENA compiler path.
-
-The implementation is split under ``compiler.aten.plena``. This module keeps
-legacy imports such as ``from compiler.aten.plena_compiler import PlenaCompiler``
-working while re-exporting the public compiler, memory, register, and tensor
-proxy types.
-"""
-
-from __future__ import annotations
+"""Internal modules for the ATen PLENA compiler implementation."""
 
 from compiler.aten.plena.compiler import PlenaCompiler
 from compiler.aten.plena.constants import BLEN, IMM2_BOUND, MLEN
@@ -28,16 +20,6 @@ from compiler.aten.plena.registers import RegisterAllocator
 from compiler.aten.plena.tile_compiler import TileCompiler
 from compiler.aten.plena.vars import FPVar, InputVar, Tensor, TensorKind, TensorVar, VRAMMatrixVar, tensor_kind
 
-
-# ``TensorInfo`` is the union of the three Info dataclasses. Callers can import
-# it as an annotation; at runtime the object is whichever specific Info subtype
-# ``TileCompiler`` constructed.
-TensorInfo = MemoryObjectInfo | SubMatrixInfo | VRAMSubMatrixInfo
-
-# ``TileLayout`` is the union of the three Layout dataclasses.
-TileLayout = MatrixBlockLayout | VRAMMatrixBlockLayout | FPRAMObjectLayout
-
-
 __all__ = [
     "BLEN",
     "IMM2_BOUND",
@@ -56,11 +38,9 @@ __all__ = [
     "RegisterAllocator",
     "SubMatrixInfo",
     "Tensor",
-    "TensorInfo",
     "TensorKind",
     "TensorVar",
     "TileCompiler",
-    "TileLayout",
     "VRAMAllocator",
     "VRAMMatrixBlockLayout",
     "VRAMMatrixVar",

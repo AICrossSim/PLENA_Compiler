@@ -9,10 +9,20 @@ from pathlib import Path
 PLENA_PKG_DIR = Path(__file__).parent
 NATIVE_OPS_YAML = PLENA_PKG_DIR / "native_ops.yaml"
 
+from compiler.aten.isa_builder import (  # noqa: E402, F401
+    Comment,
+    Instr,
+    IsaBuilder,
+    Register,
+    addr,
+    fp,
+    gp,
+)
 from compiler.aten.plena_compiler import (  # noqa: E402, F401
+    DeveloperCompiler,
     PlenaCompiler,
     TileCompiler,
-    DeveloperCompiler,
+    IsaCompiler,
     RegisterAllocator,
     TensorVar,
     InputVar,

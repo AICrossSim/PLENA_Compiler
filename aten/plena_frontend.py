@@ -19,6 +19,7 @@ Usage:
 
 import json
 import math
+import re
 from pathlib import Path
 
 import torch
@@ -27,11 +28,7 @@ import torch.nn.functional as F
 from compiler.aten.plena_compiler import PlenaCompiler
 from compiler.aten.ops.registry import OpRegistry, Backend
 import compiler.aten.ops as ops
-from transactional_emulator.testbench.model_layer_test_builder import (
-    quantize_to_mxfp,
-    _make_rope_tables,
-)
-import re
+from quant.quantizer.hardware_quantizer.mxfp import _mx_fp_quantize_hardware
 
 _IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
 
@@ -70,6 +67,33 @@ REAL_DATA_RATIO = (8 * 8 + 8) / (8 * 8)
 _HW_MAX_K_TILES = 4
 
 
+def quantize_to_mxfp(tensor: torch.Tensor) -> torch.Tensor:
+    """Quantize tensor to MXFP8 matching HBM hardware format; return dequantized result."""
+    orig_shape = tensor.shape
+    tensor_2d = tensor.float().reshape(-1, tensor.shape[-1])
+    bm_x, _, _, _ = _mx_fp_quantize_hardware(
+        tensor_2d,
+        width=8,
+        exponent_width=4,
+        exponent_bias_width=8,
+        block_size=[1, 8],
+    )
+    return bm_x.reshape(orig_shape)
+
+
+def _make_rope_tables(seq_len: int, head_dim: int, theta: float = 10000.0):
+    """Compute RoPE cos/sin tables, shape (seq_len, head_dim)."""
+    half = head_dim // 2
+    freqs = 1.0 / (theta ** (torch.arange(0, half).float() / half))
+    positions = torch.arange(seq_len).float()
+    angles = torch.outer(positions, freqs)
+    cos_half = torch.cos(angles)
+    sin_half = torch.sin(angles)
+    cos = torch.cat([cos_half, cos_half], dim=-1)
+    sin = torch.cat([sin_half, sin_half], dim=-1)
+    return cos, sin
+
+
 def _ksplit_matmul(A, B, mlen=64, max_k_tiles=_HW_MAX_K_TILES, to_inter=None, from_inter=None):
     """Matrix multiply matching hardware K-split BF16 precision.
 
@@ -82,9 +106,12 @@ def _ksplit_matmul(A, B, mlen=64, max_k_tiles=_HW_MAX_K_TILES, to_inter=None, fr
     this is equivalent to a single matmul with BF16 cast.
     """
     if to_inter is None:
-        to_inter = lambda x: x.to(torch.bfloat16)
+        def to_inter(x):
+            return x.to(torch.bfloat16)
+
     if from_inter is None:
-        from_inter = lambda x: x.float()
+        def from_inter(x):
+            return x.float()
 
     k_total = A.shape[1]
     num_k_tiles = math.ceil(k_total / mlen)
@@ -881,7 +908,7 @@ def compile_hf_model(
         li = layer_inputs[i]
 
         # Layer progress marker (visible in non-quiet emulator output)
-        prog._compiler.generated_code += f"; === LAYER {i}/{n_layers} START ===\n"
+        prog._compiler.emit_comment(f"=== LAYER {i}/{n_layers} START ===")
 
         # --- Attention block ---
         # Save residual: scratch = current (zero then add)
@@ -983,7 +1010,7 @@ def compile_hf_model(
         prog.vram_add(current_after_attn, scratch)
 
         current = current_after_attn  # carry forward
-        prog._compiler.generated_code += f"; === LAYER {i}/{n_layers} COMPLETE ===\n"
+        prog._compiler.emit_comment(f"=== LAYER {i}/{n_layers} COMPLETE ===")
 
     # Final norm
     prog.rms_norm(current, eps_offset=3, reci_hid_offset=4)
@@ -1127,7 +1154,6 @@ def compile_and_run(
     from transactional_emulator.tools.create_sim_env import create_sim_env
     from compiler.sim_env_utils.build_env import create_mem_for_sim
     from transactional_emulator.testbench.emulator_runner import (
-        run_and_assert,
         compare_emulator_output,
     )
 

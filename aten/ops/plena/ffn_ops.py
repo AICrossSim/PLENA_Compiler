@@ -55,7 +55,7 @@ def ffn_plena(prog, input_var, w_gate, w_up, w_down):
         use_loop_instructions=True,
     )
 
-    prog._compiler.generated_code += isa_code
+    prog._compiler.emit(isa_code)
 
     # FFN result is written back to the activation area in VRAM (in-place overwrite)
     return input_var
