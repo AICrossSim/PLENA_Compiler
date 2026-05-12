@@ -12,7 +12,7 @@ from utils.torch_fp_conversion import fp_2_bin, pack_fp_to_bin
 
 from compiler.assembler.assembly_to_binary import AssemblyToBinary
 
-# Project root is 3 levels up from compiler/sim_env_utils/
+# Project root is 3 levels up from PLENA_Compiler/sim_env_utils/
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
