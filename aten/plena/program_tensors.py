@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from compiler.asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -314,6 +315,44 @@ class ProgramTensorMixin:
             vlen=vlen,
             scratchpad_vram_addr=scratchpad_vram_addr,
         )
+
+    # ========================================================================
+    # Composite Decoder Operations
+    # ========================================================================
+
+    def ffn(self, input_var: VRAMMatrixVar, w_gate: InputVar, w_up: InputVar, w_down: InputVar):
+        """Emit the fused FFN kernel and return the in-place activation var."""
+        batch_size, hidden_size = input_var.shape
+        _, inter_dim = w_up.shape
+        mlen = self.mlen
+        blen = self.blen
+        activation_base_address = self.get_vram_addr(input_var.name)
+
+        isa_code = preload_addr_reg_asm(
+            addr_reg_to_set=[1, 2, 3],
+            available_registers=[1, 2, 3],
+            addr_reg_val=[w_gate.hbm_addr, w_up.hbm_addr, w_down.hbm_addr],
+        )
+        isa_code += reset_reg_asm(alive_registers=[1, 2, 3])
+        isa_code += ffn_asm(
+            mlen=mlen,
+            vlen=mlen,
+            blen=blen,
+            batch=batch_size,
+            seq_len=1,
+            hidden_size=hidden_size,
+            intermediate_size=inter_dim,
+            alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            gate_weight_hbm_offset_reg=1,
+            up_weight_hbm_offset_reg=2,
+            down_weight_hbm_offset_reg=3,
+            const_one_fp_address=5,
+            activation_base_address=activation_base_address,
+            use_loop_instructions=True,
+        )
+
+        self.emit(isa_code)
+        return input_var
 
 
 __all__ = ["ProgramTensorMixin"]

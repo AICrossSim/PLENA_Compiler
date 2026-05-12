@@ -1,7 +1,7 @@
 """
 ATen-backend runner for the generator.
 
-Wraps the proven ATen compilation path (PlenaCompiler + ops.*) to provide
+Wraps the proven ATen compilation path (PlenaCompiler direct codegen) to provide
 end-to-end model compilation + emulation + numerical verification.  This
 is the same pipeline that passes 18/18 tests in the ATen test suite.
 
@@ -45,7 +45,7 @@ def run_aten_e2e(
 
     Steps:
       1. Load model config + layer weights from HuggingFace
-      2. Build ISA via PlenaCompiler + ops.* (numerically verified path)
+      2. Build ISA via PlenaCompiler direct codegen (numerically verified path)
       3. Set up sim environment (ASM + HBM weights + FPRAM constants)
       4. Run Rust emulator
       5. Compare VRAM output against golden PyTorch reference
@@ -65,19 +65,13 @@ def run_aten_e2e(
         inter_dim:          int
         build_dir:          str
     """
+    from transactional_emulator.testbench.emulator_runner import compare_emulator_output
     from transactional_emulator.testbench.model_layer_test_builder import (
         build_and_run_decoder_test,
         build_and_run_multi_layer_test,
         get_model_dims,
         slice_dims_for_sim,
-        MLEN,
     )
-    from transactional_emulator.testbench.emulator_runner import (
-        compare_emulator_output,
-        run_emulator,
-    )
-    from transactional_emulator.testbench.config_utils import update_plena_config
-    from transactional_emulator.tools.check_mem import print_comparison_results
 
     t0 = time.time()
 
@@ -127,9 +121,9 @@ def run_aten_e2e(
         asm_name = f"aten_{model_id.split('/')[-1]}_l{current_layer}"
         layer_build = build_path / f"layer_{current_layer}"
 
-        print(f"\n[2/5] Building ISA for layer {current_layer} via PlenaCompiler + ops.*")
+        print(f"\n[2/5] Building ISA for layer {current_layer} via PlenaCompiler direct codegen")
         print(f"[3/5] Setting up sim environment: {layer_build}")
-        print(f"[4/5] Running Rust transactional emulator")
+        print("[4/5] Running Rust transactional emulator")
 
         extra_kwargs = {}
         if trust_remote_code:
@@ -148,7 +142,7 @@ def run_aten_e2e(
                 inter_dim=inter_dim,
                 **extra_kwargs,
             )
-            comp_results, comp_params = compare_emulator_output(layer_build)
+            comp_results, _comp_params = compare_emulator_output(layer_build)
             results_per_layer.append({
                 "layer": current_layer,
                 "passed": True,
@@ -165,7 +159,7 @@ def run_aten_e2e(
                     "model_id": model_id,
                 }
             try:
-                comp_results, comp_params = compare_emulator_output(layer_build)
+                comp_results, _comp_params = compare_emulator_output(layer_build)
                 results_per_layer.append({
                     "layer": current_layer,
                     "passed": False,
@@ -185,9 +179,9 @@ def run_aten_e2e(
         asm_name = f"aten_{model_id.split('/')[-1]}_chain{num_layers}"
         chain_build = build_path / f"chain_{num_layers}layers"
 
-        print(f"\n[2/5] Building chained {num_layers}-layer ISA via PlenaCompiler + ops.*")
+        print(f"\n[2/5] Building chained {num_layers}-layer ISA via PlenaCompiler direct codegen")
         print(f"[3/5] Setting up sim environment: {chain_build}")
-        print(f"[4/5] Running Rust transactional emulator")
+        print("[4/5] Running Rust transactional emulator")
 
         extra_kwargs = {}
         if trust_remote_code:
@@ -207,7 +201,7 @@ def run_aten_e2e(
                 inter_dim=inter_dim,
                 **extra_kwargs,
             )
-            comp_results, comp_params = compare_emulator_output(chain_build)
+            comp_results, _comp_params = compare_emulator_output(chain_build)
             results_per_layer.append({
                 "layer": f"chain_{num_layers}",
                 "passed": True,
@@ -224,7 +218,7 @@ def run_aten_e2e(
                     "model_id": model_id,
                 }
             try:
-                comp_results, comp_params = compare_emulator_output(chain_build)
+                comp_results, _comp_params = compare_emulator_output(chain_build)
                 results_per_layer.append({
                     "layer": f"chain_{num_layers}",
                     "passed": False,
@@ -291,7 +285,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Run HF model through ATen compilation path (PlenaCompiler + ops.*)",
+        description="Run HF model through ATen compilation path (PlenaCompiler direct codegen)",
         prog="python -m generator.aten_runner",
     )
     parser.add_argument("model_id", help="HuggingFace model ID (e.g. AICrossSim/clm-60m)")

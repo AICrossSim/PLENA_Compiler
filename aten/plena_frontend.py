@@ -15,8 +15,6 @@ from compiler.aten.model_extract import (
     find_model_root,
 )
 from compiler.aten.plena_compiler import PlenaCompiler
-from compiler.aten.ops.registry import OpRegistry, Backend
-from compiler.aten.ops.plena.linear_ops import linear_projection_plena as _linear_projection
 from compiler.aten.reference import (
     ReferencePrecision,
     _ksplit_matmul,
@@ -25,7 +23,6 @@ from compiler.aten.reference import (
     quantize_to_mxfp,
     run_decoder_reference,
 )
-import compiler.aten.ops as ops
 
 __all__ = [
     "_fix_large_immediates",
@@ -36,6 +33,7 @@ __all__ = [
 ]
 
 _IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
+
 
 def _fix_large_immediates(isa_code: str) -> str:
     """Post-process ISA: replace S_ADDI_INT gp{r}, gp0, {large} with S_LUI_INT + S_ADDI_INT.
@@ -95,7 +93,7 @@ def _add_residual(prog, target, scratch):
 
 
 def _apply_rope_projection(prog, x_var, rope_matrix, cos_var, sin_var, name):
-    x_rot = _linear_projection(prog, x_var, rope_matrix, name)
+    x_rot = prog.linear_projection(x_var, rope_matrix, name)
     prog.rope(x_var, x_rot, cos_var, sin_var)
     prog.free_tensor(x_rot)
     return x_var
@@ -120,14 +118,12 @@ def _emit_kv_stores(prog, current, layer_inputs, rope_inputs, layer_idx, num_kv_
     rope_matrix, cos_var, sin_var = rope_inputs
     kv_stored = []
     for kv_h in range(num_kv_heads):
-        K_h = _linear_projection(
-            prog,
+        K_h = prog.linear_projection(
             current,
             layer_inputs.w_k_heads[kv_h],
             f"K_{layer_idx}_h{kv_h}",
         )
-        V_h = _linear_projection(
-            prog,
+        V_h = prog.linear_projection(
             current,
             layer_inputs.w_v_heads[kv_h],
             f"V_{layer_idx}_h{kv_h}",
@@ -170,7 +166,7 @@ def _emit_attention_block(
 ):
     _save_residual_and_norm(prog, current, scratch)
 
-    Q = _linear_projection(prog, current, layer_inputs.w_q, f"Q_{layer_idx}")
+    Q = prog.linear_projection(current, layer_inputs.w_q, f"Q_{layer_idx}")
     q_full_addr = prog.get_vram_addr(Q.name)
 
     O_full = prog.alloc(f"O_full_{layer_idx}", seq_len, total_q_dim)
@@ -201,8 +197,7 @@ def _emit_attention_block(
             f"Q_rot_{layer_idx}_h{h}",
         )
 
-        O_h = ops.flash_attention(
-            prog,
+        O_h = prog.flash_attention(
             Q_h,
             K_stored,
             V_stored,
@@ -221,13 +216,13 @@ def _emit_attention_block(
         )
         _free_named_tensors(prog, ("O", "S", "PV"))
 
-    O_proj = _linear_projection(prog, O_full, layer_inputs.w_o, f"O_proj_{layer_idx}")
+    O_proj = prog.linear_projection(O_full, layer_inputs.w_o, f"O_proj_{layer_idx}")
     return _add_residual(prog, O_proj, scratch)
 
 
 def _emit_ffn_block(prog, current, layer_inputs, scratch):
     _save_residual_and_norm(prog, current, scratch)
-    ops.ffn(prog, current, layer_inputs.w_gate, layer_inputs.w_up, layer_inputs.w_down)
+    prog.ffn(current, layer_inputs.w_gate, layer_inputs.w_up, layer_inputs.w_down)
     return _add_residual(prog, current, scratch)
 
 
@@ -388,9 +383,6 @@ def compile_hf_model(
 
     # ----------------------------------------------------------- PLENA ISA
     print("\n--- PLENA Backend (ISA generation) ---")
-    registry = OpRegistry.load()
-    registry.set_backend(Backend.PLENA)
-
     prog = PlenaCompiler(mlen=mlen, blen=blen, real_data_ratio=REAL_DATA_RATIO)
 
     # Shared inputs
@@ -419,7 +411,7 @@ def compile_hf_model(
     # Load activations to VRAM
     X_batch = prog.load_batch(x_input, name="X")
     POS_batch = prog.load_batch(pos_input, name="POS")
-    ops.embedding_add(prog, X_batch, POS_batch)  # X += POS in-place
+    prog.embedding_add(X_batch, POS_batch)  # X += POS in-place
 
     # VRAM layout hazard: ffn_asm writes gate/up intermediates at absolute
     # address batch*hidden spanning up to batch*hidden + 2*inter*batch.

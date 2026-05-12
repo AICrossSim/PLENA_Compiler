@@ -9,7 +9,7 @@ Two im2col paths:
   patches.  Requires the emulator to support V_SHIFT_V (opcode 0x31,
   LSB-first right-shift per main.rs fix by George Wu, commit 24eb011).
 
-After im2col the systolic matmul uses the standard linear_plena path.
+After im2col the systolic matmul uses the compiler's standard linear path.
 
 HBM layout convention (caller must arrange data accordingly):
   input_raw shape  = (C_in * H, W_padded)   — each row is one spatial row of one channel
@@ -19,9 +19,6 @@ Alignment requirement:
   H_PREFETCH_V requires the HBM element address to be a multiple of 64.
   With W_padded=64 and ow=0 (OW=1): offset = (c*H + oh+kr) * 64 → always aligned.
 """
-
-from compiler.aten.ops.plena.linear_ops import linear_plena
-
 
 _PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows
 
@@ -196,4 +193,4 @@ def conv2d_plena(
     # ------------------------------------------------------------------
     # Systolic matmul: im2col_out @ weight_2d  -> (M, C_out)
     # ------------------------------------------------------------------
-    return linear_plena(prog, output_mat, weight_2d_var)
+    return prog.linear(output_mat, weight_2d_var)

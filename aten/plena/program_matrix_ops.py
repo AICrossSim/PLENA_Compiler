@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
+import math
+
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
+
+MAX_K_TILES = 4  # MRAM capacity: 4 x mlen^2 elements
+
+
+def _iter_k_chunks(num_k_tiles: int):
+    k_start = 0
+    while k_start < num_k_tiles:
+        k_end = min(k_start + MAX_K_TILES, num_k_tiles)
+        yield k_start, k_end - k_start
+        k_start = k_end
 
 
 class ProgramMatrixOpsMixin:
@@ -114,6 +126,72 @@ class ProgramMatrixOpsMixin:
             target_col_idx=target_col_idx,
         )
 
+    def linear_projection(self, input_var: VRAMMatrixVar, weight_var: InputVar, name: str = "linear_out"):
+        """Emit tiled PLENA linear projection, including K-split accumulation."""
+        mlen = self.mlen
+
+        rows, k_total = input_var.shape
+        _, out_features = weight_var.shape
+        num_row_blocks = math.ceil(rows / mlen)
+        if out_features % mlen != 0:
+            raise ValueError(f"out_features ({out_features}) must be a multiple of mlen ({mlen})")
+        num_col_blocks = out_features // mlen
+        num_k_tiles = math.ceil(k_total / mlen)
+
+        # When rows is not a multiple of mlen the hardware still operates on
+        # full tiles; only the first `rows` rows contain valid output.
+        output = self.alloc(name, rows, out_features, strict=rows % mlen == 0)
+
+        def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split):
+            self.vram_sub_projection_to(
+                input_var,
+                row_idx,
+                weight_var,
+                col_idx,
+                target,
+                target_row_idx,
+                target_col_idx,
+                **k_split,
+            )
+
+        if num_k_tiles <= MAX_K_TILES:
+            for col_idx in range(num_col_blocks):
+                for row_idx in range(num_row_blocks):
+                    emit_projection(row_idx, col_idx, output, row_idx, col_idx)
+            return output
+
+        # Temp buffer for one partial-sum tile. Allocating the full output shape
+        # here can overlap with the real output for wide projections.
+        temp = self.alloc(f"{name}_temp", mlen, mlen)
+        for k_chunk_idx, (k_block_start, k_block_count) in enumerate(_iter_k_chunks(num_k_tiles)):
+            k_split = {
+                "k_block_start": k_block_start,
+                "k_block_count": k_block_count,
+            }
+            for col_idx in range(num_col_blocks):
+                for row_idx in range(num_row_blocks):
+                    if k_chunk_idx == 0:
+                        emit_projection(row_idx, col_idx, output, row_idx, col_idx, **k_split)
+                    else:
+                        emit_projection(row_idx, col_idx, temp, 0, 0, **k_split)
+                        self.vram_block_add_to(
+                            output,
+                            row_idx,
+                            col_idx,
+                            temp,
+                            0,
+                            0,
+                            output,
+                            row_idx,
+                            col_idx,
+                        )
+        self.free_tensor(temp)
+        return output
+
+    def linear(self, input_var: VRAMMatrixVar, weight_var: InputVar):
+        """Default linear op compatibility surface."""
+        return self.linear_projection(input_var, weight_var)
+
     # ========================================================================
     # RoPE (1D Positional Encoding)
     # ========================================================================
@@ -158,6 +236,11 @@ class ProgramMatrixOpsMixin:
             src_row_offset=src_row_offset,
             num_rows=num_rows,
         )
+
+    def embedding_add(self, input_var: VRAMMatrixVar, pos_weight_var: VRAMMatrixVar):
+        """Add learned/positional embedding weights to input in-place."""
+        self.vram_add(input_var, pos_weight_var)
+        return input_var
 
     def vram_block_add_to(
         self,

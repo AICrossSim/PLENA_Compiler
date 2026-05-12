@@ -28,7 +28,7 @@ from generator.scheduler import gen_scheduler
 
 
 def _run_aten(args) -> int:
-    """ATen-backed end-to-end: PlenaCompiler + ops.* → emulator → numerical check."""
+    """ATen-backed end-to-end: PlenaCompiler direct codegen -> emulator -> numerical check."""
     from generator.aten_runner import run_aten_e2e
 
     result = run_aten_e2e(
