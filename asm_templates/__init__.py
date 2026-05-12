@@ -19,6 +19,7 @@ from .sequence_scan_asm import sequence_scan_asm
 from .columnwise_scan_asm import columnwise_scan_asm
 from .columnwise_scan_stride_asm import columnwise_scan_stride_asm
 from .elementwise_add_asm import elementwise_add_asm
+from .elementwise_add_vram_asm import elementwise_add_vram_asm
 from .embedding_asm import embedding_asm
 from .ffn_asm import ffn_asm, ffn_intermediate_asm, ffn_up_silu_asm
 from .flash_attn_asm import flash_attn_asm
@@ -42,6 +43,7 @@ __all__ = [
     "sequence_scan_asm",
     "columnwise_scan_stride_asm",
     "elementwise_add_asm",
+    "elementwise_add_vram_asm",
     "embedding_asm",
     "ffn_asm",
     "ffn_intermediate_asm",
