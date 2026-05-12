@@ -1,4 +1,4 @@
-"""PLENA backend compatibility shim for Flash Attention."""
+"""PLENA backend wrapper for Flash Attention."""
 
 
 def flash_attention_plena(prog, Q, K, V, scale=None, hq=1, hkv=1, h_qkv=None, causal_mask=None):

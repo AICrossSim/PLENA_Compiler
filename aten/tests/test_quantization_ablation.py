@@ -9,8 +9,8 @@ against the HF float32 ground truth. Expected result:
     fp32           (fp32 + fp32)   ~99% allclose  ← confirms quantization is sole cause
 
 Usage:
-    pytest compiler/aten/tests/test_quantization_ablation.py -v -s
-    python3 compiler/aten/tests/test_quantization_ablation.py [--layers N]
+    pytest aten/tests/test_quantization_ablation.py -v -s
+    python3 aten/tests/test_quantization_ablation.py [--layers N]
 """
 
 import argparse

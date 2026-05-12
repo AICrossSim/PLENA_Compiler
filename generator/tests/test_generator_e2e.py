@@ -308,7 +308,7 @@ def _build_fp_sram_preload(
     slot (or the harness needs to refresh slot 5 between text and vision
     runs) to fix this.  Tracking issue: TODO.
 
-    Slot map (from compiler/generator/scheduler/mem_layout_lib.json):
+    Slot map (from generator/scheduler/mem_layout_lib.json):
       0: infinity      — softmax masking sentinel (use a large fp16 negative)
       1: eps           — RMSNorm epsilon
       2: hid_reciprocal — 1.0 / hidden_size

@@ -1,4 +1,4 @@
-"""PLENA backend compatibility shim for FFN."""
+"""PLENA backend wrapper for FFN."""
 
 
 def ffn_plena(prog, input_var, w_gate, w_up, w_down):

@@ -3,7 +3,7 @@
 ## Directory Structure
 
 ```
-compiler/
+PLENA_Compiler/
 |-- asm_templates/           # Shared ISA instruction emitters (used by BOTH pipelines)
 |   |-- flashattn/           #   Flash attention (qkt, pv, online_softmax, output, reset)
 |   |-- ffn_asm.py           #   FFN (gate/up/down with K-split)
@@ -26,10 +26,15 @@ compiler/
 |   +-- reset_reg_asm.py     #   Register reset helpers
 |
 |-- aten/                    # Pipeline 1: ATen compilation backend
-|   |-- plena_compiler.py    #   PlenaCompiler class (VRAM/MRAM/FPRAM management)
+|   |-- plena_frontend.py    #   HF model -> PLENA program -> ISA text
+|   |-- plena/               #   Canonical PlenaCompiler implementation package
+|   |   |-- compiler.py      #     PlenaCompiler composition class
+|   |   |-- memory_state.py  #     Tensor/input/FP memory state
+|   |   |-- program_*.py     #     High-level program operations
+|   |   +-- isa_*.py         #     Low-level ISA emitters
 |   +-- ops/                 #   Registered ATen op implementations
 |       |-- registry.py      #     Op dispatch registry
-|       |-- plena/           #     PLENA backend (linear, attention, ffn, norm, conv, softmax, embedding)
+|       |-- plena/           #     PLENA backend wrappers
 |       +-- cpu/             #     CPU reference implementations
 |
 |-- generator/               # Pipeline 2: Config-driven code generation
@@ -82,7 +87,7 @@ compiler/
 nn.Module
   -> torch.export (FX graph of ATen ops)
   -> op dispatch (aten/ops/registry.py)
-  -> PlenaCompiler (aten/plena_compiler.py)
+  -> PlenaCompiler (aten/plena/)
      - VRAM/MRAM/FPRAM allocation
      - HBM weight layout + address register init
      - calls asm_templates/* for ISA emission
@@ -100,7 +105,7 @@ HF config.json
   -> code_gen_pass (generator/passes/code_gen.py)
      - dispatches each node to asm_templates/*
   -> assembler/ (ASM -> .mem binary)
-  -> emulator (runs but numerically incorrect -- no addr reg init)
+  -> emulator smoke / utilization analysis
 ```
 
 See `docs/COMPILATION_PIPELINES.md` for detailed comparison, known gaps,

@@ -1,13 +1,13 @@
 """Unit tests for PlenaCompiler ATen path (no emulator needed).
 
-Run: PYTHONPATH=.:tools:compiler python3 compiler/aten/tests/test_plena_compiler.py
+Run: PYTHONPATH=.:tools:.. python3 aten/tests/test_plena_compiler.py
 """
 
 import sys
 import os
 
 # Insert PLENA_Simulator root and tools/ so imports resolve correctly regardless
-# of how the test is invoked (direct python3 or via PYTHONPATH=.:tools:compiler).
+# of how the test is invoked (direct python3 or via PYTHONPATH=.:tools:..).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SIM_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR))))
 _SIM_ROOT = os.path.join(_SIM_ROOT, "PLENA_Simulator")

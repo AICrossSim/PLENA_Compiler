@@ -1,4 +1,4 @@
-"""PLENA backend compatibility shims for positional encoding operators."""
+"""PLENA backend wrappers for positional encoding operators."""
 
 
 def embedding_add_plena(prog, input_var, pos_weight_var):

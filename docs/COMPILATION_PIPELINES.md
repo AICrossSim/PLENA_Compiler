@@ -49,7 +49,7 @@ backends, and weight-handling strategies.
    embedding). A CPU fallback registry (`aten/ops/cpu/`) provides reference
    implementations for ops not yet hardware-mapped.
 
-3. **Backend**: `PlenaCompiler` (`aten/plena_compiler.py`) manages all
+3. **Backend**: `PlenaCompiler` (`aten/plena/`) manages all
    hardware state -- VRAM allocation, MRAM tile scheduling, FPRAM slot
    assignment, HBM weight layout, and address register initialization
    (`C_SET_ADDR_REG`). It calls into `asm_templates/` to emit ISA strings.
@@ -65,7 +65,8 @@ backends, and weight-handling strategies.
 
 | File | Role |
 |------|------|
-| `aten/plena_compiler.py` | PlenaCompiler class (VRAM/MRAM/FPRAM management, ISA emission) |
+| `aten/plena/` | Canonical PlenaCompiler implementation package |
+| `aten/plena_frontend.py` | HuggingFace model frontend that drives ATen compilation |
 | `aten/ops/plena/*.py` | Registered ATen op implementations (linear, attention, ffn, norm, conv, softmax, embedding) |
 | `aten/ops/cpu/*.py` | CPU reference fallbacks |
 | `aten/ops/registry.py` | Op dispatch registry |
@@ -88,8 +89,7 @@ pass with 98-100% allclose.
 
 ## Pipeline 2: Generator Path
 
-**Status**: Generates valid ISA for analysis. Numerically incomplete
-(HBM address registers uninitialized).
+**Status**: Generates valid ISA for structural analysis and smoke tests.
 
 ### How it works
 
@@ -104,16 +104,16 @@ pass with 98-100% allclose.
 3. **Backend**: `code_gen_pass` (`generator/passes/code_gen.py`) walks the
    symbolic graph and dispatches each node to the appropriate
    `asm_templates/` function, passing scheduler-derived register and
-   address parameters.
+   address parameters. It emits address-register initialization for HBM-backed
+   weights before the generated compute body.
 
 4. **Weight loading**: For E2E smoke tests, `test_generator_e2e.py` has a
    `_build_hbm_from_hf_weights` helper that loads real weights. The
    standard codegen path does not touch weights at all.
 
-5. **Output**: A `.asm` file that assembles cleanly and runs on the emulator
-   (the instructions are structurally valid), but produces numerically
-   incorrect results because HBM address registers (`C_SET_ADDR_REG`) are
-   not initialized.
+5. **Output**: A `.asm` file that assembles cleanly and runs on the emulator.
+   The generator path is still primarily used for structural codegen and
+   utilization work; the ATen path remains the numerically verified flow.
 
 ### Key files
 
