@@ -25,7 +25,6 @@ from compiler.aten.plena_compiler import (  # noqa: E402, F401
     MemoryStateMixin,
     PlenaCompiler,
     TensorVar,
-    TileCompiler,
     VRAMMatrixVar,
 )
 from compiler.aten.ops.registry import OpRegistry, Backend  # noqa: E402, F401
