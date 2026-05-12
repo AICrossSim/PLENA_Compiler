@@ -37,7 +37,6 @@ the read-only slots:
 import tilelang.language as T
 
 from ..address_alloc import FPRAM_USER_BASE
-from ..frontend import compile_func
 from ..frontend.gemm_macros import KIND
 
 
@@ -48,7 +47,7 @@ def make_flash_attention_min(
     head_count: int | None = None,
     lane_count: int | None = None,
     active_lane: int = 0,
-    num_kv_blocks: int = 2,
+    num_kv_blocks: int = 1,
     num_q_blocks: int = 2,
 ):
     MLEN = 64
@@ -123,44 +122,46 @@ def make_flash_attention_min(
             L_INIT = T.alloc_fragment((rows,), "float16")
 
             # Q DMA — sync, fires once per q_block (multi-lane).
-            T.copy(Q_hbm[0, q_block * rows, by, 0], Q_sh)
+            T.copy(
+                Q_hbm[0, q_block * rows : (q_block + 1) * rows, by, 0:hlen],
+                Q_sh,
+            )
 
-            # Zero running output. The nested ``T.serial(rows) +
-            # T.Parallel(hlen)`` pattern is folded by fuse_elementwise
-            # into a single whole-buffer plena.zero_v: with lane fusion
-            # the two loops together iterate exactly rows*hlen*lane_count
-            # = post-expansion-buffer elements, matching the HW op's
-            # whole-buffer scope. Source code stays semantically faithful
-            # — no "name only row 0 to trick the compiler" hack.
-            for row in T.serial(rows):
+            # Zero running output.
+            for row in T.unroll(rows):
                 for col in T.Parallel(hlen):
                     O_loc[row, col] = T.float16(0)
 
             # Reset per-lane FP softmax state for this q tile.
-            for row in T.serial(rows):
+            for row in T.unroll(rows):
                 M_OLD[row] = M_INIT[row]
                 L_OLD[row] = L_INIT[row]
 
             for kv_block in T.unroll(num_kv_blocks):
                 # K, V DMAs — sync, multi-lane.
-                T.copy(K_hbm[0, kv_block * rows, by, 0], K_sh)
-                T.copy(V_hbm[0, kv_block * rows, by, 0], V_sh)
+                T.copy(
+                    K_hbm[0, kv_block * rows : (kv_block + 1) * rows, by, 0:hlen],
+                    K_sh,
+                )
+                T.copy(
+                    V_hbm[0, kv_block * rows : (kv_block + 1) * rows, by, 0:hlen],
+                    V_sh,
+                )
 
-                # BTMM Q @ K^T → S_loc (head-fused, sync, multi-lane).
+                # BTMM Q @ K^T → S_loc.
                 with T.attr(0, KIND, "btmm"):
                     T.gemm(Q_sh, K_sh, S_loc, transpose_B=True)
 
-                # Per-lane online softmax body.
-                # S_loc is BHSD (last dim == mlen) → (dim2=head, dim3=row)
-                # O_loc is BSHD-packed-narrow → (dim2=row, dim3=lane)
-                for row in T.serial(rows):
+                # Scale S_loc by 1/sqrt(d_k) per row.
+                for row in T.unroll(rows):
                     for col in T.Parallel(MLEN):
                         S_loc[row, col] = S_loc[row, col] * SCALE[row]
                     M_CURR[row] = M_OLD[row]
 
+                # M_CURR = max(M_OLD, rowmax(S_loc)).
                 T.reduce_max(S_loc, M_CURR, dim=1, clear=False)
 
-                for row in T.serial(rows):
+                for row in T.unroll(rows):
                     M_RES[row] = M_OLD[row] - M_CURR[row]
                     M_RES[row] = T.exp(M_RES[row])
                     for col in T.Parallel(MLEN):
@@ -169,9 +170,10 @@ def make_flash_attention_min(
                         S_loc[row, col] = T.exp(S_loc[row, col])
                     P_SUM[row] = L_INIT[row]
 
+                # P_SUM = rowsum(exp(S - M_CURR)).
                 T.reduce_sum(S_loc, P_SUM, dim=1, clear=False)
 
-                for row in T.serial(rows):
+                for row in T.unroll(rows):
                     L_NEW[row] = L_OLD[row] * M_RES[row]
                     L_NEW[row] = L_NEW[row] + P_SUM[row]
                     for col in T.Parallel(hlen):
@@ -179,37 +181,29 @@ def make_flash_attention_min(
                     M_OLD[row] = M_CURR[row]
                     L_OLD[row] = L_NEW[row]
 
-                # Per-head P @ V — default kind. S_loc has rows=rows>1
-                # so the compiler picks plena.matmul (M_MM); per-lane
-                # offsets (LHS=by*MLEN*MLEN row-stacked, RHS / DST=by*hlen
-                # col-packed) are auto-injected from each buffer's
-                # lane-axis stride. PV_loc is fragment-only and gets
-                # marked COL_PACK by the gemm itself (no surrounding
-                # DMA / extern to do it).
+                # Per-head P @ V → PV_loc, then O += PV_loc.
                 T.gemm(S_loc, V_sh, PV_loc)
 
-                # O += PV. The nested ``T.serial(rows) + T.Parallel(hlen)``
-                # pattern is folded by fuse_elementwise into a single
-                # whole-buffer plena.v_add — semantically faithful (no
-                # "name only row 0" hack) and matches the HW op's
-                # whole-buffer scope after lane fusion.
-                for row in T.serial(rows):
+                for row in T.unroll(rows):
                     for col in T.Parallel(hlen):
                         O_loc[row, col] = O_loc[row, col] + PV_loc[row, col]
 
             # Final O = O / L_new for this q_block.
-            for row in T.serial(rows):
+            for row in T.unroll(rows):
                 L_INV[row] = 1.0 / L_NEW[row]
                 for col in T.Parallel(hlen):
                     O_loc[row, col] = O_loc[row, col] * L_INV[row]
 
             # Write O back to HBM at this q_block slot.
-            T.copy(O_loc, O_hbm[0, q_block * rows, by, 0])
+            T.copy(
+                O_loc,
+                O_hbm[0, q_block * rows : (q_block + 1) * rows, by, 0:hlen],
+            )
 
-    # The factory must return a TIR PrimFunc already lowered through
-    # the new tilelang frontend, since the CLI's `compile_kernel`
-    # consumes plain TIR (post-frontend) directly.
-    lowered = compile_func(flash_attention_min)
+    # Return the raw PrimFunc. ``compile_kernel`` runs stmt prep + the
+    # mid_ir pipeline itself, so factories no longer need to call into
+    # the legacy compile_func.
+    lowered = flash_attention_min
 
     constants = {
         "ROWS": rows,

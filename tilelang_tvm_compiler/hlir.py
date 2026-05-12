@@ -320,6 +320,15 @@ class Buffer:
     # non-4D shapes. See ``LAYOUT_AXES`` for the mapping.
     layout: str = "BSHD"
 
+    # Index into ``shape`` of the cluster (lane) axis. Set by the
+    # expand step in mid_ir when a buffer is grown for cluster-fusion;
+    # tracked through view / burn_view so any axis permutation moves
+    # the marker along with the dim. ``None`` for buffers that aren't
+    # cluster-aware (HBM globals, user-declared ``global.*`` caches,
+    # pure scalar fpram slots). Downstream addressing reads this
+    # directly instead of guessing from shape.
+    cluster_dim: Optional[int] = None
+
     # Pass-attached scratch (e.g. logical_rows, logical_cols, row_blocks,
     # col_blocks for HBM buffers). Free-form so passes can stash hints
     # without growing this dataclass.
@@ -507,13 +516,28 @@ def _format_ops(ops: List[Op], lines: List[str], indent: int, prefix: List[int])
             lines.append(f"{ind}[{idx:2d}]  {op.kind:<14}  bufs=({bs})  scalars=({ss})")
 
 
+def _fmt_idx_item(item) -> str:
+    """Render one index entry. Tries hard to expose ``tir.Var`` names
+    (e.g. ``by_phase``, ``row``) so HLIR dumps are readable instead of
+    showing opaque ``<Var>`` placeholders."""
+    if isinstance(item, (int, float, str)):
+        return str(item)
+    # tir.Var / similar IR nodes carry a ``.name`` field.
+    name = getattr(item, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    name_hint = getattr(item, "name_hint", None)
+    if isinstance(name_hint, str) and name_hint:
+        return name_hint
+    return str(item)
+
+
 def _fmt_buf_arg(a) -> str:
     """Render a buffer ref or slice for HLIR dump."""
     if isinstance(a, str):
         return a
     if isinstance(a, BufferSlice):
-        starts = ",".join(str(s) if isinstance(s, (int, float)) else f"<{type(s).__name__}>"
-                          for s in a.starts)
+        starts = ",".join(_fmt_idx_item(s) for s in a.starts)
         extents = ",".join(str(e) for e in a.extents)
         return f"{a.parent}[starts=({starts}), ext=({extents})]"
     return str(a)
@@ -522,12 +546,14 @@ def _fmt_buf_arg(a) -> str:
 def _fmt_scalar(x) -> str:
     """Compact display for ints / strs / PrimExprs."""
     if isinstance(x, BufferElement):
-        idx = ", ".join(str(i) if isinstance(i, (int, float, str)) else f"<{type(i).__name__}>"
-                        for i in x.indices)
+        idx = ", ".join(_fmt_idx_item(i) for i in x.indices)
         return f"{x.buffer}[{idx}]"
     if isinstance(x, (int, float, str)):
         return str(x)
-    return f"<{type(x).__name__} {x}>"
+    name = getattr(x, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    return str(x)
 
 
 # Sanity helper used by passes to assert progress.

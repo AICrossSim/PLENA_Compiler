@@ -260,7 +260,11 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         btmm_lane_count=args.btmm_lane_count,
         btmm_hlen=args.btmm_hlen,
     )
-    compiled = compile_kernel(func, target=target, name=args.asm_name)
+    midir_dump_dir = Path(args.dump_hlir).parent if args.dump_hlir else None
+    compiled = compile_kernel(
+        func, target=target, name=args.asm_name,
+        midir_dump_dir=midir_dump_dir,
+    )
     isa_text = compiled.isa_text
     if args.stage_output:
         isa_text = isa_text.rstrip() + _emit_output_staging(

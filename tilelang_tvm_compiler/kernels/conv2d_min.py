@@ -60,7 +60,7 @@ Layout contract for ``B_cache`` (testbench-side preload):
 
 import tilelang.language as T
 
-from ..frontend import compile_func
+from ..frontend.pipeline import compile_func
 
 
 def make_conv2d_min(

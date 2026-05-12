@@ -45,11 +45,9 @@ The kernel does NOT write back to HBM. The output ends up in FPRAM at
 (``compare_fpsram_output=True`` in comparison_params).
 """
 
-import tvm
 import tilelang.language as T
 
 from ..address_alloc import FPRAM_USER_BASE
-from ..frontend import compile_func
 from ..frontend.gemm_macros import KIND
 
 
@@ -145,9 +143,17 @@ def make_flash_decode_min(
                 L_OLD[row] = L_INIT[row]
 
             for kv_block in T.unroll(num_kv_blocks):
-                # K, V DMAs — sync, multi-lane.
-                T.copy(K_hbm[0, kv_block * rows, by, 0], K_sh)
-                T.copy(V_hbm[0, kv_block * rows, by, 0], V_sh)
+                # K, V DMAs — sync, multi-lane. Explicit slice form so
+                # mid_ir's ranged_slice inference produces clean
+                # (extent=rows, extent=hlen) tile shapes.
+                T.copy(
+                    K_hbm[0, kv_block * rows : (kv_block + 1) * rows, by, 0:hlen],
+                    K_sh,
+                )
+                T.copy(
+                    V_hbm[0, kv_block * rows : (kv_block + 1) * rows, by, 0:hlen],
+                    V_sh,
+                )
 
                 # Q @ K^T → BTMV (rows=1 LHS auto-routes to plena.btmv).
                 with T.attr(0, KIND, "btmm"):
@@ -206,7 +212,9 @@ def make_flash_decode_min(
             # tilelang's copy_op doesn't degenerate to a scalar BufferStore.
             T.copy(O_loc, O_cache[by, 0])
 
-    lowered = compile_func(flash_decode_min)
+    # Return the raw PrimFunc — ``compile_kernel`` runs stmt prep + the
+    # mid_ir pipeline itself, so factories don't pre-lower anymore.
+    lowered = flash_decode_min
 
     constants = {
         "ROWS": rows,

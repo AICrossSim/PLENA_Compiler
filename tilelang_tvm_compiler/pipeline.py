@@ -1,9 +1,14 @@
-"""End-to-end driver: TIR PrimFunc -> real PLENA ISA text.
+"""End-to-end driver: raw TIR PrimFunc -> real PLENA ISA text.
 
-Orchestrates the three passes:
-    1. PlenaCodegen.lower_to_hlir   (TIR -> HLIR)
-    2. AddressAllocationPass         (HLIR + addresses)
-    3. IsaEmitterPass                (HLIR -> ISA text)
+Orchestrates:
+    0. inline_let_stmts + lower_compound_fp_stores  (stmt prep)
+    1. mid_ir pipeline (10 passes, see frontend/mid_ir/passes/)
+    2. AddressAllocationPass                         (HLIR + addresses)
+    3. IsaEmitterPass                                (HLIR -> ISA text)
+
+The legacy ``frontend/`` graph-IR pipeline + ``codegen.PlenaCodegen``
+are no longer in the call path. They're still on disk for reference
+but aren't imported here.
 
 Hardware constants for the program shim are passed in via PlenaTarget,
 which we keep deliberately small for now -- mlen/blen/btmm shape are
@@ -13,12 +18,29 @@ fixed per chip variant.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 import tvm
 from tvm import tir
 
 from .address_alloc import AddressAllocationPass, AddressAllocConfig
-from .codegen import PlenaCodegen
+from . import dead_buffer_elim as _dead_buffer_elim
+# Direct submodule imports to avoid the legacy frontend package's
+# __init__ (which imports compile_func → frontend/pipeline.py →
+# ..pipeline.PlenaTarget, a circular import once we land here).
+from .frontend.passes import inline_let_stmts as _stmt_inline_let
+from .frontend.passes import lower_compound_fp_stores as _stmt_lower_compound
+from .frontend.mid_ir.passes import infer_lane_axis as _mid_infer_lane_axis
+from .frontend.mid_ir.passes import fold as _mid_fold
+from .frontend.mid_ir.passes import mark as _mid_mark
+from .frontend.mid_ir.passes import split as _mid_split
+from .frontend.mid_ir.passes import distribute_cluster as _mid_distribute
+from .frontend.mid_ir.passes import async_wrap as _mid_async
+from .frontend.mid_ir.passes import view as _mid_view
+from .frontend.mid_ir.passes import fuse as _mid_fuse
+from .frontend.mid_ir.passes import burn_view as _mid_burn
+from .frontend.mid_ir.passes import to_plena as _mid_to_plena
 from .hlir import HLIRModule
 from .isa_pass import IsaEmitterPass
 from .program_shim import make_shim
@@ -55,12 +77,45 @@ def compile_kernel(
     *,
     target: PlenaTarget,
     name: str = "kernel",
+    midir_dump_dir: Optional[Path] = None,
 ) -> CompiledKernel:
-    # Pass 1
-    cg = PlenaCodegen(prim_func, name=name)
-    mod = cg.lower_to_hlir()
+    """Lower a raw TIR PrimFunc through the mid_ir pipeline + downstream
+    address-alloc + ISA-emit passes.
 
-    # Pass 2
+    ``midir_dump_dir`` (when set): pass_6_to_plena will write a
+    human-readable ``<name>.midir.txt`` snapshot there for debugging.
+    """
+    # ---------- 0. stmt prep ----------
+    func = _stmt_inline_let.run(prim_func)
+    func = _stmt_lower_compound.run(func)
+
+    # ---------- 1. mid_ir pipeline ----------
+    func = _mid_infer_lane_axis.run(func)
+    midfn = _mid_fold.run(func, name=name)
+    midfn = _mid_mark.run(midfn)
+    midfn = _mid_split.run(midfn)
+    midfn = _mid_distribute.run(midfn)
+    midfn = _mid_async.run(midfn)
+    midfn = _mid_view.run(midfn)
+    midfn = _mid_fuse.run(midfn)
+    midfn = _mid_burn.run(midfn)
+    mod = _mid_to_plena.run(midfn, build_dir=midir_dump_dir)
+
+    # DEBUG: dump HLIR immediately after to_plena so we can inspect it
+    # even when later passes fail.
+    if midir_dump_dir is not None:
+        from .hlir import format_hlir as _fmt
+        (midir_dump_dir / "post_to_plena.hlir.txt").write_text(_fmt(mod))
+
+    # ---------- 1.5. drop unreachable buffers ----------
+    # Buffers declared in the kernel but not referenced by any HLIR op
+    # (e.g. softmax-state fragments in a stub kernel that bypasses
+    # softmax) would otherwise waste FPRAM/VRAM and can also crash
+    # downstream shape checks if their post-expansion layout doesn't
+    # match the lane mode that was never inferred.
+    _dead_buffer_elim.run(mod)
+
+    # ---------- 2. address alloc ----------
     addr_pass = AddressAllocationPass(AddressAllocConfig(
         mlen=target.mlen,
         blen=target.blen,
@@ -68,7 +123,7 @@ def compile_kernel(
     ))
     addr_pass.run(mod)
 
-    # Pass 3
+    # ---------- 3. ISA emit ----------
     shim = make_shim(
         mlen=target.mlen,
         blen=target.blen,

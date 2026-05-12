@@ -245,9 +245,19 @@ class ISAEmitter:
         # reads). `hbm_start_offset` is ignored in that case.
         hbm_start_offset_reg: Optional[int] = None,
     ) -> None:
-        addr_reg = self.program.compiler.register_allocator.allocate_addr(1)[0]
-        gp_addr = self.program.compiler.register_allocator.allocate_gp(1)
-        gp_preload = self.program.compiler.register_allocator.allocate_gp(5)
+        ra = self.program.compiler.register_allocator
+        addr_reg = ra.allocate_addr(1)[0]
+        # Need 1 (addr-init scratch) + 5 (preload scratch). Use
+        # spill_borrow so the allocator can move long-lived outer GPs
+        # (loop counters / indices) to IntRAM temporarily. The
+        # caller-supplied ``hbm_start_offset_reg`` is read inside the
+        # emit body, so protect it from being spilled.
+        protect = [hbm_start_offset_reg] if hbm_start_offset_reg is not None else []
+        borrowed, token = ra.spill_borrow(
+            6, compiler=self.program.compiler, protect=protect,
+        )
+        gp_addr = [borrowed[0]]
+        gp_preload = borrowed[1:6]
 
         isa = ""
         isa += preload_addr_reg_asm(
@@ -271,9 +281,8 @@ class ISAEmitter:
         )
         self.program.compiler.generated_code += isa
 
-        self.program.compiler.register_allocator.free_gp(gp_addr)
-        self.program.compiler.register_allocator.free_gp(gp_preload)
-        self.program.compiler.register_allocator.free_addr([addr_reg])
+        ra.spill_return(token, compiler=self.program.compiler)
+        ra.free_addr([addr_reg])
 
     def emit_store_tile_to_hbm(
         self,
@@ -286,9 +295,14 @@ class ISAEmitter:
         # PLENA TVM extension; see emit_load_tile_from_hbm.
         hbm_start_offset_reg: Optional[int] = None,
     ) -> None:
-        addr_reg = self.program.compiler.register_allocator.allocate_addr(1)[0]
-        gp_addr = self.program.compiler.register_allocator.allocate_gp(1)
-        gp_store = self.program.compiler.register_allocator.allocate_gp(5)
+        ra = self.program.compiler.register_allocator
+        addr_reg = ra.allocate_addr(1)[0]
+        protect = [hbm_start_offset_reg] if hbm_start_offset_reg is not None else []
+        borrowed, token = ra.spill_borrow(
+            6, compiler=self.program.compiler, protect=protect,
+        )
+        gp_addr = [borrowed[0]]
+        gp_store = borrowed[1:6]
 
         isa = ""
         isa += preload_addr_reg_asm(
@@ -311,9 +325,8 @@ class ISAEmitter:
         )
         self.program.compiler.generated_code += isa
 
-        self.program.compiler.register_allocator.free_gp(gp_addr)
-        self.program.compiler.register_allocator.free_gp(gp_store)
-        self.program.compiler.register_allocator.free_addr([addr_reg])
+        ra.spill_return(token, compiler=self.program.compiler)
+        ra.free_addr([addr_reg])
 
     def emit_zero_vram_tile(self, vram_addr: int, num_rows: Optional[int] = None) -> None:
         # `num_rows` is how many MLEN-wide rows to zero. Defaults to MLEN
@@ -824,6 +837,7 @@ class ISAEmitter:
         dst_m_tile_stride: Optional[int] = None,
         dst_row_stride: Optional[int] = None,
         task_id: str = "matmul",
+        scratch_regs: Optional[List[int]] = None,
     ) -> None:
         """Unified `(M, K) @ (K, N) -> (M, N)` matmul.
 
@@ -890,7 +904,19 @@ class ISAEmitter:
         c_orow_step = blen * int(dst_row_stride)
 
         ra = self.program.compiler.register_allocator
-        gp_regs = ra.allocate_gp(7)
+        # Caller can pre-allocate the 7 scratch GPs (and pin them) so they're
+        # disjoint from any offset registers it materialised. When caller
+        # passes them in we don't free here either — caller owns the lifetime.
+        if scratch_regs is not None:
+            if len(scratch_regs) != 7:
+                raise ValueError(
+                    f"emit_matmul_general expects 7 scratch_regs, got {len(scratch_regs)}"
+                )
+            gp_regs = list(scratch_regs)
+            caller_owns_scratch = True
+        else:
+            gp_regs = ra.allocate_gp(7)
+            caller_owns_scratch = False
         (gp_act_orow, gp_out_orow, gp_act, gp_mat, gp_out,
          gp_loop_orow, gp_loop_k) = gp_regs
 
@@ -961,7 +987,8 @@ class ISAEmitter:
                     lines.append(f"S_ADDI_INT gp{gp_out_orow}, gp{gp_out_orow}, {c_orow_step}")
                     lines.append(f"C_LOOP_END gp{gp_loop_orow}")
 
-        ra.free_gp(gp_regs)
+        if not caller_owns_scratch:
+            ra.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
     def emit_tile_binary(

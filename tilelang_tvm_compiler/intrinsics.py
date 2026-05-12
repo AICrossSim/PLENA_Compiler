@@ -99,21 +99,21 @@ register(IntrinsicSpec(
 ))
 
 register(IntrinsicSpec(
-    name="plena.v_add",
+    name="plena.tile_add",
     operand_scopes=(_scope.VRAM, _scope.VRAM, _scope.VRAM),
-    emit=lambda a: f"V_ADD    lhs={a[0]}  rhs={a[1]}  dst={a[2]}",
+    emit=lambda a: f"TILE_ADD lhs={a[0]}  rhs={a[1]}  dst={a[2]}",
 ))
 
 register(IntrinsicSpec(
-    name="plena.v_sub",
+    name="plena.tile_sub",
     operand_scopes=(_scope.VRAM, _scope.VRAM, _scope.VRAM),
-    emit=lambda a: f"V_SUB    lhs={a[0]}  rhs={a[1]}  dst={a[2]}",
+    emit=lambda a: f"TILE_SUB lhs={a[0]}  rhs={a[1]}  dst={a[2]}",
 ))
 
 register(IntrinsicSpec(
-    name="plena.v_mul",
+    name="plena.tile_mul",
     operand_scopes=(_scope.VRAM, _scope.VRAM, _scope.VRAM),
-    emit=lambda a: f"V_MUL    lhs={a[0]}  rhs={a[1]}  dst={a[2]}",
+    emit=lambda a: f"TILE_MUL lhs={a[0]}  rhs={a[1]}  dst={a[2]}",
 ))
 
 register(IntrinsicSpec(
@@ -180,9 +180,9 @@ register(IntrinsicSpec(
 ))
 
 register(IntrinsicSpec(
-    name="plena.zero_v",
+    name="plena.tile_zero",
     operand_scopes=(_scope.VRAM,),
-    emit=lambda a: f"ZERO_V   dst={a[0]}",
+    emit=lambda a: f"TILE_ZERO dst={a[0]}",
 ))
 
 

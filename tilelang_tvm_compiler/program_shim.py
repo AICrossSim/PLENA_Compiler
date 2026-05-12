@@ -76,6 +76,9 @@ def make_shim(
     register_allocator: Optional[RegisterAllocator] = None,
 ) -> ProgramShim:
     compiler = CompilerShim(register_allocator=register_allocator or RegisterAllocator())
+    # Wire the allocator back to the compiler so auto-spill can emit
+    # S_ST_INT / S_LD_INT into generated_code.
+    compiler.register_allocator.compiler = compiler
     return ProgramShim(
         mlen=mlen,
         blen=blen,

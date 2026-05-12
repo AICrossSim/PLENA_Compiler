@@ -31,10 +31,7 @@ K-side RoPE has identical structure (XK→K, SIN↔NEG_SIN role swap).
 Kept out of this minimal kernel.
 """
 
-import tvm
 import tilelang.language as T
-
-from ..frontend import compile_func
 
 
 def make_rope_min(
@@ -114,7 +111,9 @@ def make_rope_min(
 
             T.copy(Q_OUT_sh, Q_OUT_hbm[0, s_block * rows, by, 0])
 
-    lowered = compile_func(rope_min)
+    # Return the raw PrimFunc — ``compile_kernel`` runs stmt prep + the
+    # mid_ir pipeline itself, so factories don't pre-lower anymore.
+    lowered = rope_min
 
     constants = {
         "ROWS": rows,
