@@ -27,6 +27,7 @@ PLENA_Compiler/
 |
 |-- aten/                    # Pipeline 1: ATen compilation backend
 |   |-- plena_frontend.py    #   HF model -> PLENA program -> ISA text
+|   |-- e2e_runner.py        #   ATen e2e runner: PlenaCompiler -> emulator -> golden
 |   |-- plena/               #   Canonical PlenaCompiler implementation package
 |   |   |-- compiler.py      #     PlenaCompiler composition class
 |   |   |-- memory_state.py  #     Tensor/input/FP memory state
@@ -38,8 +39,7 @@ PLENA_Compiler/
 |       +-- cpu/             #     CPU reference implementations
 |
 |-- generator/               # Pipeline 2: Config-driven code generation
-|   |-- runner.py            #   CLI entry point (codegen, aten, utilization modes)
-|   |-- aten_runner.py       #   ATen backend bridge (wraps PlenaCompiler for E2E)
+|   |-- runner.py            #   CLI entry point for codegen/utilization
 |   |-- parser/              #   HF config -> symbolic graph
 |   |   |-- llm_parser.py    #     LLMModelParser (text decoder graphs)
 |   |   +-- hardware_parser.py #   configuration.svh / precision.svh reader

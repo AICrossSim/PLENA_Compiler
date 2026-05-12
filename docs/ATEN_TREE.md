@@ -10,6 +10,7 @@ aten/
 |-- isa_builder.py              # Typed ISA instruction/register builder and legalization
 |-- model_extract.py            # HuggingFace model config/layer/embedding extraction helpers
 |-- plena_frontend.py           # HF decoder model -> PLENA program -> ISA text
+|-- e2e_runner.py               # HF model -> ATen compiler -> emulator -> golden check
 |-- reference.py                # CPU golden/reference math and MXFP/BF16 helpers
 |-- vram_stage_compare.py       # Debug tooling for VRAM stage comparisons
 |
@@ -71,4 +72,6 @@ Key points:
 - `aten/ops/` is the ATen-style dispatcher surface.
 - `aten/plena_frontend.py` is the HuggingFace/ATen frontend that drives model
   compilation.
+- `aten/e2e_runner.py` runs the ATen compiler path through the emulator and
+  golden comparison.
 - The old `aten/plena_compiler.py` compatibility facade has been removed.

@@ -518,7 +518,7 @@ def run_test_aten(
     numerical verification deferred, this immediately gets full numerical
     correctness via the mature ATen compilation backend.
     """
-    from generator.aten_runner import run_aten_e2e
+    from compiler.aten.e2e_runner import run_aten_e2e
 
     print("=" * 80)
     print(f"Generator e2e harness (ATen backend) — {model_id} — "

@@ -70,14 +70,14 @@ backends, and weight-handling strategies.
 | `aten/ops/plena/*.py` | Registered ATen op implementations (linear, attention, ffn, norm, conv, softmax, embedding) |
 | `aten/ops/cpu/*.py` | CPU reference fallbacks |
 | `aten/ops/registry.py` | Op dispatch registry |
-| `generator/aten_runner.py` | E2E harness: model load -> compile -> emulate -> verify |
+| `aten/e2e_runner.py` | E2E harness: model load -> compile -> emulate -> verify |
 | `sim_env_utils/build_env.py` | Simulation environment builder |
 
 ### Entry points
 
 - **Single-layer tests**: `model_layer_test_builder.py::build_and_run_decoder_test`
-- **Full-model E2E**: `generator/aten_runner.py::run_aten_e2e`
-- **CLI**: `python -m generator.runner aten <model> --seq-len 32 --num-layers 1`
+- **Full-model E2E**: `aten/e2e_runner.py::run_aten_e2e`
+- **CLI**: `python -m compiler.aten.e2e_runner <model> --seq-len 32 --num-layers 1`
 
 ### Test suite
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PLENA Generator Runner -- entry point for both compilation pipelines.
+PLENA generator runner -- symbolic codegen and ATen e2e convenience entry.
 
 Modes:
   codegen      -- Pipeline 2 (Generator): HF config -> symbolic graph ->
@@ -12,7 +12,7 @@ Modes:
 
 Examples:
     python -m generator.runner codegen AICrossSim/clm-60m output.asm --seq-len 512
-    python -m generator.runner aten AICrossSim/clm-60m --seq-len 32 --num-layers 1
+    python -m compiler.aten.e2e_runner AICrossSim/clm-60m --seq-len 32 --num-layers 1
 
 See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
@@ -29,7 +29,7 @@ from generator.scheduler import gen_scheduler
 
 def _run_aten(args) -> int:
     """ATen-backed end-to-end: PlenaCompiler + ops.* -> emulator -> numerical check."""
-    from generator.aten_runner import run_aten_e2e
+    from compiler.aten.e2e_runner import run_aten_e2e
 
     result = run_aten_e2e(
         model_id=args.model_path,
