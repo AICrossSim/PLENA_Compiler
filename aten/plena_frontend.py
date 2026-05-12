@@ -14,6 +14,8 @@ from compiler.aten.model_extract import (
     extract_model_config,
     find_model_root,
 )
+import compiler.aten.ops as ops
+from compiler.aten.ops.registry import Backend, OpRegistry
 from compiler.aten.plena_compiler import PlenaCompiler
 from compiler.aten.reference import (
     ReferencePrecision,
@@ -84,7 +86,7 @@ def _save_residual_and_norm(prog, source, scratch):
     """Emit the common decoder pre-norm residual prologue."""
     prog.vram_fill_zero(scratch)
     prog.vram_add(scratch, source)
-    prog.rms_norm(source, eps_offset=3, reci_hid_offset=4)
+    ops.rms_norm(prog, source, eps_offset=3, reci_hid_offset=4)
 
 
 def _add_residual(prog, target, scratch):
@@ -92,9 +94,13 @@ def _add_residual(prog, target, scratch):
     return target
 
 
+def _linear_projection(prog, input_var, weight_var, name: str):
+    return ops.linear(prog, input_var, weight_var, name=name)
+
+
 def _apply_rope_projection(prog, x_var, rope_matrix, cos_var, sin_var, name):
-    x_rot = prog.linear_projection(x_var, rope_matrix, name)
-    prog.rope(x_var, x_rot, cos_var, sin_var)
+    x_rot = _linear_projection(prog, x_var, rope_matrix, name)
+    ops.rope(prog, x_var, x_rot, cos_var, sin_var)
     prog.free_tensor(x_rot)
     return x_var
 
@@ -118,12 +124,14 @@ def _emit_kv_stores(prog, current, layer_inputs, rope_inputs, layer_idx, num_kv_
     rope_matrix, cos_var, sin_var = rope_inputs
     kv_stored = []
     for kv_h in range(num_kv_heads):
-        K_h = prog.linear_projection(
+        K_h = _linear_projection(
+            prog,
             current,
             layer_inputs.w_k_heads[kv_h],
             f"K_{layer_idx}_h{kv_h}",
         )
-        V_h = prog.linear_projection(
+        V_h = _linear_projection(
+            prog,
             current,
             layer_inputs.w_v_heads[kv_h],
             f"V_{layer_idx}_h{kv_h}",
@@ -166,7 +174,7 @@ def _emit_attention_block(
 ):
     _save_residual_and_norm(prog, current, scratch)
 
-    Q = prog.linear_projection(current, layer_inputs.w_q, f"Q_{layer_idx}")
+    Q = _linear_projection(prog, current, layer_inputs.w_q, f"Q_{layer_idx}")
     q_full_addr = prog.get_vram_addr(Q.name)
 
     O_full = prog.alloc(f"O_full_{layer_idx}", seq_len, total_q_dim)
@@ -197,7 +205,8 @@ def _emit_attention_block(
             f"Q_rot_{layer_idx}_h{h}",
         )
 
-        O_h = prog.flash_attention(
+        O_h = ops.flash_attention(
+            prog,
             Q_h,
             K_stored,
             V_stored,
@@ -216,13 +225,13 @@ def _emit_attention_block(
         )
         _free_named_tensors(prog, ("O", "S", "PV"))
 
-    O_proj = prog.linear_projection(O_full, layer_inputs.w_o, f"O_proj_{layer_idx}")
+    O_proj = _linear_projection(prog, O_full, layer_inputs.w_o, f"O_proj_{layer_idx}")
     return _add_residual(prog, O_proj, scratch)
 
 
 def _emit_ffn_block(prog, current, layer_inputs, scratch):
     _save_residual_and_norm(prog, current, scratch)
-    prog.ffn(current, layer_inputs.w_gate, layer_inputs.w_up, layer_inputs.w_down)
+    ops.ffn(prog, current, layer_inputs.w_gate, layer_inputs.w_up, layer_inputs.w_down)
     return _add_residual(prog, current, scratch)
 
 
@@ -383,6 +392,9 @@ def compile_hf_model(
 
     # ----------------------------------------------------------- PLENA ISA
     print("\n--- PLENA Backend (ISA generation) ---")
+    registry = OpRegistry.load()
+    registry.set_backend(Backend.PLENA)
+
     prog = PlenaCompiler(mlen=mlen, blen=blen, real_data_ratio=REAL_DATA_RATIO)
 
     # Shared inputs
@@ -411,7 +423,7 @@ def compile_hf_model(
     # Load activations to VRAM
     X_batch = prog.load_batch(x_input, name="X")
     POS_batch = prog.load_batch(pos_input, name="POS")
-    prog.embedding_add(X_batch, POS_batch)  # X += POS in-place
+    ops.embedding_add(prog, X_batch, POS_batch)  # X += POS in-place
 
     # VRAM layout hazard: ffn_asm writes gate/up intermediates at absolute
     # address batch*hidden spanning up to batch*hidden + 2*inter*batch.
@@ -461,7 +473,7 @@ def compile_hf_model(
         prog.emit_comment(f"=== LAYER {i}/{n_layers} COMPLETE ===")
 
     # Final norm
-    prog.rms_norm(current, eps_offset=3, reci_hid_offset=4)
+    ops.rms_norm(prog, current, eps_offset=3, reci_hid_offset=4)
 
     isa_code = prog.compile()
     isa_code = _fix_large_immediates(isa_code)

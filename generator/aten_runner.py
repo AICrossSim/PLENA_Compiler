@@ -1,7 +1,7 @@
 """
 ATen-backend runner for the generator.
 
-Wraps the proven ATen compilation path (PlenaCompiler direct codegen) to provide
+Wraps the proven ATen compilation path (PlenaCompiler + ops.*) to provide
 end-to-end model compilation + emulation + numerical verification.  This
 is the same pipeline that passes 18/18 tests in the ATen test suite.
 
@@ -45,7 +45,7 @@ def run_aten_e2e(
 
     Steps:
       1. Load model config + layer weights from HuggingFace
-      2. Build ISA via PlenaCompiler direct codegen (numerically verified path)
+      2. Build ISA via PlenaCompiler + ops.* (numerically verified path)
       3. Set up sim environment (ASM + HBM weights + FPRAM constants)
       4. Run Rust emulator
       5. Compare VRAM output against golden PyTorch reference
@@ -121,7 +121,7 @@ def run_aten_e2e(
         asm_name = f"aten_{model_id.split('/')[-1]}_l{current_layer}"
         layer_build = build_path / f"layer_{current_layer}"
 
-        print(f"\n[2/5] Building ISA for layer {current_layer} via PlenaCompiler direct codegen")
+        print(f"\n[2/5] Building ISA for layer {current_layer} via PlenaCompiler + ops.*")
         print(f"[3/5] Setting up sim environment: {layer_build}")
         print("[4/5] Running Rust transactional emulator")
 
@@ -179,7 +179,7 @@ def run_aten_e2e(
         asm_name = f"aten_{model_id.split('/')[-1]}_chain{num_layers}"
         chain_build = build_path / f"chain_{num_layers}layers"
 
-        print(f"\n[2/5] Building chained {num_layers}-layer ISA via PlenaCompiler direct codegen")
+        print(f"\n[2/5] Building chained {num_layers}-layer ISA via PlenaCompiler + ops.*")
         print(f"[3/5] Setting up sim environment: {chain_build}")
         print("[4/5] Running Rust transactional emulator")
 
@@ -285,7 +285,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Run HF model through ATen compilation path (PlenaCompiler direct codegen)",
+        description="Run HF model through ATen compilation path (PlenaCompiler + ops.*)",
         prog="python -m generator.aten_runner",
     )
     parser.add_argument("model_id", help="HuggingFace model ID (e.g. AICrossSim/clm-60m)")

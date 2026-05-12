@@ -31,7 +31,7 @@
     uses_mram: false
   doc: "Online softmax: row-wise numerically stable softmax (in-place on S tile)"
 
-- func: "linear(Tensor input, Tensor weight) -> Tensor"
+- func: "linear(Tensor input, Tensor weight, str name='linear_out') -> Tensor"
   category: primitive
   in_place: false
   dispatch:
