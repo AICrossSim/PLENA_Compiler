@@ -89,7 +89,7 @@ def _build_hbm_from_hf_weights(
 ) -> dict:
     """Populate hbm_for_behave_sim.bin with real HF model weights.
 
-    Mirrors compiler/sim_env_utils/build_env.py::create_mem_for_sim but
+    Mirrors sim_env_utils/build_env.py::create_mem_for_sim but
     operates directly on HF tensors (no intermediate .pt files) and writes
     each weight block at the scheduler-assigned HBM offset.
 
