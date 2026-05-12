@@ -1,6 +1,6 @@
 """compiler.aten — ATen-style PLENA compiler path.
 
-PlenaCompiler DSL + op backend registry. Pairs with compiler.generator
+PlenaCompiler program builder + op backend registry. Pairs with compiler.generator
 for the two-path compiler (template vs. aten).
 """
 
@@ -19,30 +19,12 @@ from compiler.aten.isa_builder import (  # noqa: E402, F401
     gp,
 )
 from compiler.aten.plena_compiler import (  # noqa: E402, F401
-    DeveloperCompiler,
-    PlenaCompiler,
-    TileCompiler,
-    IsaCompiler,
-    RegisterAllocator,
-    TensorVar,
-    InputVar,
-    VRAMMatrixVar,
     FPVar,
-    TensorKind,
-    tensor_kind,
-    Tensor,
-    TensorInfo,
-    TileLayout,
-    MemoryBlock,
-    VirtualMemoryManager,
-    MRAMAllocator,
-    VRAMAllocator,
-    FPRAMAllocator,
-    SubMatrixInfo,
-    MatrixBlockLayout,
-    VRAMSubMatrixInfo,
-    VRAMMatrixBlockLayout,
-    MemoryObjectInfo,
-    FPRAMObjectLayout,
+    InputVar,
+    IsaCompiler,
+    PlenaCompiler,
+    TensorVar,
+    TileCompiler,
+    VRAMMatrixVar,
 )
 from compiler.aten.ops.registry import OpRegistry, Backend  # noqa: E402, F401

@@ -126,7 +126,7 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
     # Make sure K/V HBM subst-matrix registry knows about them
     prog._ensure_hbm_sub_matrix_registered(K)
     prog._ensure_hbm_sub_matrix_registered(V)
-    alloc = prog._compiler.register_allocator
+    alloc = prog.register_allocator
     k_addr, v_addr = alloc.allocate_addr(2)
     gp_for_preload = alloc.allocate_gp(2)
     setup = preload_addr_reg_asm(
@@ -135,7 +135,7 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
         addr_reg_val=[K.hbm_addr, V.hbm_addr],
     )
     alloc.free_gp(gp_for_preload)
-    prog._compiler.emit(setup)
+    prog.emit(setup)
 
     # Allocate VRAM buffers mirroring main's layout.
     #   S, PV each require mlen*mlen*ratio elements; O is s_q * (hq*h_qkv).
@@ -143,15 +143,15 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
     # vector_sram_base_address + computed offsets for S/PV/O, so they must be
     # allocated contiguously starting right after Q.  allocate_vram_matrix
     # bump-allocates, which preserves that contiguity.
-    q_vram_base = prog._compiler.get_vram_addr(Q.name)
+    q_vram_base = prog.get_vram_addr(Q.name)
     s_name = prog._scoped_name("_gqa_S")
     pv_name = prog._scoped_name("_gqa_PV")
     o_name = prog._scoped_name("O")
 
     # Express sizes as (rows, cols) that multiply to the required counts.
-    prog._compiler.allocate_vram_matrix(name=s_name, rows=mlen * ratio, cols=mlen, strict=False)
-    prog._compiler.allocate_vram_matrix(name=pv_name, rows=mlen * ratio, cols=mlen, strict=False)
-    prog._compiler.allocate_vram_matrix(name=o_name, rows=s_q, cols=hq * h_qkv, strict=False)
+    prog.allocate_vram_matrix(name=s_name, rows=mlen * ratio, cols=mlen, strict=False)
+    prog.allocate_vram_matrix(name=pv_name, rows=mlen * ratio, cols=mlen, strict=False)
+    prog.allocate_vram_matrix(name=o_name, rows=s_q, cols=hq * h_qkv, strict=False)
 
     # Reserve FPRAM for multi-head softmax state.  main's flash_attn_asm
     # assumes slots 0..2 hold constants (0.0, scale, -inf, preloaded by the
@@ -159,13 +159,16 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
     # 3 triples (m_old, m_res, l_old) per head, strided 3*br apart.
     # Reserve slots 0..2 first so our bump-allocated state lives at offset 3+.
     br = min(mlen, s_q)
-    fp_allocs = prog._compiler.fpram_allocator
+    fp_allocs = prog.fpram_allocator
     if "_gqa_fp_const_zero" not in fp_allocs.allocations:
         fp_allocs.allocate(name="_gqa_fp_const_zero", size=1)
         fp_allocs.allocate(name="_gqa_fp_const_scale", size=1)
         fp_allocs.allocate(name="_gqa_fp_const_neg_inf", size=1)
     fp_state_size = 3 * br * ratio
-    fp_start = prog._compiler.allocate_fpram(name="_gqa_softmax_state", size=fp_state_size)
+    fp_info = prog.add_fpram_object(name="_gqa_softmax_state", size=fp_state_size)
+    if fp_info.fpram_addr is None:
+        raise RuntimeError("Failed to allocate FPRAM for GQA softmax state")
+    fp_start = fp_info.fpram_addr
 
     # Call main's fused GQA template
     asm = flash_attn_asm(
@@ -185,13 +188,13 @@ def _flash_attention_gqa_fused(prog, Q, K, V, scale, hq, hkv, h_qkv):
         k_base_hbm_offset_reg=k_addr,
         v_base_hbm_offset_reg=v_addr,
     )
-    prog._compiler.emit(asm)
+    prog.emit(asm)
 
     # Release HBM addr regs (they're only needed during the call)
     alloc.free_addr([k_addr, v_addr])
 
     # Return O as a VRAMMatrixVar the caller can consume
-    from compiler.aten.plena_compiler import VRAMMatrixVar
+    from compiler.aten.plena.vars import VRAMMatrixVar
 
     O = VRAMMatrixVar(prog, o_name, (s_q, hq * h_qkv), display_name="O")
     prog._tensors[o_name] = O

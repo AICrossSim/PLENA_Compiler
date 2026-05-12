@@ -63,18 +63,6 @@ class IsaEmitMixin:
         """Free FPRAM object by name."""
         return self.free_fpram_object(name, strict=strict)
 
-    def save_fpram_state(self) -> int:
-        """Save FPRAM allocator snapshot."""
-        return self.fpram_allocator.save_state()
-
-    def restore_fpram_state(self, snapshot: int):
-        """Restore FPRAM allocator snapshot."""
-        self.fpram_allocator.restore_state(snapshot)
-
-    def list_fpram_allocations(self) -> list[str]:
-        """List currently allocated FPRAM object names."""
-        return list(self.fpram_allocator.allocations.keys())
-
     def get_fpram_addr(self, name: str) -> int:
         """Get FPRAM base address from object name."""
         return self.get_fpram_layout(name).fpram_addr

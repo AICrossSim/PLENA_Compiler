@@ -15,44 +15,15 @@ from compiler.aten.plena.constants import MLEN
 
 @dataclass
 class MemoryBlock:
-    """Memory Block Information"""
-
     name: str  # Allocation name (e.g., "W[0][1]" or "activation_A")
     addr: int  # Starting address
     size: int  # Block size (number of elements)
 
-    def __repr__(self) -> str:
-        return f"MemBlock({self.name}, addr={self.addr}, size={self.size})"
-
 
 class VirtualMemoryManager:
-    """
-    Virtual Memory Manager
-
-    Core Design:
-    - used_stack: Allocated and in-use memory blocks
-    - free_stack: Freed and reusable memory blocks
-
-    Workflow:
-    1. allocate(name, size): Allocate memory
-       - Prioritize best-fit search for reusable blocks in free_stack
-       - If not found, use bump allocation from the end
-    2. free(name): Free memory
-       - Move block from used_stack to free_stack
-       - Address can be reused by subsequent allocate calls
-       - Throws exception if not found when strict=True, returns None when strict=False
-
-    VRAM/MRAM storage format: (batch_size, mlen, hidden_size/mlen), column-block major.
-    mlen=64, blen=4. Alignment depends on storage hierarchy.
-    """
+    """Best-fit reuse plus bump allocation for PLENA virtual memories."""
 
     def __init__(self, total_size: int, alignment: int = MLEN, mem_name: str = "Memory"):
-        """
-        Args:
-            total_size: Total memory size (number of elements)
-            alignment: alignment granularity (VRAM uses MLEN=64, MRAM uses MLEN*MLEN=4096)
-            mem_name: Memory name, for debugging information (e.g., "VRAM" or "MRAM")
-        """
         self.total_size = total_size
         self.alignment = alignment
         self.mem_name = mem_name
@@ -67,33 +38,16 @@ class VirtualMemoryManager:
         return ((value + self.alignment - 1) // self.alignment) * self.alignment
 
     def allocate(self, name: str, size: int) -> int:
-        """
-        Allocate memory.
-
-        Strategy:
-        1. Best-fit from free_stack (reusable block with least waste).
-        2. If no suitable block, bump allocation.
-
-        Returns:
-            Allocated starting address.
-
-        Raises:
-            MemoryError: Insufficient memory.
-        """
+        """Allocate by best-fit reuse first, then bump allocation."""
         aligned_size = self._align(size)
 
-        # Strategy 1: best-fit from free_stack
-        best_idx = None
-        best_waste = float("inf")
+        best = min(
+            ((block.size - aligned_size, i) for i, block in enumerate(self.free_stack) if block.size >= aligned_size),
+            default=None,
+        )
 
-        for i, block in enumerate(self.free_stack):
-            if block.size >= aligned_size:
-                waste = block.size - aligned_size
-                if waste < best_waste:
-                    best_waste = waste
-                    best_idx = i
-
-        if best_idx is not None:
+        if best is not None:
+            _, best_idx = best
             reused_block = self.free_stack.pop(best_idx)
 
             # If block is larger than needed, split remaining part and return to free_stack
@@ -107,7 +61,6 @@ class VirtualMemoryManager:
             self.used_stack.append(new_block)
             return new_block.addr
 
-        # Strategy 2: Bump allocation
         aligned_addr = self._align(self.next_bump)
 
         if self.total_size > 0 and aligned_addr + aligned_size > self.total_size:
@@ -124,16 +77,7 @@ class VirtualMemoryManager:
         return aligned_addr
 
     def free(self, name: str, strict: bool = True) -> MemoryBlock | None:
-        """
-        Free memory: move block from used_stack to free_stack.
-
-        Args:
-            name: Name of allocation to free
-            strict: Throws KeyError if not found when strict=True, returns None when strict=False
-
-        Returns:
-            Freed memory block, returns None if strict=False and not found
-        """
+        """Move an allocation from used_stack to reusable free_stack."""
         for i, block in enumerate(self.used_stack):
             if block.name == name:
                 freed = self.used_stack.pop(i)
@@ -149,18 +93,7 @@ class VirtualMemoryManager:
         return None
 
     def mark_used(self, addr: int, size: int, name: str) -> None:
-        """
-        Register a pre-known address range as occupied without bump allocation.
-
-        Used for prestaged VRAM tensors that are already in VRAM before program
-        execution (e.g. Q pre-loaded by the test harness).  Advances next_bump
-        past the end of this region so subsequent bump allocations do not collide.
-
-        Args:
-            addr: Start address of the pre-occupied region.
-            size: Number of elements in the region.
-            name: Name for tracking/free.
-        """
+        """Register a pre-known occupied range and advance bump past it."""
         aligned_size = self._align(size)
         block = MemoryBlock(name=name, addr=addr, size=aligned_size)
         self.used_stack.append(block)
@@ -170,9 +103,7 @@ class VirtualMemoryManager:
             self.next_bump = end
 
     def _coalesce_free_stack(self):
-        """
-        Merge adjacent free blocks by address to reduce long-term fragmentation.
-        """
+        """Merge adjacent free blocks by address."""
         if len(self.free_stack) <= 1:
             return
 
@@ -191,59 +122,11 @@ class VirtualMemoryManager:
 
         self.free_stack = merged
 
-    def is_allocated(self, name: str) -> bool:
-        """Check if a name is in used_stack"""
-        return any(b.name == name for b in self.used_stack)
-
-    def get_block(self, name: str) -> MemoryBlock | None:
-        """Get memory block with specified name from used_stack"""
-        for block in self.used_stack:
-            if block.name == name:
-                return block
-        return None
-
-    def get_used_size(self) -> int:
-        """Get total used size"""
-        return sum(b.size for b in self.used_stack)
-
-    def get_free_size(self) -> int:
-        """Get total reusable size"""
-        return sum(b.size for b in self.free_stack)
-
     def reset(self):
         """Reset manager"""
         self.next_bump = 0
         self.used_stack.clear()
         self.free_stack.clear()
-
-    def print_status(self):
-        """Print memory status"""
-        print(f"=== {self.mem_name} Virtual Memory Status ===")
-        print(f"Total size: {self.total_size}")
-        print(f"Bump pointer: {self.next_bump}")
-        print(f"Used blocks ({len(self.used_stack)}):")
-        for b in self.used_stack:
-            print(f"  {b}")
-        print(f"Free blocks ({len(self.free_stack)}):")
-        for b in self.free_stack:
-            print(f"  {b}")
-        total_used = self.get_used_size()
-        total_free = self.get_free_size()
-        if self.total_size > 0:
-            available = self.total_size - self.next_bump + total_free
-            print(
-                f"Summary: used={total_used}, free={total_free}, "
-                f"bump={self.next_bump}, available={available}/{self.total_size}"
-            )
-        else:
-            print(f"Summary: used={total_used}, free={total_free}, bump={self.next_bump} (unlimited mode)")
-
-    def __repr__(self) -> str:
-        return (
-            f"VirtualMemoryManager({self.mem_name}, "
-            f"used={len(self.used_stack)}, free={len(self.free_stack)}, "
-            f"bump={self.next_bump}/{self.total_size})"
-        )
 
 
 # ==============================================================================
@@ -263,13 +146,6 @@ class SubMatrixInfo:
     # Pre-calculated addresses (computed during compiler phase, used directly at runtime)
     hbm_offset: int = 0  # Offset in HBM (in elements)
     mram_addr: int | None = None  # Address in MRAM (if loaded)
-
-    def __repr__(self) -> str:
-        mram_str = f"{self.mram_addr}" if self.mram_addr is not None else "None"
-        return (
-            f"SubMatrix({self.parent_name}[{self.row_idx}][{self.col_idx}], "
-            f"shape={self.shape}, hbm_off={self.hbm_offset}, mram={mram_str})"
-        )
 
 
 @dataclass
@@ -349,12 +225,6 @@ class VRAMSubMatrixInfo:
     # Pre-calculated VRAM address
     vram_addr: int = 0
 
-    def __repr__(self) -> str:
-        return (
-            f"VRAMSubMatrix({self.parent_name}[{self.row_idx}][{self.col_idx}], "
-            f"shape={self.shape}, vram={self.vram_addr})"
-        )
-
 
 @dataclass
 class VRAMMatrixBlockLayout:
@@ -418,10 +288,6 @@ class VRAMMatrixBlockLayout:
         """Get all sub-blocks in a column"""
         return [self.sub_blocks[(r, col_idx)] for r in range(self.num_row_blocks)]
 
-    def get_row_vram_addrs(self, row_idx: int) -> list[int]:
-        """Get list of VRAM addresses for all sub-blocks in a row"""
-        return [block.vram_addr for block in self.get_row_blocks(row_idx)]
-
 
 # ==============================================================================
 # Unified Memory Object Metadata
@@ -456,76 +322,17 @@ class FPRAMObjectLayout:
 
 
 # ==============================================================================
-# MRAM Allocator
+# Allocators
 # ==============================================================================
 
 
-class MRAMAllocator:
-    """
-    Matrix RAM address allocator (based on VirtualMemoryManager).
+class MemoryAllocatorBase:
+    """Shared wrapper over VirtualMemoryManager for compiler address spaces."""
 
-    Each sub-block is mlen x mlen = 4096 elements; aligned to mlen*mlen.
-    Default total_size=16384 holds 4 sub-blocks (MAX_K_TILES=4).
-    Supports virtual free/reuse: freed blocks move to free_stack and are
-    preferred by subsequent allocations.
-    """
-
-    def __init__(self, total_size: int = MLEN * MLEN * 4):
-        """
-        Args:
-            total_size: Total MRAM size (default 16384, can hold 4 64x64 matrix blocks)
-        """
+    def __init__(self, total_size: int, alignment: int, mem_name: str):
         self.total_size = total_size
-        self._vmm = VirtualMemoryManager(
-            total_size=total_size,
-            alignment=MLEN * MLEN,  # aligned to one sub-block size
-            mem_name="MRAM",
-        )
-
-    @property
-    def next_free(self) -> int:
-        return self._vmm.next_bump
-
-    @property
-    def used_stack(self) -> list[MemoryBlock]:
-        return self._vmm.used_stack
-
-    @property
-    def free_stack(self) -> list[MemoryBlock]:
-        return self._vmm.free_stack
-
-    def allocate(self, name: str, size: int) -> int:
-        """Allocate MRAM space (prioritize reusing freed blocks)."""
-        return self._vmm.allocate(name, size)
-
-    def free(self, name: str, strict: bool = True) -> MemoryBlock | None:
-        """Free specified allocation: move from used_stack to free_stack."""
-        return self._vmm.free(name, strict=strict)
-
-    def is_allocated(self, name: str) -> bool:
-        """Check if a name is allocated"""
-        return self._vmm.is_allocated(name)
-
-    def reset(self):
-        """Reset allocator"""
-        self._vmm.reset()
-
-    def print_status(self):
-        """Print memory status"""
-        self._vmm.print_status()
-
-
-class VRAMAllocator:
-    """
-    VRAM address allocator (based on VirtualMemoryManager).
-
-    VRAM supports best-fit reuse + bump allocation, same as MRAM/FPRAM allocators.
-    Alignment defaults to MLEN to match VRAM storage format requirements.
-    """
-
-    def __init__(self, alignment: int = MLEN, total_size: int = 0):
         self.alignment = alignment
-        self._vmm = VirtualMemoryManager(total_size=total_size, alignment=alignment, mem_name="VRAM")
+        self._vmm = VirtualMemoryManager(total_size=total_size, alignment=alignment, mem_name=mem_name)
 
     @property
     def next_free(self) -> int:
@@ -533,41 +340,47 @@ class VRAMAllocator:
 
     @next_free.setter
     def next_free(self, value: int):
+        self._validate_next_free(value)
         self._vmm.next_bump = value
 
-    @property
-    def used_stack(self) -> list[MemoryBlock]:
-        return self._vmm.used_stack
+    def _validate_next_free(self, value: int) -> None:
+        del value
 
-    @property
-    def free_stack(self) -> list[MemoryBlock]:
-        return self._vmm.free_stack
+    def free(self, name: str, strict: bool = True) -> MemoryBlock | None:
+        return self._vmm.free(name, strict=strict)
+
+    def reset(self):
+        self._vmm.reset()
+
+
+class MRAMAllocator(MemoryAllocatorBase):
+    """
+    Matrix RAM address allocator.
+
+    Each sub-block is mlen x mlen = 4096 elements; aligned to mlen*mlen.
+    Default total_size=16384 holds 4 sub-blocks (MAX_K_TILES=4).
+    """
+
+    def __init__(self, total_size: int = MLEN * MLEN * 4):
+        super().__init__(total_size=total_size, alignment=MLEN * MLEN, mem_name="MRAM")
+
+    def allocate(self, name: str, size: int) -> int:
+        return self._vmm.allocate(name, size)
+
+
+class VRAMAllocator(MemoryAllocatorBase):
+    """VRAM address allocator with MLEN-aligned best-fit reuse + bump allocation."""
+
+    def __init__(self, alignment: int = MLEN, total_size: int = 0):
+        super().__init__(total_size=total_size, alignment=alignment, mem_name="VRAM")
 
     def allocate(self, size: int, name: str = "") -> int:
         if not name:
             raise ValueError("VRAMAllocator.allocate() requires name for subsequent free.")
         return self._vmm.allocate(name, size)
 
-    def free(self, name: str, strict: bool = True) -> MemoryBlock | None:
-        return self._vmm.free(name, strict=strict)
 
-    def is_allocated(self, name: str) -> bool:
-        return self._vmm.is_allocated(name)
-
-    def reset(self):
-        self._vmm.reset()
-
-    def print_status(self):
-        self._vmm.print_status()
-
-    def __repr__(self) -> str:
-        return (
-            f"VRAMAllocator(next_free={self.next_free}, alignment={self.alignment}, "
-            f"used={len(self.used_stack)}, free={len(self.free_stack)})"
-        )
-
-
-class FPRAMAllocator:
+class FPRAMAllocator(MemoryAllocatorBase):
     """
     Floating Point RAM Allocator (based on VirtualMemoryManager).
 
@@ -593,34 +406,12 @@ class FPRAMAllocator:
         Args:
             total_size: Total FP RAM size (default 1024, matching hardware fpsram)
         """
-        self.total_size = total_size
-        self._vmm = VirtualMemoryManager(
-            total_size=total_size,
-            alignment=1,
-            mem_name="FPRAM",
-        )
+        super().__init__(total_size=total_size, alignment=1, mem_name="FPRAM")
         self.allocations: dict[str, tuple[int, int]] = {}
-        self._snapshots: dict[int, tuple[int, list[MemoryBlock], list[MemoryBlock], dict[str, tuple[int, int]]]] = {}
-        self._next_snapshot_id = 1
 
-    @property
-    def next_free(self) -> int:
-        """Compatibility alias: next bump pointer."""
-        return self._vmm.next_bump
-
-    @next_free.setter
-    def next_free(self, value: int):
+    def _validate_next_free(self, value: int) -> None:
         if value < 0 or value > self.total_size:
             raise ValueError(f"next_free out of range: {value}, expected [0, {self.total_size}]")
-        self._vmm.next_bump = value
-
-    @property
-    def used_stack(self) -> list[MemoryBlock]:
-        return self._vmm.used_stack
-
-    @property
-    def free_stack(self) -> list[MemoryBlock]:
-        return self._vmm.free_stack
 
     def allocate(self, name: str, size: int) -> int:
         """Allocate FP RAM space (best-fit + bump)."""
@@ -640,35 +431,7 @@ class FPRAMAllocator:
             self.allocations.pop(name, None)
         return freed
 
-    def save_state(self) -> int:
-        """
-        Save current allocator state and return a snapshot token.
-        """
-        sid = self._next_snapshot_id
-        self._next_snapshot_id += 1
-        self._snapshots[sid] = (
-            self._vmm.next_bump,
-            [MemoryBlock(b.name, b.addr, b.size) for b in self._vmm.used_stack],
-            [MemoryBlock(b.name, b.addr, b.size) for b in self._vmm.free_stack],
-            dict(self.allocations),
-        )
-        return sid
-
-    def restore_state(self, snapshot: int):
-        """Restore allocator state from snapshot token."""
-        if snapshot not in self._snapshots:
-            raise KeyError(f"Unknown FPRAM snapshot id: {snapshot}")
-        next_bump, used_stack, free_stack, allocations = self._snapshots[snapshot]
-        self._vmm.next_bump = next_bump
-        self._vmm.used_stack = [MemoryBlock(b.name, b.addr, b.size) for b in used_stack]
-        self._vmm.free_stack = [MemoryBlock(b.name, b.addr, b.size) for b in free_stack]
-        self.allocations = dict(allocations)
-
     def reset(self):
         """Reset allocator"""
         self._vmm.reset()
         self.allocations.clear()
-        self._snapshots.clear()
-        self._next_snapshot_id = 1
-
-

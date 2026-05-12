@@ -131,7 +131,7 @@ def test_alloc_at_correct_address():
     view_addr = x_addr + 2 * 64 * 64
     view = prog.alloc_at("X_cb2_view", 64, 64, view_addr)
 
-    actual_addr = prog._compiler.get_vram_addr(view.name)
+    actual_addr = prog.get_vram_addr(view.name)
     assert actual_addr == view_addr, (
         f"alloc_at address mismatch: expected {view_addr}, got {actual_addr}"
     )
@@ -214,7 +214,7 @@ def test_compile_hf_model_golden_vs_hf():
     )
     model.eval()
 
-    r = compile_hf_model(model, seq_len=64, hidden_size=None, inter_dim=None, num_layers=1)
+    r = compile_hf_model(model, seq_len=64, num_layers=1)
     golden = r["golden_output"]
     hf = r["hf_ground_truth"]
 
@@ -242,7 +242,7 @@ def test_native_compile_assembles():
     )
     model.eval()
 
-    r = compile_hf_model(model, seq_len=64, hidden_size=None, inter_dim=None, num_layers=1)
+    r = compile_hf_model(model, seq_len=64, num_layers=1)
     isa = r["isa"]
 
     # Assemble — should not raise ValueError (u32 overflow)

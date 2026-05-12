@@ -232,48 +232,50 @@ class IsaFPOpsMixin:
     # FPVar helpers (name-based wrappers over the address-based ISA generators)
     # =========================================================================
 
+    def _fpram_unary(self, asm_method: str, src_name: str, dst_name: str, count: int | None = None) -> str:
+        count = min(self.get_fpram_size(src_name), self.get_fpram_size(dst_name)) if count is None else count
+        return getattr(self, asm_method)(self.get_fpram_addr(src_name), self.get_fpram_addr(dst_name), count)
+
+    def _fpram_binary(
+        self,
+        asm_method: str,
+        src1_name: str,
+        src2_name: str,
+        dst_name: str,
+        count: int | None = None,
+    ) -> str:
+        count = (
+            min(self.get_fpram_size(src1_name), self.get_fpram_size(src2_name), self.get_fpram_size(dst_name))
+            if count is None
+            else count
+        )
+        return getattr(self, asm_method)(
+            self.get_fpram_addr(src1_name),
+            self.get_fpram_addr(src2_name),
+            self.get_fpram_addr(dst_name),
+            count,
+        )
+
     def fpram_copy(self, src_name: str, dst_name: str, count: int | None = None) -> str:
-        if count is None:
-            count = min(self.get_fpram_size(src_name), self.get_fpram_size(dst_name))
-        return self.fpvar_copy_asm(self.get_fpram_addr(src_name), self.get_fpram_addr(dst_name), count)
+        return self._fpram_unary("fpvar_copy_asm", src_name, dst_name, count)
 
     def fpram_reci(self, src_name: str, dst_name: str, count: int | None = None) -> str:
-        if count is None:
-            count = min(self.get_fpram_size(src_name), self.get_fpram_size(dst_name))
-        return self.fpvar_reci_asm(self.get_fpram_addr(src_name), self.get_fpram_addr(dst_name), count)
+        return self._fpram_unary("fpvar_reci_asm", src_name, dst_name, count)
 
     def fpram_exp(self, src_name: str, dst_name: str, count: int | None = None) -> str:
-        if count is None:
-            count = min(self.get_fpram_size(src_name), self.get_fpram_size(dst_name))
-        return self.fpvar_exp_asm(self.get_fpram_addr(src_name), self.get_fpram_addr(dst_name), count)
+        return self._fpram_unary("fpvar_exp_asm", src_name, dst_name, count)
 
     def fpram_add(self, src1_name: str, src2_name: str, dst_name: str, count: int | None = None) -> str:
-        if count is None:
-            count = min(self.get_fpram_size(src1_name), self.get_fpram_size(src2_name), self.get_fpram_size(dst_name))
-        return self.fpvar_add_asm(
-            self.get_fpram_addr(src1_name), self.get_fpram_addr(src2_name), self.get_fpram_addr(dst_name), count
-        )
+        return self._fpram_binary("fpvar_add_asm", src1_name, src2_name, dst_name, count)
 
     def fpram_sub(self, src1_name: str, src2_name: str, dst_name: str, count: int | None = None) -> str:
-        if count is None:
-            count = min(self.get_fpram_size(src1_name), self.get_fpram_size(src2_name), self.get_fpram_size(dst_name))
-        return self.fpvar_sub_asm(
-            self.get_fpram_addr(src1_name), self.get_fpram_addr(src2_name), self.get_fpram_addr(dst_name), count
-        )
+        return self._fpram_binary("fpvar_sub_asm", src1_name, src2_name, dst_name, count)
 
     def fpram_mul(self, src1_name: str, src2_name: str, dst_name: str, count: int | None = None) -> str:
-        if count is None:
-            count = min(self.get_fpram_size(src1_name), self.get_fpram_size(src2_name), self.get_fpram_size(dst_name))
-        return self.fpvar_mul_asm(
-            self.get_fpram_addr(src1_name), self.get_fpram_addr(src2_name), self.get_fpram_addr(dst_name), count
-        )
+        return self._fpram_binary("fpvar_mul_asm", src1_name, src2_name, dst_name, count)
 
     def fpram_max(self, src1_name: str, src2_name: str, dst_name: str, count: int | None = None) -> str:
-        if count is None:
-            count = min(self.get_fpram_size(src1_name), self.get_fpram_size(src2_name), self.get_fpram_size(dst_name))
-        return self.fpvar_max_asm(
-            self.get_fpram_addr(src1_name), self.get_fpram_addr(src2_name), self.get_fpram_addr(dst_name), count
-        )
+        return self._fpram_binary("fpvar_max_asm", src1_name, src2_name, dst_name, count)
 
     def fpram_sum(self, src_name: str, dst_name: str, count: int | None = None) -> str:
         if count is None:

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena.compiler import PlenaCompiler
 
 
 class TensorVar:
@@ -14,11 +13,9 @@ class TensorVar:
     Tensor proxy object base class
 
     All tensor variables inherit from this class.
-    Supports __matmul__ (`@`) operator, which automatically dispatches to appropriate PlenaCompiler methods.
-
     Dual naming:
     - display_name: User-visible name (e.g., "temp", "Q", "S")
-    - internal_name: System internal name (e.g., "my_func_0/temp"), used for symbol table and ISA generation
+    - internal_name: System internal name, used for symbol table and ISA generation
     """
 
     def __init__(
@@ -39,10 +36,6 @@ class TensorVar:
     def name(self) -> str:
         """Compatibility property: returns internal_name for internal system use"""
         return self.internal_name
-
-    def __matmul__(self, other):
-        """A @ B: Dispatch to appropriate computation based on operand types"""
-        return self._program._dispatch_matmul(self, other)
 
     def __repr__(self):
         if self.display_name != self.internal_name:
@@ -129,35 +122,3 @@ class VRAMMatrixVar(TensorVar):
 
     def __init__(self, program: PlenaCompiler, name: str, shape: tuple[int, int], display_name: str | None = None):
         super().__init__(program, name, "vram_matrix", shape, display_name=display_name)
-
-
-class TensorKind(Enum):
-    """Identifies which memory the tensor lives in / which proxy backs it."""
-
-    HBM = "hbm"  # legacy: InputVar
-    VRAM = "vram"  # legacy: VRAMMatrixVar
-    FPRAM = "fpram"  # legacy: FPVar
-
-
-# Type alias: a "Tensor" is any of the legacy proxy objects.  Callers can use
-# this annotation without worrying about which specific backing allocator
-# a given tensor lives in.
-Tensor = TensorVar | InputVar | VRAMMatrixVar | FPVar
-
-
-def tensor_kind(tensor: Tensor) -> TensorKind:
-    """Return the backing storage of a tensor proxy."""
-    if isinstance(tensor, FPVar):
-        return TensorKind.FPRAM
-    if isinstance(tensor, VRAMMatrixVar):
-        return TensorKind.VRAM
-    if isinstance(tensor, InputVar):
-        return TensorKind.HBM
-    if isinstance(tensor, TensorVar):
-        # Generic TensorVar without a specific backing — classify by ``kind``.
-        kind = getattr(tensor, "kind", "")
-        if kind in ("vram_matrix", "batch", "matrix"):
-            return TensorKind.VRAM
-        if kind == "input":
-            return TensorKind.HBM
-    raise TypeError(f"Unknown tensor type: {type(tensor).__name__}")

@@ -10,6 +10,36 @@ class IsaTileRowMixin:
     # Tile-row helpers (name-based)
     # =========================================================================
 
+    def _tile_addr(self, matrix_name: str, tile_row_idx: int = 0, tile_col_idx: int = 0) -> int:
+        return self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
+
+    def _tile_row_single_matrix_op(
+        self,
+        asm_method: str,
+        matrix_name: str,
+        arg,
+        tile_row_idx: int = 0,
+        tile_col_idx: int = 0,
+    ) -> str:
+        return getattr(self, asm_method)(self._tile_addr(matrix_name, tile_row_idx, tile_col_idx), arg)
+
+    def _tile_row_binary_matrix_op(
+        self,
+        asm_method: str,
+        dst_matrix: str,
+        src_matrix: str,
+        rows: list[int],
+        dst_tile_row_idx: int = 0,
+        dst_tile_col_idx: int = 0,
+        src_tile_row_idx: int = 0,
+        src_tile_col_idx: int = 0,
+    ) -> str:
+        return getattr(self, asm_method)(
+            self._tile_addr(dst_matrix, dst_tile_row_idx, dst_tile_col_idx),
+            self._tile_addr(src_matrix, src_tile_row_idx, src_tile_col_idx),
+            rows,
+        )
+
     def tile_row_max(
         self,
         source_matrix: str,
@@ -17,8 +47,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        source_addr = self.get_vram_tile_addr(source_matrix, tile_row_idx, tile_col_idx)
-        return self.tile_row_max_asm(source_addr, row_map)
+        return self._tile_row_single_matrix_op("tile_row_max_asm", source_matrix, row_map, tile_row_idx, tile_col_idx)
 
     def tile_row_sum(
         self,
@@ -27,8 +56,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        source_addr = self.get_vram_tile_addr(source_matrix, tile_row_idx, tile_col_idx)
-        return self.tile_row_sum_asm(source_addr, row_map)
+        return self._tile_row_single_matrix_op("tile_row_sum_asm", source_matrix, row_map, tile_row_idx, tile_col_idx)
 
     def tile_row_exp(
         self,
@@ -37,8 +65,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        matrix_addr = self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
-        return self.tile_row_exp_asm(matrix_addr, rows)
+        return self._tile_row_single_matrix_op("tile_row_exp_asm", matrix_name, rows, tile_row_idx, tile_col_idx)
 
     def tile_row_reci(
         self,
@@ -47,8 +74,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        matrix_addr = self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
-        return self.tile_row_reci_asm(matrix_addr, rows)
+        return self._tile_row_single_matrix_op("tile_row_reci_asm", matrix_name, rows, tile_row_idx, tile_col_idx)
 
     def tile_row_sub_fp(
         self,
@@ -57,8 +83,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        matrix_addr = self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
-        return self.tile_row_sub_fp_asm(matrix_addr, row_map)
+        return self._tile_row_single_matrix_op("tile_row_sub_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
 
     def tile_row_mul_fp(
         self,
@@ -67,8 +92,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        matrix_addr = self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
-        return self.tile_row_mul_fp_asm(matrix_addr, row_map)
+        return self._tile_row_single_matrix_op("tile_row_mul_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
 
     def tile_row_add_fp(
         self,
@@ -77,8 +101,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        matrix_addr = self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
-        return self.tile_row_add_fp_asm(matrix_addr, row_map)
+        return self._tile_row_single_matrix_op("tile_row_add_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
 
     def tile_row_add(
         self,
@@ -90,9 +113,16 @@ class IsaTileRowMixin:
         src_tile_row_idx: int = 0,
         src_tile_col_idx: int = 0,
     ) -> str:
-        dst_addr = self.get_vram_tile_addr(dst_matrix, dst_tile_row_idx, dst_tile_col_idx)
-        src_addr = self.get_vram_tile_addr(src_matrix, src_tile_row_idx, src_tile_col_idx)
-        return self.tile_row_add_asm(dst_addr, src_addr, rows)
+        return self._tile_row_binary_matrix_op(
+            "tile_row_add_asm",
+            dst_matrix,
+            src_matrix,
+            rows,
+            dst_tile_row_idx,
+            dst_tile_col_idx,
+            src_tile_row_idx,
+            src_tile_col_idx,
+        )
 
     def tile_row_sub(
         self,
@@ -104,9 +134,16 @@ class IsaTileRowMixin:
         src_tile_row_idx: int = 0,
         src_tile_col_idx: int = 0,
     ) -> str:
-        dst_addr = self.get_vram_tile_addr(dst_matrix, dst_tile_row_idx, dst_tile_col_idx)
-        src_addr = self.get_vram_tile_addr(src_matrix, src_tile_row_idx, src_tile_col_idx)
-        return self.tile_row_sub_asm(dst_addr, src_addr, rows)
+        return self._tile_row_binary_matrix_op(
+            "tile_row_sub_asm",
+            dst_matrix,
+            src_matrix,
+            rows,
+            dst_tile_row_idx,
+            dst_tile_col_idx,
+            src_tile_row_idx,
+            src_tile_col_idx,
+        )
 
     def tile_row_mul(
         self,
@@ -118,9 +155,16 @@ class IsaTileRowMixin:
         src_tile_row_idx: int = 0,
         src_tile_col_idx: int = 0,
     ) -> str:
-        dst_addr = self.get_vram_tile_addr(dst_matrix, dst_tile_row_idx, dst_tile_col_idx)
-        src_addr = self.get_vram_tile_addr(src_matrix, src_tile_row_idx, src_tile_col_idx)
-        return self.tile_row_mul_asm(dst_addr, src_addr, rows)
+        return self._tile_row_binary_matrix_op(
+            "tile_row_mul_asm",
+            dst_matrix,
+            src_matrix,
+            rows,
+            dst_tile_row_idx,
+            dst_tile_col_idx,
+            src_tile_row_idx,
+            src_tile_col_idx,
+        )
 
     def tile_row_mul_fp_broadcast(
         self,
@@ -130,8 +174,11 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        matrix_addr = self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
-        return self.tile_row_mul_fp_broadcast_asm(matrix_addr, fpram_scalar_addr, rows)
+        return self.tile_row_mul_fp_broadcast_asm(
+            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
+            fpram_scalar_addr,
+            rows,
+        )
 
     def vram_fill_zero(
         self,
@@ -140,8 +187,7 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        matrix_addr = self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
-        return self.vram_fill_zero_asm(matrix_addr, rows)
+        return self._tile_row_single_matrix_op("vram_fill_zero_asm", matrix_name, rows, tile_row_idx, tile_col_idx)
 
     # =========================================================================
     # Tile-row ISA helpers (address-based)

@@ -1,21 +1,23 @@
-"""Matrix projection, RoPE, and VRAM operations for the PLENA DSL."""
+"""Matrix projection, RoPE, and VRAM operations for the PLENA program builder."""
 
 from __future__ import annotations
 
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
 
-class DslMatrixOpsMixin:
+class ProgramMatrixOpsMixin:
     # ========================================================================
     # Matrix Projection and VRAM Operations
     # ========================================================================
 
+    def _require_var(self, value, expected_type, label: str):
+        if not isinstance(value, expected_type):
+            raise TypeError(f"{label} must be {expected_type.__name__}, got {type(value)}")
+        return value
+
     def _ensure_hbm_sub_matrix_registered(self, input_var: InputVar):
         """Ensure an HBM input is registered in compiler sub-matrix manager."""
-        if (
-            input_var.name in self._registered_hbm_sub_matrices
-            and self._registered_hbm_sub_matrices[input_var.name] is True
-        ):
+        if self._registered_hbm_sub_matrices.get(input_var.name):
             return
         h, w = input_var.shape
         super().ensure_hbm_sub_matrix(
@@ -28,16 +30,23 @@ class DslMatrixOpsMixin:
 
     def _ensure_vram_sub_matrix_registered(self, matrix_var: VRAMMatrixVar):
         """Ensure a VRAM matrix is registered in compiler sub-matrix manager."""
-        if (
-            matrix_var.name in self._registered_vram_sub_matrices
-            and self._registered_vram_sub_matrices[matrix_var.name] is True
-        ):
+        if self._registered_vram_sub_matrices.get(matrix_var.name):
             return
         super().ensure_vram_matrix_layout(
             name=matrix_var.name,
             shape=matrix_var.shape,
         )
         self._registered_vram_sub_matrices[matrix_var.name] = True
+
+    def _prepare_projection(self, vram_matrix, mram_input, target, auto_reset_mram: bool):
+        vram_matrix = self._require_var(vram_matrix, VRAMMatrixVar, "vram_matrix")
+        mram_input = self._require_var(mram_input, InputVar, "mram_input")
+        target = self._require_var(target, VRAMMatrixVar, "target")
+        self._ensure_vram_sub_matrix_registered(vram_matrix)
+        self._ensure_hbm_sub_matrix_registered(mram_input)
+        if auto_reset_mram:
+            super().reset_mram()
+        return vram_matrix, mram_input, target
 
     def vram_sub_projection_to(
         self,
@@ -56,17 +65,9 @@ class DslMatrixOpsMixin:
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[:][mram_col_idx]
         Supports K-split: k_block_start/k_block_count select a subset of K tiles.
         """
-        if not isinstance(vram_matrix, VRAMMatrixVar):
-            raise TypeError(f"vram_matrix must be VRAMMatrixVar, got {type(vram_matrix)}")
-        if not isinstance(mram_input, InputVar):
-            raise TypeError(f"mram_input must be InputVar, got {type(mram_input)}")
-        if not isinstance(target, VRAMMatrixVar):
-            raise TypeError(f"target must be VRAMMatrixVar, got {type(target)}")
-
-        self._ensure_vram_sub_matrix_registered(vram_matrix)
-        self._ensure_hbm_sub_matrix_registered(mram_input)
-        if auto_reset_mram:
-            super().reset_mram()
+        vram_matrix, mram_input, target = self._prepare_projection(
+            vram_matrix, mram_input, target, auto_reset_mram
+        )
         super().load_sub_matrix_col(
             name=mram_input.name,
             col_idx=mram_col_idx,
@@ -99,17 +100,9 @@ class DslMatrixOpsMixin:
         """
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[mram_row_idx][:]^T
         """
-        if not isinstance(vram_matrix, VRAMMatrixVar):
-            raise TypeError(f"vram_matrix must be VRAMMatrixVar, got {type(vram_matrix)}")
-        if not isinstance(mram_input, InputVar):
-            raise TypeError(f"mram_input must be InputVar, got {type(mram_input)}")
-        if not isinstance(target, VRAMMatrixVar):
-            raise TypeError(f"target must be VRAMMatrixVar, got {type(target)}")
-
-        self._ensure_vram_sub_matrix_registered(vram_matrix)
-        self._ensure_hbm_sub_matrix_registered(mram_input)
-        if auto_reset_mram:
-            super().reset_mram()
+        vram_matrix, mram_input, target = self._prepare_projection(
+            vram_matrix, mram_input, target, auto_reset_mram
+        )
         super().load_sub_matrix_row(name=mram_input.name, row_idx=mram_row_idx)
         super().vram_sub_projection_T_to(
             vram_mat_name=vram_matrix.name,
@@ -185,13 +178,9 @@ class DslMatrixOpsMixin:
 
         Supports writing back to the same matrix/block (in-place overwrite).
         """
-        allowed = (VRAMMatrixVar,)
-        if not isinstance(src1, allowed):
-            raise TypeError(f"src1 must be VRAMMatrixVar, got {type(src1)}")
-        if not isinstance(src2, allowed):
-            raise TypeError(f"src2 must be VRAMMatrixVar, got {type(src2)}")
-        if not isinstance(target, allowed):
-            raise TypeError(f"target must be VRAMMatrixVar, got {type(target)}")
+        src1 = self._require_var(src1, VRAMMatrixVar, "src1")
+        src2 = self._require_var(src2, VRAMMatrixVar, "src2")
+        target = self._require_var(target, VRAMMatrixVar, "target")
 
         super().vram_block_add_to(
             src1_matrix=src1.name,
@@ -206,4 +195,4 @@ class DslMatrixOpsMixin:
         )
 
 
-__all__ = ["DslMatrixOpsMixin"]
+__all__ = ["ProgramMatrixOpsMixin"]

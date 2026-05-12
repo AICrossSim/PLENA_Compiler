@@ -1,11 +1,11 @@
-"""Tensor, memory, and normalization operations for the PLENA DSL."""
+"""Tensor, memory, and normalization operations for the PLENA program builder."""
 
 from __future__ import annotations
 
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
 
 
-class DslTensorMixin:
+class ProgramTensorMixin:
     # ========================================================================
     # Input Declaration
     # ========================================================================
@@ -190,14 +190,14 @@ class DslTensorMixin:
         """
         display_name = name
         internal_name = self._scoped_name(name)
-        self._compiler.add_vram_object(
+        self.add_vram_object(
             name=internal_name,
             shape=(rows, cols),
             vram_addr=vram_addr,
             allocate_if_none=False,
         )
         isa_code = f"; VRAM View {name}: ({rows}, {cols}) at VRAM[{vram_addr}]\n"
-        self._compiler.emit(isa_code)
+        self.emit(isa_code)
         var = VRAMMatrixVar(self, internal_name, (rows, cols), display_name=display_name)
         self._tensors[internal_name] = var
         return var
@@ -316,4 +316,4 @@ class DslTensorMixin:
         )
 
 
-__all__ = ["DslTensorMixin"]
+__all__ = ["ProgramTensorMixin"]

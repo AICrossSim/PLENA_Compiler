@@ -7,6 +7,23 @@ from compiler.aten.isa_builder import IsaBuilder
 
 
 class IsaMatrixMixin:
+    def _emit_hbm_matrix_load(self, layout, gp_count: int, build_body) -> str:
+        gp_regs = self.register_allocator.allocate_gp(gp_count)
+        gp_for_addr = self.register_allocator.allocate_gp(2)
+        addr_reg = self.register_allocator.allocate_addr(1)[0]
+        try:
+            isa_code = preload_addr_reg_asm(
+                addr_reg_to_set=[addr_reg],
+                available_registers=gp_for_addr,
+                addr_reg_val=[layout.hbm_base_addr],
+            )
+            isa_code += build_body(addr_reg, gp_regs)
+            return self._emit(isa_code)
+        finally:
+            self.register_allocator.free_gp(gp_regs)
+            self.register_allocator.free_gp(gp_for_addr)
+            self.register_allocator.free_addr([addr_reg])
+
     def reset_mram(self) -> str:
         """
         Reset MRAM allocator, free all allocated space
@@ -32,23 +49,17 @@ class IsaMatrixMixin:
             total_size = num_col_blocks * block_size
             mram_start_addr = self.mram_allocator.allocate(f"{name}[{row_idx}][:]", total_size)
 
-        gp_regs = self.register_allocator.allocate_gp(4)
-        gp_for_addr = self.register_allocator.allocate_gp(2)
-        addr_reg = self.register_allocator.allocate_addr(1)[0]
-
-        isa_code = preload_addr_reg_asm(
-            addr_reg_to_set=[addr_reg], available_registers=gp_for_addr, addr_reg_val=[layout.hbm_base_addr]
+        return self._emit_hbm_matrix_load(
+            layout,
+            3,
+            lambda addr_reg, gp_regs: self.load_row_sub_matrices_asm(
+                name=name,
+                row_idx=row_idx,
+                mram_start_addr=mram_start_addr,
+                hbm_addr_reg=addr_reg,
+                gp_regs=gp_regs,
+            ),
         )
-
-        isa_code += self.load_row_sub_matrices_asm(
-            name=name, row_idx=row_idx, mram_start_addr=mram_start_addr, hbm_addr_reg=addr_reg, gp_regs=gp_regs
-        )
-
-        self.register_allocator.free_gp(gp_regs)
-        self.register_allocator.free_gp(gp_for_addr)
-        self.register_allocator.free_addr([addr_reg])
-
-        return self._emit(isa_code)
 
     def load_sub_matrix_col(
         self,
@@ -71,29 +82,19 @@ class IsaMatrixMixin:
             total_size = effective_count * block_size
             mram_start_addr = self.mram_allocator.allocate(f"{name}[:][{col_idx}]", total_size)
 
-        gp_regs = self.register_allocator.allocate_gp(3)
-        gp_for_addr = self.register_allocator.allocate_gp(2)
-        addr_reg = self.register_allocator.allocate_addr(1)[0]
-
-        isa_code = preload_addr_reg_asm(
-            addr_reg_to_set=[addr_reg], available_registers=gp_for_addr, addr_reg_val=[layout.hbm_base_addr]
+        return self._emit_hbm_matrix_load(
+            layout,
+            3,
+            lambda addr_reg, gp_regs: self.load_col_sub_matrices_asm(
+                name=name,
+                col_idx=col_idx,
+                mram_start_addr=mram_start_addr,
+                hbm_addr_reg=addr_reg,
+                gp_regs=gp_regs,
+                k_block_start=k_block_start,
+                k_block_count=k_block_count,
+            ),
         )
-
-        isa_code += self.load_col_sub_matrices_asm(
-            name=name,
-            col_idx=col_idx,
-            mram_start_addr=mram_start_addr,
-            hbm_addr_reg=addr_reg,
-            gp_regs=gp_regs,
-            k_block_start=k_block_start,
-            k_block_count=k_block_count,
-        )
-
-        self.register_allocator.free_gp(gp_regs)
-        self.register_allocator.free_gp(gp_for_addr)
-        self.register_allocator.free_addr([addr_reg])
-
-        return self._emit(isa_code)
 
     def allocate_vram_matrix(
         self,
@@ -282,6 +283,65 @@ class IsaMatrixMixin:
         isa_code = "\n".join(lines) + "\n"
         return self._emit(isa_code)
 
+    def _target_tile_addr(self, target_matrix: str, target_row_idx: int, target_col_idx: int) -> tuple[int, int, int]:
+        if target_matrix not in self:
+            raise KeyError(f"Target matrix '{target_matrix}' not found. Use allocate_vram_matrix first.")
+
+        target_info = self[target_matrix]
+        target_rows, _target_cols = target_info.shape
+        target_base_addr = target_info.vram_addr
+        result_vram_addr = (
+            target_base_addr + target_col_idx * target_rows * self.mlen + target_row_idx * self.mlen * self.mlen
+        )
+        return result_vram_addr, target_base_addr, target_rows
+
+    def _emit_vram_sub_projection_to(
+        self,
+        *,
+        transposed: bool,
+        vram_mat_name: str,
+        vram_row_idx: int,
+        mram_mat_name: str,
+        mram_idx: int,
+        target_matrix: str,
+        target_row_idx: int,
+        target_col_idx: int,
+        k_block_start: int = 0,
+        k_block_count: int | None = None,
+    ) -> str:
+        result_vram_addr, target_base_addr, target_rows = self._target_tile_addr(
+            target_matrix, target_row_idx, target_col_idx
+        )
+        gp_regs = self.register_allocator.allocate_gp(9)
+
+        if transposed:
+            isa_code = f"; VRAM Sub Projection T To: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[{mram_idx}][:]^T -> {target_matrix}[{target_row_idx}][{target_col_idx}]\n"
+            asm = self.vram_sub_projection_T_asm(
+                vram_mat_name=vram_mat_name,
+                vram_row_idx=vram_row_idx,
+                mram_mat_name=mram_mat_name,
+                mram_row_idx=mram_idx,
+                result_vram_addr=result_vram_addr,
+                gp_regs=gp_regs,
+            )
+        else:
+            isa_code = f"; VRAM Sub Projection To: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[:][{mram_idx}] -> {target_matrix}[{target_row_idx}][{target_col_idx}]\n"
+            asm = self.vram_sub_projection_asm(
+                vram_mat_name=vram_mat_name,
+                vram_row_idx=vram_row_idx,
+                mram_mat_name=mram_mat_name,
+                mram_col_idx=mram_idx,
+                result_vram_addr=result_vram_addr,
+                gp_regs=gp_regs,
+                k_block_start=k_block_start,
+                k_block_count=k_block_count,
+            )
+        isa_code += f"; Target VRAM addr: {result_vram_addr} (base={target_base_addr}, offset=col*{target_rows}*{self.mlen} + row*{self.mlen}*{self.mlen})\n"
+        isa_code += asm
+
+        self.register_allocator.free_gp(gp_regs)
+        return self._emit(isa_code)
+
     def vram_sub_projection_to(
         self,
         vram_mat_name: str,
@@ -299,37 +359,18 @@ class IsaMatrixMixin:
           target[target_row_idx][target_col_idx] = VRAM_A[vram_row_idx][:] @ MRAM_W[:][mram_col_idx].
         Target matrix must have been allocated via allocate_vram_matrix.
         """
-        if target_matrix not in self:
-            raise KeyError(f"Target matrix '{target_matrix}' not found. Use allocate_vram_matrix first.")
-
-        target_info = self[target_matrix]
-        target_rows, _target_cols = target_info.shape
-        target_base_addr = target_info.vram_addr
-
-        # VRAM layout: [batch, mlen, hidden/mlen], column-block major.
-        # Sub-block (r, c) addr = base + c * rows * mlen + r * mlen * mlen.
-        result_vram_addr = (
-            target_base_addr + target_col_idx * target_rows * self.mlen + target_row_idx * self.mlen * self.mlen
-        )
-
-        gp_regs = self.register_allocator.allocate_gp(9)
-
-        isa_code = f"; VRAM Sub Projection To: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[:][{mram_col_idx}] -> {target_matrix}[{target_row_idx}][{target_col_idx}]\n"
-        isa_code += f"; Target VRAM addr: {result_vram_addr} (base={target_base_addr}, offset=col*{target_rows}*{self.mlen} + row*{self.mlen}*{self.mlen})\n"
-        isa_code += self.vram_sub_projection_asm(
+        return self._emit_vram_sub_projection_to(
+            transposed=False,
             vram_mat_name=vram_mat_name,
             vram_row_idx=vram_row_idx,
             mram_mat_name=mram_mat_name,
-            mram_col_idx=mram_col_idx,
-            result_vram_addr=result_vram_addr,
-            gp_regs=gp_regs,
+            mram_idx=mram_col_idx,
+            target_matrix=target_matrix,
+            target_row_idx=target_row_idx,
+            target_col_idx=target_col_idx,
             k_block_start=k_block_start,
             k_block_count=k_block_count,
         )
-
-        self.register_allocator.free_gp(gp_regs)
-
-        return self._emit(isa_code)
 
     def vram_sub_projection_T_to(
         self,
@@ -350,35 +391,16 @@ class IsaMatrixMixin:
           K[j][:]: (mlen, hidden_size) row sub-block, transposed to (hidden_size, mlen)
           S[i][j]: (mlen, mlen)
         """
-        if target_matrix not in self:
-            raise KeyError(f"Target matrix '{target_matrix}' not found. Use allocate_vram_matrix first.")
-
-        target_info = self[target_matrix]
-        target_rows, _target_cols = target_info.shape
-        target_base_addr = target_info.vram_addr
-
-        # VRAM layout: [batch, mlen, hidden/mlen], column-block major.
-        # Sub-block (r, c) addr = base + c * rows * mlen + r * mlen * mlen.
-        result_vram_addr = (
-            target_base_addr + target_col_idx * target_rows * self.mlen + target_row_idx * self.mlen * self.mlen
-        )
-
-        gp_regs = self.register_allocator.allocate_gp(9)
-
-        isa_code = f"; VRAM Sub Projection T To: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[{mram_row_idx}][:]^T -> {target_matrix}[{target_row_idx}][{target_col_idx}]\n"
-        isa_code += f"; Target VRAM addr: {result_vram_addr} (base={target_base_addr}, offset=col*{target_rows}*{self.mlen} + row*{self.mlen}*{self.mlen})\n"
-        isa_code += self.vram_sub_projection_T_asm(
+        return self._emit_vram_sub_projection_to(
+            transposed=True,
             vram_mat_name=vram_mat_name,
             vram_row_idx=vram_row_idx,
             mram_mat_name=mram_mat_name,
-            mram_row_idx=mram_row_idx,
-            result_vram_addr=result_vram_addr,
-            gp_regs=gp_regs,
+            mram_idx=mram_row_idx,
+            target_matrix=target_matrix,
+            target_row_idx=target_row_idx,
+            target_col_idx=target_col_idx,
         )
-
-        self.register_allocator.free_gp(gp_regs)
-
-        return self._emit(isa_code)
 
 
 __all__ = ["IsaMatrixMixin"]

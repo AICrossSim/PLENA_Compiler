@@ -50,7 +50,7 @@ def softmax_plena(prog, input_var, scale: float = 1.0):
 
     # Reserve fp_preload region (addresses 0-2): 0=0.0, 1=scale, 2=-inf
     # This ensures FPRAM variable allocation starts after these reserved slots
-    prog._compiler.fpram_allocator.next_free = 3
+    prog.fpram_allocator.next_free = 3
 
     # Allocate FPRAM variables
     scale_fp = prog.fp_var("scale_fp", size=1)  # scale factor
@@ -69,10 +69,9 @@ def softmax_plena(prog, input_var, scale: float = 1.0):
     prog.fpvar_fill_from_fpram(l_old, src_fpram_addr=0)  # load 0.0
 
     # Row-by-row online softmax
-    compiler = prog._compiler
     for row in range(mlen):
         # 1. Save old max for this row
-        compiler.fpvar_copy_asm(m_old.address + row, m_old_saved.address, 1)
+        prog.fpvar_copy_asm(m_old.address + row, m_old_saved.address, 1)
 
         # 2. Scale: S[row] *= scale
         prog.tile_row_mul_fp_broadcast(S, scale_fp.address, row)
@@ -81,11 +80,11 @@ def softmax_plena(prog, input_var, scale: float = 1.0):
         prog.tile_row_max(row_max_tmp.address, S, row)
 
         # 4. Update running max: m_old[row] = max(m_old[row], row_max)
-        compiler.fpvar_max_asm(m_old.address + row, row_max_tmp.address, m_old.address + row, 1)
+        prog.fpvar_max_asm(m_old.address + row, row_max_tmp.address, m_old.address + row, 1)
 
         # 5. Decay factor: m_res[row] = exp(m_old_saved - m_curr)
-        compiler.fpvar_sub_asm(m_old_saved.address, m_old.address + row, m_old_saved.address, 1)
-        compiler.fpvar_exp_asm(m_old_saved.address, m_res.address + row, 1)
+        prog.fpvar_sub_asm(m_old_saved.address, m_old.address + row, m_old_saved.address, 1)
+        prog.fpvar_exp_asm(m_old_saved.address, m_res.address + row, 1)
 
         # 6. Subtract max: S[row] -= m_curr
         prog.tile_row_sub_fp(S, m_old.address + row, row)
@@ -97,8 +96,8 @@ def softmax_plena(prog, input_var, scale: float = 1.0):
         prog.tile_row_sum(sum_p_tmp.address, S, row)
 
         # 9. Update accumulated sum: l_old[row] = l_old[row]*m_res[row] + sum_p
-        compiler.fpvar_mul_asm(l_old.address + row, m_res.address + row, l_old.address + row, 1)
-        compiler.fpvar_add_asm(l_old.address + row, sum_p_tmp.address, l_old.address + row, 1)
+        prog.fpvar_mul_asm(l_old.address + row, m_res.address + row, l_old.address + row, 1)
+        prog.fpvar_add_asm(l_old.address + row, sum_p_tmp.address, l_old.address + row, 1)
 
     # Final normalization: P[row] /= l_old[row]
     prog.fpvar_reci(l_old, inv_l)

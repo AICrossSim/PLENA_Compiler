@@ -1,11 +1,11 @@
-"""Flash-attention operations for the PLENA DSL."""
+"""Flash-attention operations for the PLENA program builder."""
 
 from __future__ import annotations
 
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
 
 
-class DslAttentionMixin:
+class ProgramAttentionMixin:
     # ========================================================================
     # Flash Attention Operations
     # ========================================================================
@@ -79,4 +79,4 @@ class DslAttentionMixin:
         )
 
 
-__all__ = ["DslAttentionMixin"]
+__all__ = ["ProgramAttentionMixin"]

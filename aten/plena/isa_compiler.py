@@ -31,156 +31,18 @@ class IsaCompiler(
     """
     ISA Compiler: lowers PLENA compiler operations to assembly text.
 
-    Owns symbol_table, register_allocator, and the InterruptManager.
-    Sub-matrix / memory management is inherited from TileCompiler; the
-    legacy ``self.tile_compiler`` accessor is preserved as a property
-    returning ``self`` for a handful of remaining external callers.
+    Owns register allocation, generated assembly, and tiled memory metadata.
     """
 
     _ONLINE_SOFTMAX_FPSRAM_BASE = 10
 
-    class InterruptManager:
-        """
-        Interrupt Manager — manages execution timing only.
-        Actual handlers live on IsaCompiler as ``_handle_k_start``,
-        ``_handle_k_prefetch_done``, ``_handle_s_tile_done``, ``_handle_k_end``.
-        """
-
-        def __init__(self, compiler: IsaCompiler):
-            self.compiler = compiler
-            self.enabled = False
-
-            self._k_count = 0
-            self._tile_count = 0
-
-            self.current_matrix: str = ""
-            self.current_activation: str = ""
-            self._mlen = compiler.mlen
-            self._blen = compiler.blen
-            self._batch = compiler.mlen
-
-            self._q_block_idx = 0
-            self._k_block_idx = 0
-            self._s_tile_address = 0
-
-        @property
-        def tile_compiler(self):
-            return self.compiler.tile_compiler
-
-        @property
-        def k_count(self) -> int:
-            return self._k_count
-
-        @property
-        def tile_count(self) -> int:
-            return self._tile_count
-
-        @property
-        def batch(self) -> int:
-            return self._batch
-
-        @property
-        def out_features(self) -> int:
-            if self.current_matrix and self.current_matrix in self:
-                info = self[self.current_matrix]
-                return info.shape[0]
-            return self._mlen
-
-        @property
-        def hidden_size(self) -> int:
-            if self.current_matrix and self.current_matrix in self:
-                info = self[self.current_matrix]
-                return info.shape[1]
-            return self._mlen
-
-        @property
-        def k_block(self) -> int:
-            return self._k_block_idx
-
-        @property
-        def q_block(self) -> int:
-            return self._q_block_idx
-
-        @property
-        def s_tile_address(self) -> int:
-            return self._s_tile_address
-
-        @property
-        def mlen(self) -> int:
-            return self._mlen
-
-        @property
-        def blen(self) -> int:
-            return self._blen
-
-        def reset(self):
-            """Reset counters (does not clear current_matrix)."""
-            self._k_count = 0
-            self._tile_count = 0
-            self._q_block_idx = 0
-            self._k_block_idx = 0
-            self._s_tile_address = 0
-
-        def enable(self):
-            self.enabled = True
-
-        def disable(self):
-            self.enabled = False
-
-        def trigger_k_start(self) -> str:
-            if not self.enabled:
-                return ""
-            return self.compiler._handle_k_start()
-
-        def trigger_k_prefetch_done(self) -> str:
-            if not self.enabled:
-                return ""
-            result = self.compiler._handle_k_prefetch_done()
-            self._k_count += 1
-            return result
-
-        def trigger_s_tile_done(self) -> str:
-            if not self.enabled:
-                return ""
-            result = self.compiler._handle_s_tile_done()
-            self._tile_count += 1
-            return result
-
-        def trigger_k_end(self) -> str:
-            if not self.enabled:
-                return ""
-            return self.compiler._handle_k_end()
-
     def __init__(self, mlen: int = 64, blen: int = 4, real_data_ratio: float = 1.125, unroll_loops: bool = False):
-        # TileCompiler.__init__ sets mlen, blen, unroll_loops, the HBM/VRAM/FPRAM
-        # matrices and allocators, loaded_sub_blocks, and _address_cache.
+        # TileCompiler.__init__ sets dimensions, layout tables, memory allocators,
+        # and the currently loaded MRAM sub-block table.
         super().__init__(mlen=mlen, blen=blen, unroll_loops=unroll_loops)
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
         self.generated_code = ""
-        self.interrupt = self.InterruptManager(self)
-
-    # Back-compat shim: older callers (and a couple of external ops modules)
-    # reach into ``compiler.tile_compiler`` directly. After the merge,
-    # IsaCompiler *is* the TileCompiler, so the property just returns
-    # ``self``.
-    @property
-    def tile_compiler(self) -> IsaCompiler:
-        return self
-
-    # Interrupt handler placeholders (overridden by flash-attention passes).
-
-    def _handle_k_start(self) -> str:
-        return ""
-
-    def _handle_k_prefetch_done(self) -> str:
-        return ""
-
-    def _handle_s_tile_done(self) -> str:
-        return ""
-
-    def _handle_k_end(self) -> str:
-        return ""
 
     def load_batch(
         self,
@@ -473,14 +335,6 @@ class IsaCompiler(
         # Call TileCompiler.reset() explicitly since the merged class shadows it.
         TileCompiler.reset(self)
 
-    def print_symbol_table(self):
-        """Print symbol table"""
-        self.print_table()
-
-    def get_symbol_table(self):
-        """Get managed object table view."""
-        return self
-
     def get_tensor_info(self, name: str):
         """Get unified tensor/object info by name."""
         return self[name]
@@ -568,9 +422,4 @@ class IsaCompiler(
         """Free a VRAM object by name (defaults to non-strict)."""
         return TileCompiler.free_vram_object(self, name, strict=strict)
 
-
-# Compatibility alias for callers that imported the old low-level layer name.
-DeveloperCompiler = IsaCompiler
-
-
-__all__ = ["DeveloperCompiler", "IsaCompiler"]
+__all__ = ["IsaCompiler"]

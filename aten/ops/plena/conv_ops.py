@@ -114,12 +114,12 @@ def conv2d_plena(
     # Look up VRAM base addresses from the symbol table
     # ------------------------------------------------------------------
     if use_shift:
-        mask_vec_vram_addr = prog._compiler.get_vram_addr(mask_mat.name)
+        mask_vec_vram_addr = prog.get_vram_addr(mask_mat.name)
     else:
-        basis_vram_base = prog._compiler.get_vram_addr(basis_mat.name)
-    scratch_vram_addr = prog._compiler.get_vram_addr(scratch_mat.name)
-    temp_vram_addr = prog._compiler.get_vram_addr(temp_mat.name)
-    output_vram_base = prog._compiler.get_vram_addr(output_mat.name)
+        basis_vram_base = prog.get_vram_addr(basis_mat.name)
+    scratch_vram_addr = prog.get_vram_addr(scratch_mat.name)
+    temp_vram_addr = prog.get_vram_addr(temp_mat.name)
+    output_vram_base = prog.get_vram_addr(output_mat.name)
 
     # ------------------------------------------------------------------
     # GP register allocation
@@ -146,7 +146,7 @@ def conv2d_plena(
         setup_lines.append(f"S_LUI_INT gp{setup_gp}, {hbm_base >> 12}")
         setup_lines.append(f"S_ADDI_INT gp{setup_gp}, gp{setup_gp}, {hbm_base & 0xFFF}")
     setup_lines.append(f"C_SET_ADDR_REG a{addr_reg_idx}, gp0, gp{setup_gp}")
-    prog._compiler.emit("\n".join(setup_lines) + "\n")
+    prog.emit("\n".join(setup_lines) + "\n")
 
     # ------------------------------------------------------------------
     # Emit: im2col assembly
@@ -191,7 +191,7 @@ def conv2d_plena(
             fp_one_reg=fp_one_reg,  # f1 = 1.0 by default (must be in fp_preload[fp_one_reg])
             fp_ex_reg=2,  # f2 = V_RED_SUM accumulator
         )
-    prog._compiler.emit(asm_code)
+    prog.emit(asm_code)
 
     # ------------------------------------------------------------------
     # Systolic matmul: im2col_out @ weight_2d  -> (M, C_out)
