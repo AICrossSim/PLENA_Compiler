@@ -73,9 +73,9 @@ def test_fpvar_helper_uses_canonical_emit_path():
 
 def test_hbm_load_helper_uses_typed_legalization():
     """Converted HBM load helpers should legalize typed large immediates."""
-    from compiler.aten.plena_compiler import TileCompiler
+    from compiler.aten.plena_compiler import IsaCompiler
 
-    compiler = TileCompiler()
+    compiler = IsaCompiler()
     compiler.register_matrix("W", (512, 512), hbm_base_addr=0)
 
     code = compiler.load_sub_matrix_asm("W", row_idx=0, col_idx=0, mram_dest_addr=0)

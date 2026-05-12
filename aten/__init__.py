@@ -22,6 +22,7 @@ from compiler.aten.plena_compiler import (  # noqa: E402, F401
     FPVar,
     InputVar,
     IsaCompiler,
+    MemoryStateMixin,
     PlenaCompiler,
     TensorVar,
     TileCompiler,

@@ -1,7 +1,7 @@
 """Pure emitter for VRAM sub-projection ISA.
 
-Shared implementation kernel used by ``TileCompiler.vram_sub_projection_asm``
-and ``TileCompiler.vram_sub_projection_T_asm``. The caller resolves all
+Shared implementation kernel used by ``IsaCompiler.vram_sub_projection_asm``
+and ``IsaCompiler.vram_sub_projection_T_asm``. The caller resolves all
 instance-dependent state (register allocator, tile layouts, MRAM addresses,
 ``unroll_loops`` default) and passes it in as plain parameters, so this
 emitter can be unit-tested in isolation.

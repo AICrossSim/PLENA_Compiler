@@ -16,8 +16,8 @@ from compiler.aten.plena.isa_emit import IsaEmitMixin
 from compiler.aten.plena.isa_fp_ops import IsaFPOpsMixin
 from compiler.aten.plena.isa_matrix import IsaMatrixMixin
 from compiler.aten.plena.isa_tile_rows import IsaTileRowMixin
+from compiler.aten.plena.memory_state import MemoryStateMixin
 from compiler.aten.plena.registers import RegisterAllocator
-from compiler.aten.plena.tile_compiler import TileCompiler
 
 
 class IsaCompiler(
@@ -26,7 +26,7 @@ class IsaCompiler(
     IsaTileRowMixin,
     IsaFPOpsMixin,
     IsaEmitMixin,
-    TileCompiler,
+    MemoryStateMixin,
 ):
     """
     ISA Compiler: lowers PLENA compiler operations to assembly text.
@@ -37,8 +37,7 @@ class IsaCompiler(
     _ONLINE_SOFTMAX_FPSRAM_BASE = 10
 
     def __init__(self, mlen: int = 64, blen: int = 4, real_data_ratio: float = 1.125, unroll_loops: bool = False):
-        # TileCompiler.__init__ sets dimensions, layout tables, memory allocators,
-        # and the currently loaded MRAM sub-block table.
+        # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
         super().__init__(mlen=mlen, blen=blen, unroll_loops=unroll_loops)
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
@@ -332,8 +331,8 @@ class IsaCompiler(
         """Reset compiler state (clear code, but retain symbol table)"""
         self.generated_code = ""
         self.register_allocator = RegisterAllocator()
-        # Call TileCompiler.reset() explicitly since the merged class shadows it.
-        TileCompiler.reset(self)
+        # Call MemoryStateMixin.reset() explicitly since the merged class shadows it.
+        MemoryStateMixin.reset(self)
 
     def get_tensor_info(self, name: str):
         """Get unified tensor/object info by name."""
@@ -348,11 +347,11 @@ class IsaCompiler(
     ):
         """Register an HBM object and build its HBM layout.
 
-        Wraps ``TileCompiler.add_hbm_object`` with a different positional
+        Wraps the memory-layout ``add_hbm_object`` with a different positional
         parameter order ``(name, hbm_addr, shape, ...)`` that all IsaCompiler
         callers use.
         """
-        return TileCompiler.add_hbm_object(
+        return MemoryStateMixin.add_hbm_object(
             self,
             name=name,
             shape=shape,
@@ -362,7 +361,7 @@ class IsaCompiler(
 
     def free_hbm_object(self, name: str, strict: bool = False):
         """Free an HBM object by name (defaults to non-strict)."""
-        return TileCompiler.free_hbm_object(self, name, strict=strict)
+        return MemoryStateMixin.free_hbm_object(self, name, strict=strict)
 
     def get_vram_addr(self, name: str) -> int:
         """Get VRAM base address of an object."""
@@ -420,6 +419,6 @@ class IsaCompiler(
 
     def free_vram_object(self, name: str, strict: bool = False):
         """Free a VRAM object by name (defaults to non-strict)."""
-        return TileCompiler.free_vram_object(self, name, strict=strict)
+        return MemoryStateMixin.free_vram_object(self, name, strict=strict)
 
 __all__ = ["IsaCompiler"]
