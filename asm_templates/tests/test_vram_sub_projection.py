@@ -96,7 +96,7 @@ class TestVramSubProjectionAsmImpl(unittest.TestCase):
 
     def test_output_byte_identical_to_method(self):
         """The free function must produce byte-identical output to IsaCompiler's method."""
-        from compiler.aten.plena_compiler import IsaCompiler
+        from compiler.aten.plena import IsaCompiler
 
         compiler = IsaCompiler(mlen=64, blen=4, unroll_loops=False)
 

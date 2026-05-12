@@ -16,7 +16,7 @@ from compiler.aten.model_extract import (
 )
 import compiler.aten.ops as ops
 from compiler.aten.ops.registry import Backend, OpRegistry
-from compiler.aten.plena_compiler import PlenaCompiler
+from compiler.aten.plena import PlenaCompiler
 from compiler.aten.reference import (
     ReferencePrecision,
     _ksplit_matmul,

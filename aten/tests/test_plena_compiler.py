@@ -60,7 +60,7 @@ def test_isa_builder_preserves_relative_large_immediates():
 
 def test_fpvar_helper_uses_canonical_emit_path():
     """Converted FPVar helpers should still append and return asm text."""
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler()
     code = prog.fpvar_add_asm(src1_addr=0, src2_addr=4, dst_addr=8, count=2)
@@ -73,7 +73,7 @@ def test_fpvar_helper_uses_canonical_emit_path():
 
 def test_hbm_load_helper_uses_typed_legalization():
     """Converted HBM load helpers should legalize typed large immediates."""
-    from compiler.aten.plena_compiler import IsaCompiler
+    from compiler.aten.plena import IsaCompiler
 
     compiler = IsaCompiler()
     compiler.register_matrix("W", (512, 512), hbm_base_addr=0)
@@ -87,7 +87,7 @@ def test_hbm_load_helper_uses_typed_legalization():
 
 def test_vram_fill_zero_all_column_blocks():
     """vram_fill_zero must zero ALL column blocks of a wide matrix."""
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler()
     x = prog.alloc("X", 64, 384)
@@ -103,7 +103,7 @@ def test_vram_fill_zero_all_column_blocks():
 
 def test_vram_add_all_column_blocks():
     """vram_add must add ALL column blocks of wide matrices."""
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler()
     x = prog.alloc("X", 64, 384)
@@ -120,7 +120,7 @@ def test_vram_add_all_column_blocks():
 
 def test_alloc_at_correct_address():
     """alloc_at must create a VRAM view at the specified address."""
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler()
     # Allocate a matrix, then create a view into its second column block

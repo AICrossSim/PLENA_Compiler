@@ -18,7 +18,7 @@ from compiler.aten.isa_builder import (  # noqa: E402, F401
     fp,
     gp,
 )
-from compiler.aten.plena_compiler import (  # noqa: E402, F401
+from compiler.aten.plena import (  # noqa: E402, F401
     FPVar,
     InputVar,
     IsaCompiler,
