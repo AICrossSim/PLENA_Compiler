@@ -90,10 +90,22 @@ def make_rope_min(
             NS_FP  = T.alloc_fragment((hlen,), "float16")
             OUT_FP = T.alloc_fragment((hlen,), "float16")
 
-            T.copy(XQ_hbm     [0, s_block * rows, by, 0], XQ_sh)
-            T.copy(COS_hbm    [0, s_block * rows, by, 0], COS_sh)
-            T.copy(SIN_hbm    [0, s_block * rows, by, 0], SIN_sh)
-            T.copy(NEG_SIN_hbm[0, s_block * rows, by, 0], NEG_SIN_sh)
+            T.copy(
+                XQ_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+                XQ_sh,
+            )
+            T.copy(
+                COS_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+                COS_sh,
+            )
+            T.copy(
+                SIN_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+                SIN_sh,
+            )
+            T.copy(
+                NEG_SIN_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+                NEG_SIN_sh,
+            )
 
             for row in T.serial(rows):
                 T.copy(XQ_sh     [row, 0], X_FP)
@@ -109,7 +121,10 @@ def make_rope_min(
 
                 T.copy(OUT_FP, Q_OUT_sh[row, 0])
 
-            T.copy(Q_OUT_sh, Q_OUT_hbm[0, s_block * rows, by, 0])
+            T.copy(
+                Q_OUT_sh,
+                Q_OUT_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+            )
 
     # Return the raw PrimFunc — ``compile_kernel`` runs stmt prep + the
     # mid_ir pipeline itself, so factories don't pre-lower anymore.

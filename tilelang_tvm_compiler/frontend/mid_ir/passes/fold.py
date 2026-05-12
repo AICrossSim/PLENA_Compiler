@@ -480,7 +480,8 @@ def _index_exprs_equal(a, b) -> bool:
 
 def _wrap_src(load: tir.BufferLoad,
               dst_indices: List,
-              buf_table: Dict[str, BufferDef]
+              buf_table: Dict[str, BufferDef],
+              dst_buf: Optional[BufferDef] = None,
               ) -> Optional[Union[BufferRef, Broadcast]]:
     """Convert a BufferLoad src into either a plain BufferRef (when
     its index tuple matches dst's exactly) or a Broadcast (when it's
@@ -490,12 +491,28 @@ def _wrap_src(load: tir.BufferLoad,
     AND len(src) < len(dst). The missing trailing dims become
     ``broadcast_dims``.
 
-    Anything else (mismatched non-prefix shapes, scalar src in non-
-    last position, etc.) raises FoldError so we notice unsupported
-    patterns early.
+    Special case: FPRAM scalar fragment stores (rank-1
+    ``local.fragment`` dst) lower to one ``S_*_FP`` per call, with
+    every operand carrying its own independent scalar address. Index
+    matching is irrelevant — return the BufferRef as-is so the FPRAM
+    scalar emitter can use ``src.indices`` directly. Used by kernels
+    like RoPE that compute pair-swap addresses ``X_FP[2*i+1]`` against
+    ``__tmp_fp_0[2*i]``.
+
+    Anything else (mismatched non-prefix shapes on SIMD-style refs)
+    returns None so fold fails loudly.
     """
     src_ref = _load_to_ref(load, buf_table)
     src_idx = src_ref.indices
+    is_fpram_scalar_dst = (
+        dst_buf is not None
+        and dst_buf.scope in ("local.fragment", "fragment", "fragment.fpram")
+        and len(dst_buf.shape) == 1
+    )
+    if is_fpram_scalar_dst:
+        # FPRAM scalar lower-cycle: each operand is just a scalar
+        # address, no SIMD axis to align.
+        return src_ref
     if len(src_idx) == len(dst_indices):
         # Same rank — every position must be index-equal to dst's
         # for this to be a valid per-element op.
@@ -507,8 +524,6 @@ def _wrap_src(load: tir.BufferLoad,
         if all(_index_exprs_equal(s, p) for s, p in zip(src_idx, prefix)):
             broadcast_dims = list(range(len(src_idx), len(dst_indices)))
             return Broadcast(src=src_ref, broadcast_dims=broadcast_dims)
-    # Couldn't fit either pattern (e.g. shifted index ``src[m + kw]`` vs
-    # dst ``[m]``). Caller falls back to RawStore.
     return None
 
 
@@ -546,13 +561,11 @@ def _try_fold_store(store: tir.BufferStore,
         last = store.indices[-1]
         if not (isinstance(last, tir.Var) and last.same_as(parallel_var)):
             return None
-    # Bail on dst with compound indices (e.g. ``buf[MLEN + k] = ...``)
-    # — these aren't whole-axis covers, they're per-element scalar
-    # writes. Caller wraps them in RawStore.
-    for idx in store.indices:
-        if isinstance(idx, (tir.Add, tir.Sub, tir.Mul,
-                            tir.FloorDiv, tir.FloorMod)):
-            return None
+    # Compound indices (e.g. ``buf[2 * i + 1] = ...``) are kept as
+    # affine PrimExpr in the resulting Elementwise/BufferRef. Used by
+    # kernels like RoPE that compute pair offsets ``e = 2*i,
+    # o = 2*i + 1`` and write into a per-pair fragment. Downstream
+    # ``_render_idx_as_primexpr`` materialises them.
     dst = _store_to_ref(store, buf_table)
     # Peel TVM's fp16↔fp32 cast roundtrip so reciprocal / binop / unary
     # matchers below see a clean fp16 expression tree.
@@ -573,7 +586,7 @@ def _try_fold_store(store: tir.BufferStore,
         a = _peel_cast_roundtrip(expr.args[0])
         if not isinstance(a, tir.BufferLoad):
             return None
-        wrapped = _wrap_src(a, dst.indices, buf_table)
+        wrapped = _wrap_src(a, dst.indices, buf_table, dst_buf=dst.buffer)
         if wrapped is None:
             return None
         return Elementwise(dst=dst, srcs=[wrapped], op=unary, axis=axis, size=size)
@@ -585,7 +598,7 @@ def _try_fold_store(store: tir.BufferStore,
         if (isinstance(a, (tir.IntImm, tir.FloatImm))
                 and float(a.value) == 1.0
                 and isinstance(b, tir.BufferLoad)):
-            wrapped = _wrap_src(b, dst.indices, buf_table)
+            wrapped = _wrap_src(b, dst.indices, buf_table, dst_buf=dst.buffer)
             if wrapped is None:
                 return None
             return Elementwise(
@@ -595,7 +608,7 @@ def _try_fold_store(store: tir.BufferStore,
 
     # Pure copy: dst[idx] = src[idx].
     if isinstance(expr, tir.BufferLoad):
-        wrapped = _wrap_src(expr, dst.indices, buf_table)
+        wrapped = _wrap_src(expr, dst.indices, buf_table, dst_buf=dst.buffer)
         if wrapped is None:
             return None
         return Elementwise(
@@ -609,7 +622,7 @@ def _try_fold_store(store: tir.BufferStore,
         for arg in (expr.a, expr.b):
             arg = _peel_cast_roundtrip(arg)
             if isinstance(arg, tir.BufferLoad):
-                wrapped = _wrap_src(arg, dst.indices, buf_table)
+                wrapped = _wrap_src(arg, dst.indices, buf_table, dst_buf=dst.buffer)
                 if wrapped is None:
                     return None
                 srcs.append(wrapped)
@@ -907,14 +920,14 @@ def _walk_stmt(stmt,
         # could accumulate these into a side list for diagnostics.
         return []
     if isinstance(stmt, tir.BufferStore):
-        # A bare BufferStore that didn't fold: keep it as RawStore so
-        # downstream passes can dispatch on it (e.g. conv2d's
-        # ``in_FP_padded[MLEN + k] = 0`` zero-pad init, or a
-        # shifted-copy body).
         ew = _try_fold_store(stmt, parallel_var=None, buf_table=buf_table)
         if ew is not None:
             return [ew]
-        return [_to_raw_store(stmt, buf_table)]
+        raise FoldError(
+            f"unrecognised BufferStore — every store must lower to a "
+            f"single elementwise / reduce / broadcast pattern. "
+            f"dst={stmt.buffer.name}{list(stmt.indices)} := {stmt.value!r}"
+        )
     raise FoldError(f"unhandled stmt type {type(stmt).__name__}")
 
 

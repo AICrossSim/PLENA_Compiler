@@ -751,9 +751,17 @@ def _lower_v_fp_transfer(
         )
     n_rows = n_elem // mlen
     vram_off_base = _ref_flat_offset(vram_ref, phase_var_zero=cluster_axis_name)
+    # The HW instruction (S_MAP_FP_V / S_MAP_V_FP) transfers VLEN=MLEN
+    # contiguous fp slots in one issue across all cluster lanes. Under
+    # sync wrap the cluster-phase index on the FP ref must be treated
+    # as 0 — same convention vram_off_base uses. cluster_dim records
+    # exactly which physical axis carries the phase index.
+    fp_indices = _zero_cluster_axis_in_fp_indices(
+        fp_ref, cluster_axis_name,
+    )
     fp_addr = _hlir.BufferElement(
         buffer=fp_buf.name,
-        indices=tuple(_render_idx_as_primexpr(i) for i in fp_ref.indices),
+        indices=fp_indices,
     )
 
     def _make_leaf(vram_off, fp_addr_arg):
@@ -780,10 +788,27 @@ def _lower_v_fp_transfer(
     # FPRAM advances by mlen elements per row too.
     fp_addr_stepped = _hlir.BufferElement(
         buffer=fp_buf.name,
-        indices=tuple(_render_idx_as_primexpr(i) for i in fp_ref.indices),
+        indices=fp_indices,
     )  # NB: fp ref indices stay; row_stride lives in vram offset only.
     leaf = _make_leaf(vram_off, fp_addr_stepped)
     return _hlir.make_for_op(loop_var=row_var, extent=n_rows, body=[leaf])
+
+
+def _zero_cluster_axis_in_fp_indices(
+    ref: BufferRef, cluster_axis_name: Optional[str],
+) -> "tuple":
+    """Render ``ref.indices`` to PrimExprs, replacing the cluster-phase
+    axis with 0 when the enclosing MultiLaneOp covers all lanes in one
+    issue. ``ref.buffer.cluster_dim`` (set by split / propagated by
+    burn_view) tells us which physical axis carries the phase index.
+    """
+    indices = list(ref.indices)
+    cluster_dim = getattr(ref.buffer, "cluster_dim", None)
+    if (cluster_axis_name is not None
+            and cluster_dim is not None
+            and 0 <= cluster_dim < len(indices)):
+        indices[cluster_dim] = 0
+    return tuple(_render_idx_as_primexpr(i) for i in indices)
 
 
 def _ref_touch_count(ref: BufferRef) -> int:
@@ -1306,6 +1331,11 @@ _MULTI_LANE_OP_KINDS = frozenset({
     # op covers all cluster lanes in one issue — don't re-wrap in a
     # synthetic for-lane loop.
     "copy_v_to_v",
+    # vram↔fpram transfer: one S_MAP_FP_V / S_MAP_V_FP transfers VLEN=MLEN
+    # contiguous slots in one issue (a full MLEN-wide vram row, spanning
+    # all cluster lanes natively). Sync wrap zeroes the cluster phase
+    # axis on both sides — same one-issue-covers-all-lanes contract.
+    "row_load_v_to_fp", "row_store_fp_to_v",
 })
 
 
