@@ -1,6 +1,6 @@
 // precision.svh - PLENA numeric precision parameters.
 //
-// Intentionally minimal: compiler/generator/parser/hardware_parser.py (and the
+// Intentionally minimal: generator/parser/hardware_parser.py (and the
 // helpers under tools/) tolerate an empty precision file and fall back to the
 // following per-parameter defaults when the corresponding `parameter` line is
 // absent:

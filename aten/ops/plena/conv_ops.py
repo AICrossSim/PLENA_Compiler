@@ -9,7 +9,7 @@ Two im2col paths:
   patches.  Requires the emulator to support V_SHIFT_V (opcode 0x31,
   LSB-first right-shift per main.rs fix by George Wu, commit 24eb011).
 
-After im2col the systolic matmul uses the standard linear_plena path.
+After im2col the systolic matmul uses the compiler's standard linear path.
 
 HBM layout convention (caller must arrange data accordingly):
   input_raw shape  = (C_in * H, W_padded)   — each row is one spatial row of one channel
@@ -19,9 +19,6 @@ Alignment requirement:
   H_PREFETCH_V requires the HBM element address to be a multiple of 64.
   With W_padded=64 and ow=0 (OW=1): offset = (c*H + oh+kr) * 64 → always aligned.
 """
-
-from compiler.aten.ops.plena.linear_ops import linear_plena
-
 
 _PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows
 
@@ -114,12 +111,12 @@ def conv2d_plena(
     # Look up VRAM base addresses from the symbol table
     # ------------------------------------------------------------------
     if use_shift:
-        mask_vec_vram_addr = prog._compiler.get_vram_addr(mask_mat.name)
+        mask_vec_vram_addr = prog.get_vram_addr(mask_mat.name)
     else:
-        basis_vram_base = prog._compiler.get_vram_addr(basis_mat.name)
-    scratch_vram_addr = prog._compiler.get_vram_addr(scratch_mat.name)
-    temp_vram_addr = prog._compiler.get_vram_addr(temp_mat.name)
-    output_vram_base = prog._compiler.get_vram_addr(output_mat.name)
+        basis_vram_base = prog.get_vram_addr(basis_mat.name)
+    scratch_vram_addr = prog.get_vram_addr(scratch_mat.name)
+    temp_vram_addr = prog.get_vram_addr(temp_mat.name)
+    output_vram_base = prog.get_vram_addr(output_mat.name)
 
     # ------------------------------------------------------------------
     # GP register allocation
@@ -146,7 +143,7 @@ def conv2d_plena(
         setup_lines.append(f"S_LUI_INT gp{setup_gp}, {hbm_base >> 12}")
         setup_lines.append(f"S_ADDI_INT gp{setup_gp}, gp{setup_gp}, {hbm_base & 0xFFF}")
     setup_lines.append(f"C_SET_ADDR_REG a{addr_reg_idx}, gp0, gp{setup_gp}")
-    prog._compiler.generated_code += "\n".join(setup_lines) + "\n"
+    prog.emit("\n".join(setup_lines) + "\n")
 
     # ------------------------------------------------------------------
     # Emit: im2col assembly
@@ -191,9 +188,9 @@ def conv2d_plena(
             fp_one_reg=fp_one_reg,  # f1 = 1.0 by default (must be in fp_preload[fp_one_reg])
             fp_ex_reg=2,  # f2 = V_RED_SUM accumulator
         )
-    prog._compiler.generated_code += asm_code
+    prog.emit(asm_code)
 
     # ------------------------------------------------------------------
     # Systolic matmul: im2col_out @ weight_2d  -> (M, C_out)
     # ------------------------------------------------------------------
-    return linear_plena(prog, output_mat, weight_2d_var)
+    return prog.linear(output_mat, weight_2d_var)

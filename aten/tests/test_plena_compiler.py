@@ -1,13 +1,13 @@
 """Unit tests for PlenaCompiler ATen path (no emulator needed).
 
-Run: PYTHONPATH=.:tools:compiler python3 compiler/aten/tests/test_plena_compiler.py
+Run: PYTHONPATH=.:tools:.. python3 aten/tests/test_plena_compiler.py
 """
 
 import sys
 import os
 
 # Insert PLENA_Simulator root and tools/ so imports resolve correctly regardless
-# of how the test is invoked (direct python3 or via PYTHONPATH=.:tools:compiler).
+# of how the test is invoked (direct python3 or via PYTHONPATH=.:tools:..).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SIM_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR))))
 _SIM_ROOT = os.path.join(_SIM_ROOT, "PLENA_Simulator")
@@ -18,12 +18,76 @@ for _p in [_SIM_ROOT, os.path.join(_SIM_ROOT, "tools"), os.path.join(_SIM_ROOT, 
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import torch
+import torch  # noqa: E402
+
+
+def test_isa_builder_renders_typed_instruction():
+    """Typed ISA builder should render the existing asm syntax."""
+    from compiler.aten.isa_builder import IsaBuilder, fp, gp
+
+    asm = IsaBuilder()
+    asm.comment("typed builder smoke")
+    asm.instr("S_ADDI_INT", gp(3), gp(0), 4096)
+    asm.instr("S_ADD_FP", fp(1), fp(1), fp(2))
+
+    rendered = asm.render()
+    assert "; typed builder smoke" in rendered
+    assert "S_ADDI_INT gp3, gp0, 4096" in rendered
+    assert "S_ADD_FP f1, f1, f2" in rendered
+    print("  PASS test_isa_builder_renders_typed_instruction")
+
+
+def test_isa_builder_legalizes_large_absolute_immediates():
+    """Typed ISA builder should split large absolute S_ADDI_INT loads."""
+    from compiler.aten.isa_builder import IsaBuilder, gp
+
+    rendered = IsaBuilder().instr("S_ADDI_INT", gp(5), gp(0), 300000).render()
+    assert "S_LUI_INT gp5, 73" in rendered
+    assert "S_ADDI_INT gp5, gp5, 992" in rendered
+    assert "S_ADDI_INT gp5, gp0, 300000" not in rendered
+    print("  PASS test_isa_builder_legalizes_large_absolute_immediates")
+
+
+def test_isa_builder_preserves_relative_large_immediates():
+    """Typed ISA builder should not split relative S_ADDI_INT instructions."""
+    from compiler.aten.isa_builder import IsaBuilder, gp
+
+    rendered = IsaBuilder().instr("S_ADDI_INT", gp(5), gp(3), 300000).render()
+    assert "S_ADDI_INT gp5, gp3, 300000" in rendered
+    assert "S_LUI_INT" not in rendered
+    print("  PASS test_isa_builder_preserves_relative_large_immediates")
+
+
+def test_fpvar_helper_uses_canonical_emit_path():
+    """Converted FPVar helpers should still append and return asm text."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler()
+    code = prog.fpvar_add_asm(src1_addr=0, src2_addr=4, dst_addr=8, count=2)
+
+    assert code == prog.get_code()
+    assert "S_ADD_FP f1, f1, f2" in code
+    assert "C_LOOP_START" in code
+    print("  PASS test_fpvar_helper_uses_canonical_emit_path")
+
+
+def test_hbm_load_helper_uses_typed_legalization():
+    """Converted HBM load helpers should legalize typed large immediates."""
+    from compiler.aten.plena import IsaCompiler
+
+    compiler = IsaCompiler()
+    compiler.register_matrix("W", (512, 512), hbm_base_addr=0)
+
+    code = compiler.load_sub_matrix_asm("W", row_idx=0, col_idx=0, mram_dest_addr=0)
+    assert "S_LUI_INT gp1, 64" in code
+    assert "S_ADDI_INT gp1, gp0, 262144" not in code
+    assert "H_PREFETCH_M gp3, gp1, a1, 1, 0" in code
+    print("  PASS test_hbm_load_helper_uses_typed_legalization")
 
 
 def test_vram_fill_zero_all_column_blocks():
     """vram_fill_zero must zero ALL column blocks of a wide matrix."""
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler()
     x = prog.alloc("X", 64, 384)
@@ -39,7 +103,7 @@ def test_vram_fill_zero_all_column_blocks():
 
 def test_vram_add_all_column_blocks():
     """vram_add must add ALL column blocks of wide matrices."""
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler()
     x = prog.alloc("X", 64, 384)
@@ -56,7 +120,7 @@ def test_vram_add_all_column_blocks():
 
 def test_alloc_at_correct_address():
     """alloc_at must create a VRAM view at the specified address."""
-    from compiler.aten.plena_compiler import PlenaCompiler
+    from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler()
     # Allocate a matrix, then create a view into its second column block
@@ -67,7 +131,7 @@ def test_alloc_at_correct_address():
     view_addr = x_addr + 2 * 64 * 64
     view = prog.alloc_at("X_cb2_view", 64, 64, view_addr)
 
-    actual_addr = prog._compiler.get_vram_addr(view.name)
+    actual_addr = prog.get_vram_addr(view.name)
     assert actual_addr == view_addr, (
         f"alloc_at address mismatch: expected {view_addr}, got {actual_addr}"
     )
@@ -150,7 +214,7 @@ def test_compile_hf_model_golden_vs_hf():
     )
     model.eval()
 
-    r = compile_hf_model(model, seq_len=64, hidden_size=None, inter_dim=None, num_layers=1)
+    r = compile_hf_model(model, seq_len=64, num_layers=1)
     golden = r["golden_output"]
     hf = r["hf_ground_truth"]
 
@@ -167,16 +231,18 @@ def test_compile_hf_model_golden_vs_hf():
 
 def test_native_compile_assembles():
     """Native-dim ISA must assemble without overflow."""
-    from compiler.aten.plena_frontend import compile_hf_model, _fix_large_immediates
+    import os
+    import tempfile
+
+    from compiler.aten.plena_frontend import compile_hf_model
     from transformers import AutoModelForCausalLM
-    import tempfile, os
 
     model = AutoModelForCausalLM.from_pretrained(
         "AICrossSim/clm-60m", torch_dtype=torch.float32
     )
     model.eval()
 
-    r = compile_hf_model(model, seq_len=64, hidden_size=None, inter_dim=None, num_layers=1)
+    r = compile_hf_model(model, seq_len=64, num_layers=1)
     isa = r["isa"]
 
     # Assemble — should not raise ValueError (u32 overflow)
@@ -213,6 +279,11 @@ if __name__ == "__main__":
     print("=" * 60)
 
     tests = [
+        test_isa_builder_renders_typed_instruction,
+        test_isa_builder_legalizes_large_absolute_immediates,
+        test_isa_builder_preserves_relative_large_immediates,
+        test_fpvar_helper_uses_canonical_emit_path,
+        test_hbm_load_helper_uses_typed_legalization,
         test_vram_fill_zero_all_column_blocks,
         test_vram_add_all_column_blocks,
         test_alloc_at_correct_address,

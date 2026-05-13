@@ -16,7 +16,7 @@ from utils.logger import get_logger  # noqa: E402
 
 from .build_sys_tools import env_setup, init_mem  # noqa: E402
 
-# Project root is 3 levels up from compiler/sim_env_utils/
+# Project root is 3 levels up from PLENA_Compiler/sim_env_utils/
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = get_logger("testbench")

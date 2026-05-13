@@ -89,7 +89,7 @@ def _build_hbm_from_hf_weights(
 ) -> dict:
     """Populate hbm_for_behave_sim.bin with real HF model weights.
 
-    Mirrors compiler/sim_env_utils/build_env.py::create_mem_for_sim but
+    Mirrors sim_env_utils/build_env.py::create_mem_for_sim but
     operates directly on HF tensors (no intermediate .pt files) and writes
     each weight block at the scheduler-assigned HBM offset.
 
@@ -308,7 +308,7 @@ def _build_fp_sram_preload(
     slot (or the harness needs to refresh slot 5 between text and vision
     runs) to fix this.  Tracking issue: TODO.
 
-    Slot map (from compiler/generator/scheduler/mem_layout_lib.json):
+    Slot map (from generator/scheduler/mem_layout_lib.json):
       0: infinity      — softmax masking sentinel (use a large fp16 negative)
       1: eps           — RMSNorm epsilon
       2: hid_reciprocal — 1.0 / hidden_size
@@ -518,7 +518,7 @@ def run_test_aten(
     numerical verification deferred, this immediately gets full numerical
     correctness via the mature ATen compilation backend.
     """
-    from generator.aten_runner import run_aten_e2e
+    from compiler.aten.e2e_runner import run_aten_e2e
 
     print("=" * 80)
     print(f"Generator e2e harness (ATen backend) — {model_id} — "

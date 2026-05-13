@@ -3,7 +3,7 @@
 Verifies the extracted free function produces the expected ISA output for
 looped/unrolled and transposed/non-transposed variants, and asserts
 byte-identical parity with the delegating
-``TileCompiler._vram_sub_projection_asm_impl`` method.
+``IsaCompiler._vram_sub_projection_asm_impl`` method.
 """
 
 import sys
@@ -95,10 +95,10 @@ class TestVramSubProjectionAsmImpl(unittest.TestCase):
         self.assertIn("M_MM_WO", asm)
 
     def test_output_byte_identical_to_method(self):
-        """The free function must produce byte-identical output to TileCompiler's method."""
-        from compiler.aten.plena_compiler import TileCompiler
+        """The free function must produce byte-identical output to IsaCompiler's method."""
+        from compiler.aten.plena import IsaCompiler
 
-        tc = TileCompiler(mlen=64, blen=4, unroll_loops=False)
+        compiler = IsaCompiler(mlen=64, blen=4, unroll_loops=False)
 
         method_kwargs = dict(
             header_lines=["; header"],
@@ -113,7 +113,7 @@ class TestVramSubProjectionAsmImpl(unittest.TestCase):
             caller_name="test",
         )
 
-        method_out = tc._vram_sub_projection_asm_impl(**method_kwargs)
+        method_out = compiler._vram_sub_projection_asm_impl(**method_kwargs)
         free_out = vram_sub_projection_asm_impl(
             mlen=64,
             blen=4,

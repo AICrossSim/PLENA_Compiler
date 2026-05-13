@@ -9,8 +9,8 @@ against the HF float32 ground truth. Expected result:
     fp32           (fp32 + fp32)   ~99% allclose  ← confirms quantization is sole cause
 
 Usage:
-    pytest compiler/aten/tests/test_quantization_ablation.py -v -s
-    python3 compiler/aten/tests/test_quantization_ablation.py [--layers N]
+    pytest aten/tests/test_quantization_ablation.py -v -s
+    python3 aten/tests/test_quantization_ablation.py [--layers N]
 """
 
 import argparse
@@ -84,8 +84,8 @@ def test_mxfp8_is_sole_gap_source():
     for mode in MODES:
         r = results[mode]
         print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print(f"\n  MXFP8 weight quantization = 100% of the gap")
-    print(f"  BF16 intermediate precision = 0% of the gap")
+    print("\n  MXFP8 weight quantization = 100% of the gap")
+    print("  BF16 intermediate precision = 0% of the gap")
 
 
 if __name__ == "__main__":
@@ -103,5 +103,5 @@ if __name__ == "__main__":
     for mode in MODES:
         r = results[mode]
         print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print(f"\n  Conclusion: MXFP8 weight quantization = 100% of the gap")
-    print(f"  BF16 intermediate precision = 0% of the gap")
+    print("\n  Conclusion: MXFP8 weight quantization = 100% of the gap")
+    print("  BF16 intermediate precision = 0% of the gap")
