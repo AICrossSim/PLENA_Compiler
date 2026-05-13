@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-PLENA generator runner -- symbolic codegen and ATen e2e convenience entry.
+PLENA generator runner -- symbolic codegen and utilization analysis.
 
 Modes:
   codegen      -- Pipeline 2 (Generator): HF config -> symbolic graph ->
                   code_gen_pass -> ASM. Valid ISA for analysis/profiling;
                   numerically incomplete (HBM address registers not set).
-  aten         -- Pipeline 1 (ATen): HF model -> PlenaCompiler -> verified
-                  ISA. Numerically verified, 98-100% allclose.
   utilization  -- PE utilization analysis report (no ISA emitted).
 
 Examples:
     python -m generator.runner codegen AICrossSim/clm-60m output.asm --seq-len 512
-    python -m compiler.aten.e2e_runner AICrossSim/clm-60m --seq-len 32 --num-layers 1
+    python -m generator.runner utilization AICrossSim/clm-60m dummy.asm --seq-len 512
 
 See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
@@ -27,23 +25,8 @@ from generator.passes.utilization_report import analyse_overall_utilization
 from generator.scheduler import gen_scheduler
 
 
-def _run_aten(args) -> int:
-    """ATen-backed end-to-end: PlenaCompiler + ops.* -> emulator -> numerical check."""
-    from compiler.aten.e2e_runner import run_aten_e2e
-
-    result = run_aten_e2e(
-        model_id=args.model_path,
-        seq_len=args.seq_len,
-        num_layers=args.num_layers if args.num_layers is not None else 1,
-        build_dir=args.build_dir,
-        trust_remote_code=args.trust_remote_code,
-        partial_load=args.partial_load,
-    )
-    return 0 if result["passed"] else 1
-
-
 def _run_codegen(args) -> int:
-    """Original generator codegen path — symbolic graph → ISA → .asm file."""
+    """Original generator codegen path: symbolic graph -> ISA -> .asm file."""
     model_path = args.model_path
     output_file = args.output_file
     seq_len = args.seq_len
@@ -166,36 +149,23 @@ def _run_codegen(args) -> int:
 def run():
     # Use proper argparse for all modes
     parser = argparse.ArgumentParser(
-        description="Generator runner — codegen and ATen compilation modes",
+        description="Generator runner: symbolic codegen and utilization analysis",
         prog="python -m generator.runner",
     )
-    parser.add_argument("mode", choices=["codegen", "aten", "utilization"],
+    parser.add_argument("mode", choices=["codegen", "utilization"],
                         help="Execution mode: codegen (ASM generation), "
-                             "aten (PlenaCompiler e2e with emulator), "
                              "utilization (PE utilization report)")
     parser.add_argument("model_path", help="HuggingFace model ID (e.g. AICrossSim/clm-60m)")
     parser.add_argument("output_file", nargs="?", default=None,
-                        help="Output .asm file (required for codegen/utilization, ignored for aten)")
+                        help="Output .asm file (required for codegen; pass a dummy path for utilization)")
     parser.add_argument("--seq-len", type=int, default=512,
-                        help="Sequence length (default: 512 for codegen, 64 for aten)")
+                        help="Sequence length (default: 512)")
     parser.add_argument("--num-layers", type=int, default=None,
                         help="Override num_hidden_layers in model config")
-    parser.add_argument("--build-dir", type=str, default=None,
-                        help="Build directory for aten mode sim artifacts")
-    parser.add_argument("--trust-remote-code", action="store_true",
-                        help="Trust remote code for HF model loading (aten mode)")
-    parser.add_argument("--partial-load", action="store_true",
-                        help="Load only needed weight shards for large models (aten mode)")
 
     args = parser.parse_args()
 
-    if args.mode == "aten":
-        # Default seq_len for aten mode is 64 (sim-optimal), not 512
-        if "--seq-len" not in sys.argv:
-            args.seq_len = 64
-        return _run_aten(args)
-    else:
-        return _run_codegen(args)
+    return _run_codegen(args)
 
 
 if __name__ == "__main__":
