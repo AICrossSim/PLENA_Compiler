@@ -60,8 +60,6 @@ Layout contract for ``B_cache`` (testbench-side preload):
 
 import tilelang.language as T
 
-from ..frontend.pipeline import compile_func
-
 
 def make_conv2d_min(
     *,
@@ -105,9 +103,6 @@ def make_conv2d_min(
 
     @T.prim_func
     def conv2d_min(
-        # NCHW. ``T.func_attr({"plena.layout": "NCHW"})`` below tells
-        # the compiler axes[2] is the row dim (s-tiled) and axes[1] is
-        # the channel dim (lane-grouped).
         Input:  T.Tensor((1, C_IN,  H_PAD, W_PAD), "float16"),
         Output: T.Tensor((1, C_OUT, H,     W),     "float16"),
     ):
@@ -115,85 +110,62 @@ def make_conv2d_min(
         if False:
             _ = (H_PAD, W_PAD, H, W, C_IN, C_OUT, OC_IC)
 
-        with T.Kernel(1, threads=128) as _bx:
-            # ---- VRAM buffers ----
-            # No B_cache: weights are pre-loaded *directly* into
-            # ``B_FP`` at FPRAM startup (the testbench's ``fp_preload``
-            # writes to B_FP's FPRAM address, derived from
-            # ``--dump-buffer-addrs``). This avoids the awkward
-            # ``T.copy(B_cache[r, 0], B_FP[r * MLEN])`` indirection,
-            # which silently drops its body during lowering — tilelang
-            # treats ``B_FP[r * MLEN]`` as a scalar access (not a
-            # region slice) and produces an empty for-loop, so B_FP
-            # never gets populated and every FMA multiplies by zero.
+        with T.Kernel(1, threads=1) as _bx:
+            # Single-channel padded input tile, re-staged per ic.
+            in_stage = T.alloc_shared((H_PAD, W_PAD), "float16")
 
-            # Whole padded input staged in VRAM. Multi-tile h2v emitter
-            # walks the (C_IN, S_TILES, D_TILES) inner-tile grid and
-            # fires one H_LOAD_V per tile. NCHW layout — axis 2 is the
-            # row dim (s-tiled), axis 3 is the col dim (d-tiled), and
-            # axis 1 (C_IN) becomes the lane-group dim under canonical
-            # BSHD ordering.
-            in_stage = T.alloc_shared((1, C_IN, H_PAD, W_PAD), "float16")
+            # ``A_sh`` and ``A_sh_acc`` live in VRAM so the per-tap
+            # multiply + accumulate lower to vector instructions
+            # (``V_MUL_VF`` / ``V_ADD_VV``) instead of the per-element
+            # FPRAM scalar loop. The kw-shift chain stays in FPRAM —
+            # only the multiply and the accumulate move to vram.
+            #
+            # Shape ``(1, MLEN)`` (not ``(MLEN,)``) on purpose: fold's
+            # broadcast detection only kicks in when ``len(src.indices)
+            # < len(dst.indices)``, so a 1D shared dst with a scalar
+            # fp src ``w_aux[0]`` fails to fold (same rank, no
+            # broadcast path). 2D dst + 1D scalar src matches the
+            # path flash_attention already uses.
+            A_sh     = T.alloc_shared((1, MLEN), "float16")
+            A_sh_acc = T.alloc_shared((1, MLEN), "float16")
 
-            # VRAM scratch — per-tap intermediate. Holds the kw-shifted
-            # input row * weight scalar for one (ic, kh, kw) tap.
-            A_sh = T.alloc_shared((1, 1, 1, MLEN), "float16")
-
-            # VRAM scratch — per-(oc, oh) accumulator. Reset to zero at
-            # the start of each output row, then receives all
-            # C_IN * KH * KW vector-scalar contributions before
-            # being copied into ``C_loc``.
-            A_sh_acc = T.alloc_shared((1, 1, 1, MLEN), "float16")
-
-            # ---- FPRAM fragments (1D so scope_inference keeps them in fpram) ----
             # ``B_FP`` holds the full weight tensor after MLEN-padding:
-            # OC_IC rows of MLEN slots each, indexed as
-            # ``B_FP[(oc * C_IN + ic) * MLEN + k_tap]``. Only the first
-            # K_FLAT slots in each row are real weights — the rest are
-            # zero-padded by the testbench so the row-wise S_MAP_FP_V
-            # transfer can move whole MLEN-wide chunks. Marked global.fpram
-            # because the testbench's fp_preload writes the weights into
-            # FPRAM at this buffer's allocated address before the kernel
-            # runs — its layout is the user's contract with the testbench
-            # and must not be reshaped by lane-fusion expansion.
+            # OC_IC rows of MLEN slots each. The testbench's
+            # ``fp_preload`` writes weights into FPRAM at this buffer's
+            # allocated address before the kernel runs.
             B_FP         = T.alloc_fragment((OC_IC * MLEN,), "float16",
                                              scope="global.fpram")
+            # Per-tap weight scalar — 1D so the FPRAM-scalar fold path
+            # accepts the multiply (`A_sh[m] = A_sh[m] * w_aux[0]`).
+            w_aux        = T.alloc_fragment((1,), "float16")
             in_FP_aux    = T.alloc_fragment((MLEN,), "float16")
             in_FP_padded = T.alloc_fragment((MLEN + KW - 1,), "float16")
             shift_FP     = T.alloc_fragment((MLEN,), "float16")
 
-            # Final output (1, C_OUT, MLEN, MLEN). With NCHW layout
-            # the channel dim becomes the lane-group axis (canonical H)
-            # — for C_OUT > 1 the buffer needs multi-tile placement.
-            # Stage_output's writeback path works for C_OUT == 1; the
-            # multi-C_OUT case is gated until __main__._emit_output_staging
-            # learns the per-channel stride.
-            C_loc = T.alloc_shared((1, C_OUT, MLEN, MLEN), "float16")
+            # Single-channel output tile, drained to HBM per oc.
+            C_loc = T.alloc_shared((MLEN, MLEN), "float16")
 
-            # ---- Stage whole padded input HBM->VRAM (multi-tile DMA) ----
-            T.copy(Input[0, 0, 0, 0], in_stage)
-
-            # ---- Weights live in FPRAM from the start ----
-            # ``B_FP`` is preloaded by the testbench (fp_preload writes
-            # the weight tensor into FPRAM at B_FP's allocated address).
-            # No kernel-side staging needed.
-
-            # ---- One-time init of in_FP_padded's zero tail ----
             for k in T.serial(KW - 1):
                 in_FP_padded[MLEN + k] = T.float16(0)
 
             for oc in T.serial(C_OUT):
                 for oh in T.serial(H):
-                    # ---- Zero per-row accumulator ----
                     for m in T.Parallel(MLEN):
-                        A_sh_acc[0, 0, 0, m] = T.float16(0)
+                        A_sh_acc[0, m] = T.float16(0)
 
-                    # ---- C_IN × KH × KW vector-scalar FMA chain ----
                     for ic in T.serial(C_IN):
+                        # (Re-)stage this input channel's full padded
+                        # tile into VRAM. Inner kh_idx reads from it
+                        # row-wise.
+                        T.copy(
+                            Input[0, ic, 0:H_PAD, 0:W_PAD],
+                            in_stage[0:H_PAD, 0:W_PAD],
+                        )
                         for kh_idx in T.unroll(KH):
-                            # Load input row from input channel ic.
-                            # NCHW indexing: row at axis 2.
-                            T.copy(in_stage[0, ic, oh + kh_idx, 0], in_FP_aux)
+                            T.copy(
+                                in_stage[oh + kh_idx, 0:MLEN],
+                                in_FP_aux[0:MLEN],
+                            )
 
                             for i in T.serial(MLEN):
                                 in_FP_padded[i] = in_FP_aux[i]
@@ -204,29 +176,38 @@ def make_conv2d_min(
                                 for m in T.serial(MLEN):
                                     shift_FP[m] = in_FP_padded[m + kw_idx]
 
-                                T.copy(shift_FP, A_sh[0, 0, 0, 0])
+                                # fpram → vram row copy: lowers to a
+                                # single ``S_MAP_V_FP`` (whole MLEN row
+                                # in one issue) instead of MLEN scalar
+                                # loads + stores.
+                                T.copy(shift_FP[0:MLEN], A_sh[0, 0:MLEN])
 
-                                # B_FP layout: row r = oc*C_IN + ic,
-                                # tap k_tap = kh*KW + kw.
-                                # Flat index = r * MLEN + k_tap.
+                                w_aux[0] = B_FP[(oc * C_IN + ic) * MLEN + k_tap]
+
+                                # vram × fp_scalar broadcast → one
+                                # ``V_MUL_VF`` per row; with A_sh being
+                                # 1×MLEN that's a single instruction.
                                 for m in T.Parallel(MLEN):
-                                    A_sh[0, 0, 0, m] = (
-                                        A_sh[0, 0, 0, m]
-                                        * B_FP[(oc * C_IN + ic) * MLEN + k_tap]
-                                    )
+                                    A_sh[0, m] = A_sh[0, m] * w_aux[0]
+                                # vram + vram → one ``V_ADD_VV``.
                                 for m in T.Parallel(MLEN):
-                                    A_sh_acc[0, 0, 0, m] = (
-                                        A_sh_acc[0, 0, 0, m] + A_sh[0, 0, 0, m]
-                                    )
+                                    A_sh_acc[0, m] = A_sh_acc[0, m] + A_sh[0, m]
 
-                    # ---- Per-(oc, oh) writeback into C_loc ----
-                    # NCHW indexing: oc at axis 1, oh at axis 2.
-                    T.copy(A_sh_acc, C_loc[0, oc, oh, 0])
+                    T.copy(
+                        A_sh_acc[0, 0:MLEN],
+                        C_loc[oh, 0:MLEN],
+                    )
 
-            # ---- Writeback ALL output rows in one full-tile DMA ----
-            T.copy(C_loc, Output[0, 0, 0, 0])
+                # Drain this oc's full (MLEN, MLEN) tile to HBM.
+                T.copy(
+                    C_loc[0:MLEN, 0:MLEN],
+                    Output[0, oc, 0:MLEN, 0:MLEN],
+                )
 
-    lowered = compile_func(conv2d_min)
+    # Return the raw PrimFunc. ``compile_kernel`` runs stmt prep + the
+    # mid_ir pipeline itself, so factories no longer need to call into
+    # the legacy compile_func.
+    lowered = conv2d_min
 
     constants = {
         "H": H, "W": W,

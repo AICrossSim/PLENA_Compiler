@@ -41,6 +41,15 @@ class AssemblyToBinary:
         imm = instruction.imm
         rmask = instruction.rmask
         binary_instruction = 0
+
+        imm_mask = (1 << self.imm_width) - 1 if self.imm_width > 0 else 0
+        if imm_mask and isinstance(imm, int) and (imm < 0 or imm > imm_mask):
+            print(
+                f"[assembler] WARN: imm overflow on {instruction.opcode}: "
+                f"raw imm={imm} (0x{imm & 0xFFFFFFFFFFFFFFFF:X}), "
+                f"IMM_WIDTH={self.imm_width}, masking to 0x{imm & imm_mask:X}"
+            )
+            imm = imm & imm_mask
         # print(f"Converting instruction: {instruction.opcode} with opcode={hex(opcode)}, rd={rd}, rs1={rs1}, rs2={rs2}, rstride={rstride}, funct1={funct1}, funct2={funct2}, imm={imm}")
         ow = self.operands_width
         opw = self.opcode_width
@@ -113,9 +122,16 @@ class AssemblyToBinary:
         return binary_instruction
     
     def write_binary_to_file(self, binary_instructions, output_file: str):
+        instr_mask = (1 << self.instruction_length) - 1 if self.instruction_length > 0 else 0xFFFFFFFF
         with open(output_file, 'w') as file:
-            for instruction in binary_instructions:
-                file.write(f"0x{instruction:08X}\n")
+            for idx, instruction in enumerate(binary_instructions):
+                if instruction & ~instr_mask:
+                    print(
+                        f"[assembler] WARN: instruction #{idx} overflows "
+                        f"INSTRUCTION_LENGTH={self.instruction_length}: "
+                        f"raw=0x{instruction:X}, truncating to 0x{instruction & instr_mask:08X}"
+                    )
+                file.write(f"0x{instruction & instr_mask:08X}\n")
     
     def generate_binary(self, asm_file: str, output_file: str):
         """

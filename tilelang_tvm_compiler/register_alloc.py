@@ -41,10 +41,16 @@ class RegisterExhausted(RuntimeError):
     pass
 
 
-# IntRAM spill region. SPILL_BASE leaves the first 256 words for
-# user / preload data; SPILL_SLOTS is the max simultaneous spilled GPs.
+# IntRAM regions (units = u32 words; emulator's intsram is sized 1024).
+#  [0, 256)            user / preload scratch
+#  [SPILL_BASE, ...)   GP auto-spill backing store
+#  [IDX_BASE, ...)     loop idx backing store
+# Keeping the regions disjoint means a loop's idx in IntRAM can never
+# be clobbered by a GP spill done by the loop body.
 SPILL_BASE = 256
 SPILL_SLOTS = 256
+IDX_BASE = 512
+IDX_SLOTS = 256
 
 
 @dataclass
@@ -80,6 +86,9 @@ class RegisterAllocator:
         self._addr_free: List[int] = [i for i in range(addr_total) if i not in addr_reserved_set]
         # Spill slot bitmap.
         self._spill_slots_in_use: List[bool] = [False] * SPILL_SLOTS
+        # Idx slot bitmap (loop idx values stored in IntRAM instead of
+        # GPs so deep nests don't pin the whole GP file).
+        self._idx_slots_in_use: List[bool] = [False] * IDX_SLOTS
         # Late-bound by the shim/compiler so allocate_gp can auto-spill
         # on demand. Stays None for tests that don't wire it up.
         self.compiler = None
@@ -97,6 +106,15 @@ class RegisterAllocator:
     # GP register pool
     # ------------------------------------------------------------------
     def allocate_gp(self, n: int) -> List[int]:
+        # Auto-spill is allowed only against UNPINNED in-use regs. Loop
+        # hw-counters and idx regs are always pinned by `_emit_for`, so
+        # they can never be picked as spill victims -- which was the
+        # earlier bug (spilled hw counter reloaded too late, after
+        # C_LOOP_END had already read garbage). If every in-use reg is
+        # pinned, `_auto_spill` itself raises RegisterExhausted -- that
+        # is the kernel-author's signal to convert one of the outer
+        # `for` loops to `T.unroll(...)` (which doesn't pin
+        # gp_loop+gp_idx) so non-loop work has room to spill.
         if n > len(self._gp_free):
             self._auto_spill(n - len(self._gp_free))
         out = self._gp_free[:n]
@@ -142,7 +160,11 @@ class RegisterAllocator:
             raise RegisterExhausted(
                 f"auto-spill: need {need} GPs but only {len(candidates)} "
                 f"unpinned in-use to spill; in_use={self._gp_in_use!r} "
-                f"pinned={sorted(self._pinned_gp)!r}"
+                f"pinned={sorted(self._pinned_gp)!r}. "
+                f"Hint: every in-use GP is pinned (typically by nested "
+                f"`for` loops reserving gp_loop+gp_idx each). Convert one "
+                f"of the outer loops to `T.unroll(...)` so it doesn't "
+                f"pin two regs, leaving room for non-loop work to spill."
             )
         for r in candidates:
             slot = self._claim_spill_slot()
@@ -220,6 +242,12 @@ class RegisterAllocator:
             for r in reversed(self._gp_in_use):
                 if r in protect_set:
                     continue
+                # Pinned GPs (loop hw counters, long-lived symbol-table
+                # bindings) are referenced by register number without
+                # going through free_gp, so spilling them would silently
+                # corrupt the value. Matches the _auto_spill filter.
+                if r in self._pinned_gp:
+                    continue
                 candidates.append(r)
                 if len(candidates) == need:
                     break
@@ -227,7 +255,8 @@ class RegisterAllocator:
                 raise RegisterExhausted(
                     f"spill_borrow: need to spill {need} GP(s) but only "
                     f"{len(candidates)} are unprotected; in_use="
-                    f"{self._gp_in_use!r} protect={sorted(protect_set)!r}"
+                    f"{self._gp_in_use!r} protect={sorted(protect_set)!r} "
+                    f"pinned={sorted(self._pinned_gp)!r}"
                 )
             for r in candidates:
                 slot = self._claim_spill_slot()
@@ -279,6 +308,31 @@ class RegisterAllocator:
         if not self._spill_slots_in_use[slot]:
             raise RuntimeError(f"double-release of spill slot {slot}")
         self._spill_slots_in_use[slot] = False
+
+    # ------------------------------------------------------------------
+    # Loop idx slot pool (IntRAM-backed loop indices). Disjoint from
+    # spill slots so a body's GP spill can't clobber an outer loop's idx.
+    # ------------------------------------------------------------------
+    def claim_idx_slot(self) -> int:
+        """Allocate an IntRAM word for a loop's idx. Returns the
+        absolute IntRAM address (suitable for `S_LD_INT gp, gp0, addr`).
+        """
+        for i, used in enumerate(self._idx_slots_in_use):
+            if not used:
+                self._idx_slots_in_use[i] = True
+                return IDX_BASE + i
+        raise RegisterExhausted(
+            f"idx slots exhausted ({IDX_SLOTS} used). Bump IDX_SLOTS or "
+            f"reduce simultaneous loop nesting depth."
+        )
+
+    def release_idx_slot(self, addr: int) -> None:
+        slot = addr - IDX_BASE
+        if not (0 <= slot < IDX_SLOTS):
+            raise RuntimeError(f"release_idx_slot: addr {addr} out of range")
+        if not self._idx_slots_in_use[slot]:
+            raise RuntimeError(f"double-release of idx slot {slot}")
+        self._idx_slots_in_use[slot] = False
 
     # ------------------------------------------------------------------
     # Address register pool

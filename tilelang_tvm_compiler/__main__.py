@@ -129,11 +129,6 @@ def _emit_output_staging(
         )
     rows, cols = _logical_2d(buf.shape, buf.layout)
     mlen = target.mlen
-    if rows % mlen or cols % mlen:
-        raise SystemExit(
-            f"staging only supports mlen-aligned shapes for now, got "
-            f"rows={rows} cols={cols} mlen={mlen}"
-        )
     tile_elems = mlen * mlen
     full_tensor_size = rows * cols
 
@@ -216,6 +211,17 @@ def _emit_output_staging(
 
     # ----- Single-tile fast path (non-4D, or 4D buffers that fit
     # exactly one MLEN×MLEN tile) — same iteration as before.
+    # The MLEN-alignment check only applies here; the 4D path above
+    # walks a per-(inner-tile) grid where alignment is enforced
+    # tile-by-tile via the TileLayout, not on the logical-2D
+    # projection (which can be misleading for multi-channel NCHW /
+    # multi-head BSHD shapes that genuinely need the 7D physical
+    # layout to stage correctly).
+    if rows % mlen or cols % mlen:
+        raise SystemExit(
+            f"staging only supports mlen-aligned shapes for now, got "
+            f"rows={rows} cols={cols} mlen={mlen}"
+        )
     row_blocks = rows // mlen
     col_blocks = cols // mlen
     shim.compiler.generated_code += (

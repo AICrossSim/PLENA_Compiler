@@ -143,11 +143,28 @@ def _shape_ints(buf: tir.Buffer) -> List[int]:
 
 
 def _buffer_def(buf: tir.Buffer, default_scope: str = "global") -> BufferDef:
+    shape = _shape_ints(buf)
+    scope = _scope_string(buf, default_scope)
+    # Hard rule: 1D ``shared`` (VRAM tile) buffers are rejected.
+    # Reason: fold's broadcast detection in ``_wrap_src`` only flips a
+    # same-rank operand into ``Broadcast`` when the src ref's rank is
+    # strictly shorter than dst's. A 1D shared dst paired with a 1D
+    # ``fp[0]``-style scalar src therefore fails to fold (same rank,
+    # but the src is logically a scalar broadcast). Force authors to
+    # write ``(1, N)`` instead; downstream tile/row machinery is built
+    # around ≥2D shared anyway.
+    if scope.startswith("shared") and len(shape) == 1:
+        raise FoldError(
+            f"1D shared buffer {buf.name!r} (shape={shape}) is not "
+            f"supported. Use ``T.alloc_shared((1, N), ...)`` instead — "
+            f"1D shared loses the broadcast-axis fold needed for "
+            f"`vram[i] op fp_scalar[0]` to lower to a vector op."
+        )
     return BufferDef(
         name=buf.name,
-        shape=_shape_ints(buf),
+        shape=shape,
         dtype=str(buf.dtype),
-        scope=_scope_string(buf, default_scope),
+        scope=scope,
     )
 
 
@@ -823,11 +840,17 @@ def _walk_stmt(stmt,
                 return [ew]
         # Serial outer wrapping a single fold-able store (1D fp scalar
         # update like ``L_INV[row] = 1 / L_NEW[row]``): fold the inner
-        # body.
+        # body. The serial for is *absorbed* by the Elementwise — its
+        # extent becomes ``size`` so downstream lowering knows the op
+        # covers that many elements along ``axis=-1`` (otherwise the
+        # default ``size=1`` mis-types it as a single scalar and FPRAM
+        # unrolling won't kick in).
         if _is_serial_for(stmt) and isinstance(stmt.body, tir.BufferStore):
+            extent = (int(stmt.extent.value)
+                      if isinstance(stmt.extent, tir.IntImm) else 1)
             ew = _try_fold_store(
                 stmt.body, parallel_var=stmt.loop_var,
-                buf_table=buf_table, axis=-1,
+                buf_table=buf_table, axis=-1, size=extent,
             )
             if ew is not None:
                 return [ew]
@@ -972,6 +995,19 @@ def run(func: tir.PrimFunc, name: str = "kernel") -> MidFunc:
                 for s in raw
             ]
 
+    # Carry select prim_func attrs forward so downstream passes (e.g.
+    # to_plena reading ``plena.layout``) can find them. We unwrap TVM
+    # ObjectRef strings to plain Python so dict access works uniformly.
+    attrs_out: Dict[str, str] = {}
+    if func.attrs is not None:
+        for k in ("plena.layout",):
+            if k in func.attrs:
+                v = func.attrs[k]
+                if isinstance(v, tir.StringImm):
+                    attrs_out[k] = str(v.value)
+                else:
+                    attrs_out[k] = str(v)
+
     return MidFunc(
         name=name,
         params=params,
@@ -979,6 +1015,7 @@ def run(func: tir.PrimFunc, name: str = "kernel") -> MidFunc:
         body=body,
         lane_axes=lane_axes,
         cluster_counts=[],   # filled by pass_3
+        attrs=attrs_out,
     )
 
 

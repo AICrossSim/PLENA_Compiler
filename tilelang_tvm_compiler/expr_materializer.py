@@ -218,20 +218,59 @@ class ExprMaterializer:
             raise ExprMaterializeError(
                 f"negative int literal not supported yet: {n}"
             )
+        # Eager flush: write the ISA to generated_code immediately so
+        # call-order matches emit-order. Lazy isa strings caused
+        # cross-call register clobbering (a later allocate_gp triggered
+        # auto_spill or reuse that interleaved with an earlier lazy
+        # "S_LD_INT gp{r}, ..." -- the same physical reg ended up being
+        # loaded twice with different values, second one winning).
+        self.shim.compiler.generated_code += isa
         return MaterializedExpr(
-            register=r, isa=isa, owns_register=True, _materializer=self
+            register=r, isa="", owns_register=True, _materializer=self
         )
 
     def _materialize_var(self, v: tir.Var) -> MaterializedExpr:
-        """Look up a bound var in the symbol table; do not allocate."""
+        """Look up a bound var in the symbol table.
+
+        Two binding forms:
+          * ``int``                  — GP reg already holding the value
+            (legacy / unroll loop idx). No alloc, no ISA.
+          * ``("ram", intram_addr)`` — value lives in IntRAM (serial
+            loop idx; see ``_emit_for``). Borrow a fresh GP, emit a
+            ``S_LD_INT`` to load it, and return as ``owns_register=True``
+            so the caller's release() returns the GP to the pool. Every
+            use re-loads (cheap; avoids pinning a permanent GP for the
+            idx in deeply nested kernels).
+        """
         if v not in self.symbol_table:
             raise ExprMaterializeError(
                 f"unbound tir.Var {v.name!r}; not in symbol_table "
                 f"(known: {[x.name for x in self.symbol_table]!r})"
             )
-        reg = self.symbol_table[v]
-        return MaterializedExpr(
-            register=reg, isa="", owns_register=False, _materializer=self
+        binding = self.symbol_table[v]
+        if isinstance(binding, int):
+            return MaterializedExpr(
+                register=binding, isa="", owns_register=False, _materializer=self
+            )
+        if isinstance(binding, tuple) and len(binding) == 2 and binding[0] == "ram":
+            ram_addr = int(binding[1])
+            ra = self.shim.compiler.register_allocator
+            reg = ra.allocate_gp(1)[0]
+            # IMPORTANT: write the load ISA directly to ``generated_code``
+            # rather than the lazy ``isa`` field. Auto-spill (triggered by
+            # later allocs) emits S_ST/LD_INT eagerly into generated_code,
+            # so a later isa-string concatenation would reorder relative
+            # to those spill instructions and silently corrupt the value
+            # this load was supposed to deliver.
+            self.shim.compiler.generated_code += (
+                f"; load ram-backed idx {v.name} <- intram[{ram_addr}]\n"
+                f"S_LD_INT gp{reg}, gp0, {ram_addr}\n"
+            )
+            return MaterializedExpr(
+                register=reg, isa="", owns_register=True, _materializer=self
+            )
+        raise ExprMaterializeError(
+            f"symbol_table[{v.name!r}] has unsupported binding {binding!r}"
         )
 
     # ------------------------------------------------------------------
@@ -258,13 +297,41 @@ class ExprMaterializer:
                 return self._materialize(rhs)
 
         m_lhs = self._materialize(lhs)
-        m_rhs = self._materialize(rhs)
-
+        # Pin m_lhs.register across both the m_rhs materialise AND the
+        # out_reg alloc: any allocate_gp in between may trigger auto_spill,
+        # which picks non-pinned in-use regs as victims. Without the pin,
+        # m_lhs's value could be silently displaced to IntRAM and the same
+        # physical register handed out as m_rhs's or out_reg's, aliasing
+        # operands.
         ra = self.shim.compiler.register_allocator
-        out_reg = ra.allocate_gp(1)[0]
-        isa = m_lhs.isa + m_rhs.isa + (
+        lhs_was_owned = m_lhs.owns_register
+        if lhs_was_owned:
+            ra.pin_gp(m_lhs.register)
+        m_rhs = None
+        try:
+            m_rhs = self._materialize(rhs)
+            # Same protection for m_rhs while we alloc out_reg.
+            rhs_was_owned = m_rhs.owns_register
+            if rhs_was_owned:
+                ra.pin_gp(m_rhs.register)
+            try:
+                out_reg = ra.allocate_gp(1)[0]
+            finally:
+                if rhs_was_owned:
+                    ra.unpin_gp(m_rhs.register)
+        finally:
+            if lhs_was_owned:
+                ra.unpin_gp(m_lhs.register)
+
+        # Eager flush. m_lhs.isa and m_rhs.isa are already empty under
+        # the eager-emit invariant (their ISA was written to
+        # generated_code at construction time); we keep the `+ m.isa`
+        # bits for any legacy MaterializedExpr that might still carry a
+        # non-empty isa string.
+        self.shim.compiler.generated_code += m_lhs.isa + m_rhs.isa + (
             f"{opcode} gp{out_reg}, gp{m_lhs.register}, gp{m_rhs.register}\n"
         )
+        isa = ""
 
         # Eagerly free operand registers we own; the result is in out_reg.
         if m_lhs.owns_register:
@@ -308,15 +375,26 @@ class ExprMaterializer:
             if shift is not None:
                 return self._materialize_unary_imm(lhs, "S_SRLI_INT", shift)
 
-        # x % 2^k would normally be `x & ((1<<k)-1)`, but PLENA has no AND,
-        # so we cannot lower this. Fall through to the error.
+        # x % 2^k = x - (x // 2^k) * 2^k. PLENA has no bitwise AND, but
+        # the shift + multiply + subtract sequence uses only ops we
+        # already support. Lower by rewriting the PrimExpr and
+        # re-entering the materializer — FloorDiv hits the S_SRLI_INT
+        # branch above and Mul-by-pow2 hits the S_SLLI_INT path the
+        # binop dispatcher already handles.
+        if op_str == "%":
+            shift = _try_pow2_shift_amount(rhs)
+            if shift is not None:
+                m = 1 << shift
+                shifted = tir.FloorDiv(lhs, tir.IntImm("int32", m))
+                scaled = tir.Mul(shifted, tir.IntImm("int32", m))
+                return self._materialize(tir.Sub(lhs, scaled))
 
         raise ExprMaterializeError(
             f"cannot lower runtime {op_str}: PLENA ISA has no integer divide and "
             f"no bitwise-AND. The only supported runtime forms are `x // 2^k` "
-            f"(via S_SRLI_INT). Got `{lhs} {op_str} {rhs}`. Restructure the "
-            f"kernel so this is computed at compile time, or use a power-of-2 "
-            f"divisor."
+            f"(via S_SRLI_INT) and `x % 2^k` (lowered as `x - (x // 2^k) * 2^k`). "
+            f"Got `{lhs} {op_str} {rhs}`. Restructure the kernel so this is "
+            f"computed at compile time, or use a power-of-2 divisor."
         )
 
 
@@ -340,10 +418,25 @@ class ExprMaterializer:
 
         m_operand = self._materialize(operand)
         ra = self.shim.compiler.register_allocator
-        out_reg = ra.allocate_gp(1)[0]
-        isa = m_operand.isa + (
+        # Pin m_operand's register across the out_reg alloc -- same race
+        # as _materialize_binop: an auto_spill triggered here could
+        # otherwise displace m_operand's value to IntRAM and reuse the
+        # same physical register for out_reg, causing reads from
+        # m_operand.register to silently return out_reg's content.
+        if m_operand.owns_register:
+            ra.pin_gp(m_operand.register)
+        try:
+            out_reg = ra.allocate_gp(1)[0]
+        finally:
+            if m_operand.owns_register:
+                ra.unpin_gp(m_operand.register)
+        # Eager flush (see _materialize_binop / _materialize_var for
+        # the rationale -- lazy isa strings interleave incorrectly with
+        # eager auto-spill / ram-idx loads).
+        self.shim.compiler.generated_code += m_operand.isa + (
             f"{opcode} gp{out_reg}, gp{m_operand.register}, {imm}\n"
         )
+        isa = ""
         if m_operand.owns_register:
             ra.free_gp([m_operand.register])
         return MaterializedExpr(

@@ -294,8 +294,7 @@ class RawStore:
     Downstream passes treat RawStore as opaque: they don't peek at
     ``value``, don't apply cluster/permute rewrites to its indices.
     The lowering pass (mid_ir → plena_ir / HLIR) is responsible for
-    pattern-matching specific RawStore shapes (e.g. conv2d's shift
-    copy → ``plena.row_load_v_to_fp`` etc.) and erroring on
+    pattern-matching specific RawStore shapes and erroring on
     unrecognized ones.
 
     ``value`` is held as an opaque object (typically a tir.PrimExpr

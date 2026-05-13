@@ -255,34 +255,14 @@ def make_tile_layout(
         )
     h_groups = h // lane_count
 
-    # Single-tile fast path. Layout-conditional so we can preserve
-    # both BSHD's "row-major scratch fragment" convention and NCHW's
-    # "per-channel tile" semantics:
-    #
-    # * BSHD (legacy default) — return None whenever s ≤ mlen AND
-    #   d ≤ mlen, regardless of h_groups. Kernels like
-    #   flash_attention_min and tiled_conv2d allocate VRAM-only
-    #   fragments like S_loc (1, H, mlen, mlen) that get expanded
-    #   to 4D by ``allocate_group_memory`` but conceptually live as
-    #   a 2D (rows, mlen) tile in row-major. Forcing the 7D
-    #   physical layout here permutes the offsets and breaks every
-    #   internal access (since these buffers never see HBM, the
-    #   logical-vs-physical layout difference matters).
-    #
-    # * Anything else (NCHW for now) — require ALL tile-grid dims to
-    #   collapse to 1 (d_tiles = s_tiles = h_groups = b = 1). NCHW's
-    #   channel axis sits outer of (H, W) in HBM, so a multi-channel
-    #   buffer with h_groups > 1 genuinely needs multi-tile staging
-    #   even when each per-channel block fits a single MLEN×MLEN
-    #   inner tile — otherwise the stage_output / v2h_slice fast
-    #   paths would compute the wrong cross-channel HBM offset.
-    if layout == "BSHD":
-        if s <= mlen and d <= mlen:
-            return None
-    else:
-        if d_tiles == 1 and s_tiles == 1 and h_groups == 1 and b == 1:
-            return None
-
+    # Every 4D BSHD/NCHW buffer gets a TileLayout — even trivially
+    # 1×1×1×1-tile-grid ones. Downstream code (isa_emit) walks the
+    # same 7D physical-offset formula uniformly; the "single-tile
+    # fast path" the old code returned None for is now expressed as
+    # the degenerate ``d_tiles=s_tiles=h_groups=b=1`` case of the
+    # same formula. This removes a category of "is the buffer a
+    # single tile or multi tile?" branches from every pass that
+    # consumes TileLayout.
     return TileLayout(
         logical_b=b, logical_s=s, logical_h=h, logical_d=d,
         d_tiles=d_tiles, s_tiles=s_tiles, h_groups=h_groups,
@@ -377,6 +357,25 @@ class BufferSlice:
     parent: str                               # name of parent Buffer
     starts: Tuple[Any, ...]                   # int | tir.PrimExpr per dim
     extents: Tuple[int, ...]                  # int per dim
+
+
+@dataclass
+class VramRegion:
+    """A logical sub-region of a VRAM (or MRAM) on-chip buffer.
+
+    Mirrors :class:`BufferSlice` but for on-chip buffers — used by ops
+    whose lowering needs to know the multi-dim shape of the region (to
+    split it into multiple HW-MLEN-wide transfers and to compute
+    per-chunk physical addresses against the parent's 7D tile layout).
+
+    starts / extents are per-dim and refer to the parent's logical
+    shape. Each ``starts`` entry is either a Python int or a
+    ``tir.PrimExpr`` (loop-derived; materialised at ISA emit time).
+    Each ``extents`` entry is a Python int.
+    """
+    parent: str
+    starts: Tuple[Any, ...]
+    extents: Tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -540,6 +539,10 @@ def _fmt_buf_arg(a) -> str:
         starts = ",".join(_fmt_idx_item(s) for s in a.starts)
         extents = ",".join(str(e) for e in a.extents)
         return f"{a.parent}[starts=({starts}), ext=({extents})]"
+    if isinstance(a, VramRegion):
+        starts = ",".join(_fmt_idx_item(s) for s in a.starts)
+        extents = ",".join(str(e) for e in a.extents)
+        return f"{a.parent}<vram>[starts=({starts}), ext=({extents})]"
     return str(a)
 
 
@@ -566,7 +569,7 @@ def assert_addresses_resolved(mod: HLIRModule) -> None:
 
 
 __all__ = [
-    "Buffer", "BufferSlice", "BufferElement", "Op", "HLIRModule",
+    "Buffer", "BufferSlice", "VramRegion", "BufferElement", "Op", "HLIRModule",
     "make_for_op",
     "assert_addresses_resolved", "format_hlir",
 ]

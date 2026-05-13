@@ -304,17 +304,8 @@ register(IntrinsicSpec(
 
 
 # ---------------------------------------------------------------------------
-# Row-wide VRAM <-> FPRAM transfers. Each call moves exactly mlen elements
-# (one full row); call inside a TIR loop for multi-row tiles. VRAM side is
-# (buffer + element offset); FP side is a flat scalar address.
+# VRAM <-> VRAM and slice-form VRAM <-> FPRAM transfers.
 # ---------------------------------------------------------------------------
-
-register(IntrinsicSpec(
-    name="plena.row_load_v_to_fp",
-    # vram_src_buf, vram_offset, fp_dst_addr
-    operand_scopes=(_scope.VRAM, None, None),
-    emit=lambda a: f"ROW_LOAD_V_TO_FP src={a[0]}+{a[1]} dst={a[2]}",
-))
 
 register(IntrinsicSpec(
     # Single MLEN-wide row copy in VRAM, lane-fused. Lowers to
@@ -329,12 +320,13 @@ register(IntrinsicSpec(
     emit=lambda a: f"COPY_V_TO_V  src={a[0]}+{a[1]}  dst={a[2]}+{a[3]}",
 ))
 
-register(IntrinsicSpec(
-    name="plena.row_store_fp_to_v",
-    # fp_src_addr, vram_dst_buf, vram_offset
-    operand_scopes=(None, _scope.VRAM, None),
-    emit=lambda a: f"ROW_STORE_FP_TO_V src={a[0]} dst={a[1]}+{a[2]}",
-))
+# NOTE: ``plena.row_load_v_to_fp`` / ``plena.row_store_fp_to_v`` are
+# retired. The single-row contract they enforced was too narrow: a
+# logical ``T.copy(vram_slice, fpram_buf)`` may span multiple MLEN
+# rows, span lane-grouped (narrow-D) layouts, or land on a buffer
+# whose VRAM placement is the 7D physical layout. The
+# ``v_fp_transfer_slice_{v_to_fp,fp_to_v}`` ops carry the whole
+# logical region; isa_emit splits it into per-MLEN issues internally.
 
 
 # ---------------------------------------------------------------------------

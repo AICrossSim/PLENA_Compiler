@@ -128,16 +128,16 @@ def make_flash_attention_min(
             )
 
             # Zero running output.
-            for row in T.unroll(rows):
+            for row in T.serial(rows):
                 for col in T.Parallel(hlen):
                     O_loc[row, col] = T.float16(0)
 
             # Reset per-lane FP softmax state for this q tile.
-            for row in T.unroll(rows):
+            for row in T.serial(rows):
                 M_OLD[row] = M_INIT[row]
                 L_OLD[row] = L_INIT[row]
 
-            for kv_block in T.unroll(num_kv_blocks):
+            for kv_block in T.serial(num_kv_blocks):
                 # K, V DMAs — sync, multi-lane.
                 T.copy(
                     K_hbm[0, kv_block * rows : (kv_block + 1) * rows, by, 0:hlen],
@@ -153,7 +153,7 @@ def make_flash_attention_min(
                     T.gemm(Q_sh, K_sh, S_loc, transpose_B=True)
 
                 # Scale S_loc by 1/sqrt(d_k) per row.
-                for row in T.unroll(rows):
+                for row in T.serial(rows):
                     for col in T.Parallel(MLEN):
                         S_loc[row, col] = S_loc[row, col] * SCALE[row]
                     M_CURR[row] = M_OLD[row]
@@ -161,7 +161,7 @@ def make_flash_attention_min(
                 # M_CURR = max(M_OLD, rowmax(S_loc)).
                 T.reduce_max(S_loc, M_CURR, dim=1, clear=False)
 
-                for row in T.unroll(rows):
+                for row in T.serial(rows):
                     M_RES[row] = M_OLD[row] - M_CURR[row]
                     M_RES[row] = T.exp(M_RES[row])
                     for col in T.Parallel(MLEN):
@@ -173,7 +173,7 @@ def make_flash_attention_min(
                 # P_SUM = rowsum(exp(S - M_CURR)).
                 T.reduce_sum(S_loc, P_SUM, dim=1, clear=False)
 
-                for row in T.unroll(rows):
+                for row in T.serial(rows):
                     L_NEW[row] = L_OLD[row] * M_RES[row]
                     L_NEW[row] = L_NEW[row] + P_SUM[row]
                     for col in T.Parallel(hlen):
@@ -184,12 +184,12 @@ def make_flash_attention_min(
                 # Per-head P @ V → PV_loc, then O += PV_loc.
                 T.gemm(S_loc, V_sh, PV_loc)
 
-                for row in T.unroll(rows):
+                for row in T.serial(rows):
                     for col in T.Parallel(hlen):
                         O_loc[row, col] = O_loc[row, col] + PV_loc[row, col]
 
             # Final O = O / L_new for this q_block.
-            for row in T.unroll(rows):
+            for row in T.serial(rows):
                 L_INV[row] = 1.0 / L_NEW[row]
                 for col in T.Parallel(hlen):
                     O_loc[row, col] = O_loc[row, col] * L_INV[row]

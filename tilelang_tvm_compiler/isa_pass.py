@@ -24,12 +24,96 @@ from tvm import tir
 from . import hlir as _hlir
 from . import scope as _scope
 from .expr_materializer import ExprMaterializer, MaterializedExpr
+from .frontend.mid_ir.cluster_guard import MLEN as _HW_MLEN
 from .isa_emitter import ISAEmitter
 from .program_shim import ProgramShim
 
 
 class IsaEmissionError(RuntimeError):
     pass
+
+
+# Maximum unsigned literal that fits in the S_ADDI_INT three-operand
+# immediate slot. opcode(6) + 2*operand(4) = 14 bits taken by other
+# fields, leaving 32 - 14 = 18 bits for imm. Mirrors _S_ADDI_MAX in
+# expr_materializer.py and _normalize_large_addi_immediates in
+# tilelang_runtime_compier/tile_tensor_program/_program.py.
+_S_ADDI_IMM_MAX = (1 << 18) - 1  # 262143
+
+
+def _normalize_large_addi_immediates(asm_code: str) -> str:
+    """Rewrite `S_ADDI_INT rd, rs1, imm` when imm overflows the 18-bit slot.
+
+    Strategy:
+      - rs1 == gp0:           LUI rd, hi    ; ADDI rd, rd, lo
+      - rs1 != gp0, rd != rs1: LUI rd, hi   ; ADDI rd, rd, lo ; S_ADD_INT rd, rd, rs1
+      - rs1 != gp0, rd == rs1: cannot expand text-only without a scratch reg.
+        Emit a warning and leave the line untouched (the binary-stage
+        instruction mask will then truncate it, producing wrong code that
+        the user can spot via the warning).
+    """
+    lines: List[str] = []
+    for raw_line in asm_code.splitlines():
+        line = raw_line.rstrip("\n")
+        stripped = line.strip()
+        if not stripped or stripped.startswith(";"):
+            lines.append(line)
+            continue
+
+        parts = stripped.split(None, 1)
+        if len(parts) != 2 or parts[0] != "S_ADDI_INT":
+            lines.append(line)
+            continue
+
+        operands = [item.strip() for item in parts[1].split(",")]
+        if len(operands) != 3:
+            lines.append(line)
+            continue
+
+        rd, rs1, imm_text = operands
+        try:
+            imm_value = int(imm_text)
+        except ValueError:
+            lines.append(line)
+            continue
+
+        if 0 <= imm_value <= _S_ADDI_IMM_MAX:
+            lines.append(line)
+            continue
+
+        if imm_value < 0:
+            print(
+                f"[isa_pass] WARN: negative imm in {stripped!r}; "
+                f"normalize pass only handles unsigned overflow."
+            )
+            lines.append(line)
+            continue
+
+        upper = imm_value >> 12
+        lower = imm_value & 0xFFF
+
+        if rs1 == "gp0":
+            lines.append(f"S_LUI_INT {rd}, {upper}")
+            lines.append(f"S_ADDI_INT {rd}, {rd}, {lower}")
+            continue
+
+        if rd != rs1:
+            lines.append(f"S_LUI_INT {rd}, {upper}")
+            lines.append(f"S_ADDI_INT {rd}, {rd}, {lower}")
+            lines.append(f"S_ADD_INT {rd}, {rd}, {rs1}")
+            continue
+
+        print(
+            f"[isa_pass] WARN: cannot expand large-imm S_ADDI_INT in-place "
+            f"(rd==rs1=={rd}, imm={imm_value}): {stripped!r}. "
+            f"Need a scratch register — fix the emitter to use a separate rd."
+        )
+        lines.append(line)
+
+    normalized = "\n".join(lines)
+    if asm_code.endswith("\n"):
+        normalized += "\n"
+    return normalized
 
 
 class IsaEmitterPass:
@@ -72,8 +156,8 @@ class IsaEmitterPass:
             "fp_exp_at": self._emit_fp_exp_at,
             "fp_reci_at": self._emit_fp_reci_at,
             "fp_sqrt_at": self._emit_fp_sqrt_at,
-            "row_load_v_to_fp": self._emit_row_load_v_to_fp,
-            "row_store_fp_to_v": self._emit_row_store_fp_to_v,
+            "v_fp_transfer_slice_v_to_fp": self._emit_v_fp_transfer_slice_v_to_fp,
+            "v_fp_transfer_slice_fp_to_v": self._emit_v_fp_transfer_slice_fp_to_v,
             "copy_v_to_v": self._emit_copy_v_to_v,
             # Row-level VRAM/FP ops. Contract: one HLIR op = one HW
             # instruction over a SINGLE row. Multi-row callers must wrap
@@ -114,6 +198,9 @@ class IsaEmitterPass:
                     f"the op out of HLIR earlier."
                 )
             handler(mod, op)
+        self.shim.compiler.generated_code = _normalize_large_addi_immediates(
+            self.shim.compiler.generated_code
+        )
         return self.shim.compiler.generated_code
 
     @staticmethod
@@ -295,9 +382,27 @@ class IsaEmitterPass:
             self._resolve_fp_scalar_addr_arg(mod, a, op.kind, f"arg{i}")
             for i, a in enumerate(op.scalar_args)
         ]
-        mats = [self.materializer.materialize(a) for a in addr_exprs]
-        for m in mats:
+        # Materialize one address expression at a time, commit its ISA to
+        # ``generated_code`` immediately, and ``pin_gp`` the result reg so
+        # the next materialize() call cannot auto-spill it.
+        #
+        # Why pinning is required:
+        # ExprMaterializer eagerly frees operand registers after writing a
+        # binop's ISA text. ``allocate_gp`` then auto-spills the
+        # most-recently-allocated in-use reg when pressure is high — and
+        # that "most-recently-allocated" reg can be the previous mats[i]'s
+        # final reg itself. The spill stores the value to IntRAM but the
+        # MaterializedExpr's ``register`` field still names the same reg,
+        # which the next materialize() then overwrites. Net effect: by
+        # the time we emit S_LD_FP/S_MUL_FP, mats[0]/mats[1] both point
+        # at a reg holding mats[2]'s value. Pinning blocks that path.
+        ra = self.shim.compiler.register_allocator
+        mats: List[MaterializedExpr] = []
+        for a in addr_exprs:
+            m = self.materializer.materialize(a)
             self.shim.compiler.generated_code += m.isa
+            ra.pin_gp(m.register)
+            mats.append(m)
 
         try:
             lines = [f"; fp scalar task {op.annotations.get('intrinsic', op.kind)} op={kernel_op}"]
@@ -326,6 +431,7 @@ class IsaEmitterPass:
             self.shim.compiler.generated_code += "\n".join(lines) + "\n"
         finally:
             for m in reversed(mats):
+                ra.unpin_gp(m.register)
                 m.release()
 
     def _emit_row_scalar_op_at(
@@ -725,7 +831,117 @@ class IsaEmitterPass:
             for s in sl.starts
         )
 
+    def _slice_tile_grid(
+        self,
+        parent: _hlir.Buffer,
+        sl: _hlir.BufferSlice,
+        on_chip: _hlir.Buffer,
+    ):
+        """Compute the inner-tile grid for one HBM↔on-chip slice copy.
+
+        Symmetric between h2v load and v2h store: the iteration grid
+        only depends on the on-chip buffer's physical layout and the
+        slice's footprint, not on direction. The returned strides feed
+        either ``emit_load_tile_from_hbm`` or ``emit_store_tile_to_hbm``.
+
+        Returns a tuple ``(d_tiles, s_tiles, h_groups, logical_b,
+        inner_mlen, lane_count, hbm_strides, vram_strides)`` where
+        ``hbm_strides`` is ``(b, s, h)`` and ``vram_strides`` is
+        ``(d_tile, s_tile, h_grp, b)`` — all in elements.
+
+        Single tile (one mlen×mlen tile, or smaller) is the degenerate
+        case where every tile count is 1 — the caller runs one loop
+        iteration and emits a single H_LOAD_V / H_STORE_V.
+        """
+        dst = on_chip
+        mlen = self.shim.mlen
+
+        if dst.tile_layout is not None:
+            # 4D BSHD path. Parent must be 4D — we read its layout-
+            # aware per-axis HBM strides (b/s/h/d).
+            if len(parent.shape) != 4:
+                raise IsaEmissionError(
+                    f"dma_h2v_slice: HBM parent {parent.name!r} must "
+                    f"be 4D for tile_layout-driven dst; got shape "
+                    f"{tuple(parent.shape)}"
+                )
+            hbm_stride_b, hbm_stride_s, hbm_stride_h, _hbm_stride_d = (
+                _hlir.hbm_strides_for_layout(parent.shape, parent.layout)
+            )
+            tl = dst.tile_layout
+            inner_d = tl.d_inner
+            inner_lane = tl.lane_count * inner_d
+            inner_s = tl.mlen * inner_lane
+            b_stride = inner_s
+            inner_b = tl.logical_b * inner_s
+            h_grp_stride = inner_b
+            s_tile_stride = tl.h_groups * inner_b
+            d_tile_stride = tl.s_tiles * s_tile_stride
+            return (
+                tl.d_tiles, tl.s_tiles, tl.h_groups, tl.logical_b,
+                tl.mlen, tl.lane_count,
+                (hbm_stride_b, hbm_stride_s, hbm_stride_h),
+                (d_tile_stride, s_tile_stride, h_grp_stride, b_stride),
+            )
+
+        # No tile_layout: row-major flat view. dst dictates the tile
+        # grid; HBM strides come from parent's row-major flat layout
+        # treating axes[-2] as row and axes[-1] as col regardless of
+        # layout-name semantics. This is the right model for any
+        # plain ``T.alloc_shared((rows, cols))`` staging buffer.
+        if len(dst.shape) == 2:
+            dst_rows = int(dst.shape[0])
+            dst_cols = int(dst.shape[1])
+        elif len(dst.shape) == 1:
+            dst_rows = 1
+            dst_cols = int(dst.shape[0])
+        else:
+            raise IsaEmissionError(
+                f"dma_h2v_slice on {parent.name!r}: dst {dst.name!r} "
+                f"has rank {len(dst.shape)} with no tile_layout; "
+                f"only 1D / 2D dst supported on the row-major-flat path"
+            )
+        if dst_rows % mlen != 0 or dst_cols % mlen != 0:
+            raise IsaEmissionError(
+                f"dma_h2v_slice on {parent.name!r}: dst {dst.name!r} "
+                f"shape ({dst_rows}, {dst_cols}) is not (MLEN={mlen})-"
+                f"aligned on both axes; partial-tile loads not supported"
+            )
+        s_tiles = dst_rows // mlen
+        d_tiles = dst_cols // mlen
+        d_tile_stride = mlen
+        s_tile_stride = mlen * dst_cols
+
+        # Parent HBM row stride = product of axes after the row axis.
+        # For 4D ``(N, C, H, W)`` and a per-channel slice, row =
+        # axes[-2] (H), col = axes[-1] (W); per-row HBM stride = W.
+        # We map this to the existing (b/s/h) stride triple by routing
+        # the row stride through ``hbm_stride_s`` (s_tile multiplier in
+        # the emitter); h-stride / b-stride aren't iterated in this
+        # path (h_groups == logical_b == 1).
+        pshape = [int(x) for x in parent.shape]
+        if len(pshape) < 2:
+            # 1D HBM parent — degenerate row stride = 1.
+            hbm_row_stride = 1
+        else:
+            hbm_row_stride = 1
+            for d in pshape[-1:]:
+                hbm_row_stride = int(d)
+        return (
+            d_tiles, s_tiles, 1, 1,
+            mlen, 1,
+            (0, hbm_row_stride, 0),
+            (d_tile_stride, s_tile_stride, 0, 0),
+        )
+
     def _emit_dma_h2v_slice(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Emit H_LOAD_V instructions for one HBM→VRAM slice copy.
+
+        Single path for all dst shapes: compute an inner-tile grid via
+        :meth:`_h2v_tile_grid` and walk it. The grid is ``1×1×1×1`` for
+        a slice that fits one mlen×mlen tile; larger dst (2D row-major
+        or 4D BSHD with ``tile_layout``) expand into multiple issues.
+        """
         sl = op.buffer_args[0]
         _arg1 = op.buffer_args[1]
         if isinstance(_arg1, _hlir.BufferSlice):
@@ -744,119 +960,36 @@ class IsaEmitterPass:
         _check_scope(parent, _scope.HBM, op.kind, "src.parent")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
 
-        # Multi-tile path: when dst's logical 4D BSHD shape overflows a
-        # single (MLEN, LANE_COUNT, D_INNER) inner tile, the
-        # AddressAllocationPass populated dst.tile_layout. Iterate the
-        # outer (D_TILES, S_TILES, H_GROUPS, B) grid and emit one
-        # H_LOAD_V per inner tile, with per-tile HBM and VRAM offsets.
-        if dst.tile_layout is not None:
-            self._emit_dma_h2v_slice_multi_tile(mod, op, sl, parent, dst)
-            return
+        (d_tiles, s_tiles, h_groups, logical_b,
+         inner_mlen, lane_count,
+         (hbm_stride_b, hbm_stride_s, hbm_stride_h),
+         (d_tile_stride, s_tile_stride, h_grp_stride, b_stride)) = (
+            self._slice_tile_grid(parent, sl, dst)
+        )
 
-        # Single-tile fast path — original behaviour for kernels whose
-        # local buffers fit one (MLEN x MLEN) tile.
-        self._check_slice_single_tile(parent, sl)
-        m_off, static_off = self._materialise_slice_offset(parent, sl)
-        starts_s = self._format_starts(sl)
-        if m_off is None:
-            self.shim.compiler.generated_code += (
-                f"; dma_h2v_slice  {parent.name}[{starts_s}]+{list(sl.extents)} "
-                f"-> {dst.name}  (parent_off={static_off} elems)\n"
-            )
-            self.emitter.emit_load_tile_from_hbm(
-                hbm_addr=parent.address, vram_addr=dst.address,
-                hbm_stride=parent.hbm_stride, hbm_scale_size=parent.hbm_scale_size,
-                hbm_start_offset=static_off,
-            )
-        else:
-            self.shim.compiler.generated_code += (
-                f"; dma_h2v_slice  {parent.name}[{starts_s}]+{list(sl.extents)} "
-                f"-> {dst.name}  (parent_off=gp{m_off.register} dyn)\n"
-            )
-            self.emitter.emit_load_tile_from_hbm(
-                hbm_addr=parent.address, vram_addr=dst.address,
-                hbm_stride=parent.hbm_stride, hbm_scale_size=parent.hbm_scale_size,
-                hbm_start_offset_reg=m_off.register,
-            )
-            m_off.release()
-
-    def _emit_dma_h2v_slice_multi_tile(
-        self,
-        mod: _hlir.HLIRModule,
-        op: _hlir.Op,
-        sl: _hlir.BufferSlice,
-        parent: _hlir.Buffer,
-        dst: _hlir.Buffer,
-    ) -> None:
-        """Emit one H_LOAD_V per inner tile in dst's tile grid.
-
-        Currently supports only fully-static slice starts (every entry
-        in ``sl.starts`` is a Python int). The dynamic-start case can be
-        added by materialising one base GP register and per-tile adding
-        the static tile-offset constants — same pattern as the existing
-        ``_materialise_slice_offset`` for v2h. For now we surface a
-        clear error if a dynamic start shows up so we don't silently
-        miscompile.
-        """
-        layout = dst.tile_layout
-        assert layout is not None
-        # Slice base offset: dynamic + static contribution. The dynamic
-        # piece is materialised into a GP register once; the static
-        # residual is folded into each per-tile constant offset below.
         m_off, slice_static = self._materialise_slice_offset(parent, sl)
         base_static = parent.hbm_offset + (
             slice_static if slice_static is not None else 0
         )
 
-        # HBM strides per logical (B, S, H, D) dim (row-major).
-        if len(parent.shape) != 4:
-            raise IsaEmissionError(
-                f"multi-tile dma_h2v_slice currently requires a 4D HBM "
-                f"parent; got shape {parent.shape}"
-            )
-        # HBM strides per canonical (b, s, h, d) role. The numbers come
-        # from the parent's declared layout's row-major HBM order; for
-        # NCHW the row-axis (h_img) strides like W_img while the
-        # channel-axis (c) strides like H_img*W_img — so the canonical
-        # h-stride and s-stride differ from BSHD's positional order.
-        hbm_stride_b, hbm_stride_s, hbm_stride_h, _hbm_stride_d = (
-            _hlir.hbm_strides_for_layout(parent.shape, parent.layout)
-        )
-        # hbm_stride_d == 1 by construction (col is the innermost axis
-        # in every layout we currently support). Asserted via the
-        # ``hbm_strides_for_layout`` helper.
-
-        # VRAM tile-grid strides from the 7D physical layout. Match the
-        # convention used by ``_flatten_starts_tiled`` in lower_to_hlir:
-        # B's own stride is one inner tile (``inner_s``); ``inner_b`` is
-        # B's total volume and is the stride of the next-outer axis
-        # (H_GROUPS), not of B itself.
-        inner_d = layout.d_inner
-        inner_lane = layout.lane_count * inner_d
-        inner_s = layout.mlen * inner_lane
-        b_stride = inner_s
-        inner_b = layout.logical_b * inner_s
-        h_grp_stride = inner_b
-        s_tile_stride = layout.h_groups * inner_b
-        d_tile_stride = layout.s_tiles * s_tile_stride
-
         starts_s = self._format_starts(sl)
         self.shim.compiler.generated_code += (
-            f"; dma_h2v_slice (multi-tile)  {parent.name}[{starts_s}]"
-            f"+{list(sl.extents)} -> {dst.name}  "
-            f"(grid d_tiles={layout.d_tiles}, s_tiles={layout.s_tiles}, "
-            f"h_groups={layout.h_groups}, b={layout.logical_b})\n"
+            f"; dma_h2v_slice  {parent.name}[{starts_s}]+{list(sl.extents)} "
+            f"-> {dst.name}  "
+            f"(grid d_tiles={d_tiles}, s_tiles={s_tiles}, "
+            f"h_groups={h_groups}, b={logical_b}"
+            f"{', dyn base gp' + str(m_off.register) if m_off is not None else ''})\n"
         )
-        for d_tile in range(layout.d_tiles):
-            for s_tile in range(layout.s_tiles):
-                for h_grp in range(layout.h_groups):
-                    for b in range(layout.logical_b):
+        for d_tile in range(d_tiles):
+            for s_tile in range(s_tiles):
+                for h_grp in range(h_groups):
+                    for b in range(logical_b):
                         hbm_off = (
                             base_static
                             + b * hbm_stride_b
-                            + s_tile * layout.mlen * hbm_stride_s
-                            + h_grp * layout.lane_count * hbm_stride_h
-                            + d_tile * layout.mlen
+                            + s_tile * inner_mlen * hbm_stride_s
+                            + h_grp * lane_count * hbm_stride_h
+                            + d_tile * inner_mlen
                         )
                         vram_off = (
                             d_tile * d_tile_stride
@@ -866,9 +999,7 @@ class IsaEmitterPass:
                         )
                         self.shim.compiler.generated_code += (
                             f";   tile (d={d_tile}, s={s_tile}, h={h_grp}, "
-                            f"b={b}): hbm_off={hbm_off}  "
-                            f"vram_off={vram_off}"
-                            f"{' +dyn' if m_off is not None else ''}\n"
+                            f"b={b}): hbm_off={hbm_off}  vram_off={vram_off}\n"
                         )
                         if m_off is not None:
                             self.emitter.emit_load_tile_from_hbm(
@@ -927,20 +1058,13 @@ class IsaEmitterPass:
             m_off.release()
 
     def _emit_dma_v2h_slice(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """Multi-tile-aware writeback dispatcher.
+        """Emit H_STORE_V instructions for one VRAM→HBM slice copy.
 
-        Output writebacks are the typical multi-tile slice case: BMM_WO
-        deposits `eh` mlen*mlen tiles in VRAM head-major; each tile
-        becomes one H_STORE_V into the correspondingly-offset region of
-        the HBM parent.
-
-        The "BASE" element offset within parent is materialised ONCE
-        (either as an int for static slices, or into a GP register via
-        ExprMaterializer for dynamic slices). For each per-head tile
-        we then add a compile-time constant `h_idx * D` to that base:
-            * static: simple int + int
-            * dynamic: `S_ADDI_INT tile_off_reg, base_reg, h_idx*D` (or
-              reuse base_reg directly when h_idx == 0)
+        Mirror of :meth:`_emit_dma_h2v_slice`: same tile-grid model
+        from :meth:`_slice_tile_grid`, same per-tile offset math, just
+        store-direction emit. Single tile = ``1×1×1×1`` grid → one
+        H_STORE_V. Multi-tile (4D with tile_layout, or 2D row-major
+        larger than one mlen tile) expands naturally.
         """
         src = mod.get_buffer(op.buffer_args[0])
         sl = op.buffer_args[1]
@@ -953,84 +1077,76 @@ class IsaEmitterPass:
         _check_scope(parent, _scope.HBM, op.kind, "dst.parent")
 
         ra = self.shim.compiler.register_allocator
-        starts_s = self._format_starts(sl)
+
+        (d_tiles, s_tiles, h_groups, logical_b,
+         inner_mlen, lane_count,
+         (hbm_stride_b, hbm_stride_s, hbm_stride_h),
+         (d_tile_stride, s_tile_stride, h_grp_stride, b_stride)) = (
+            self._slice_tile_grid(parent, sl, src)
+        )
 
         m_base, static_base = self._materialise_slice_offset(parent, sl)
         is_dyn = m_base is not None
+        base_static = static_base if static_base is not None else 0
 
-        # ``per-head tiles`` count is the slice extent along the
-        # canonical channel axis, which lives at different positions
-        # depending on the parent's layout (axes[2] in BSHD, axes[1] in
-        # NCHW). Resolve via LAYOUT_AXES rather than hard-coding [2].
-        ch_axis = _hlir.LAYOUT_AXES[parent.layout][2]
+        starts_s = self._format_starts(sl)
         self.shim.compiler.generated_code += (
             f"; dma_v2h_slice  {src.name} -> "
             f"{parent.name}[{starts_s}]+{list(sl.extents)}  "
-            f"({'dynamic base gp' + str(m_base.register) if is_dyn else 'static base ' + str(static_base)}"
-            f", {sl.extents[ch_axis]} per-head tiles)\n"
+            f"(grid d_tiles={d_tiles}, s_tiles={s_tiles}, "
+            f"h_groups={h_groups}, b={logical_b}"
+            f"{', dyn base gp' + str(m_base.register) if is_dyn else ''})\n"
         )
-
-        if self._slice_is_single_logical_tile(parent, sl):
-            self.shim.compiler.generated_code += (
-                "; ... grouped narrow writeback as one logical mlen*mlen tile\n"
-            )
-            if is_dyn:
-                self.emitter.emit_store_tile_to_hbm(
-                    vram_addr=src.address,
-                    hbm_addr=parent.address,
-                    hbm_stride=parent.hbm_stride,
-                    hbm_scale_size=parent.hbm_scale_size,
-                    hbm_start_offset_reg=m_base.register,
-                )
-                m_base.release()
-            else:
-                self.emitter.emit_store_tile_to_hbm(
-                    vram_addr=src.address,
-                    hbm_addr=parent.address,
-                    hbm_stride=parent.hbm_stride,
-                    hbm_scale_size=parent.hbm_scale_size,
-                    hbm_start_offset=static_base,
-                )
-            return
-
-        for h_idx, vram_off, tile_const in self._iter_slice_tiles_per_head(parent, sl):
-            tile_vram = src.address + vram_off
-            if is_dyn:
-                # Dynamic base + compile-time tile_const offset.
-                if tile_const == 0:
-                    tile_off_reg = m_base.register   # reuse, no extra add
-                    tile_off_owned = False
-                else:
-                    tile_off_reg = ra.allocate_gp(1)[0]
-                    tile_off_owned = True
-                    self.shim.compiler.generated_code += (
-                        f"S_ADDI_INT gp{tile_off_reg}, gp{m_base.register}, "
-                        f"{tile_const}\n"
-                    )
-                self.shim.compiler.generated_code += (
-                    f"; ... tile h={h_idx} vram[+{vram_off}] -> "
-                    f"hbm[base+{tile_const}]\n"
-                )
-                self.emitter.emit_store_tile_to_hbm(
-                    vram_addr=tile_vram, hbm_addr=parent.address,
-                    hbm_stride=parent.hbm_stride,
-                    hbm_scale_size=parent.hbm_scale_size,
-                    hbm_start_offset_reg=tile_off_reg,
-                )
-                if tile_off_owned:
-                    ra.free_gp([tile_off_reg])
-            else:
-                tile_hbm_off = static_base + tile_const
-                self.shim.compiler.generated_code += (
-                    f"; ... tile h={h_idx} vram[+{vram_off}] -> "
-                    f"hbm[{tile_hbm_off}]\n"
-                )
-                self.emitter.emit_store_tile_to_hbm(
-                    vram_addr=tile_vram, hbm_addr=parent.address,
-                    hbm_stride=parent.hbm_stride,
-                    hbm_scale_size=parent.hbm_scale_size,
-                    hbm_start_offset=tile_hbm_off,
-                )
+        for d_tile in range(d_tiles):
+            for s_tile in range(s_tiles):
+                for h_grp in range(h_groups):
+                    for b in range(logical_b):
+                        tile_const = (
+                            b * hbm_stride_b
+                            + s_tile * inner_mlen * hbm_stride_s
+                            + h_grp * lane_count * hbm_stride_h
+                            + d_tile * inner_mlen
+                        )
+                        vram_off = (
+                            d_tile * d_tile_stride
+                            + s_tile * s_tile_stride
+                            + h_grp * h_grp_stride
+                            + b * b_stride
+                        )
+                        tile_vram = src.address + vram_off
+                        self.shim.compiler.generated_code += (
+                            f";   tile (d={d_tile}, s={s_tile}, h={h_grp}, "
+                            f"b={b}): vram[+{vram_off}] -> "
+                            f"hbm[base+{tile_const}]\n"
+                        )
+                        if is_dyn:
+                            if tile_const == 0:
+                                tile_off_reg = m_base.register
+                                tile_off_owned = False
+                            else:
+                                tile_off_reg = ra.allocate_gp(1)[0]
+                                tile_off_owned = True
+                                self.shim.compiler.generated_code += (
+                                    f"S_ADDI_INT gp{tile_off_reg}, "
+                                    f"gp{m_base.register}, {tile_const}\n"
+                                )
+                            self.emitter.emit_store_tile_to_hbm(
+                                vram_addr=tile_vram, hbm_addr=parent.address,
+                                hbm_stride=parent.hbm_stride,
+                                hbm_scale_size=parent.hbm_scale_size,
+                                hbm_start_offset_reg=tile_off_reg,
+                            )
+                            if tile_off_owned:
+                                ra.free_gp([tile_off_reg])
+                        else:
+                            self.emitter.emit_store_tile_to_hbm(
+                                vram_addr=tile_vram, hbm_addr=parent.address,
+                                hbm_stride=parent.hbm_stride,
+                                hbm_scale_size=parent.hbm_scale_size,
+                                hbm_start_offset=base_static + tile_const,
+                            )
+        if is_dyn:
+            m_base.release()
 
         if is_dyn:
             m_base.release()
@@ -1746,60 +1862,269 @@ class IsaEmitterPass:
         self._emit_row_scalar_op_at(mod, op, row_op="add", masked=True, has_fp=True)
 
     # ------------------------------------------------------------------
-    # Row-wide VRAM <-> FPRAM transfer. One call = one S_MAP_*_FP/V
-    # instruction = mlen elements. Loop in TIR for multi-row tiles.
+    # Slice-level VRAM <-> FPRAM transfer. HLIR carries the whole logical
+    # region (VramRegion: starts + extents on the parent buffer); this
+    # emitter splits it into HW-MLEN-wide chunks, computes each chunk's
+    # physical VRAM offset via the parent's 7D tile layout, and emits
+    # one S_MAP_*_FP/V per chunk.
+    #
+    # The parent is always a 4D ``(B, S, H, D)`` BSHD buffer (the
+    # pad-to-4D step in to_plena guarantees rank==4 on every VRAM/MRAM
+    # buffer). Its physical placement in VRAM is the 7D tile layout
+    # described in ``hlir.TileLayout``:
+    #
+    #     (D_TILES, S_TILES, H_GROUPS, B, MLEN, LANE_COUNT, D_INNER)
+    #
+    # A logical position ``(b, s, h, d)`` decomposes as:
+    #     d_tile  = d  // MLEN          d_inner_off = d  %  MLEN
+    #     s_tile  = s  // MLEN          s_inner_off = s  %  MLEN
+    #     h_grp   = h  // LANE_COUNT    lane        = h  %  LANE_COUNT
     # ------------------------------------------------------------------
-    def _emit_row_v_fp_transfer(
+    def _vram_region_iter_chunks(
+        self,
+        parent: _hlir.Buffer,
+        region: _hlir.VramRegion,
+    ):
+        """Yield ``(vram_offset_expr, fp_step_elems)`` for each HW-MLEN
+        chunk inside ``region``. ``fp_step_elems`` is the cumulative
+        element count consumed by all chunks so far — callers add it
+        to the base fp address.
+
+        Region semantics (post pad-to-4D): every parent is rank 4
+        BSHD; ``starts`` / ``extents`` are 4-tuples. The region's
+        last-axis extent (``ed``) drives the chunking — one S_MAP per
+        ``D_INNER`` slots along D. The (b, s, h, d_tile) outer
+        coordinates are walked once each; the chunk's physical VRAM
+        offset is the 7D inner-tile address.
+        """
+        starts = region.starts
+        extents = region.extents
+        if len(parent.shape) != 4:
+            raise IsaEmissionError(
+                f"VramRegion(parent={region.parent!r}) expects 4D BSHD "
+                f"parent; got shape {tuple(parent.shape)}. pad-to-4D "
+                f"in to_plena should have normalised this."
+            )
+        if len(starts) != 4 or len(extents) != 4:
+            raise IsaEmissionError(
+                f"VramRegion(parent={region.parent!r}) rank mismatch: "
+                f"starts={tuple(starts)} extents={tuple(extents)}; "
+                f"both must be 4-tuples"
+            )
+        tl = parent.tile_layout
+        if tl is None:
+            # ``make_tile_layout`` returns None for buffers that fit a
+            # single inner tile (s ≤ mlen ∧ d ≤ mlen on BSHD). Synthesise
+            # the trivial 1×1×1×1 layout so the offset math below works
+            # uniformly without a separate code path.
+            b_sz, s_sz, h_sz, d_sz = (int(x) for x in parent.shape)
+            tl = _hlir.TileLayout(
+                logical_b=b_sz, logical_s=s_sz, logical_h=h_sz, logical_d=d_sz,
+                d_tiles=1, s_tiles=1, h_groups=1,
+                mlen=self.shim.mlen, lane_count=1,
+                d_inner=d_sz if d_sz > 0 else self.shim.mlen,
+            )
+
+        eb, es, eh, ed = (int(x) for x in extents)
+        if ed % tl.d_inner != 0:
+            raise IsaEmissionError(
+                f"VramRegion(parent={region.parent!r}): innermost extent "
+                f"ed={ed} not a multiple of D_INNER={tl.d_inner}"
+            )
+        d_chunks = ed // tl.d_inner
+
+        # Lane axis is sync-wrap-folded by mid_ir: a single
+        # ``S_MAP_*_FP/V`` instruction covers every lane in one issue,
+        # so the emitter must NOT iterate the lane axis (doing so would
+        # re-issue the same multi-lane instruction lane_count times at
+        # offsets that no longer align to mlen). Assert the region
+        # covers the full lane span on whatever axis the parent's
+        # ``cluster_dim`` marks, then fold that axis out of the walk.
+        cluster_dim = getattr(parent, "cluster_dim", None)
+        outer_iter = {"b": eb, "s": es, "h": eh}
+        if cluster_dim is not None:
+            # BSHD positions: 0=B, 1=S, 2=H, 3=D. Lane never lands at D.
+            lane_key = {0: "b", 1: "s", 2: "h"}.get(cluster_dim)
+            if lane_key is None:
+                raise IsaEmissionError(
+                    f"VramRegion(parent={region.parent!r}): cluster_dim "
+                    f"={cluster_dim} is not a recognised BSHD lane "
+                    f"position (0=B / 1=S / 2=H)"
+                )
+            lane_span = int(parent.shape[cluster_dim])
+            lane_ext = outer_iter[lane_key]
+            if lane_ext != lane_span:
+                raise IsaEmissionError(
+                    f"VramRegion(parent={region.parent!r}): lane axis "
+                    f"({lane_key.upper()}, cluster_dim={cluster_dim}) "
+                    f"must cover the full lane span "
+                    f"({lane_span}) under sync wrap; got extent "
+                    f"{lane_ext}"
+                )
+            # Fold lane axis out — one S_MAP per (b, s, h_grp, d_chunk)
+            # except along the lane direction itself.
+            outer_iter[lane_key] = 1
+
+        # 7D physical strides (in elements). One inner tile holds
+        # MLEN * LANE_COUNT * D_INNER contiguous values; outer tiles
+        # walk (B, H_GROUPS, S_TILES, D_TILES) with the standard 7D
+        # stride pattern.
+        tile_elems = tl.mlen * tl.lane_count * tl.d_inner
+        b_stride = tile_elems
+        h_grp_stride = tl.logical_b * tile_elems
+        s_tile_stride = tl.h_groups * h_grp_stride
+        d_tile_stride = tl.s_tiles * s_tile_stride
+
+        # Helper: render ``starts[axis]`` + extra as a PrimExpr.
+        def _start_plus(axis: int, extra: int):
+            s = starts[axis]
+            if isinstance(s, int):
+                v = s + extra
+                return tir.IntImm("int32", int(v))
+            if extra == 0:
+                return s
+            return tir.Add(s, tir.IntImm("int32", int(extra)))
+
+        def _floordiv(expr, divisor: int):
+            if divisor == 1:
+                return expr
+            if isinstance(expr, tir.IntImm):
+                return tir.IntImm("int32", int(expr.value) // divisor)
+            return tir.FloorDiv(expr, tir.IntImm("int32", int(divisor)))
+
+        def _floormod(expr, divisor: int):
+            if divisor == 1:
+                return tir.IntImm("int32", 0)
+            if isinstance(expr, tir.IntImm):
+                return tir.IntImm("int32", int(expr.value) % divisor)
+            return tir.FloorMod(expr, tir.IntImm("int32", int(divisor)))
+
+        def _mul(expr, k: int):
+            if k == 0:
+                return tir.IntImm("int32", 0)
+            if k == 1:
+                return expr
+            if isinstance(expr, tir.IntImm):
+                return tir.IntImm("int32", int(expr.value) * k)
+            return tir.Mul(expr, tir.IntImm("int32", int(k)))
+
+        def _sum(terms):
+            non_zero = [
+                t for t in terms
+                if not (isinstance(t, tir.IntImm) and int(t.value) == 0)
+            ]
+            if not non_zero:
+                return tir.IntImm("int32", 0)
+            acc = non_zero[0]
+            for t in non_zero[1:]:
+                acc = tir.Add(acc, t)
+            return acc
+
+        fp_elems_so_far = 0
+        # Cartesian walk over (b_off, h_off, s_off, d_chunk). The lane
+        # axis among (B, S, H) was folded to extent 1 above so a
+        # single S_MAP per chunk covers every lane.
+        for d_chunk in range(d_chunks):
+            for s_off in range(outer_iter["s"]):
+                for h_off in range(outer_iter["h"]):
+                    for b_off in range(outer_iter["b"]):
+                        b_expr = _start_plus(0, b_off)
+                        s_expr = _start_plus(1, s_off)
+                        h_expr = _start_plus(2, h_off)
+                        # d_start covers the current D_INNER-wide slot
+                        # within the region; it indexes into parent's D.
+                        d_expr = _start_plus(3, d_chunk * tl.d_inner)
+
+                        d_tile = _floordiv(d_expr, tl.mlen)
+                        d_inner = _floormod(d_expr, tl.mlen)
+                        s_tile = _floordiv(s_expr, tl.mlen)
+                        s_inner = _floormod(s_expr, tl.mlen)
+                        h_grp = _floordiv(h_expr, tl.lane_count)
+                        lane = _floormod(h_expr, tl.lane_count)
+
+                        # 7D physical flat offset.
+                        terms = [
+                            _mul(d_tile, d_tile_stride),
+                            _mul(s_tile, s_tile_stride),
+                            _mul(h_grp, h_grp_stride),
+                            _mul(b_expr, b_stride),
+                            _mul(s_inner, tl.lane_count * tl.d_inner),
+                            _mul(lane, tl.d_inner),
+                            d_inner,
+                        ]
+                        vram_off = _sum(terms)
+                        yield vram_off, fp_elems_so_far
+                        # One S_MAP transfers ``lane_count * d_inner``
+                        # (= MLEN) contiguous FPRAM slots — the whole
+                        # lane group's slice in one issue.
+                        fp_elems_so_far += tl.lane_count * tl.d_inner
+
+    def _emit_v_fp_transfer_slice(
         self,
         mod: _hlir.HLIRModule,
         op: _hlir.Op,
         *,
-        direction: str,  # "v_to_fp" or "fp_to_v"
+        direction: str,                          # "v_to_fp" or "fp_to_v"
     ) -> None:
-        if direction == "v_to_fp":
-            vram = mod.get_buffer(op.buffer_args[0])
-            vram_offset_expr = op.scalar_args[0]
-            fp_addr_expr = op.scalar_args[1]
-            opcode = "S_MAP_FP_V"  # builds FP from V (V -> FP)
-        elif direction == "fp_to_v":
-            fp_addr_expr = op.scalar_args[0]
-            vram = mod.get_buffer(op.buffer_args[0])
-            vram_offset_expr = op.scalar_args[1]
-            opcode = "S_MAP_V_FP"  # builds V from FP (FP -> V)
-        else:
-            raise IsaEmissionError(f"unknown direction {direction!r}")
-
+        if len(op.buffer_args) != 1 or not isinstance(op.buffer_args[0], _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"{op.kind}: buffer_args[0] must be VramRegion; "
+                f"got {op.buffer_args!r}"
+            )
+        if len(op.scalar_args) != 1:
+            raise IsaEmissionError(
+                f"{op.kind}: expected 1 scalar arg (fp_addr); "
+                f"got {len(op.scalar_args)}"
+            )
+        region: _hlir.VramRegion = op.buffer_args[0]
+        vram = mod.get_buffer(region.parent)
         _check_scope(vram, _scope.VRAM, op.kind, "vram")
 
-        vram_addr_expr = tir.Add(
-            tir.IntImm("int32", int(vram.address)),
-            vram_offset_expr,
+        fp_addr_base = self._resolve_fp_scalar_addr_arg(
+            mod, op.scalar_args[0], op.kind, "fp",
         )
-        # Resolve fp_addr through the same path as the fp_*_at family so a
-        # BufferElement(fp_buf, indices) becomes (buf.address + linear_index).
-        fp_addr_expr = self._resolve_fp_scalar_addr_arg(
-            mod, fp_addr_expr, op.kind, "fp",
+        opcode = "S_MAP_FP_V" if direction == "v_to_fp" else "S_MAP_V_FP"
+
+        self.shim.compiler.generated_code += (
+            f"; v↔fp transfer slice {op.kind} parent={region.parent} "
+            f"starts={list(region.starts)!r} extents={list(region.extents)!r}\n"
         )
-        m_vram = self.materializer.materialize(vram_addr_expr)
-        self.shim.compiler.generated_code += m_vram.isa
-        m_fp = self.materializer.materialize(fp_addr_expr)
-        self.shim.compiler.generated_code += m_fp.isa
-        try:
-            lines = [f"; row vram<->fp transfer task {op.annotations.get('intrinsic', op.kind)} dir={direction}"]
-            if direction == "v_to_fp":
-                lines.append(f"{opcode} gp{m_fp.register}, gp{m_vram.register}, 0")
-            else:
-                lines.append(f"{opcode} gp{m_vram.register}, gp{m_fp.register}, 0")
-            self.shim.compiler.generated_code += "\n".join(lines) + "\n"
-        finally:
-            m_fp.release()
-            m_vram.release()
 
-    def _emit_row_load_v_to_fp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_v_fp_transfer(mod, op, direction="v_to_fp")
+        for vram_off_expr, fp_step in self._vram_region_iter_chunks(vram, region):
+            vram_addr_expr = tir.Add(
+                tir.IntImm("int32", int(vram.address)),
+                vram_off_expr,
+            )
+            fp_chunk_addr = (
+                fp_addr_base if fp_step == 0
+                else tir.Add(fp_addr_base, tir.IntImm("int32", int(fp_step)))
+            )
+            m_vram = self.materializer.materialize(vram_addr_expr)
+            self.shim.compiler.generated_code += m_vram.isa
+            m_fp = self.materializer.materialize(fp_chunk_addr)
+            self.shim.compiler.generated_code += m_fp.isa
+            try:
+                if direction == "v_to_fp":
+                    self.shim.compiler.generated_code += (
+                        f"{opcode} gp{m_fp.register}, gp{m_vram.register}, 0\n"
+                    )
+                else:
+                    self.shim.compiler.generated_code += (
+                        f"{opcode} gp{m_vram.register}, gp{m_fp.register}, 0\n"
+                    )
+            finally:
+                m_fp.release()
+                m_vram.release()
 
-    def _emit_row_store_fp_to_v(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_v_fp_transfer(mod, op, direction="fp_to_v")
+    def _emit_v_fp_transfer_slice_v_to_fp(
+        self, mod: _hlir.HLIRModule, op: _hlir.Op,
+    ) -> None:
+        self._emit_v_fp_transfer_slice(mod, op, direction="v_to_fp")
+
+    def _emit_v_fp_transfer_slice_fp_to_v(
+        self, mod: _hlir.HLIRModule, op: _hlir.Op,
+    ) -> None:
+        self._emit_v_fp_transfer_slice(mod, op, direction="fp_to_v")
 
     def _emit_copy_v_to_v(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         """One MLEN-wide row copy in VRAM via ``V_ADD_VF dst, src, f0, 0``.
@@ -1912,7 +2237,7 @@ class IsaEmitterPass:
         # (e.g. an inner kv_block accumulation containing a 16x16 unrolled
         # emit_matmul). Costs one S_ADDI_INT per iter to re-init gp_idx;
         # the hardware loop overhead disappears entirely.
-        if loop_kind == "unrolled":
+        if loop_kind in ("unroll", "unrolled"):
             gp_idx = ra.allocate_gp(1)[0]
             self.shim.compiler.generated_code += (
                 f"; unroll for {loop_var.name} in "
@@ -1941,19 +2266,40 @@ class IsaEmitterPass:
             ra.free_gp([gp_idx])
             return
 
-        # Allocate counter (hardware tracker) and idx (body-visible).
+        # gp_loop is the PLENA hw counter — C_LOOP_END decrements it, so
+        # it MUST stay in a GP and MUST be pinned for the whole body.
         gp_loop = ra.allocate_gp(1)[0]
-        gp_idx = ra.allocate_gp(1)[0]
+        ra.pin_gp(gp_loop)
 
-        self.shim.compiler.generated_code += (
-            f"; for {loop_var.name} in [{init_imm}, {init_imm + extent_imm}) "
-            f"-- hw counter gp{gp_loop}, idx gp{gp_idx}\n"
-            f"S_ADDI_INT gp{gp_idx}, gp0, {init_imm}\n"
-            f"C_LOOP_START gp{gp_loop}, {extent_imm}\n"
-        )
+        # idx lives in IntRAM, not a GP. Deep nests (flash_attention with
+        # an inner matmul, conv2d's 6-level grid) used to exhaust the GP
+        # file when every loop pinned two GPs. Storing the idx in IntRAM
+        # turns it into 1 GP per loop -- the materializer re-loads the
+        # idx on every use via S_LD_INT.
+        idx_addr = ra.claim_idx_slot()
+        # Init: 0 -> intram[idx_addr]. gp0 is constant zero, so we can
+        # store it directly without using a scratch GP.
+        if init_imm == 0:
+            self.shim.compiler.generated_code += (
+                f"; for {loop_var.name} in [{init_imm}, {init_imm + extent_imm}) "
+                f"-- hw counter gp{gp_loop}, idx ram[{idx_addr}]\n"
+                f"S_ST_INT gp0, gp0, {idx_addr}\n"
+                f"C_LOOP_START gp{gp_loop}, {extent_imm}\n"
+            )
+        else:
+            # Non-zero init: borrow one GP to compute the value, store,
+            # free immediately. Allocator is free to spill if needed.
+            init_gp = ra.allocate_gp(1)[0]
+            self.shim.compiler.generated_code += (
+                f"; for {loop_var.name} in [{init_imm}, {init_imm + extent_imm}) "
+                f"-- hw counter gp{gp_loop}, idx ram[{idx_addr}]\n"
+                f"S_ADDI_INT gp{init_gp}, gp0, {init_imm}\n"
+                f"S_ST_INT gp{init_gp}, gp0, {idx_addr}\n"
+                f"C_LOOP_START gp{gp_loop}, {extent_imm}\n"
+            )
+            ra.free_gp([init_gp])
 
-        self.symbol_table[loop_var] = gp_idx
-        ra.pin_gp(gp_idx)
+        self.symbol_table[loop_var] = ("ram", idx_addr)
         try:
             for sub_op in op.body or []:
                 handler = self._dispatch.get(sub_op.kind)
@@ -1964,14 +2310,24 @@ class IsaEmitterPass:
                     )
                 handler(mod, sub_op)
         finally:
-            ra.unpin_gp(gp_idx)
             del self.symbol_table[loop_var]
 
+        # idx += 1: load -> addi -> store. Borrow one GP for the round-
+        # trip (auto-spill may briefly displace some other live GP, but
+        # gp_loop is pinned so it cannot be the victim).
+        inc_gp = ra.allocate_gp(1)[0]
         self.shim.compiler.generated_code += (
-            f"S_ADDI_INT gp{gp_idx}, gp{gp_idx}, 1\n"
+            f"; idx {loop_var.name} += 1 (ram[{idx_addr}])\n"
+            f"S_LD_INT gp{inc_gp}, gp0, {idx_addr}\n"
+            f"S_ADDI_INT gp{inc_gp}, gp{inc_gp}, 1\n"
+            f"S_ST_INT gp{inc_gp}, gp0, {idx_addr}\n"
             f"C_LOOP_END gp{gp_loop}\n"
         )
-        ra.free_gp([gp_loop, gp_idx])
+        ra.free_gp([inc_gp])
+
+        ra.unpin_gp(gp_loop)
+        ra.free_gp([gp_loop])
+        ra.release_idx_slot(idx_addr)
 
 
 def _check_scope(buf: _hlir.Buffer, expected: str, op_kind: str, role: str) -> None:
