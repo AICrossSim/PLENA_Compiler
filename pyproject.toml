@@ -25,6 +25,5 @@ packages = [
     "asm_templates",
     "aten",
     "generator",
-    "sim_env_utils",
     "utils",
 ]

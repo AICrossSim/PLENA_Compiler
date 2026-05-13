@@ -541,3 +541,129 @@ def compile_hf_model(
         "info": info,
         "golden_precision": golden_precision,
     }
+<<<<<<< Updated upstream
+=======
+
+
+# ---------------------------------------------------------------------------
+# Convenience: compile + run emulator + compare
+# ---------------------------------------------------------------------------
+def compile_and_run(
+    model,
+    build_dir,
+    **kwargs,
+) -> dict:
+    """Compile, run emulator, and compare against golden.
+
+    Convenience wrapper that calls compile_hf_model, sets up simulation
+    environment, runs the Rust transactional emulator, and compares output.
+
+    Args:
+        model:     nn.Module (HF CausalLM model, already loaded)
+        build_dir: Directory for simulation artifacts
+        **kwargs:  Forwarded to compile_hf_model (seq_len, hidden_size, etc.)
+
+    Returns:
+        dict with compilation info + comparison results including
+        'allclose_match_rate' percentage.
+    """
+    from transactional_emulator.tools.create_sim_env import create_sim_env
+    from sim_env_utils.build_env import create_mem_for_sim
+    from transactional_emulator.testbench.emulator_runner import (
+        run_and_assert,
+        compare_emulator_output,
+    )
+
+    result = compile_hf_model(model, **kwargs)
+    build_dir = Path(build_dir)
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    mlen = kwargs.get("mlen", 64)
+    blen = kwargs.get("blen", 4)
+    asm_name = f"model_{result['info']['model_type']}_{result['info']['num_layers']}L"
+
+    # Write sim env files
+    create_sim_env(
+        result["input_tensors"],
+        result["isa"],
+        {"original_output": result["golden_output"]},
+        result["fp_preload"],
+        build_dir=str(build_dir),
+    )
+
+    create_mem_for_sim(
+        data_size=256,
+        mode="behave_sim",
+        asm=asm_name,
+        data=None,
+        specified_data_order=result["data_order"],
+        build_path=build_dir,
+    )
+
+    with open(build_dir / "comparison_params.json", "w") as f:
+        json.dump(result["comparison_params"], f, indent=2)
+
+    with open(build_dir / "generated_asm_code.asm", "w") as f:
+        f.write(result["isa"])
+
+    print(f"\nSimulation environment created: {build_dir}")
+    print(f"  Result location: VRAM row {result['comparison_params']['start_row_idx']}")
+    print(f"  Layers: {result['info']['num_layers']}, data_order: {result['data_order']}")
+
+    # Run emulator and compare (don't exit on failure — VRAM stage comparison follows)
+    from transactional_emulator.testbench.emulator_runner import update_plena_config, run_emulator
+    update_plena_config(vlen=mlen, mlen=mlen, blen=blen, verbose=False)
+    print("\n--- Running Rust transactional emulator ---")
+    run_emulator(build_dir)
+
+    print("\n--- Comparing emulator output vs golden ---")
+    comp_results, _params = compare_emulator_output(build_dir)
+    from transactional_emulator.tools.check_mem import print_comparison_results
+    print_comparison_results(comp_results, verbose=True, comparison_params=_params)
+
+    if comp_results["allclose_pass"]:
+        print(f"\n[ATen-style {asm_name} test PASSED - ISA generated + emulator verified]")
+    else:
+        print(f"\n[ATen-style {asm_name} test FAILED - emulator numerical check failed]")
+
+    # Three-way comparison
+    golden = result["golden_output"]
+    hf_gt = result["hf_ground_truth"]
+    print("\n--- Three-way comparison ---")
+    if hf_gt is not None and golden is not None:
+        # HF float32 vs golden (MXFP8 + BF16)
+        n = min(hf_gt.numel(), golden.numel())
+        allclose_hf_vs_gold = (
+            torch.isclose(hf_gt.float().flatten()[:n],
+                          golden.float().flatten()[:n], atol=1e-2)
+            .float().mean().item() * 100
+        )
+        print(f"  HF float32 vs golden (MXFP8+BF16):  {allclose_hf_vs_gold:.2f}% allclose")
+    # Emulator vs golden: reported by compare_emulator_output
+    emu_match = comp_results.get("allclose_match_rate", None)
+    if emu_match is not None:
+        print(f"  Emulator vs golden (MXFP8+BF16):    {emu_match:.2f}% allclose")
+
+    # VRAM stage comparison: validates each pipeline segment using
+    # emulator's own intermediates as golden input (immune to accumulation drift)
+    try:
+        from compiler.aten.vram_stage_compare import compare_stages
+        emulator_dir = Path(__file__).parent.parent.parent / "transactional_emulator"
+        vram_path = str(emulator_dir / "vram_dump.bin")
+        print("\n--- VRAM stage comparison (authoritative) ---")
+        stage_results = compare_stages(
+            vram_path=vram_path,
+            build_dir=str(build_dir),
+            hidden=result["info"]["hidden_size"],
+            inter=result["info"].get("inter_dim", result["info"]["hidden_size"] * 4),
+            num_heads=result["info"]["num_heads"],
+            num_kv_heads=result["info"]["num_kv_heads"],
+        )
+        stage_pass = stage_results.get("norm+FFN+norm", 0) >= 99.0
+        comp_results["vram_stage_allclose"] = stage_results.get("norm+FFN+norm", None)
+        comp_results["vram_stage_pass"] = stage_pass
+    except Exception as e:
+        print(f"  (skipped: {e})")
+
+    return {**result["info"], **comp_results}
+>>>>>>> Stashed changes
