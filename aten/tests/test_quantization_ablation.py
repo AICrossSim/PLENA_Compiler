@@ -1,6 +1,6 @@
 """Ablation study proving HF-vs-golden accuracy gap is from MXFP8 weight quantization.
 
-Runs compile_hf_model in four precision modes and compares golden output
+Runs compile_native_hf_decoder in four precision modes and compares golden output
 against the HF float32 ground truth. Expected result:
 
     hardware       (MXFP8 + BF16)  ~52% allclose  ← full HW gap
@@ -25,13 +25,13 @@ DEFAULT_LAYERS = 5
 
 def _run_ablation(num_layers: int) -> dict[str, dict]:
     from transformers import AutoModelForCausalLM
-    from compiler.aten.plena_frontend import compile_hf_model
+    from compiler.aten.plena_frontend import compile_native_hf_decoder
 
     model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
     results = {}
 
     for mode in MODES:
-        result = compile_hf_model(
+        result = compile_native_hf_decoder(
             model, seq_len=64, num_layers=num_layers, golden_precision=mode,
         )
         golden = result["golden_output"]

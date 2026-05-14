@@ -26,8 +26,8 @@ PLENA_Compiler/
 |   +-- reset_reg_asm.py     #   Register reset helpers
 |
 |-- aten/                    # Pipeline 1: ATen compilation backend
-|   |-- plena_frontend.py    #   HF model -> PLENA program -> ISA text
-|   |-- e2e_runner.py        #   ATen e2e runner: PlenaCompiler -> emulator -> golden
+|   |-- plena_frontend.py    #   native HF decoder -> PLENA program -> ISA text
+|   |-- sliced_emulator_runner.py #   sliced HF weights -> emulator -> golden
 |   |-- plena/               #   Canonical PlenaCompiler implementation package
 |   |   |-- compiler.py      #     PlenaCompiler composition class
 |   |   |-- memory_state.py  #     Tensor/input/FP memory state

@@ -512,20 +512,20 @@ def run_test_aten(
     seq_len: int = 64,
     num_layers: int = 1,
 ) -> int:
-    """Run the ATen-backed e2e pipeline (PlenaCompiler + ops.*).
+    """Run the sim-sliced ATen-backed e2e pipeline (PlenaCompiler + ops.*).
 
     Unlike ``run_test`` which uses the generator's own codegen path and has
-    numerical verification deferred, this immediately gets full numerical
-    correctness via the mature ATen compilation backend.
+    numerical verification deferred, this immediately gets emulator numerical
+    coverage through ``compiler.aten.sliced_emulator_runner`` at simulator-sliced dims.
     """
-    from compiler.aten.e2e_runner import run_aten_e2e
+    from compiler.aten.sliced_emulator_runner import run_sliced_emulator_check
 
     print("=" * 80)
     print(f"Generator e2e harness (ATen backend) — {model_id} — "
           f"seq_len={seq_len}, num_layers={num_layers}")
     print("=" * 80)
 
-    result = run_aten_e2e(
+    result = run_sliced_emulator_check(
         model_id=model_id,
         seq_len=seq_len,
         num_layers=num_layers,
@@ -550,7 +550,7 @@ if __name__ == "__main__":
     _ap.add_argument("--num-layers", type=int, default=None,
                      help="Override num_hidden_layers (e.g. 1 for fast e2e runs, ~22x less ASM)")
     _ap.add_argument("--aten", action="store_true",
-                     help="Use ATen backend (PlenaCompiler + ops.*) instead of generator codegen")
+                     help="Use sim-sliced ATen harness instead of generator codegen")
     _args = _ap.parse_args()
     if _args.aten:
         sys.exit(run_test_aten(
