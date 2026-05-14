@@ -204,9 +204,9 @@ def test_rotate_half_matrix_identity():
     print("  PASS test_rotate_half_matrix_identity")
 
 
-def test_compile_hf_model_golden_vs_hf():
+def test_compile_native_hf_decoder_golden_vs_hf():
     """Golden (MXFP8+BF16) should closely match HF float32 at native dims."""
-    from compiler.aten.plena_frontend import compile_hf_model
+    from compiler.aten.plena_frontend import compile_native_hf_decoder
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -214,7 +214,7 @@ def test_compile_hf_model_golden_vs_hf():
     )
     model.eval()
 
-    r = compile_hf_model(model, seq_len=64, num_layers=1)
+    r = compile_native_hf_decoder(model, seq_len=64, num_layers=1)
     golden = r["golden_output"]
     hf = r["hf_ground_truth"]
 
@@ -226,7 +226,7 @@ def test_compile_hf_model_golden_vs_hf():
 
     assert pct >= 95.0, f"Golden vs HF allclose {pct:.1f}% < 95%"
     assert cos.item() >= 0.99, f"Golden vs HF cosine {cos.item():.4f} < 0.99"
-    print(f"  PASS test_compile_hf_model_golden_vs_hf ({pct:.1f}% allclose, cos={cos.item():.4f})")
+    print(f"  PASS test_compile_native_hf_decoder_golden_vs_hf ({pct:.1f}% allclose, cos={cos.item():.4f})")
 
 
 def test_native_compile_assembles():
@@ -234,7 +234,7 @@ def test_native_compile_assembles():
     import os
     import tempfile
 
-    from compiler.aten.plena_frontend import compile_hf_model
+    from compiler.aten.plena_frontend import compile_native_hf_decoder
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -242,7 +242,7 @@ def test_native_compile_assembles():
     )
     model.eval()
 
-    r = compile_hf_model(model, seq_len=64, num_layers=1)
+    r = compile_native_hf_decoder(model, seq_len=64, num_layers=1)
     isa = r["isa"]
 
     # Assemble — should not raise ValueError (u32 overflow)
@@ -290,7 +290,7 @@ if __name__ == "__main__":
         test_fix_large_immediates_roundtrip,
         test_fix_large_immediates_preserves_relative_adds,
         test_rotate_half_matrix_identity,
-        test_compile_hf_model_golden_vs_hf,
+        test_compile_native_hf_decoder_golden_vs_hf,
         test_native_compile_assembles,
     ]
 

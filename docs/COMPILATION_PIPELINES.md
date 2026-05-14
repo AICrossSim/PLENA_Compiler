@@ -66,18 +66,18 @@ backends, and weight-handling strategies.
 | File | Role |
 |------|------|
 | `aten/plena/` | Canonical PlenaCompiler implementation package |
-| `aten/plena_frontend.py` | HuggingFace model frontend that drives ATen compilation |
+| `aten/plena_frontend.py` | Native HuggingFace decoder frontend (`compile_native_hf_decoder`) |
 | `aten/ops/plena/*.py` | Registered ATen op implementations (linear, attention, ffn, norm, conv, softmax, embedding) |
 | `aten/ops/cpu/*.py` | CPU reference fallbacks |
 | `aten/ops/registry.py` | Op dispatch registry |
-| `aten/e2e_runner.py` | E2E harness: model load -> compile -> emulate -> verify |
+| `aten/sliced_emulator_runner.py` | Sliced-dimension emulator harness: model load -> compile -> emulate -> verify |
 | `sim_env_utils/build_env.py` | Simulation environment builder |
 
 ### Entry points
 
-- **Single-layer tests**: `model_layer_test_builder.py::build_and_run_decoder_test`
-- **Full-model E2E**: `aten/e2e_runner.py::run_aten_e2e`
-- **CLI**: `python -m compiler.aten.e2e_runner <model> --seq-len 32 --num-layers 1`
+- **Sliced single-layer tests**: `sliced_layer_test_builder.py::build_and_run_sliced_decoder_layer_test`
+- **Sliced emulator CLI**: `python -m compiler.aten.sliced_emulator_runner <model> --seq-len 32 --num-layers 1`
+- **Native decoder compile**: `aten/plena_frontend.py::compile_native_hf_decoder`
 
 ### Test suite
 

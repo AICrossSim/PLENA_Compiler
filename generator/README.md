@@ -6,12 +6,15 @@ The generator path is the symbolic codegen and utilization-analysis pipeline:
 HF config -> symbolic graph -> scheduler -> ASM
 ```
 
-It is separate from the ATen e2e compiler path. For numerically verified ATen
-compilation, use:
+It is separate from the ATen compiler/emulator path. For quick numerically verified
+sim-sliced ATen checks, use:
 
 ```bash
-python -m compiler.aten.e2e_runner AICrossSim/clm-60m --seq-len 64 --num-layers 1
+python -m compiler.aten.sliced_emulator_runner AICrossSim/clm-60m --seq-len 64 --num-layers 1
 ```
+
+For native hidden/intermediate dimensions, use
+`compiler.aten.plena_frontend.compile_native_hf_decoder` from Python.
 
 Run symbolic codegen:
 
