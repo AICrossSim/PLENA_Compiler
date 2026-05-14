@@ -164,6 +164,16 @@ class TvmTestbenchSpec:
     # ---- optional kernel hooks ----
     build_pre_kernel_stub: Optional[PreKernelStubBuilder] = None
     build_fp_preload: Optional[FpPreloadBuilder] = None
+    patch_isa: Optional[Any] = None
+    """Optional last-mile rewrite hook over the assembled ASM text.
+
+    Signature: ``(isa_text: str) -> str``. Called after the compile
+    subprocess emits the kernel ASM and (if any) the pre-kernel stub
+    is prepended, but before ``create_sim_env`` writes it to disk.
+    Used by debug step kernels to patch a single instruction's
+    operand (e.g. flip ``V_RED_SUM ..., 1`` to ``..., 0`` to see
+    what the unmasked path produces) without touching the compiler.
+    """
     int_preload: Any = None
     """Static int-preload tensor (sim_env_utils takes it through). None
     for everything we have today."""
@@ -291,6 +301,15 @@ def run(spec: TvmTestbenchSpec) -> int:
     if spec.build_pre_kernel_stub is not None:
         stub_isa = spec.build_pre_kernel_stub(addrs)
     isa_text = stub_isa + kernel_isa
+    if spec.patch_isa is not None:
+        patched = spec.patch_isa(isa_text)
+        if patched != isa_text:
+            print(
+                f"      NB  patch_isa hook rewrote ASM "
+                f"({isa_text.count(chr(10))} -> "
+                f"{patched.count(chr(10))} lines)"
+            )
+        isa_text = patched
     print(
         f"      OK  ({kernel_isa.count(chr(10))} kernel lines"
         + (f" + {stub_isa.count(chr(10))} stub lines" if stub_isa else "")

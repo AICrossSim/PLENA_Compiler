@@ -81,6 +81,9 @@ def _walk(stmt: Stmt, in_cluster: bool, ids: _IdCounter) -> Stmt:
                 kind=stmt.kind,
                 thread_tag=stmt.thread_tag,
                 parent_grid_axis_name=stmt.parent_grid_axis_name,
+                original_axis_name=stmt.original_axis_name,
+                axis_var=stmt.axis_var,
+                original_axis_var=stmt.original_axis_var,
             )
         # grid / logical_grid: pass through, but if we're already inside
         # a cluster the leaf-op bodies here still need async wrapping.
@@ -94,6 +97,9 @@ def _walk(stmt: Stmt, in_cluster: bool, ids: _IdCounter) -> Stmt:
             kind=stmt.kind,
             thread_tag=stmt.thread_tag,
             parent_grid_axis_name=stmt.parent_grid_axis_name,
+            original_axis_name=stmt.original_axis_name,
+            axis_var=stmt.axis_var,
+            original_axis_var=stmt.original_axis_var,
         )
     if isinstance(stmt, For):
         new_body = [_walk(s, in_cluster=in_cluster, ids=ids) for s in stmt.body]
@@ -104,6 +110,7 @@ def _walk(stmt: Stmt, in_cluster: bool, ids: _IdCounter) -> Stmt:
             extent=stmt.extent,
             body=new_body,
             kind=stmt.kind,
+            loop_var_var=stmt.loop_var_var,
         )
     if isinstance(stmt, Async):
         # Already wrapped; preserve and recurse (idempotency).

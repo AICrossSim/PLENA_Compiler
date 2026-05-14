@@ -34,7 +34,7 @@ IntRAM spill region:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 class RegisterExhausted(RuntimeError):
@@ -101,6 +101,60 @@ class RegisterAllocator:
         # unbinds a loop var, keeping the symbol_table contents safe
         # from being trashed by auto-spill.
         self._pinned_gp: set = set()
+        # GP register event trace, one row per state-changing call.
+        # Filled by ``_record(...)`` from every public mutator below.
+        # Dumped at end of compile to ``<build_dir>/<asm>.gp_trace.tsv``
+        # so the ASM can be cross-referenced line-by-line with the
+        # allocation events that produced it.
+        self._trace: List[Dict[str, str]] = []
+        # Source-site stack pushed by ISA pass / materializer when they
+        # want events grouped under a logical operation (e.g. ``op[12]
+        # row_reduce_sum_at``, ``materialize Add``). Whatever sits on
+        # top here annotates every event until popped.
+        self._site_stack: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Event trace
+    # ------------------------------------------------------------------
+    def push_site(self, label: str) -> None:
+        """Annotate every subsequent event until the matching ``pop_site``
+        with ``label``. Used by ISA pass / materializer to tag events
+        with the logical op or expression they came from."""
+        self._site_stack.append(label)
+
+    def pop_site(self) -> None:
+        if self._site_stack:
+            self._site_stack.pop()
+
+    def _site(self) -> str:
+        return " > ".join(self._site_stack)
+
+    def _asm_line(self) -> int:
+        """Current line count of ``generated_code`` — used as a coarse
+        cursor so trace rows can be aligned with the ASM dump."""
+        if self.compiler is None:
+            return 0
+        return self.compiler.generated_code.count("\n") + 1
+
+    def _record(self, event: str, **fields: object) -> None:
+        """Append one row to ``self._trace``. Captures the post-mutation
+        state (free pool / in-use list / pinned set) so a reader can
+        replay the timeline without reconstructing it from deltas."""
+        row: Dict[str, object] = {
+            "asm_line": self._asm_line(),
+            "site":     self._site(),
+            "event":    event,
+        }
+        row.update(fields)
+        # Snapshot pool state AFTER the event, so a reader can compare
+        # consecutive rows to spot leaks / double-frees / pinning bugs.
+        row["free"]   = ",".join(str(r) for r in self._gp_free)
+        row["in_use"] = ",".join(str(r) for r in self._gp_in_use)
+        row["pinned"] = ",".join(str(r) for r in sorted(self._pinned_gp))
+        self._trace.append(row)
+
+    def trace_rows(self) -> List[Dict[str, object]]:
+        return list(self._trace)
 
     # ------------------------------------------------------------------
     # GP register pool
@@ -120,6 +174,7 @@ class RegisterAllocator:
         out = self._gp_free[:n]
         self._gp_free = self._gp_free[n:]
         self._gp_in_use.extend(out)
+        self._record("allocate_gp", n=n, regs=",".join(str(r) for r in out))
         return out
 
     def pin_gp(self, reg: int) -> None:
@@ -129,9 +184,11 @@ class RegisterAllocator:
         corrupt the binding because the materializer reads it via
         the symbol table without going through ``free_gp``."""
         self._pinned_gp.add(reg)
+        self._record("pin_gp", regs=str(reg))
 
     def unpin_gp(self, reg: int) -> None:
         self._pinned_gp.discard(reg)
+        self._record("unpin_gp", regs=str(reg))
 
     def _auto_spill(self, need: int) -> None:
         """Free up ``need`` more GPs by spilling the most-recently
@@ -179,6 +236,9 @@ class RegisterAllocator:
             # caller frees this register later we use the same key to
             # reload its contents into the same physical GP.
             self._auto_spills_by_borrow[r] = _SpillRecord(orig_reg=r, slot=slot)
+            self._record(
+                "auto_spill", regs=str(r), slot=slot, addr=addr,
+            )
 
     def free_gp(self, regs: Iterable[int]) -> None:
         # Push back at the front to maximise locality (next alloc reuses
@@ -193,6 +253,7 @@ class RegisterAllocator:
                 # release the same register twice when constant-folding
                 # collapsed an intermediate onto the final result reg.
                 # Tolerate it instead of crashing.
+                self._record("free_gp_noop", regs=str(r))
                 continue
             if r in self._gp_in_use:
                 self._gp_in_use.remove(r)
@@ -208,8 +269,12 @@ class RegisterAllocator:
                 # Reg goes back to in-use (its outer-scope owner still
                 # holds it). Don't push to free pool.
                 self._gp_in_use.append(r)
+                self._record(
+                    "auto_reload", regs=str(r), slot=rec.slot, addr=addr,
+                )
                 continue
             self._gp_free.insert(0, r)
+            self._record("free_gp", regs=str(r))
 
     # ------------------------------------------------------------------
     # Spill-borrow API
@@ -268,8 +333,14 @@ class RegisterAllocator:
                 spilled.append(_SpillRecord(orig_reg=r, slot=slot))
                 self._gp_in_use.remove(r)
                 self._gp_free.insert(0, r)
+                self._record(
+                    "borrow_spill", regs=str(r), slot=slot, addr=addr,
+                )
 
         borrowed = self.allocate_gp(n)
+        self._record("spill_borrow", n=n,
+                     regs=",".join(str(r) for r in borrowed),
+                     spilled=",".join(str(s.orig_reg) for s in spilled))
         return borrowed, BorrowToken(borrowed=borrowed, spilled=spilled)
 
     def spill_return(self, token: BorrowToken, *, compiler) -> None:
@@ -293,6 +364,10 @@ class RegisterAllocator:
                 f"S_LD_INT gp{rec.orig_reg}, gp0, {addr}\n"
             )
             self._release_spill_slot(rec.slot)
+            self._record(
+                "borrow_reload", regs=str(rec.orig_reg),
+                slot=rec.slot, addr=addr,
+            )
 
     def _claim_spill_slot(self) -> int:
         for i, used in enumerate(self._spill_slots_in_use):
@@ -320,6 +395,7 @@ class RegisterAllocator:
         for i, used in enumerate(self._idx_slots_in_use):
             if not used:
                 self._idx_slots_in_use[i] = True
+                self._record("claim_idx_slot", slot=i, addr=IDX_BASE + i)
                 return IDX_BASE + i
         raise RegisterExhausted(
             f"idx slots exhausted ({IDX_SLOTS} used). Bump IDX_SLOTS or "
@@ -333,6 +409,7 @@ class RegisterAllocator:
         if not self._idx_slots_in_use[slot]:
             raise RuntimeError(f"double-release of idx slot {slot}")
         self._idx_slots_in_use[slot] = False
+        self._record("release_idx_slot", slot=slot, addr=addr)
 
     # ------------------------------------------------------------------
     # Address register pool
@@ -344,6 +421,9 @@ class RegisterAllocator:
             )
         out = self._addr_free[:n]
         self._addr_free = self._addr_free[n:]
+        self._record(
+            "allocate_addr", n=n, regs=",".join(f"a{r}" for r in out),
+        )
         return out
 
     def free_addr(self, regs: Iterable[int]) -> None:
@@ -351,6 +431,7 @@ class RegisterAllocator:
             if r in self._addr_free:
                 raise RuntimeError(f"double-free of a{r}")
             self._addr_free.insert(0, r)
+            self._record("free_addr", regs=f"a{r}")
 
 
 __all__ = [

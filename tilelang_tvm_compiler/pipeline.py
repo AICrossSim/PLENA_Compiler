@@ -62,6 +62,11 @@ class CompiledKernel:
     name: str
     hlir: HLIRModule
     isa_text: str
+    # GP allocator trace captured during ISA emit. ``None`` if the
+    # compile path didn't expose it. Each entry is a dict with keys
+    # ``asm_line``/``site``/``event``/``free``/``in_use``/``pinned``
+    # plus event-specific fields (regs, slot, addr, n, ...).
+    gp_trace: list = None
 
     def __repr__(self) -> str:
         return (
@@ -99,7 +104,7 @@ def compile_kernel(
     midfn = _mid_view.run(midfn)
     midfn = _mid_fuse.run(midfn)
     midfn = _mid_burn.run(midfn)
-    mod = _mid_to_plena.run(midfn, build_dir=midir_dump_dir)
+    mod = _mid_to_plena.run(midfn, build_dir=midir_dump_dir, mlen=target.mlen)
 
     # DEBUG: dump HLIR immediately after to_plena so we can inspect it
     # even when later passes fail.
@@ -124,17 +129,21 @@ def compile_kernel(
     addr_pass.run(mod)
 
     # ---------- 3. ISA emit ----------
+    allocator = RegisterAllocator()
     shim = make_shim(
         mlen=target.mlen,
         blen=target.blen,
         btmm_lane_count=target.btmm_lane_count,
         btmm_hlen=target.btmm_hlen,
-        register_allocator=RegisterAllocator(),
+        register_allocator=allocator,
     )
     isa_pass = IsaEmitterPass(shim)
     isa_text = isa_pass.run(mod)
 
-    return CompiledKernel(name=name, hlir=mod, isa_text=isa_text)
+    return CompiledKernel(
+        name=name, hlir=mod, isa_text=isa_text,
+        gp_trace=allocator.trace_rows(),
+    )
 
 
 def compile_module(

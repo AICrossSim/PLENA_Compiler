@@ -53,7 +53,8 @@ from typing import Dict, List, Optional, Tuple
 
 from ..cluster_guard import should_skip_cluster, MLEN
 from ..ir import (
-    BufferDef, BufferRef, Slice,
+    AxisRole, AxisInfo,
+    BufferDef, BufferRef, Slice, VarRef,
     Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
@@ -67,6 +68,12 @@ class ViewError(RuntimeError):
 
 class ViewConflictError(ViewError):
     pass
+
+
+# Per-``run`` lookup so a CLUSTER ParallelAxis can find its enclosing
+# number axis's VarRef by name. Split emits ``number -> phase`` nesting,
+# so the number axis is always visited first.
+_NUMBER_VAR_BY_NAME: dict = {}
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +108,10 @@ class _ClusterCtx:
     number_name: str            # "by_number"
     cluster_count: int
     original_axis_name: str    # "by" (for HBM lane-var substitution)
-
-
-def _strip_number_suffix(name: str) -> str:
-    if name.endswith("_number"):
-        return name[: -len("_number")]
-    return name
+    # Identity channels — set by ``_walk`` from the CLUSTER ParallelAxis.
+    phase_var: VarRef
+    number_var: VarRef
+    original_var: VarRef
 
 
 # ---------------------------------------------------------------------------
@@ -115,14 +120,15 @@ def _strip_number_suffix(name: str) -> str:
 
 
 def _subst_lane_var(idx, ctx: _ClusterCtx):
-    """Recursively rewrite an IndexExpr: any string == original lane
-    axis name (e.g. ``"by"``) becomes the composite expression."""
-    if isinstance(idx, str) and idx == ctx.original_axis_name:
+    """Recursively rewrite an IndexExpr: any ``VarRef`` matching the
+    original lane axis (by identity) becomes the composite
+    ``phase + number * cluster_count`` expression."""
+    if isinstance(idx, VarRef) and idx == ctx.original_var:
         return {
             "op": "add",
             "args": [
-                ctx.phase_name,
-                {"op": "mul", "args": [ctx.number_name, ctx.cluster_count]},
+                ctx.phase_var,
+                {"op": "mul", "args": [ctx.number_var, ctx.cluster_count]},
             ],
         }
     if isinstance(idx, dict):
@@ -173,6 +179,13 @@ def _forced_view_kind(buf: BufferDef) -> Optional[str]:
         a full lane width, so head-pack vs head-stack are equivalent).
       * 0 < D < MLEN   → must be BSHD; the innermost dim is sub-lane
         (typically hlen) so heads have to be col-packed.
+
+    Invariant: this is called inside the view pass, between split
+    (which prepends the lane axis at position 0 and sets cluster_dim=0)
+    and burn_view (which is what actually permutes physical shape).
+    So ``shape[-1]`` is the original innermost D axis at this point.
+    The lookup would have to switch to ``cluster_dim``-aware indexing
+    if this helper ever moved downstream of burn_view.
     """
     rank = len(buf.shape)
     if rank <= 2:
@@ -195,7 +208,7 @@ def _rewrite_lane_ref(ref: BufferRef, ctx: _ClusterCtx,
     row-only buffers force identity, sub-MLEN D forces BSHD) — see
     ``_forced_view_kind``.
     """
-    new_indices = [ctx.phase_name] + list(ref.indices)
+    new_indices = [ctx.phase_var] + list(ref.indices)
     rank = len(new_indices)
     forced = _forced_view_kind(ref.buffer)
     effective = forced if forced is not None else view_kind
@@ -212,6 +225,34 @@ def _rewrite_lane_ref(ref: BufferRef, ctx: _ClusterCtx,
     )
 
 
+def _axes_after_lane_rewrite(
+    pre_axes: List[AxisInfo],
+    ref: BufferRef,
+    ctx: _ClusterCtx,
+    view_kind: str,
+) -> List[AxisInfo]:
+    """Mirror ``_rewrite_lane_ref`` on the per-axis info table.
+
+    ``_rewrite_lane_ref`` only *prepends* the cluster phase to
+    ``indices`` and stamps ``view_perm`` — it does NOT permute
+    indices. burn_view is the pass that bakes view_perm into both
+    Buffer.shape and ref.indices; the axes list must follow the same
+    schedule, so this helper only prepends the CLUSTER entry. The
+    permute on axes happens in burn_view alongside the index permute.
+    """
+    return [
+        AxisInfo(role=AxisRole.CLUSTER, extent=int(ctx.cluster_count))
+    ] + list(pre_axes)
+
+
+def _axes_after_global_rewrite(
+    pre_axes: List[AxisInfo],
+) -> List[AxisInfo]:
+    """Global refs are unchanged by view (no phase prepend, no view_perm).
+    Just return a shallow copy so downstream mutations don't alias."""
+    return list(pre_axes)
+
+
 def _rewrite_ref(ref: BufferRef, ctx: _ClusterCtx,
                  view_kind: str) -> BufferRef:
     # ``global`` / ``global.vram`` / ``global.mram`` / ``global.fpram``:
@@ -222,6 +263,28 @@ def _rewrite_ref(ref: BufferRef, ctx: _ClusterCtx,
     if ref.buffer.scope == "global" or ref.buffer.scope.startswith("global."):
         return _rewrite_global_ref(ref, ctx)
     return _rewrite_lane_ref(ref, ctx, view_kind)
+
+
+def _rewrite_ref_with_axes(
+    ref: BufferRef, pre_axes: List[AxisInfo],
+    ctx: _ClusterCtx, view_kind: str,
+) -> Tuple[BufferRef, List[AxisInfo]]:
+    """Run the same rewrite the ref undergoes on its axes table.
+
+    Keeps the two channels (physical buffer view + per-op axis roles)
+    in lock-step: a cluster phase prepended to the ref's indices also
+    prepends a CLUSTER ``AxisInfo`` to its axes; a permute on
+    ``view_perm`` permutes axes the same way.
+    """
+    is_global = (
+        ref.buffer.scope == "global" or ref.buffer.scope.startswith("global.")
+    )
+    if is_global:
+        return _rewrite_global_ref(ref, ctx), _axes_after_global_rewrite(pre_axes)
+    return (
+        _rewrite_lane_ref(ref, ctx, view_kind),
+        _axes_after_lane_rewrite(pre_axes, ref, ctx, view_kind),
+    )
 
 
 def _rewrite_src(src, ctx: _ClusterCtx, view_kind: str):
@@ -238,6 +301,24 @@ def _rewrite_src(src, ctx: _ClusterCtx, view_kind: str):
             broadcast_dims=new_dims,
         )
     return _rewrite_ref(src, ctx, view_kind)
+
+
+def _rewrite_src_with_axes(
+    src, pre_axes: List[AxisInfo],
+    ctx: _ClusterCtx, view_kind: str,
+):
+    """Axes-aware src rewrite that mirrors ``_rewrite_src``.
+
+    Returns ``(new_src, new_axes)``. For Broadcast srcs, the wrapped
+    BufferRef's axes are rewritten the same way as a plain ref's.
+    """
+    if isinstance(src, Broadcast):
+        new_dims = [d + 1 for d in src.broadcast_dims]
+        new_inner, new_axes = _rewrite_ref_with_axes(
+            src.src, pre_axes, ctx, view_kind,
+        )
+        return Broadcast(src=new_inner, broadcast_dims=new_dims), new_axes
+    return _rewrite_ref_with_axes(src, pre_axes, ctx, view_kind)
 
 
 # ---------------------------------------------------------------------------
@@ -304,23 +385,25 @@ def _view_kind_for(op_key: str, position: str) -> str:
 
 def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
     if isinstance(op, Dma):
+        kv_src = _view_kind_for("Dma", "src")
+        kv_dst = _view_kind_for("Dma", "dst")
+        new_src, new_src_axes = _rewrite_ref_with_axes(op.src, op.src_axes, ctx, kv_src)
+        new_dst, new_dst_axes = _rewrite_ref_with_axes(op.dst, op.dst_axes, ctx, kv_dst)
         return Dma(
-            src=_rewrite_ref(op.src, ctx, _view_kind_for("Dma", "src")),
-            dst=_rewrite_ref(op.dst, ctx, _view_kind_for("Dma", "dst")),
-            marker=op.marker,
-            can_async=op.can_async,
+            src=new_src, dst=new_dst,
+            src_axes=new_src_axes, dst_axes=new_dst_axes,
+            marker=op.marker, can_async=op.can_async,
         )
     if isinstance(op, Gemm):
         key = _gemm_kind_key(op)
+        new_a, new_a_axes = _rewrite_ref_with_axes(op.a, op.a_axes, ctx, _view_kind_for(key, "a"))
+        new_b, new_b_axes = _rewrite_ref_with_axes(op.b, op.b_axes, ctx, _view_kind_for(key, "b"))
+        new_c, new_c_axes = _rewrite_ref_with_axes(op.c, op.c_axes, ctx, _view_kind_for(key, "c"))
         return Gemm(
-            a=_rewrite_ref(op.a, ctx, _view_kind_for(key, "a")),
-            b=_rewrite_ref(op.b, ctx, _view_kind_for(key, "b")),
-            c=_rewrite_ref(op.c, ctx, _view_kind_for(key, "c")),
-            transpose_a=op.transpose_a,
-            transpose_b=op.transpose_b,
-            kind=op.kind,
-            marker=op.marker,
-            can_async=op.can_async,
+            a=new_a, b=new_b, c=new_c,
+            a_axes=new_a_axes, b_axes=new_b_axes, c_axes=new_c_axes,
+            transpose_a=op.transpose_a, transpose_b=op.transpose_b,
+            kind=op.kind, marker=op.marker, can_async=op.can_async,
         )
     if isinstance(op, Elementwise):
         # View follows the dst buffer's anchor: if dst was anchored to
@@ -328,27 +411,30 @@ def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
         # honor that. Otherwise default to BSHD — both pure ew (v_add)
         # and broadcast ew (row_*_fp_at) accept BSHD freely.
         view = "BHSD" if op.dst.buffer.name in bhsd_buffers else "BSHD"
+        new_dst, new_dst_axes = _rewrite_ref_with_axes(op.dst, op.dst_axes, ctx, view)
+        new_srcs: list = []
+        new_src_axes: list = []
+        for s, sa in zip(op.srcs, op.src_axes or [[]] * len(op.srcs)):
+            new_s, new_sa = _rewrite_src_with_axes(s, sa, ctx, view)
+            new_srcs.append(new_s)
+            new_src_axes.append(new_sa)
         return Elementwise(
-            dst=_rewrite_ref(op.dst, ctx, view),
-            srcs=[_rewrite_src(s, ctx, view) for s in op.srcs],
-            op=op.op,
-            axis=op.axis,
-            size=op.size,
-            marker=op.marker,
-            can_async=op.can_async,
+            dst=new_dst, srcs=new_srcs, op=op.op,
+            dst_axes=new_dst_axes, src_axes=new_src_axes,
+            axis=op.axis, size=op.size,
+            marker=op.marker, can_async=op.can_async,
         )
     if isinstance(op, Reduce):
         # Reduce src is what determines layout (the row-reducible
         # buffer). If src is BHSD-anchored (BTMM output) → BHSD; else
         # BSHD.
         view = "BHSD" if op.src.buffer.name in bhsd_buffers else "BSHD"
+        new_dst, new_dst_axes = _rewrite_ref_with_axes(op.dst, op.dst_axes, ctx, view)
+        new_src, new_src_axes = _rewrite_ref_with_axes(op.src, op.src_axes, ctx, view)
         return Reduce(
-            dst=_rewrite_ref(op.dst, ctx, view),
-            src=_rewrite_ref(op.src, ctx, view),
-            op=op.op,
-            axis=op.axis,
-            marker=op.marker,
-            can_async=op.can_async,
+            dst=new_dst, src=new_src, op=op.op, axis=op.axis,
+            dst_axes=new_dst_axes, src_axes=new_src_axes,
+            marker=op.marker, can_async=op.can_async,
         )
     if isinstance(op, RawStore):
         # RawStore is opaque; don't rewrite. (And it shouldn't appear
@@ -369,12 +455,49 @@ def _walk(stmt: Stmt, ctx: Optional[_ClusterCtx], bhsd_buffers: set) -> Stmt:
                 raise ViewError(
                     f"cluster {stmt.axis_name!r} has no parent_grid_axis_name"
                 )
+            original = stmt.original_axis_name
+            if original is None:
+                raise ViewError(
+                    f"cluster {stmt.axis_name!r} missing original_axis_name; "
+                    f"pass_3_split should have set it"
+                )
+            # Identity channel from pass_3_split: phase axis carries
+            # axis_var (phase var) + original_axis_var (pre-split user
+            # var). Number var must be looked up by name from the
+            # surrounding scope (the matching ``*_number`` axis), but
+            # we only need the VarRef — we don't have it in scope here,
+            # so we capture it from a sibling lookup during walking.
+            # In practice the number ParallelAxis is the *parent* of
+            # this CLUSTER node (split emits ``number -> phase`` nesting),
+            # so by the time we hit the CLUSTER node we passed through
+            # the number axis. We grab its axis_var via a small
+            # side-channel: walk-time companion below.
+            if stmt.axis_var is None:
+                raise ViewError(
+                    f"cluster {stmt.axis_name!r} missing axis_var; "
+                    f"pass_3_split should have set it"
+                )
+            if stmt.original_axis_var is None:
+                raise ViewError(
+                    f"cluster {stmt.axis_name!r} missing original_axis_var; "
+                    f"pass_3_split should have set it"
+                )
+            number_var = _NUMBER_VAR_BY_NAME.get(stmt.parent_grid_axis_name)
+            if number_var is None:
+                raise ViewError(
+                    f"cluster {stmt.axis_name!r}: parent number axis "
+                    f"{stmt.parent_grid_axis_name!r} not visited before "
+                    f"this CLUSTER (axis_var lookup failed). Did split "
+                    f"break the number-outside / phase-inside nesting?"
+                )
             new_ctx = _ClusterCtx(
                 phase_name=stmt.axis_name,
                 number_name=stmt.parent_grid_axis_name,
                 cluster_count=stmt.extent,
-                original_axis_name=_strip_number_suffix(
-                    stmt.parent_grid_axis_name),
+                original_axis_name=original,
+                phase_var=stmt.axis_var,
+                number_var=number_var,
+                original_var=stmt.original_axis_var,
             )
             return ParallelAxis(
                 axis_name=stmt.axis_name,
@@ -383,7 +506,14 @@ def _walk(stmt: Stmt, ctx: Optional[_ClusterCtx], bhsd_buffers: set) -> Stmt:
                 kind=stmt.kind,
                 thread_tag=stmt.thread_tag,
                 parent_grid_axis_name=stmt.parent_grid_axis_name,
+                original_axis_name=stmt.original_axis_name,
+                axis_var=stmt.axis_var,
+                original_axis_var=stmt.original_axis_var,
             )
+        # Non-cluster ParallelAxis. Record axis_var by name so a nested
+        # CLUSTER can find its number-axis identity later.
+        if stmt.axis_var is not None:
+            _NUMBER_VAR_BY_NAME[stmt.axis_name] = stmt.axis_var
         return ParallelAxis(
             axis_name=stmt.axis_name,
             extent=stmt.extent,
@@ -391,6 +521,9 @@ def _walk(stmt: Stmt, ctx: Optional[_ClusterCtx], bhsd_buffers: set) -> Stmt:
             kind=stmt.kind,
             thread_tag=stmt.thread_tag,
             parent_grid_axis_name=stmt.parent_grid_axis_name,
+            original_axis_name=stmt.original_axis_name,
+            axis_var=stmt.axis_var,
+            original_axis_var=stmt.original_axis_var,
         )
     if isinstance(stmt, For):
         return For(
@@ -398,6 +531,7 @@ def _walk(stmt: Stmt, ctx: Optional[_ClusterCtx], bhsd_buffers: set) -> Stmt:
             extent=stmt.extent,
             body=[_walk(s, ctx, bhsd_buffers) for s in stmt.body],
             kind=stmt.kind,
+            loop_var_var=stmt.loop_var_var,
         )
     if isinstance(stmt, Async):
         return Async(
@@ -496,6 +630,7 @@ def run(func: MidFunc) -> MidFunc:
     Errors on globally-inconsistent views."""
     if should_skip_cluster(func):
         return func
+    _NUMBER_VAR_BY_NAME.clear()
     bhsd_buffers = _collect_bhsd_buffers(func.body)
     new_body = [_walk(s, ctx=None, bhsd_buffers=bhsd_buffers) for s in func.body]
     new_func = MidFunc(

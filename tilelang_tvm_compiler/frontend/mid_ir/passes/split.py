@@ -72,9 +72,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from tvm import tir as _tir
+
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    BufferDef, BufferRef, Slice,
+    BufferDef, BufferRef, Slice, VarRef,
     Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
@@ -171,10 +173,18 @@ def _swap_src(src, ctx: _Ctx):
 
 
 def _walk_stmt(stmt: Stmt, ctx: _Ctx) -> Stmt:
+    # NOTE: split rewrites BufferDef shapes (prepends cluster dim) but
+    # intentionally leaves BufferRef.indices alone — async_wrap is the
+    # pass that adds the corresponding ``by_phase`` index later. Since
+    # ``axes`` are aligned to ``indices`` (one entry per index), they
+    # transparently survive split. We deep-copy them so downstream
+    # mutations don't alias the originals.
     if isinstance(stmt, Dma):
         return Dma(
             src=_swap_ref(stmt.src, ctx),
             dst=_swap_ref(stmt.dst, ctx),
+            src_axes=list(stmt.src_axes),
+            dst_axes=list(stmt.dst_axes),
             marker=stmt.marker,
             can_async=stmt.can_async,
         )
@@ -186,6 +196,9 @@ def _walk_stmt(stmt: Stmt, ctx: _Ctx) -> Stmt:
             transpose_a=stmt.transpose_a,
             transpose_b=stmt.transpose_b,
             kind=stmt.kind,
+            a_axes=list(stmt.a_axes),
+            b_axes=list(stmt.b_axes),
+            c_axes=list(stmt.c_axes),
             marker=stmt.marker,
             can_async=stmt.can_async,
         )
@@ -194,6 +207,8 @@ def _walk_stmt(stmt: Stmt, ctx: _Ctx) -> Stmt:
             dst=_swap_ref(stmt.dst, ctx),
             srcs=[_swap_src(s, ctx) for s in stmt.srcs],
             op=stmt.op,
+            dst_axes=list(stmt.dst_axes),
+            src_axes=[list(s) for s in stmt.src_axes],
             axis=stmt.axis,
             size=stmt.size,
             marker=stmt.marker,
@@ -205,6 +220,8 @@ def _walk_stmt(stmt: Stmt, ctx: _Ctx) -> Stmt:
             src=_swap_ref(stmt.src, ctx),
             op=stmt.op,
             axis=stmt.axis,
+            dst_axes=list(stmt.dst_axes),
+            src_axes=list(stmt.src_axes),
             marker=stmt.marker,
             can_async=stmt.can_async,
         )
@@ -221,6 +238,7 @@ def _walk_stmt(stmt: Stmt, ctx: _Ctx) -> Stmt:
             extent=stmt.extent,
             body=[_walk_stmt(s, ctx) for s in stmt.body],
             kind=stmt.kind,
+            loop_var_var=stmt.loop_var_var,
         )
     if isinstance(stmt, Async):
         return Async(
@@ -231,6 +249,7 @@ def _walk_stmt(stmt: Stmt, ctx: _Ctx) -> Stmt:
         return MultiLaneOp(
             inner=_walk_stmt(stmt.inner, ctx),
             cluster_axis_names=list(stmt.cluster_axis_names),
+            cluster_axis_vars=list(stmt.cluster_axis_vars),
             dim_map=dict(stmt.dim_map),
         )
     raise SplitError(f"unhandled stmt type {type(stmt).__name__}")
@@ -242,7 +261,15 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
     The number axis preserves the source kind (BLOCK_IDX stays
     BLOCK_IDX, LOGICAL_GRID stays LOGICAL_GRID); the phase axis
     becomes CLUSTER and back-references the number axis name via
-    ``parent_grid_axis_name``."""
+    ``parent_grid_axis_name``.
+
+    Identity channel: we mint *fresh* ``tir.Var`` objects for the phase
+    and number axes (no existing TIR var corresponds to them — they
+    didn't exist pre-split). ``original_axis_var`` on both new axes
+    points at the pre-split user var's :class:`VarRef`, taken from
+    ``stmt.axis_var`` so consumers can recognise references to the
+    original lane variable by identity.
+    """
     splittable_kinds = (ParallelKind.BLOCK_IDX, ParallelKind.LOGICAL_GRID)
     if stmt.kind in splittable_kinds and stmt.axis_name in ctx.lane_axes:
         idx = ctx.lane_axes.index(stmt.axis_name)
@@ -254,14 +281,35 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
             )
         outer_extent = stmt.extent // cluster
         inner_body = [_walk_stmt(s, ctx) for s in stmt.body]
-        number_name = f"{stmt.axis_name}_number"
+        original_name = stmt.axis_name
+        number_name = f"{original_name}_number"
+        phase_name = f"{original_name}_phase"
+        # Identity propagation: the user-written lane var (e.g. ``by``)
+        # came from fold and lives on ``stmt.axis_var``. Both halves of
+        # the split point back at it via ``original_axis_var`` so
+        # downstream identity checks can recognise references to the
+        # pre-split var even after we've replaced the axis with two new
+        # ones.
+        original_var_ref = stmt.axis_var
+        if original_var_ref is None:
+            raise SplitError(
+                f"split: lane-axis ParallelAxis {original_name!r} has no "
+                f"axis_var; fold must have populated it"
+            )
+        # Mint fresh tir.Vars for the phase / number axes; they didn't
+        # exist in the input TIR.
+        phase_var_obj = _tir.Var(phase_name, "int32")
+        number_var_obj = _tir.Var(number_name, "int32")
         phase_axis = ParallelAxis(
-            axis_name=f"{stmt.axis_name}_phase",
+            axis_name=phase_name,
             extent=cluster,
             body=inner_body,
             kind=ParallelKind.CLUSTER,
             thread_tag=None,
             parent_grid_axis_name=number_name,
+            original_axis_name=original_name,
+            axis_var=VarRef(phase_var_obj),
+            original_axis_var=original_var_ref,
         )
         number_axis = ParallelAxis(
             axis_name=number_name,
@@ -270,6 +318,9 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
             kind=stmt.kind,                 # BLOCK_IDX or LOGICAL_GRID
             thread_tag=stmt.thread_tag,     # only set for BLOCK_IDX
             parent_grid_axis_name=None,
+            original_axis_name=original_name,
+            axis_var=VarRef(number_var_obj),
+            original_axis_var=original_var_ref,
         )
         return number_axis
 
@@ -281,6 +332,9 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
         kind=stmt.kind,
         thread_tag=stmt.thread_tag,
         parent_grid_axis_name=stmt.parent_grid_axis_name,
+        original_axis_name=stmt.original_axis_name,
+        axis_var=stmt.axis_var,
+        original_axis_var=stmt.original_axis_var,
     )
 
 
@@ -327,6 +381,31 @@ def run(func: MidFunc,
     for buf in list(func.params) + list(func.allocs):
         if _is_lane_aware_buffer(buf) and buf.name not in grown:
             grown[buf.name] = _grow_buffer(buf, cluster_total)
+
+    # Sanity check: every name in lane_axes must correspond to a
+    # ParallelAxis in the body. Without this, a typo silently leaves
+    # the body unchanged — every downstream "this axis is the cluster
+    # axis" assumption then fails far away from the source.
+    found_axis_names: set = set()
+
+    def _collect_axis_names(stmt):
+        if isinstance(stmt, ParallelAxis):
+            found_axis_names.add(stmt.axis_name)
+            for c in stmt.body:
+                _collect_axis_names(c)
+        elif hasattr(stmt, "body") and isinstance(getattr(stmt, "body"), list):
+            for c in stmt.body:
+                _collect_axis_names(c)
+    for s in func.body:
+        _collect_axis_names(s)
+    missing = [n for n in func.lane_axes if n not in found_axis_names]
+    if missing:
+        raise SplitError(
+            f"lane_axes {missing!r} not found among the kernel's ParallelAxis "
+            f"names {sorted(found_axis_names)!r}. Did the kernel actually bind "
+            f"these axes via T.Kernel(...)? Mismatch would otherwise silently "
+            f"skip cluster split."
+        )
 
     ctx = _Ctx(
         cluster_counts=list(cluster_counts),

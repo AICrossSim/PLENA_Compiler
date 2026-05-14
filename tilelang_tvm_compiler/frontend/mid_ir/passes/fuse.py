@@ -38,7 +38,7 @@ from typing import Dict, List, Optional
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    BufferRef, Broadcast,
+    BufferRef, Broadcast, VarRef,
     Dma, Gemm, Elementwise, Reduce, RawStore,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
@@ -50,29 +50,37 @@ class FuseError(RuntimeError):
     pass
 
 
+# Per-``run`` lookup: name -> VarRef for non-cluster ParallelAxes. The
+# CLUSTER walker reads it to find its sibling number axis's identity.
+_NUMBER_VAR_BY_NAME: dict = {}
+
+
 @dataclass
 class _ClusterAxis:
     """One enclosing cluster axis as seen by fuse.
 
-    ``phase_name`` is the name of the cluster-phase ParallelAxis (e.g.
-    ``"by_phase"``); ``number_name`` is its sibling grid number axis
-    (``"by_number"``); ``count`` is the cluster width (lane count).
-    ``original_name`` is the user-visible lane axis (e.g. ``"by"``) —
-    derived from ``phase_name`` by stripping the ``"_phase"`` suffix,
-    matching pass_3_split's naming convention.
+    Names are kept for HLIR dump / API surfaces (``cluster_axis_names``
+    is a list of strings). Identity comparisons live on the VarRef
+    fields; ``_collapse_lane_axis`` only compares by identity.
 
     Used by ``_collapse_lane_axis`` to recognise both:
-      * Per-lane indices written as ``add(by_phase, mul(by_number, 4))``
-        (produced by pass_4b_view for non-global buffers).
-      * Bare-string ``"by"`` (kept verbatim for global / global.* refs
-        whose indices are never rewritten by view).
-    Both forms collapse to ``ranged_slice(mul(by_number, 4), 4)`` so
-    multi-lane sync ops read the full cluster's chunk in one go.
+      * Per-lane indices written as
+        ``add(phase_var, mul(number_var, count))`` (produced by
+        pass_4b_view for non-global buffers).
+      * Bare ``VarRef`` matching the original lane var
+        (``by``-equivalent), kept verbatim for global / global.* refs
+        whose indices view skipped.
+    Both forms collapse to ``ranged_slice(mul(number_var, count),
+    count)`` so multi-lane sync ops read the full cluster's chunk in
+    one go.
     """
     phase_name: str
     number_name: str
     count: int
     original_name: str
+    phase_var: VarRef
+    number_var: VarRef
+    original_var: VarRef
 
 
 # ---------------------------------------------------------------------------
@@ -106,20 +114,25 @@ def _build_dim_map(op, cluster_axis_names: List[str]) -> Dict[str, List[int]]:
     """For each non-global buffer the op touches, record the physical
     dims that map to each cluster axis (in cluster_axis_names order).
 
-    Today every cluster axis lands at physical dim 0 (pass_4b
-    prepends the phase index at index position 0). Multi-axis
-    cluster nests would prepend multiple times — outermost cluster
-    at dim 0, next at dim 1, etc. The list reflects that ordering.
+    Reads ``ref.buffer.cluster_dim`` directly — split sets it on
+    cluster-expanded buffers and view/burn_view permute it along with
+    any axis reshuffle. For ``global.*`` user caches (not
+    cluster-expanded), ``cluster_dim is None`` and the buffer is
+    excluded from the map.
     """
     n_axes = len(cluster_axis_names)
     out: Dict[str, List[int]] = {}
-    for ref in op.list_refs() if hasattr(op, "list_refs") else _collect_op_refs(op):
+    refs = op.list_refs() if hasattr(op, "list_refs") else _collect_op_refs(op)
+    for ref in refs:
         if ref.buffer.scope == "global":
             continue
-        # The convention: outermost cluster phase is at physical dim 0,
-        # next inner at dim 1, ... etc. So dim_map[name] = [0, 1, ...,
-        # n_axes-1] in cluster_axis_names' order.
-        out[ref.buffer.name] = list(range(n_axes))
+        cdim = ref.buffer.cluster_dim
+        if cdim is None:
+            continue
+        # Single-axis cluster today: emit ``[cdim]`` for every entry
+        # in cluster_axis_names. Multi-axis support would carry an
+        # ordered list on the BufferDef.
+        out[ref.buffer.name] = [cdim] * n_axes
     return out
 
 
@@ -136,17 +149,38 @@ def _walk(stmt: Stmt, cluster_stack: List[_ClusterAxis]) -> Stmt:
                     f"cluster axis {stmt.axis_name!r} missing "
                     f"parent_grid_axis_name; pass_3_split should have set it"
                 )
-            # Derive the user-visible original axis name from
-            # ``phase_name``: pass_3_split names the cluster phase as
-            # ``"{original}_phase"`` and the grid number as
-            # ``"{original}_number"``.
+            # Read the user-visible original axis name straight off the
+            # ParallelAxis (set by pass_3_split). Parsing string
+            # suffixes (``"_phase"`` / ``"_number"``) used to work but
+            # made the contract fragile against any future renaming
+            # scheme; ``original_axis_name`` is the explicit channel.
             phase = stmt.axis_name
-            original = phase[:-len("_phase")] if phase.endswith("_phase") else phase
+            original = stmt.original_axis_name
+            if original is None:
+                raise FuseError(
+                    f"cluster axis {phase!r} missing original_axis_name; "
+                    f"pass_3_split should have set it"
+                )
+            if stmt.axis_var is None or stmt.original_axis_var is None:
+                raise FuseError(
+                    f"cluster axis {phase!r}: identity fields "
+                    f"(axis_var / original_axis_var) must be set by split"
+                )
+            number_var = _NUMBER_VAR_BY_NAME.get(stmt.parent_grid_axis_name)
+            if number_var is None:
+                raise FuseError(
+                    f"cluster {phase!r}: number axis "
+                    f"{stmt.parent_grid_axis_name!r} VarRef not recorded; "
+                    f"split must emit ``number -> phase`` nesting"
+                )
             new_stack = cluster_stack + [_ClusterAxis(
                 phase_name=phase,
                 number_name=stmt.parent_grid_axis_name,
                 count=stmt.extent,
                 original_name=original,
+                phase_var=stmt.axis_var,
+                number_var=number_var,
+                original_var=stmt.original_axis_var,
             )]
             return ParallelAxis(
                 axis_name=stmt.axis_name,
@@ -155,7 +189,14 @@ def _walk(stmt: Stmt, cluster_stack: List[_ClusterAxis]) -> Stmt:
                 kind=stmt.kind,
                 thread_tag=stmt.thread_tag,
                 parent_grid_axis_name=stmt.parent_grid_axis_name,
+                original_axis_name=stmt.original_axis_name,
+                axis_var=stmt.axis_var,
+                original_axis_var=stmt.original_axis_var,
             )
+        # Non-cluster ParallelAxis. Record axis_var by name so a nested
+        # CLUSTER can pick up the matching number VarRef.
+        if stmt.axis_var is not None:
+            _NUMBER_VAR_BY_NAME[stmt.axis_name] = stmt.axis_var
         return ParallelAxis(
             axis_name=stmt.axis_name,
             extent=stmt.extent,
@@ -163,6 +204,9 @@ def _walk(stmt: Stmt, cluster_stack: List[_ClusterAxis]) -> Stmt:
             kind=stmt.kind,
             thread_tag=stmt.thread_tag,
             parent_grid_axis_name=stmt.parent_grid_axis_name,
+            original_axis_name=stmt.original_axis_name,
+            axis_var=stmt.axis_var,
+            original_axis_var=stmt.original_axis_var,
         )
     if isinstance(stmt, For):
         return For(
@@ -170,6 +214,7 @@ def _walk(stmt: Stmt, cluster_stack: List[_ClusterAxis]) -> Stmt:
             extent=stmt.extent,
             body=[_walk(s, cluster_stack) for s in stmt.body],
             kind=stmt.kind,
+            loop_var_var=stmt.loop_var_var,
         )
     if isinstance(stmt, Async):
         return _fuse_async(stmt, cluster_stack)
@@ -185,29 +230,30 @@ def _collapse_lane_axis(idx, axes: List[_ClusterAxis]):
     """Fold a per-lane index expression back into a cluster-wide
     ``ranged_slice``.
 
-    pass_4b_view turns the original lane var (e.g. ``"by"``) into
-    ``add(phase, mul(number, count))`` — that's the correct per-lane
-    expression for op kinds that fire once per lane (Reduce, Broadcast
-    Elementwise). For multi-lane ops (Async-wrapped DMA / btmm / pure
-    Elementwise) the cluster fires the op exactly once across all
-    lanes, so the same axis position should describe a span of
-    ``count`` consecutive lane indices starting at the cluster's base
-    — encoded as ``ranged_slice(mul(number, count), count)``.
+    pass_4b_view turns the original lane var (e.g. ``by``) into
+    ``add(phase_var, mul(number_var, count))`` — that's the correct
+    per-lane expression for op kinds that fire once per lane (Reduce,
+    Broadcast Elementwise). For multi-lane ops (Async-wrapped DMA /
+    btmm / pure Elementwise) the cluster fires the op exactly once
+    across all lanes, so the same axis position should describe a span
+    of ``count`` consecutive lane indices starting at the cluster's
+    base — encoded as ``ranged_slice(mul(number_var, count), count)``.
 
     Match the exact shape produced by ``_subst_lane_var``:
-        ``{"op": "add", "args": [phase_name_str,
+        ``{"op": "add", "args": [phase_var (VarRef),
                                  {"op": "mul", "args":
-                                  [number_name_str, count_int]}]}``
-    OR a bare ``"by"`` string (kept on global / global.* refs whose
-    indices view skipped). Anything else is left alone.
+                                  [number_var (VarRef), count_int]}]}``
+    OR a bare ``VarRef`` equal (by identity) to ``ax.original_var``
+    (kept on global / global.* refs whose indices view skipped).
+    Anything else is left alone.
     """
-    if isinstance(idx, str):
+    if isinstance(idx, VarRef):
         for ax in axes:
-            if idx == ax.original_name:
+            if idx == ax.original_var:
                 return {
                     "op": "ranged_slice",
                     "args": [
-                        {"op": "mul", "args": [ax.number_name, ax.count]},
+                        {"op": "mul", "args": [ax.number_var, ax.count]},
                         ax.count,
                     ],
                 }
@@ -216,18 +262,18 @@ def _collapse_lane_axis(idx, axes: List[_ClusterAxis]):
         return idx
     if idx.get("op") == "add":
         args = idx.get("args", [])
-        if len(args) == 2 and isinstance(args[0], str):
+        if len(args) == 2 and isinstance(args[0], VarRef):
             phase = args[0]
             inner = args[1]
             if (isinstance(inner, dict) and inner.get("op") == "mul"):
                 m_args = inner.get("args", [])
-                if (len(m_args) == 2 and isinstance(m_args[0], str)
+                if (len(m_args) == 2 and isinstance(m_args[0], VarRef)
                         and isinstance(m_args[1], int)):
                     number, count = m_args[0], m_args[1]
                     for ax in axes:
-                        if (ax.phase_name == phase
-                                and ax.number_name == number
-                                and ax.count == count):
+                        if (phase == ax.phase_var
+                                and number == ax.number_var
+                                and count == ax.count):
                             return {
                                 "op": "ranged_slice",
                                 "args": [
@@ -275,11 +321,19 @@ def _collapse_src(src, axes: List[_ClusterAxis]):
 
 def _collapse_lane_in_op(op, axes: List[_ClusterAxis]):
     """Rebuild ``op`` with HBM refs widened to cluster-wide ranged
-    slices. Only HBM refs are touched; on-chip refs are unchanged."""
+    slices. Only HBM refs are touched; on-chip refs are unchanged.
+
+    axes (per-axis info on each operand) are passed through verbatim
+    — collapsing HBM lane slices only changes ``indices``/extents at
+    the *value* level, not the axis-role tagging. axis-aware passes
+    that need the new extent should consult ``ref.buffer.shape``.
+    """
     if isinstance(op, Dma):
         return Dma(
             src=_collapse_ref(op.src, axes),
             dst=_collapse_ref(op.dst, axes),
+            src_axes=list(op.src_axes),
+            dst_axes=list(op.dst_axes),
             marker=op.marker,
             can_async=op.can_async,
         )
@@ -291,6 +345,9 @@ def _collapse_lane_in_op(op, axes: List[_ClusterAxis]):
             transpose_a=op.transpose_a,
             transpose_b=op.transpose_b,
             kind=op.kind,
+            a_axes=list(op.a_axes),
+            b_axes=list(op.b_axes),
+            c_axes=list(op.c_axes),
             marker=op.marker,
             can_async=op.can_async,
         )
@@ -299,6 +356,8 @@ def _collapse_lane_in_op(op, axes: List[_ClusterAxis]):
             dst=_collapse_ref(op.dst, axes),
             srcs=[_collapse_src(s, axes) for s in op.srcs],
             op=op.op,
+            dst_axes=list(op.dst_axes),
+            src_axes=[list(s) for s in op.src_axes],
             axis=op.axis,
             size=op.size,
             marker=op.marker,
@@ -334,9 +393,11 @@ def _fuse_async(stmt: Async, cluster_stack: List[_ClusterAxis]) -> Stmt:
         )
     inner = _collapse_lane_in_op(inner, cluster_stack)
     axis_names = [ax.phase_name for ax in cluster_stack]
+    axis_vars = [ax.phase_var for ax in cluster_stack]
     return MultiLaneOp(
         inner=inner,
         cluster_axis_names=axis_names,
+        cluster_axis_vars=axis_vars,
         dim_map=_build_dim_map(inner, axis_names),
     )
 
@@ -350,6 +411,7 @@ def run(func: MidFunc) -> MidFunc:
     """Collapse Async regions into MultiLaneOp nodes."""
     if should_skip_cluster(func):
         return func
+    _NUMBER_VAR_BY_NAME.clear()
     return MidFunc(
         name=func.name,
         params=list(func.params),

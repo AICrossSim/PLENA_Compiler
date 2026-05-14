@@ -51,6 +51,7 @@ from typing import Dict, List, Optional, Tuple
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
+    AxisRole, AxisInfo,
     BufferDef, BufferRef, Slice,
     Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
     For, Async, MultiLaneOp,
@@ -210,6 +211,28 @@ def _rewrite_ref(ref: BufferRef,
     )
 
 
+def _permute_axes(axes: List[AxisInfo], ref: BufferRef) -> List[AxisInfo]:
+    """Apply the same view_perm to the per-axis info that burn_view
+    applies to ref.indices. ``ref.view_perm`` is the perm; ``axes``
+    is in pre-permute (view-pass) order.
+
+    Returns the post-permute list. Length must equal ``len(ref.indices)``;
+    we accept and pass through a zero-length / mismatched list as
+    a transitional courtesy (so passes not yet axes-aware don't crash
+    the bake).
+    """
+    perm = ref.view_perm
+    if perm is None or not axes:
+        return list(axes)
+    if len(axes) != len(perm):
+        # Length mismatch usually indicates a producer pass hasn't been
+        # updated yet (axes still empty). Don't permute; downstream
+        # consumers will fall back to legacy guess and we'll catch the
+        # gap during verification.
+        return list(axes)
+    return [axes[i] for i in perm]
+
+
 def _rewrite_src(src, new_defs):
     if isinstance(src, Broadcast):
         return Broadcast(
@@ -224,6 +247,8 @@ def _rewrite_op(op, new_defs):
         return Dma(
             src=_rewrite_ref(op.src, new_defs),
             dst=_rewrite_ref(op.dst, new_defs),
+            src_axes=_permute_axes(op.src_axes, op.src),
+            dst_axes=_permute_axes(op.dst_axes, op.dst),
             marker=op.marker,
             can_async=op.can_async,
         )
@@ -235,14 +260,24 @@ def _rewrite_op(op, new_defs):
             transpose_a=op.transpose_a,
             transpose_b=op.transpose_b,
             kind=op.kind,
+            a_axes=_permute_axes(op.a_axes, op.a),
+            b_axes=_permute_axes(op.b_axes, op.b),
+            c_axes=_permute_axes(op.c_axes, op.c),
             marker=op.marker,
             can_async=op.can_async,
         )
     if isinstance(op, Elementwise):
+        # Permute per-src axes using each src's own view_perm.
+        new_src_axes = []
+        for s, sa in zip(op.srcs, op.src_axes or [[]] * len(op.srcs)):
+            inner = s.src if isinstance(s, Broadcast) else s
+            new_src_axes.append(_permute_axes(sa, inner))
         return Elementwise(
             dst=_rewrite_ref(op.dst, new_defs),
             srcs=[_rewrite_src(s, new_defs) for s in op.srcs],
             op=op.op,
+            dst_axes=_permute_axes(op.dst_axes, op.dst),
+            src_axes=new_src_axes,
             axis=op.axis,
             size=op.size,
             marker=op.marker,
@@ -254,6 +289,8 @@ def _rewrite_op(op, new_defs):
             src=_rewrite_ref(op.src, new_defs),
             op=op.op,
             axis=op.axis,
+            dst_axes=_permute_axes(op.dst_axes, op.dst),
+            src_axes=_permute_axes(op.src_axes, op.src),
             marker=op.marker,
             can_async=op.can_async,
         )
@@ -274,6 +311,9 @@ def _walk(stmt: Stmt, new_defs: Dict[str, BufferDef]) -> Stmt:
             kind=stmt.kind,
             thread_tag=stmt.thread_tag,
             parent_grid_axis_name=stmt.parent_grid_axis_name,
+            original_axis_name=stmt.original_axis_name,
+            axis_var=stmt.axis_var,
+            original_axis_var=stmt.original_axis_var,
         )
     if isinstance(stmt, For):
         return For(
@@ -281,6 +321,7 @@ def _walk(stmt: Stmt, new_defs: Dict[str, BufferDef]) -> Stmt:
             extent=stmt.extent,
             body=[_walk(s, new_defs) for s in stmt.body],
             kind=stmt.kind,
+            loop_var_var=stmt.loop_var_var,
         )
     if isinstance(stmt, Async):
         return Async(
@@ -291,6 +332,7 @@ def _walk(stmt: Stmt, new_defs: Dict[str, BufferDef]) -> Stmt:
         return MultiLaneOp(
             inner=_rewrite_op(stmt.inner, new_defs),
             cluster_axis_names=list(stmt.cluster_axis_names),
+            cluster_axis_vars=list(stmt.cluster_axis_vars),
             dim_map=dict(stmt.dim_map),
         )
     return _rewrite_op(stmt, new_defs)

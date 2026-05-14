@@ -201,7 +201,7 @@ class AddressAllocationPass:
                 # ``T.func_attr({"plena.layout": ...})``) controls how
                 # the 4D axes map to the canonical (B, S, H, D) tile
                 # roles.
-                if len(buf.shape) == 4:
+                if len(buf.shape) == 4 and not buf.is_pinned_global:
                     buf.tile_layout = _hlir.make_tile_layout(
                         shape=tuple(int(x) for x in buf.shape),
                         layout=buf.layout,
@@ -210,7 +210,7 @@ class AddressAllocationPass:
             elif phys == _scope.MRAM:
                 buf.address = mram_cur
                 mram_cur += buf.num_elements
-                if len(buf.shape) == 4:
+                if len(buf.shape) == 4 and not buf.is_pinned_global:
                     buf.tile_layout = _hlir.make_tile_layout(
                         shape=tuple(int(x) for x in buf.shape),
                         layout=buf.layout,

@@ -838,6 +838,8 @@ class ISAEmitter:
         dst_row_stride: Optional[int] = None,
         task_id: str = "matmul",
         scratch_regs: Optional[List[int]] = None,
+        transpose_b: bool = False,
+        unroll_loops: bool = False,
     ) -> None:
         """Unified `(M, K) @ (K, N) -> (M, N)` matmul.
 
@@ -845,6 +847,14 @@ class ISAEmitter:
         BLEN×BLEN sub-tile is produced by K_tiles `M_MM` issuances followed
         by one `M_MM_WO`. No software scratch / v_add is needed for K
         accumulation.
+
+        When ``transpose_b=True``, B is expected in MRAM as ``(N, K)``
+        row-major (matches the nn.Linear weight convention). The inner
+        op switches from ``M_MM`` to ``M_TMM`` which transposes the
+        (mlen, mlen) MRAM tile on the fly, and the per-N column
+        sub-tile step changes from ``blen`` (columns of (K, N)) to
+        ``blen * mlen`` (rows of (N, K)) — sim enforces the latter via
+        ``mat_offset.assert_multiple_of(mlen)`` inside ``M_TMM``.
 
         Shape constraints:
           M : multiple of mlen,  M_tiles = M / mlen
@@ -890,10 +900,21 @@ class ISAEmitter:
             lhs_k_tile_stride = mlen * mlen
         if lhs_m_tile_stride is None:
             lhs_m_tile_stride = K_tiles * mlen * mlen
+        # When ``transpose_b`` is set, B is laid out as ``(N, K)`` —
+        # tiles are packed N-major (one full K-row of mlen-tiles per
+        # N-mlen step). When unset, B is ``(K, N)`` and tiles are
+        # packed K-major. The inner-tile layout stays row-major in both
+        # cases; M_TMM transposes the (mlen, mlen) tile on the fly.
         if rhs_n_mlen_tile_stride is None:
-            rhs_n_mlen_tile_stride = mlen * mlen
+            if transpose_b:
+                rhs_n_mlen_tile_stride = K_tiles * mlen * mlen
+            else:
+                rhs_n_mlen_tile_stride = mlen * mlen
         if rhs_k_tile_stride is None:
-            rhs_k_tile_stride = N_mlen_tiles * mlen * mlen
+            if transpose_b:
+                rhs_k_tile_stride = mlen * mlen
+            else:
+                rhs_k_tile_stride = N_mlen_tiles * mlen * mlen
         if dst_row_stride is None:
             dst_row_stride = N
         if dst_m_tile_stride is None:
@@ -901,7 +922,16 @@ class ISAEmitter:
 
         tiles_per_mlen = mlen // blen
         a_orow_step = blen * mlen
-        c_orow_step = blen * int(dst_row_stride)
+        # M_MM_WO writes 4 rows (i=0..blen-1) at vram[vec_base + i*mlen]
+        # — physical row stride is always mlen, regardless of how dense
+        # the dst's logical N maps inside each mlen-row (e.g. N=16 with
+        # 4 lanes packed: 4 cols per lane stored together inside one
+        # mlen-row). The outer orow advance must therefore step by
+        # ``blen * mlen`` to jump 4 physical mlen-rows; the previous
+        # ``blen * dst_row_stride`` formula collapsed to a 1-mlen-row
+        # step for narrow N (≤ mlen) and made the kernel re-write the
+        # same mlen-rows repeatedly.
+        c_orow_step = blen * mlen
 
         ra = self.program.compiler.register_allocator
         # Caller can pre-allocate the 7 scratch GPs (and pin them) so they're
@@ -946,6 +976,18 @@ class ISAEmitter:
                 )
                 cols_here = min(mlen, N - n_mlen * mlen)
                 tiles_per_n_mlen = cols_here // blen
+                # Per-oc B offset within the current (mlen, mlen) tile:
+                #   M_MM picks (mlen, blen) columns at byte stride blen.
+                #   M_TMM picks blen ROWS (transposed -> the same blen
+                #   columns of B^T) at byte stride mlen*blen — sim asserts
+                #   ``mat_offset / mlen ∈ [0, mlen)`` after the inner
+                #   ``assert_multiple_of(mlen)``, so the per-row scale is
+                #   exactly mlen.
+                oc_b_step = blen * mlen if transpose_b else blen
+                # Matmul opcode: M_TMM transposes the (mlen, mlen) MRAM
+                # tile on the fly; its (rs1, rs2) order is also swapped
+                # vs M_MM (rs1 = vram_lhs, rs2 = mram_rhs).
+                mm_opcode = "M_TMM" if transpose_b else "M_MM"
                 for oc in range(tiles_per_n_mlen):
                     dst_col = n_mlen * mlen + oc * blen
                     if lhs_offset_reg is not None:
@@ -965,20 +1007,103 @@ class ISAEmitter:
                             f"S_ADDI_INT gp{gp_out_orow}, gp0, "
                             f"{dst_m_base_static_full + dst_col}"
                         )
+
+                    if unroll_loops:
+                        # Fully unrolled body: emit ``tiles_per_mlen``
+                        # copies of the (K_tiles M_MM + M_MM_WO) cell,
+                        # each with its own static lhs_act / mat base.
+                        # No C_LOOP nesting — diagnostic mode for the
+                        # debugger to read straight through.
+                        for orow in range(tiles_per_mlen):
+                            act_static = lhs_static_full + orow * a_orow_step
+                            dst_static = dst_m_base_static_full + dst_col + orow * c_orow_step
+                            if lhs_offset_reg is not None:
+                                act_dyn = lhs_static_dyn + orow * a_orow_step
+                                lines.append(
+                                    f"S_ADDI_INT gp{gp_act}, gp{lhs_offset_reg}, "
+                                    f"{act_dyn}"
+                                )
+                            else:
+                                lines.append(
+                                    f"S_ADDI_INT gp{gp_act}, gp0, {act_static}"
+                                )
+                            for k in range(K_tiles):
+                                act_k = act_static + k * int(lhs_k_tile_stride) - (orow * a_orow_step + lhs_static_full - lhs_static_full)
+                                # Recompute act/mat per k explicitly so
+                                # there is no incremental S_ADDI between
+                                # M_MMs (matches unroll-only style).
+                                if k > 0:
+                                    if lhs_offset_reg is not None:
+                                        lines.append(
+                                            f"S_ADDI_INT gp{gp_act}, "
+                                            f"gp{lhs_offset_reg}, "
+                                            f"{lhs_static_dyn + orow * a_orow_step + k * int(lhs_k_tile_stride)}"
+                                        )
+                                    else:
+                                        lines.append(
+                                            f"S_ADDI_INT gp{gp_act}, gp0, "
+                                            f"{act_static + k * int(lhs_k_tile_stride)}"
+                                        )
+                                mat_static = (
+                                    rhs_n_mlen_static_full
+                                    + oc * oc_b_step
+                                    + k * int(rhs_k_tile_stride)
+                                )
+                                if rhs_offset_reg is not None:
+                                    mat_dyn = (
+                                        rhs_n_mlen_static_dyn
+                                        + oc * oc_b_step
+                                        + k * int(rhs_k_tile_stride)
+                                    )
+                                    lines.append(
+                                        f"S_ADDI_INT gp{gp_mat}, "
+                                        f"gp{rhs_offset_reg}, {mat_dyn}"
+                                    )
+                                else:
+                                    lines.append(
+                                        f"S_ADDI_INT gp{gp_mat}, gp0, {mat_static}"
+                                    )
+                                if transpose_b:
+                                    lines.append(
+                                        f"M_TMM 0, gp{gp_act}, gp{gp_mat}"
+                                    )
+                                else:
+                                    lines.append(
+                                        f"M_MM 0, gp{gp_mat}, gp{gp_act}"
+                                    )
+                            if dst_offset_reg is not None:
+                                lines.append(
+                                    f"S_ADDI_INT gp{gp_out_orow}, "
+                                    f"gp{dst_offset_reg}, "
+                                    f"{dst_m_base_static_dyn + dst_col + orow * c_orow_step}"
+                                )
+                            else:
+                                lines.append(
+                                    f"S_ADDI_INT gp{gp_out_orow}, gp0, "
+                                    f"{dst_static}"
+                                )
+                            lines.append(
+                                f"M_MM_WO gp{gp_out_orow}, gp0, 0"
+                            )
+                        continue
+
                     lines.append(f"C_LOOP_START gp{gp_loop_orow}, {tiles_per_mlen}")
                     lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act_orow}, 0")
                     if rhs_offset_reg is not None:
                         lines.append(
                             f"S_ADDI_INT gp{gp_mat}, gp{rhs_offset_reg}, "
-                            f"{rhs_n_mlen_static_dyn + oc * blen}"
+                            f"{rhs_n_mlen_static_dyn + oc * oc_b_step}"
                         )
                     else:
                         lines.append(
                             f"S_ADDI_INT gp{gp_mat}, gp0, "
-                            f"{rhs_n_mlen_static_full + oc * blen}"
+                            f"{rhs_n_mlen_static_full + oc * oc_b_step}"
                         )
                     lines.append(f"C_LOOP_START gp{gp_loop_k}, {K_tiles}")
-                    lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
+                    if transpose_b:
+                        lines.append(f"M_TMM 0, gp{gp_act}, gp{gp_mat}")
+                    else:
+                        lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
                     lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {int(lhs_k_tile_stride)}")
                     lines.append(f"S_ADDI_INT gp{gp_mat}, gp{gp_mat}, {int(rhs_k_tile_stride)}")
                     lines.append(f"C_LOOP_END gp{gp_loop_k}")

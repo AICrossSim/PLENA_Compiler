@@ -80,7 +80,11 @@ class MarkError(RuntimeError):
 
 def _mark_dma(op: Dma) -> Dma:
     # DMA is always a single multi-lane HW instruction.
-    return Dma(src=op.src, dst=op.dst, marker=Marker.DMA, can_async=True)
+    return Dma(
+        src=op.src, dst=op.dst,
+        src_axes=list(op.src_axes), dst_axes=list(op.dst_axes),
+        marker=Marker.DMA, can_async=True,
+    )
 
 
 def _mark_gemm(op: Gemm) -> Gemm:
@@ -92,6 +96,9 @@ def _mark_gemm(op: Gemm) -> Gemm:
         a=op.a, b=op.b, c=op.c,
         transpose_a=op.transpose_a, transpose_b=op.transpose_b,
         kind=op.kind,
+        a_axes=list(op.a_axes),
+        b_axes=list(op.b_axes),
+        c_axes=list(op.c_axes),
         marker=Marker.BTMM if is_btmm else None,
         can_async=is_btmm,
     )
@@ -127,6 +134,8 @@ def _mark_elementwise(op: Elementwise) -> Elementwise:
     )
     return Elementwise(
         dst=op.dst, srcs=op.srcs, op=op.op, axis=op.axis, size=op.size,
+        dst_axes=list(op.dst_axes),
+        src_axes=[list(s) for s in op.src_axes],
         marker=Marker.LANE_OP,
         can_async=can_async,
     )
@@ -137,6 +146,8 @@ def _mark_reduce(op: Reduce) -> Reduce:
     # per-row, never async.
     return Reduce(
         dst=op.dst, src=op.src, op=op.op, axis=op.axis,
+        dst_axes=list(op.dst_axes),
+        src_axes=list(op.src_axes),
         marker=Marker.LANE_OP,
         can_async=False,
     )
@@ -164,6 +175,7 @@ def _walk(stmt: Stmt) -> Stmt:
             extent=stmt.extent,
             body=[_walk(s) for s in stmt.body],
             kind=stmt.kind,
+            loop_var_var=stmt.loop_var_var,
         )
     if isinstance(stmt, ParallelAxis):
         return ParallelAxis(
@@ -173,6 +185,9 @@ def _walk(stmt: Stmt) -> Stmt:
             kind=stmt.kind,
             thread_tag=stmt.thread_tag,
             parent_grid_axis_name=stmt.parent_grid_axis_name,
+            original_axis_name=stmt.original_axis_name,
+            axis_var=stmt.axis_var,
+            original_axis_var=stmt.original_axis_var,
         )
     if isinstance(stmt, Async):
         # mark runs before pass_4_async, so we don't expect Async here.
@@ -184,6 +199,7 @@ def _walk(stmt: Stmt) -> Stmt:
         return MultiLaneOp(
             inner=_walk(stmt.inner),
             cluster_axis_names=list(stmt.cluster_axis_names),
+            cluster_axis_vars=list(stmt.cluster_axis_vars),
             dim_map=dict(stmt.dim_map),
         )
     raise MarkError(f"unhandled stmt type {type(stmt).__name__}")

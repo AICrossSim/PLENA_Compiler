@@ -16,7 +16,8 @@ emitter contract is honoured.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Tuple
+import warnings
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import tvm
 from tvm import tir
@@ -138,15 +139,19 @@ class IsaEmitterPass:
             "mm_slot": self._emit_mm_slot,
             "matmul": self._emit_matmul,
             "mv": self._emit_mv,
-            # Whole-buffer (tile-wide) VRAM ops — one HLIR op walks
-            # every mlen-wide row of the dst buffer.
-            "tile_zero": self._emit_tile_zero,
-            "tile_add": self._emit_tile_add,
-            "tile_sub": self._emit_tile_sub,
-            "tile_mul": self._emit_tile_mul,
-            "tile_exp": self._emit_tile_exp,
-            "tile_reci": self._emit_tile_reci,
-            "tile_sqrt": self._emit_tile_sqrt,
+            # 1-D vector VRAM ops — each op handles ONE logical 1D
+            # vector of length ``n_elem``. The emitter unrolls it into
+            # ``ceil(n_elem / mlen)`` HW issues; multi-row tiles are
+            # expressed by the lowering wrapping ``v_*`` inside a
+            # ``for row`` so a 2-D tile becomes M explicit per-row
+            # vector ops in the HLIR.
+            "v_zero": self._emit_v_zero,
+            "v_add": self._emit_v_add,
+            "v_sub": self._emit_v_sub,
+            "v_mul": self._emit_v_mul,
+            "v_exp": self._emit_v_exp,
+            "v_reci": self._emit_v_reci,
+            "v_sqrt": self._emit_v_sqrt,
             "fp_copy_at": self._emit_fp_copy_at,
             "fp_zero_at": self._emit_fp_zero_at,
             "fp_add_at": self._emit_fp_add_at,
@@ -189,7 +194,8 @@ class IsaEmitterPass:
             "; ============================================================\n\n"
         )
 
-        for op in mod.ops:
+        ra = self.shim.compiler.register_allocator
+        for i, op in enumerate(mod.ops):
             handler = self._dispatch.get(op.kind)
             if handler is None:
                 raise IsaEmissionError(
@@ -197,7 +203,11 @@ class IsaEmitterPass:
                     f"Either add it to isa_pass dispatch table, or guard "
                     f"the op out of HLIR earlier."
                 )
-            handler(mod, op)
+            ra.push_site(f"op[{i}] {op.kind}")
+            try:
+                handler(mod, op)
+            finally:
+                ra.pop_site()
         self.shim.compiler.generated_code = _normalize_large_addi_immediates(
             self.shim.compiler.generated_code
         )
@@ -226,20 +236,33 @@ class IsaEmitterPass:
         role: str,
         row_expr,
         head_expr,
+        op_axes: Optional[Tuple[Tuple[str, int], ...]] = None,
     ) -> Tuple[tir.PrimExpr, tir.PrimExpr | None]:
         """Translate logical ``(head=H-idx, row=S-idx)`` coords on a
-        BSHD buffer into a physical vram-row index + optional V_MASK.
+        VRAM buffer into a physical vram-row index + optional V_MASK.
 
-        row_*_op cares only about the innermost ``D`` dim of the
-        buffer — everything to the left is just a flat row counter:
+        Driven by the per-op ``op_axes`` table that mid_ir → HLIR
+        lowering stamps on ``hlir.Op.buffer_axes``. Each entry pairs
+        a role string with the dim's extent:
 
-            flat_row = row * H + head   # (for rank>=3 BSHD)
-            flat_row = row              # (rank<3 fallback)
+            ``"simd"``     — innermost D / vector axis
+            ``"cluster"``  — lane / head axis
+            ``"batch"``    — row-fanout axis (rows OR degenerate
+                             leading B placeholder; pick the rows
+                             one by largest extent)
 
-        Dispatch on D:
+        Computation:
 
-          * ``D >= MLEN``: each ``flat_row`` is exactly one full mlen
-            vector. ``vram_row = flat_row``; no mask needed.
+            flat_row = row * row_stride + head * head_stride
+
+        where ``row_stride`` / ``head_stride`` is the product of every
+        physical dim's extent strictly inside that role's position
+        (i.e. between the role and the innermost dim).
+
+        Then:
+
+          * ``D >= MLEN`` and ``D % MLEN == 0``: each flat_row is one
+            full mlen vector. ``vram_row = flat_row``; no mask.
           * ``D < MLEN`` (``lane_count = MLEN/D``): ``lane_count``
             consecutive flat_rows pack into one mlen-row.
             ``vram_row = flat_row // lane_count``,
@@ -251,27 +274,58 @@ class IsaEmitterPass:
                 f"{op_kind} {role} buffer {buf.name!r}: empty shape"
             )
         mlen = int(self.shim.mlen)
-        d_dim = int(buf.shape[-1])
         rank = len(buf.shape)
 
-        # ``flat_row`` = row-major position across the non-D dims.
-        # ``head_expr`` indexes the cluster axis (lane) — its stride
-        # (in non-D logical-row units) is the product of every dim
-        # strictly between ``cluster_dim`` and the innermost ``D``.
-        # ``row_expr`` indexes the rows axis (BSHD S, typically
-        # ``len-3``) — its stride is the product of every dim between
-        # the rows axis and ``D``, which equals 1 for row-stacked
-        # buffers (rows directly before D) and ``H`` for col-packed
-        # ones (rows before H = lane = cluster_dim).
-        cluster_dim = buf.cluster_dim
-        if rank >= 3:
-            rows_axis = rank - 3  # canonical BSHD S position
+        if op_axes is None:
+            raise IsaEmissionError(
+                f"{op_kind} {role} buffer {buf.name!r}: op_axes required "
+                f"(callers must thread per-op axes from hlir.Op.buffer_axes "
+                f"so this resolver can locate the rows / cluster / D dim "
+                f"by role tag instead of guessing from shape)."
+            )
+        if len(op_axes) != rank:
+            raise IsaEmissionError(
+                f"{op_kind} {role} buffer {buf.name!r}: op_axes rank "
+                f"{len(op_axes)} doesn't match buffer rank {rank} "
+                f"(shape={list(buf.shape)} op_axes={list(op_axes)})"
+            )
+
+        # Locate dims by role. ``simd`` must exist and is the innermost
+        # vector axis. ``cluster`` is optional (rank-2 fragments don't
+        # have one). ``batch`` may appear multiple times — pick the one
+        # with the largest extent as the rows axis; extent-1 batch
+        # entries are pad-to-4D / cluster-expand placeholders.
+        d_axis: Optional[int] = None
+        cluster_dim: Optional[int] = None
+        rows_axis: Optional[int] = None
+        rows_extent = -1
+        for i, (role_name, _extent) in enumerate(op_axes):
+            if role_name == "simd":
+                d_axis = i
+            elif role_name == "cluster":
+                cluster_dim = i
+            elif role_name == "batch":
+                if int(_extent) > rows_extent:
+                    rows_extent = int(_extent)
+                    rows_axis = i
+        if d_axis is None:
+            raise IsaEmissionError(
+                f"{op_kind} {role} buffer {buf.name!r}: no ``simd`` axis "
+                f"in op_axes {list(op_axes)}"
+            )
+        d_dim = int(buf.shape[d_axis])
+
+        if rank >= 3 and rows_axis is not None:
             head_stride = 1
             if cluster_dim is not None:
-                for axis in range(cluster_dim + 1, rank - 1):
+                lo = min(cluster_dim, d_axis) + 1
+                hi = max(cluster_dim, d_axis)
+                for axis in range(lo, hi):
                     head_stride *= int(buf.shape[axis])
             row_stride = 1
-            for axis in range(rows_axis + 1, rank - 1):
+            lo = min(rows_axis, d_axis) + 1
+            hi = max(rows_axis, d_axis)
+            for axis in range(lo, hi):
                 row_stride *= int(buf.shape[axis])
             terms = []
             if head_stride == 1:
@@ -434,6 +488,464 @@ class IsaEmitterPass:
                 ra.unpin_gp(m.register)
                 m.release()
 
+    def _tile_layout_strides(self, buf: _hlir.Buffer):
+        """Element-strides for the 7D physical layout of a VRAM/MRAM buffer.
+
+        Mirrors the stride math ``_slice_tile_grid`` uses for the
+        ``tile_layout is not None`` branch but factored out so non-DMA
+        emitters can read it. Returns a dict::
+
+            {
+              "d_tiles":       outer d-tile count,
+              "s_tiles":       outer s-tile count,
+              "h_groups":      outer h-group count,
+              "logical_b":     batch count (almost always 1),
+              "mlen":          inner s-tile height,
+              "lane_count":    inner lane count (1 when D >= mlen),
+              "d_inner":       inner d width (mlen when D >= mlen),
+              "s_inner_stride": elements between consecutive s_inner rows
+                                in the same tile (= lane_count * d_inner),
+              "h_grp_stride":  elements between consecutive h_groups,
+              "s_tile_stride": elements between consecutive s_tiles,
+              "d_tile_stride": elements between consecutive d_tiles,
+            }
+
+        Buffers without a ``tile_layout`` (rank < 4, or 4D with
+        ``d_tiles == s_tiles == h_groups == logical_b == 1`` flattened
+        away upstream) get a ``None`` return — callers fall back to
+        their pre-7D row-major-flat path.
+        """
+        tl = getattr(buf, "tile_layout", None)
+        if tl is None:
+            return None
+        inner_d = int(tl.d_inner)
+        inner_lane = int(tl.lane_count) * inner_d
+        inner_s = int(tl.mlen) * inner_lane
+        b_stride = inner_s
+        inner_b = int(tl.logical_b) * inner_s
+        h_grp_stride = inner_b
+        s_tile_stride = int(tl.h_groups) * inner_b
+        d_tile_stride = int(tl.s_tiles) * s_tile_stride
+        return {
+            "d_tiles":        int(tl.d_tiles),
+            "s_tiles":        int(tl.s_tiles),
+            "h_groups":       int(tl.h_groups),
+            "logical_b":      int(tl.logical_b),
+            "mlen":           int(tl.mlen),
+            "lane_count":     int(tl.lane_count),
+            "d_inner":        int(tl.d_inner),
+            "s_inner_stride": inner_lane,
+            "h_grp_stride":   h_grp_stride,
+            "s_tile_stride":  s_tile_stride,
+            "d_tile_stride":  d_tile_stride,
+            "b_stride":       b_stride,
+        }
+
+    def _buffer_tile_grid_iter(self, buf: _hlir.Buffer):
+        """Yield every mlen-row of ``buf`` in physical address order.
+
+        For each ``(d_tile, s_tile, h_grp, b, s_inner)`` cell of the
+        buffer's 7D physical layout, yields
+        ``(d_tile, s_tile, h_grp, b, s_inner, phys_offset)`` where
+        ``phys_offset`` is in *elements* relative to ``buf.address``.
+        One yielded entry == one HW mlen-wide vector op
+        (``V_*_VV`` / ``V_*_VF`` / ``V_RED_*`` / ``V_EXP_V`` / etc.).
+
+        Walks the outer tile grid in physical-address order
+        (d_tile slowest, b fastest at the tile level), then steps
+        through s_inner inside each tile. ``s_inner`` covers
+        ``tl.mlen`` rows because each s_inner row is one HW vector
+        (its width is ``lane_count * d_inner == mlen`` by tile-layout
+        invariant). Use this in any emitter that wants to issue one
+        HW vector op per mlen-row covering the whole buffer (v_zero,
+        tile_add, tile_mul, …) — it hides the 7D layout behind one
+        loop and stays in lock-step with what ``_slice_tile_grid``
+        walks for DMAs.
+
+        Buffers that aren't 4D (no ``tile_layout``) raise — callers
+        with 1D / 2D scratch must use the legacy flat-offset
+        emitters; everything pad-to-4D'd by to_plena hits this path.
+        """
+        info = self._tile_layout_strides(buf)
+        if info is None:
+            raise IsaEmissionError(
+                f"_buffer_tile_grid_iter: buffer {buf.name!r} has no "
+                f"tile_layout (rank={len(buf.shape)}, shape={tuple(buf.shape)}) "
+                f"— this helper only handles 4D buffers; 1D/2D callers must "
+                f"stay on the flat-offset path."
+            )
+        s_inner_stride = info["s_inner_stride"]
+        for d_tile in range(info["d_tiles"]):
+            for s_tile in range(info["s_tiles"]):
+                for h_grp in range(info["h_groups"]):
+                    for b in range(info["logical_b"]):
+                        tile_base = (
+                            d_tile * info["d_tile_stride"]
+                            + s_tile * info["s_tile_stride"]
+                            + h_grp * info["h_grp_stride"]
+                            + b * info["b_stride"]
+                        )
+                        for s_inner in range(info["mlen"]):
+                            phys = tile_base + s_inner * s_inner_stride
+                            yield (d_tile, s_tile, h_grp, b,
+                                   s_inner, phys)
+
+    def _logical_to_phys_row_offset(
+        self,
+        buf: _hlir.Buffer,
+        region: _hlir.VramRegion,
+    ):
+        """Translate a single-row ``VramRegion`` into the physical
+        7D *mlen-row base* offset (in elements, relative to
+        ``buf.address``) plus an optional packed-head mask expression.
+
+        Returns ``(phys_offset_expr, mask_expr_or_None, info)``.
+
+        ``region`` must describe exactly one logical row:
+        ``extents = (..., 1, ..., 1, D_full)`` with non-D extents
+        equal to 1. ``starts`` is 4 entries in physical-axis order
+        (matching ``buf.shape``); the helper routes each entry to
+        the right stride **by the buffer's role tags**, so it works
+        for any lane-fusion mode:
+
+            * col_pack:  shape=(B=1, S, H=lane, D_narrow), cluster_dim=2
+              → starts[2] is the lane index, gets split into
+              (h_grp, lane); mask = 1 << lane.
+            * row_stack: shape=(B=lane, S, H=1, MLEN), cluster_dim=0
+              → starts[0] is the lane index, same split logic.
+            * bshd_lift / no cluster: cluster_dim is None, every
+              non-D, non-rows axis is either a B placeholder or H
+              placeholder; their starts contribute via the matching
+              stride (b_stride / h_grp_stride). lane_count == 1 here,
+              so mask_expr is None.
+        """
+        info = self._tile_layout_strides(buf)
+        if info is None:
+            raise IsaEmissionError(
+                f"_logical_to_phys_row_offset: buffer {buf.name!r} has no "
+                f"tile_layout (rank={len(buf.shape)}, shape={tuple(buf.shape)})"
+            )
+        mlen = info["mlen"]
+        lane_count = info["lane_count"]
+        if len(region.starts) != 4 or len(region.extents) != 4:
+            raise IsaEmissionError(
+                f"_logical_to_phys_row_offset: region {region.parent!r} "
+                f"must be 4D; got starts={tuple(region.starts)} "
+                f"extents={tuple(region.extents)}"
+            )
+
+        cluster_dim = getattr(buf, "cluster_dim", None)
+        rank = len(buf.shape)
+        d_axis = rank - 1
+
+        # Per-axis role assignment (matches the layout
+        # ``_hlir_axes_for_buffer`` produces in mid_ir): the innermost
+        # axis is "d", the cluster_dim (if set) is "lane", everything
+        # else is "batch". Among batch axes the one with the largest
+        # extent acts as "rows"; the rest are pad placeholders that
+        # carry a B=1 or H=1 stride term.
+        roles: List[str] = []
+        for i in range(rank):
+            if i == d_axis:
+                roles.append("d")
+            elif cluster_dim is not None and i == cluster_dim:
+                roles.append("lane")
+            else:
+                roles.append("batch")
+
+        def _to_expr(x):
+            if isinstance(x, int):
+                return tir.IntImm("int32", int(x))
+            return x
+
+        # Per-physical-axis "step one unit along this axis" stride
+        # table (in elements). Indexed by axis position the same way
+        # ``roles`` is, so any axis-handling branch (rows / lane /
+        # batch placeholder) can look up its stride without caring
+        # about which role label happens to live there. The S axis
+        # gets its s_inner_stride here; the s_tile/s_inner split
+        # for the multi-s_tile case is handled in the i==1 branch.
+        axis_stride = [
+            info["b_stride"],
+            info["s_inner_stride"],
+            info["h_grp_stride"],
+            1,
+        ]
+
+        # Per-axis stride contribution. We iterate physical axes
+        # in order so any 7D nuance (s_tile / s_inner split when
+        # s_tiles > 1) lives next to its axis's stride choice.
+        terms: List = []
+        mask_expr = None
+
+        for i, role in enumerate(roles):
+            start = _to_expr(region.starts[i])
+            if role == "d":
+                # D start is folded into d_tile bump by the caller's
+                # outer loop; the per-issue base is always at the
+                # logical row's d-tile=0 chunk. Non-zero d-starts are
+                # not supported here.
+                if not (isinstance(region.starts[i], (int, tir.IntImm))
+                        and (int(region.starts[i])
+                             if isinstance(region.starts[i], int)
+                             else int(region.starts[i].value)) == 0):
+                    raise IsaEmissionError(
+                        f"row_*_at on {buf.name!r}: d-axis start must be "
+                        f"0; got {region.starts[i]!r}"
+                    )
+                continue
+            if role == "lane":
+                # col_pack puts cluster_dim at axis 2 (H) with
+                # lane_count>1 (within-mlen packing); axis_stride[2] =
+                # h_grp_stride is correct there.
+                # row_stack puts cluster_dim at axis 0 (B) with
+                # lane_count==1 (no packed-head — d already fills mlen).
+                # Per the M_BMM_WO / M_BMV_WO hardware writeback in
+                # ``transactional_emulator/src/main.rs``, lane j's data
+                # lands at ``vec_base + j * (per_lane_elems)`` where
+                # per_lane_elems = product(shape[1:]) — i.e. the flat
+                # row-major stride for axis 0. For S=mlen this equals
+                # ``mlen*inner_lane = b_stride`` (default works); for
+                # S<mlen (flash_decode rows=1 S_loc) b_stride overshoots.
+                lane_stride = axis_stride[i]
+                if lane_count == 1 and i == 0:
+                    lane_stride = 1
+                    for dim in buf.shape[i + 1:]:
+                        lane_stride *= int(dim)
+                if lane_count > 1:
+                    h_grp = tir.floordiv(
+                        start, tir.IntImm("int32", lane_count),
+                    )
+                    lane = tir.floormod(
+                        start, tir.IntImm("int32", lane_count),
+                    )
+                    if lane_stride:
+                        terms.append(
+                            tir.Mul(h_grp,
+                                    tir.IntImm("int32", lane_stride))
+                        )
+                    mask_expr = tir.shift_left(
+                        tir.IntImm("int32", 1), lane,
+                    )
+                else:
+                    if lane_stride:
+                        terms.append(
+                            tir.Mul(start,
+                                    tir.IntImm("int32", lane_stride))
+                        )
+                continue
+            # role == "batch": could be the rows axis or a degenerate
+            # placeholder. The stride is determined by where this axis
+            # sits in the physical layout.
+            #
+            # Two physical positions matter:
+            #   * S row (s_inner inside an s_tile, multiplied by
+            #     ``s_inner_stride``). When s_tiles > 1 the value is
+            #     also split into (s_tile, s_inner).
+            #   * B placeholder (a leading batch dim). It rides on
+            #     ``b_stride``.
+            #   * H placeholder (when cluster_dim is at a different
+            #     position than this batch axis, e.g. row_stack puts
+            #     H=1 at axis 2 with role "batch"). It rides on
+            #     ``h_grp_stride``.
+            #
+            # We disambiguate by axis index: the axis index immediately
+            # before d_axis (or cluster_dim, whichever is later) is
+            # treated as H if it differs from the rows position. The
+            # leading axis is B. The S axis is the only batch axis
+            # whose extent in ``buf.shape`` matches a "real" rows
+            # dimension (not 1).
+            #
+            # In practice we route by axis index:
+            #   i == 0 and cluster_dim != 0 → B placeholder (b_stride)
+            #   i == 1 → S (s_inner_stride / s_tile_stride split)
+            #   i == 2 and cluster_dim != 2 → H placeholder (h_grp_stride)
+            if i == 0:
+                if info["b_stride"]:
+                    terms.append(
+                        tir.Mul(start, tir.IntImm("int32", info["b_stride"]))
+                    )
+            elif i == 1:
+                if info["s_tiles"] > 1:
+                    s_tile = tir.floordiv(start, tir.IntImm("int32", mlen))
+                    s_inner = tir.floormod(start, tir.IntImm("int32", mlen))
+                    terms.append(
+                        tir.Mul(s_tile,
+                                tir.IntImm("int32", info["s_tile_stride"]))
+                    )
+                    terms.append(
+                        tir.Mul(s_inner,
+                                tir.IntImm("int32", info["s_inner_stride"]))
+                    )
+                else:
+                    if info["s_inner_stride"] == 1:
+                        terms.append(start)
+                    else:
+                        terms.append(
+                            tir.Mul(start,
+                                    tir.IntImm("int32", info["s_inner_stride"]))
+                        )
+            elif i == 2:
+                if info["h_grp_stride"]:
+                    terms.append(
+                        tir.Mul(start,
+                                tir.IntImm("int32", info["h_grp_stride"]))
+                    )
+            else:
+                raise IsaEmissionError(
+                    f"row_*_at on {buf.name!r}: unexpected batch axis at "
+                    f"physical index {i}"
+                )
+
+        if not terms:
+            return tir.IntImm("int32", 0), mask_expr, info
+        expr = terms[0]
+        for t in terms[1:]:
+            expr = tir.Add(expr, t)
+        return expr, mask_expr, info
+
+    def _region_origin_offset(self, buf: _hlir.Buffer,
+                              region) -> "tir.PrimExpr | int":
+        """Translate a Region's ``starts`` into a physical element
+        offset against ``buf.address``.
+
+        Handles the cluster axis specially: when the cluster axis is
+        packed-head (``lane_count > 1``), an index value < lane_count
+        is a within-mlen lane segment whose stride is ``d_inner``
+        (not ``h_grp_stride``). Larger indices split into
+        ``h_grp = idx // lane_count`` (walks ``h_grp_stride``) and
+        ``lane = idx % lane_count`` (walks ``d_inner``). For non-
+        packed buffers (``lane_count == 1``) the cluster axis stride
+        is ``h_grp_stride`` directly.
+        """
+        tl_info = self._tile_layout_strides(buf)
+        if tl_info is None:
+            for i, s in enumerate(region.starts):
+                if isinstance(s, int) and s == 0:
+                    continue
+                if isinstance(s, tir.IntImm) and int(s.value) == 0:
+                    continue
+                raise IsaEmissionError(
+                    f"_region_origin_offset: {region.parent!r} non-zero "
+                    f"start at axis {i} but parent has no tile_layout"
+                )
+            return 0
+        cluster_dim = getattr(buf, "cluster_dim", None)
+        lane_count = int(tl_info["lane_count"])
+        d_inner = int(tl_info["d_inner"])
+        h_grp_stride = int(tl_info["h_grp_stride"])
+        s_inner_stride = int(tl_info["s_inner_stride"])
+        b_stride = int(tl_info["b_stride"])
+
+        def _is_zero(x) -> bool:
+            if isinstance(x, int) and x == 0:
+                return True
+            if isinstance(x, tir.IntImm) and int(x.value) == 0:
+                return True
+            return False
+
+        def _mul(expr, k: int):
+            if k == 0:
+                return tir.IntImm("int32", 0)
+            if isinstance(expr, int):
+                return tir.IntImm("int32", expr * k)
+            if isinstance(expr, tir.IntImm):
+                return tir.IntImm("int32", int(expr.value) * k)
+            if k == 1:
+                return expr
+            return tir.Mul(expr, tir.IntImm("int32", k))
+
+        terms = []
+        for i, s in enumerate(region.starts):
+            if _is_zero(s):
+                continue
+            if (cluster_dim is not None and i == cluster_dim
+                    and lane_count == 1 and i == 0):
+                # row_stack lane axis: B carries lane stacking, no
+                # packed-head (lane_count == 1). Each lane occupies
+                # ``shape[1] * shape[2] * shape[3]`` elements
+                # (logical_s * h_groups_etc * inner_lane in the 7D
+                # picture), NOT the per-axis-table ``b_stride =
+                # mlen * inner_lane`` (which assumes B is outer batch
+                # over a full-mlen s_tile). For S_loc with S=mlen the
+                # two values coincide; for S<mlen (flash_decode's
+                # rows=1 S_loc) b_stride overshoots and lane 1's data
+                # ends up past the buffer.
+                lane_stride = 1
+                for dim in buf.shape[i + 1:]:
+                    lane_stride *= int(dim)
+                terms.append(_mul(s, lane_stride))
+                continue
+            if cluster_dim is not None and i == cluster_dim and lane_count > 1:
+                # Packed-head lane axis. For a static int we split
+                # into (h_grp, lane) the usual way. For a PrimExpr
+                # (typically the cluster phase var, which mid_ir
+                # guarantees is < lane_count) we skip the floordiv /
+                # floormod split and emit ``s * d_inner`` directly —
+                # the floordiv/floormod expansion materialises into
+                # an SRLI+SLLI+SUB chain that easily exhausts the
+                # 16-GP budget when nested inside outer loops, and
+                # the result simplifies to the same expression.
+                if isinstance(s, int):
+                    h_grp = s // lane_count
+                    lane = s % lane_count
+                    if h_grp:
+                        terms.append(
+                            tir.IntImm("int32", h_grp * h_grp_stride)
+                        )
+                    if lane:
+                        terms.append(
+                            tir.IntImm("int32", lane * d_inner)
+                        )
+                elif isinstance(s, tir.IntImm):
+                    val = int(s.value)
+                    h_grp = val // lane_count
+                    lane = val % lane_count
+                    if h_grp:
+                        terms.append(
+                            tir.IntImm("int32", h_grp * h_grp_stride)
+                        )
+                    if lane:
+                        terms.append(
+                            tir.IntImm("int32", lane * d_inner)
+                        )
+                else:
+                    terms.append(_mul(s, d_inner))
+                continue
+            # Regular axis: pick stride from per-axis table.
+            if i == 0:
+                stride = b_stride
+            elif i == 1:
+                stride = s_inner_stride
+            elif i == 2:
+                stride = h_grp_stride
+            else:
+                stride = 1
+            terms.append(_mul(s, stride))
+
+        terms = [t for t in terms
+                 if not (isinstance(t, tir.IntImm) and int(t.value) == 0)]
+        if not terms:
+            return 0
+        acc = terms[0]
+        for t in terms[1:]:
+            acc = tir.Add(acc, t)
+        return acc
+
+    def _d_tile_info(self, buf: _hlir.Buffer) -> Tuple[int, int]:
+        """Return ``(n_d_tiles, d_tile_stride_elems)`` for a VRAM buffer.
+
+        Thin convenience wrapper over ``_tile_layout_strides`` —
+        ``row_*_at`` emitters only ever walk the d-tile axis (the row /
+        head coords pick a specific s_inner + h_grp + b within one
+        d-tile plane), so they just need the outer d-tile count and
+        the bump amount.
+        """
+        info = self._tile_layout_strides(buf)
+        if info is None or info["d_tiles"] <= 1:
+            return 1, 0
+        return info["d_tiles"], info["d_tile_stride"]
+
     def _emit_row_scalar_op_at(
         self,
         mod: _hlir.HLIRModule,
@@ -444,118 +956,228 @@ class IsaEmitterPass:
         masked: bool = False,
         has_fp: bool = False,
     ) -> None:
-        src = mod.get_buffer(op.buffer_args[0])
-        _check_scope(src, _scope.VRAM, op.kind, "src")
-        # `reduce` always has an FP destination; otherwise has_fp is set by
-        # the per-op dispatcher to distinguish (vram, vram, row, head) from
-        # (vram, fp_addr, vram, row, head) at the HLIR level.
+        """Row-scalar HW vector op on a single logical row of VRAM.
+
+        Region schema (every variant):
+            * reduce_max / reduce_sum:
+                buffer_args = [src_region]
+                scalar_args = [fp_addr (BufferElement)]
+            * exp / reci (no FP operand):
+                buffer_args = [src_region, dst_region]
+                scalar_args = []
+            * add / sub / mul fp:
+                buffer_args = [src_region, dst_region]
+                scalar_args = [fp_addr (BufferElement)]
+
+        ``src_region`` / ``dst_region`` are ``VramRegion`` with 4D
+        BSHD starts/extents picking exactly one (b, s, h) logical
+        row. ``extents`` must be ``(1, 1, 1, D_full)`` — the emitter
+        walks d_tiles itself. ``starts[2]`` (the H index) is *not*
+        clipped to a single lane in packed-head buffers: it carries
+        the actual head idx (0..head_count-1), and the emitter splits
+        it into (h_grp, lane) — h_grp picks the mlen-row, lane drives
+        the ``V_MASK`` bit so the V_*_VF only updates the target
+        head's data.
+        """
         has_fp = has_fp or reduce
-        # Scalar layout (positional, after the buffer args):
-        #   reduce / has-fp non-reduce: [fp_addr, row, head]
-        #   exp / no-fp:                [row, head]
-        # row, head are layout-agnostic logical S/H coords (see
-        # intrinsics.py row_*_at spec); _resolve_row_at_coords folds
-        # them into physical (vram_row, mask) via buf.shape.
-        if has_fp:
-            if len(op.scalar_args) != 3:
+        if reduce:
+            if len(op.buffer_args) != 1:
                 raise IsaEmissionError(
-                    f"{op.kind} expects 3 scalar args (fp_addr, row, head); got {len(op.scalar_args)}"
+                    f"{op.kind} expects 1 buffer_arg (src region); "
+                    f"got {len(op.buffer_args)}"
                 )
+            expected_scalar = 1
+        elif has_fp:
+            if len(op.buffer_args) != 2:
+                raise IsaEmissionError(
+                    f"{op.kind} expects 2 buffer_args (src/dst regions); "
+                    f"got {len(op.buffer_args)}"
+                )
+            expected_scalar = 1
+        else:
+            if len(op.buffer_args) != 2:
+                raise IsaEmissionError(
+                    f"{op.kind} expects 2 buffer_args (src/dst regions); "
+                    f"got {len(op.buffer_args)}"
+                )
+            expected_scalar = 0
+        if len(op.scalar_args) != expected_scalar:
+            raise IsaEmissionError(
+                f"{op.kind} expects {expected_scalar} scalar_args; "
+                f"got {len(op.scalar_args)}"
+            )
+        for slot, name in enumerate(
+            ("src",) if reduce else ("src", "dst")
+        ):
+            if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
+                raise IsaEmissionError(
+                    f"{op.kind} {name}: expected VramRegion, got "
+                    f"{type(op.buffer_args[slot]).__name__}"
+                )
+
+        src_region: _hlir.VramRegion = op.buffer_args[0]
+        src = mod.get_buffer(src_region.parent)
+        _check_scope(src, _scope.VRAM, op.kind, "src")
+        if len(src_region.extents) != 4:
+            raise IsaEmissionError(
+                f"{op.kind} src: region must be 4D; got "
+                f"extents={tuple(src_region.extents)}"
+            )
+        # All non-D extents must be 1 (one logical row per op).
+        if any(int(e) != 1 for e in src_region.extents[:3]):
+            raise IsaEmissionError(
+                f"{op.kind} src: row_*_at processes one logical row, "
+                f"non-D extents must be 1; got "
+                f"{tuple(src_region.extents[:3])}"
+            )
+
+        fp_addr_expr = None
+        if has_fp:
             fp_addr_expr = self._resolve_fp_scalar_addr_arg(
                 mod, op.scalar_args[0], op.kind, "fp",
             )
-            row_expr, head_expr = op.scalar_args[1], op.scalar_args[2]
-        else:
-            if len(op.scalar_args) != 2:
-                raise IsaEmissionError(
-                    f"{op.kind} expects 2 scalar args (row, head); got {len(op.scalar_args)}"
-                )
-            fp_addr_expr = None
-            row_expr, head_expr = op.scalar_args[0], op.scalar_args[1]
 
-        src_row_expr, mask_expr = self._resolve_row_at_coords(
-            src, op.kind, "src", row_expr, head_expr
+        src_base_off, src_mask_expr, src_info = self._logical_to_phys_row_offset(
+            src, src_region,
         )
-        mats = []
-
-        emit_v_mask = masked and mask_expr is not None
+        emit_v_mask = masked and src_mask_expr is not None
         use_mask_flag = 1 if emit_v_mask else 0
 
-        row_addr_expr = tir.Add(
-            tir.IntImm("int32", int(src.address)),
-            tir.Mul(src_row_expr, tir.IntImm("int32", int(self.shim.mlen))),
+        mats = []
+        m_src = self.materializer.materialize(
+            tir.Add(tir.IntImm("int32", int(src.address)), src_base_off)
         )
-        m_src = self.materializer.materialize(row_addr_expr)
         self.shim.compiler.generated_code += m_src.isa
         mats.append(m_src)
         gp_src = m_src.register
 
         gp_mask = None
         try:
-            lines = [f"; row scalar task {op.annotations.get('intrinsic', op.kind)} op={row_op}"]
+            lines = [
+                f"; row scalar task {op.annotations.get('intrinsic', op.kind)} "
+                f"op={row_op} "
+                f"src.parent={src_region.parent} "
+                f"starts={list(src_region.starts)!r}"
+            ]
             if emit_v_mask:
-                m_mask = self.materializer.materialize(mask_expr)
+                m_mask = self.materializer.materialize(src_mask_expr)
                 self.shim.compiler.generated_code += m_mask.isa
                 mats.append(m_mask)
                 gp_mask = m_mask.register
                 lines.append(f"C_SET_V_MASK_REG gp{gp_mask}")
 
+            n_d_tiles = src_info["d_tiles"]
+            d_tile_stride_s = src_info["d_tile_stride"]
+
             if reduce:
-                # buffer_args=[vram_src]; FP destination is the scalar address.
+                # buffer_args=[src_region]; FP destination is scalar_args[0].
                 m_dst = self.materializer.materialize(fp_addr_expr)
                 self.shim.compiler.generated_code += m_dst.isa
                 mats.append(m_dst)
-                opcode = {"reduce_max": "V_RED_MAX", "reduce_sum": "V_RED_SUM"}[row_op]
+                opcode = {"reduce_max": "V_RED_MAX",
+                          "reduce_sum": "V_RED_SUM"}[row_op]
+                # V_RED_* accumulate into f1; load the FPRAM slot
+                # first so kernels that pre-seeded it see the seed.
+                # Across d_tiles, accumulate into the same f1.
                 lines.append(f"S_LD_FP f1, gp{m_dst.register}, 0")
-                lines.append(f"{opcode} f1, gp{gp_src}, {use_mask_flag}")
+                for t in range(n_d_tiles):
+                    lines.append(f"{opcode} f1, gp{gp_src}, {use_mask_flag}")
+                    if t < n_d_tiles - 1:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_src}, gp{gp_src}, "
+                            f"{d_tile_stride_s}"
+                        )
                 lines.append(f"S_ST_FP f1, gp{m_dst.register}, 0")
-            elif fp_addr_expr is None:
-                # exp / reci: buffer_args=[vram_src, vram_dst], no FP operand.
-                dst = mod.get_buffer(op.buffer_args[1])
-                _check_scope(dst, _scope.VRAM, op.kind, "dst")
-                dst_row_expr, dst_mask_expr = self._resolve_row_at_coords(
-                    dst, op.kind, "dst", row_expr, head_expr
-                )
-                if emit_v_mask and dst_mask_expr is None:
-                    raise IsaEmissionError(
-                        f"{op.kind} src requires packed-head mask but dst {dst.name!r} does not"
-                    )
-                dst_row_expr = tir.Add(
-                    tir.IntImm("int32", int(dst.address)),
-                    tir.Mul(dst_row_expr, tir.IntImm("int32", int(self.shim.mlen))),
-                )
-                m_dst = self.materializer.materialize(dst_row_expr)
-                self.shim.compiler.generated_code += m_dst.isa
-                mats.append(m_dst)
-                opcode = {"exp": "V_EXP_V", "reci": "V_RECI_V"}[row_op]
-                lines.append(f"{opcode} gp{m_dst.register}, gp{gp_src}, {use_mask_flag}")
             else:
-                # add/sub/mul: buffer_args=[vram_src, vram_dst]; FP scalar in fp_addr_expr.
-                dst = mod.get_buffer(op.buffer_args[1])
+                dst_region: _hlir.VramRegion = op.buffer_args[1]
+                dst = mod.get_buffer(dst_region.parent)
                 _check_scope(dst, _scope.VRAM, op.kind, "dst")
-                dst_row_expr, dst_mask_expr = self._resolve_row_at_coords(
-                    dst, op.kind, "dst", row_expr, head_expr
+                if len(dst_region.extents) != 4:
+                    raise IsaEmissionError(
+                        f"{op.kind} dst: region must be 4D; got "
+                        f"extents={tuple(dst_region.extents)}"
+                    )
+                if any(int(e) != 1 for e in dst_region.extents[:3]):
+                    raise IsaEmissionError(
+                        f"{op.kind} dst: non-D extents must be 1; "
+                        f"got {tuple(dst_region.extents[:3])}"
+                    )
+                dst_base_off, dst_mask_expr, dst_info = (
+                    self._logical_to_phys_row_offset(dst, dst_region)
                 )
                 if emit_v_mask and dst_mask_expr is None:
                     raise IsaEmissionError(
-                        f"{op.kind} src requires packed-head mask but dst {dst.name!r} does not"
+                        f"{op.kind} src requires packed-head mask but dst "
+                        f"{dst.name!r} does not"
                     )
-                dst_row_expr = tir.Add(
-                    tir.IntImm("int32", int(dst.address)),
-                    tir.Mul(dst_row_expr, tir.IntImm("int32", int(self.shim.mlen))),
+                if emit_v_mask and dst_region.parent != src_region.parent:
+                    warnings.warn(
+                        f"{op.kind}: masked V_*_V with dst "
+                        f"{dst_region.parent!r} != src "
+                        f"{src_region.parent!r} — unmasked heads will "
+                        f"overwrite dst with src; previous cross-lane "
+                        f"writes to dst will be lost. Use in-place "
+                        f"(dst == src) or insert an explicit copy_v_to_v.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                if dst_info["d_tiles"] != n_d_tiles:
+                    raise IsaEmissionError(
+                        f"{op.kind}: src/dst d_tiles mismatch "
+                        f"({n_d_tiles} vs {dst_info['d_tiles']})"
+                    )
+                d_tile_stride_d = dst_info["d_tile_stride"]
+                m_dst = self.materializer.materialize(
+                    tir.Add(tir.IntImm("int32", int(dst.address)), dst_base_off)
                 )
-                m_rhs = self.materializer.materialize(fp_addr_expr)
-                self.shim.compiler.generated_code += m_rhs.isa
-                mats.append(m_rhs)
-                m_dst = self.materializer.materialize(dst_row_expr)
                 self.shim.compiler.generated_code += m_dst.isa
                 mats.append(m_dst)
-                lines.append(f"S_LD_FP f1, gp{m_rhs.register}, 0")
-                if row_op == "sub":
-                    lines.append(f"V_SUB_VF gp{m_dst.register}, gp{gp_src}, f1, {use_mask_flag}, 0")
+
+                if fp_addr_expr is None:
+                    # exp / reci
+                    opcode = {"exp": "V_EXP_V", "reci": "V_RECI_V"}[row_op]
+                    for t in range(n_d_tiles):
+                        lines.append(
+                            f"{opcode} gp{m_dst.register}, gp{gp_src}, "
+                            f"{use_mask_flag}"
+                        )
+                        if t < n_d_tiles - 1:
+                            lines.append(
+                                f"S_ADDI_INT gp{gp_src}, gp{gp_src}, "
+                                f"{d_tile_stride_s}"
+                            )
+                            lines.append(
+                                f"S_ADDI_INT gp{m_dst.register}, "
+                                f"gp{m_dst.register}, {d_tile_stride_d}"
+                            )
                 else:
-                    opcode = {"add": "V_ADD_VF", "mul": "V_MUL_VF"}[row_op]
-                    lines.append(f"{opcode} gp{m_dst.register}, gp{gp_src}, f1, {use_mask_flag}")
+                    # add / sub / mul with FP scalar
+                    m_rhs = self.materializer.materialize(fp_addr_expr)
+                    self.shim.compiler.generated_code += m_rhs.isa
+                    mats.append(m_rhs)
+                    lines.append(f"S_LD_FP f1, gp{m_rhs.register}, 0")
+                    for t in range(n_d_tiles):
+                        if row_op == "sub":
+                            lines.append(
+                                f"V_SUB_VF gp{m_dst.register}, gp{gp_src}, "
+                                f"f1, {use_mask_flag}, 0"
+                            )
+                        else:
+                            opcode = {"add": "V_ADD_VF",
+                                      "mul": "V_MUL_VF"}[row_op]
+                            lines.append(
+                                f"{opcode} gp{m_dst.register}, gp{gp_src}, "
+                                f"f1, {use_mask_flag}"
+                            )
+                        if t < n_d_tiles - 1:
+                            lines.append(
+                                f"S_ADDI_INT gp{gp_src}, gp{gp_src}, "
+                                f"{d_tile_stride_s}"
+                            )
+                            lines.append(
+                                f"S_ADDI_INT gp{m_dst.register}, "
+                                f"gp{m_dst.register}, {d_tile_stride_d}"
+                            )
 
             if emit_v_mask:
                 lines.append(f"S_ADDI_INT gp{gp_mask}, gp0, 0")
@@ -1152,31 +1774,51 @@ class IsaEmitterPass:
             m_base.release()
 
     def _emit_btmm(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        lhs = mod.get_buffer(op.buffer_args[0])
-        rhs = mod.get_buffer(op.buffer_args[1])
-        dst = mod.get_buffer(op.buffer_args[2])
+        """Lane-fused (packed-head) Q @ K^T.
+
+        Region schema:
+            buffer_args = [a_region (VramRegion), b_region (MramRegion),
+                           c_region (VramRegion)]
+            scalar_args = [a_dim_roles, b_dim_roles, c_dim_roles]
+
+        BTMM HW takes the whole packed-head tile in one issue; the
+        regions describe the full operands and the emitter doesn't
+        need to walk M/K/N internally — just hand off the three
+        physical base addresses. Per-lane offsets are zero here
+        (multi-lane HW instruction spans every lane natively).
+        """
+        if len(op.buffer_args) != 3:
+            raise IsaEmissionError(
+                f"plena.btmm expects 3 buffer_args (regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        a_reg, b_reg, c_reg = op.buffer_args
+        if not isinstance(a_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.btmm a: expected VramRegion, got "
+                f"{type(a_reg).__name__}"
+            )
+        if not isinstance(b_reg, _hlir.MramRegion):
+            raise IsaEmissionError(
+                f"plena.btmm b: expected MramRegion, got "
+                f"{type(b_reg).__name__}"
+            )
+        if not isinstance(c_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.btmm c: expected VramRegion, got "
+                f"{type(c_reg).__name__}"
+            )
+        lhs = mod.get_buffer(a_reg.parent)
+        rhs = mod.get_buffer(b_reg.parent)
+        dst = mod.get_buffer(c_reg.parent)
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
 
-        # group_heads = scalar arg (also doubles as expected btmm_lane_count
-        # in many of our kernels). We don't currently feed it into the ISA
-        # itself -- the BTMM hardware shape is fixed by the program config
-        # -- but we keep the value around for future verification.
-        if op.scalar_args:
-            ghs = int(op.scalar_args[0])
-            if ghs != self.shim.btmm_lane_count:
-                # Soft warning baked into the ISA stream so we can grep
-                # for it; not a hard failure because some kernels deliberately
-                # under-fill the lanes.
-                self.shim.compiler.generated_code += (
-                    f"; WARNING: btmm group_heads={ghs} != program btmm_lane_count="
-                    f"{self.shim.btmm_lane_count}\n"
-                )
-
         # Result-tile-count for the writeback. For our minimal_btmm:
         # lhs (mlen, gh, hlen) x rhs (mlen, gh, hlen) -> dst (mlen, gh, mlen)
-        # so dst has gh tiles per group, total tile_count = (mlen*gh*mlen)/tile_elems
+        # so dst has gh tiles per group, total tile_count =
+        # (mlen*gh*mlen)/tile_elems.
         tile_count = max(1, dst.num_elements // self.shim.tile_elems)
 
         self.emitter.emit_btmm(
@@ -1193,23 +1835,49 @@ class IsaEmitterPass:
     def _emit_mv(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         """Per-head matrix-vector: M_MV + M_MV_WO.
 
-        HLIR signature:
-            buffer_args = [A_vram, B_mram, C_vram]
-            scalar_args = [lhs_offset, rhs_offset, dst_offset]
-              * each offset is int OR PrimExpr; PrimExpr is materialized
-                to a gp register and passed as a *_offset_reg.
+        Region schema (same shape as matmul):
+            buffer_args = [a_region, b_region, c_region]
+                a_region: VramRegion (rank-1 LHS row, M extent == 1)
+                b_region: MramRegion
+                c_region: VramRegion
+            scalar_args = [a_dim_roles, b_dim_roles, c_dim_roles]
+                4-tuples of "M"/"K"/"N"/"_".
+
+        Origin offsets come from the regions' starts (lane_var on the
+        cluster axis when wrapped in CLUSTER), translated to physical
+        offsets via ``_tile_layout_strides``.
         """
-        lhs = mod.get_buffer(op.buffer_args[0])
-        rhs = mod.get_buffer(op.buffer_args[1])
-        dst = mod.get_buffer(op.buffer_args[2])
+        if len(op.buffer_args) != 3:
+            raise IsaEmissionError(
+                f"plena.mv expects 3 buffer_args (a/b/c regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        a_reg, b_reg, c_reg = op.buffer_args
+        if not isinstance(a_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.mv a: expected VramRegion, got "
+                f"{type(a_reg).__name__}"
+            )
+        if not isinstance(b_reg, _hlir.MramRegion):
+            raise IsaEmissionError(
+                f"plena.mv b: expected MramRegion, got "
+                f"{type(b_reg).__name__}"
+            )
+        if not isinstance(c_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.mv c: expected VramRegion, got "
+                f"{type(c_reg).__name__}"
+            )
+        lhs = mod.get_buffer(a_reg.parent)
+        rhs = mod.get_buffer(b_reg.parent)
+        dst = mod.get_buffer(c_reg.parent)
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        if len(op.scalar_args) != 3:
-            raise IsaEmissionError(
-                f"plena.mv expects 3 scalar args (lhs_offset, rhs_offset, "
-                f"dst_offset); got {len(op.scalar_args)}"
-            )
+
+        lhs_raw_off = self._region_origin_offset(lhs, a_reg)
+        rhs_raw_off = self._region_origin_offset(rhs, b_reg)
+        dst_raw_off = self._region_origin_offset(dst, c_reg)
 
         def _resolve(expr, name):
             """Returns (static_int_or_None, gp_register_or_None, handle_or_None)."""
@@ -1221,9 +1889,9 @@ class IsaEmitterPass:
             self.shim.compiler.generated_code += m.isa
             return None, m.register, m
 
-        lhs_static, lhs_reg, lhs_h = _resolve(op.scalar_args[0], "lhs_offset")
-        rhs_static, rhs_reg, rhs_h = _resolve(op.scalar_args[1], "rhs_offset")
-        dst_static, dst_reg, dst_h = _resolve(op.scalar_args[2], "dst_offset")
+        lhs_static, lhs_reg, lhs_h = _resolve(lhs_raw_off, "lhs_offset")
+        rhs_static, rhs_reg, rhs_h = _resolve(rhs_raw_off, "rhs_offset")
+        dst_static, dst_reg, dst_h = _resolve(dst_raw_off, "dst_offset")
 
         try:
             self.emitter.emit_mv(
@@ -1241,22 +1909,37 @@ class IsaEmitterPass:
                     h.release()
 
     def _emit_btmv(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """Lane-fused matrix-vector. Same address resolution as _emit_btmm,
-        but emits M_BTMV + M_BMV_WO."""
-        lhs = mod.get_buffer(op.buffer_args[0])
-        rhs = mod.get_buffer(op.buffer_args[1])
-        dst = mod.get_buffer(op.buffer_args[2])
+        """Lane-fused matrix-vector (decode-style btmm with M=1).
+
+        Region schema same as _emit_btmm; differs only in op kind.
+        """
+        if len(op.buffer_args) != 3:
+            raise IsaEmissionError(
+                f"plena.btmv expects 3 buffer_args (regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        a_reg, b_reg, c_reg = op.buffer_args
+        if not isinstance(a_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.btmv a: expected VramRegion, got "
+                f"{type(a_reg).__name__}"
+            )
+        if not isinstance(b_reg, _hlir.MramRegion):
+            raise IsaEmissionError(
+                f"plena.btmv b: expected MramRegion, got "
+                f"{type(b_reg).__name__}"
+            )
+        if not isinstance(c_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.btmv c: expected VramRegion, got "
+                f"{type(c_reg).__name__}"
+            )
+        lhs = mod.get_buffer(a_reg.parent)
+        rhs = mod.get_buffer(b_reg.parent)
+        dst = mod.get_buffer(c_reg.parent)
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-
-        if op.scalar_args:
-            ghs = int(op.scalar_args[0])
-            if ghs != self.shim.btmm_lane_count:
-                self.shim.compiler.generated_code += (
-                    f"; WARNING: btmv group_heads={ghs} != program btmm_lane_count="
-                    f"{self.shim.btmm_lane_count}\n"
-                )
 
         self.emitter.emit_btmv(
             lhs_packed_vram_addr=lhs.address,
@@ -1330,53 +2013,141 @@ class IsaEmitterPass:
         )
 
     def _emit_matmul(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """Unified `(M, K) @ (K, N) -> (M, N)` matmul; supersedes mm + mm_slot.
+        """Unified `(M, K) @ (K, N) -> (M, N)` matmul.
 
-        HLIR signature:
-            buffer_args = [A_vram, B_mram, C_vram]
-            scalar_args = [M_tiles, K_tiles, N,
-                           lhs_offset, rhs_offset,
-                           dst_offset, dst_row_stride]
-              * M_tiles, K_tiles, N : compile-time ints
-              * lhs_offset / rhs_offset / dst_offset : int OR PrimExpr.
-                Dynamic offsets get materialised to a gp register and
-                passed to `emit_matmul_general` via the corresponding
-                ``*_offset_reg`` parameter; static int offsets fold into
-                the emitter's own static residual.
-              * dst_row_stride      : compile-time int (0 -> default to N)
-
-        K reduction is folded into the matmul op (M_MM accumulate +
-        M_MM_WO drain), so no caller-side scratch / tile_add is needed for
-        K. Layout assumes packed mlen-tile grids in VRAM/MRAM (see
-        `ISAEmitter.emit_matmul_general` for the precise convention).
+        Region schema (Einstein-style):
+            buffer_args = [a_region, b_region, c_region]
+                Vram/MramRegion (4D start+extent on the parent buffer's
+                physical shape). a_region is VRAM, b_region is MRAM,
+                c_region is VRAM. starts encode per-lane / per-batch
+                origin; extents are the per-axis logical span.
+            scalar_args = [a_dim_roles, b_dim_roles, c_dim_roles]
+                each a 4-tuple of "M"/"K"/"N"/"_" labels aligned with
+                the matching region. K appears in a and b but not in
+                c (contracted); M in a and c; N in b and c. The
+                ordering of K vs N inside b's roles tells the emitter
+                whether B is K-inner (standard, M_MM) or K-outer
+                (transpose_B, M_TMM).
         """
-        lhs = mod.get_buffer(op.buffer_args[0])
-        rhs = mod.get_buffer(op.buffer_args[1])
-        dst = mod.get_buffer(op.buffer_args[2])
+        if len(op.buffer_args) != 3:
+            raise IsaEmissionError(
+                f"plena.matmul expects 3 buffer_args (a/b/c regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        a_reg, b_reg, c_reg = op.buffer_args
+        if not isinstance(a_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.matmul a: expected VramRegion, got "
+                f"{type(a_reg).__name__}"
+            )
+        if not isinstance(b_reg, _hlir.MramRegion):
+            raise IsaEmissionError(
+                f"plena.matmul b: expected MramRegion, got "
+                f"{type(b_reg).__name__}"
+            )
+        if not isinstance(c_reg, _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"plena.matmul c: expected VramRegion, got "
+                f"{type(c_reg).__name__}"
+            )
+        if len(op.scalar_args) != 3:
+            raise IsaEmissionError(
+                f"plena.matmul expects 3 scalar_args (a/b/c dim_roles); "
+                f"got {len(op.scalar_args)}"
+            )
+        a_roles, b_roles, c_roles = op.scalar_args
+        if len(a_roles) != 4 or len(b_roles) != 4 or len(c_roles) != 4:
+            raise IsaEmissionError(
+                f"plena.matmul dim_roles must each be 4-tuples; got "
+                f"a={a_roles!r} b={b_roles!r} c={c_roles!r}"
+            )
+
+        lhs = mod.get_buffer(a_reg.parent)
+        rhs = mod.get_buffer(b_reg.parent)
+        dst = mod.get_buffer(c_reg.parent)
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        if len(op.scalar_args) != 7:
+
+        mlen = int(self.shim.mlen)
+
+        def _find_role_axis(roles: Tuple[str, ...], role: str,
+                            operand: str) -> Optional[int]:
+            hits = [i for i, r in enumerate(roles) if r == role]
+            if not hits:
+                return None
+            if len(hits) > 1:
+                raise IsaEmissionError(
+                    f"plena.matmul {operand}: role {role!r} appears at "
+                    f"multiple axes {hits} in roles {roles!r}"
+                )
+            return hits[0]
+
+        c_M_axis = _find_role_axis(c_roles, "M", "c")
+        c_N_axis = _find_role_axis(c_roles, "N", "c")
+        a_M_axis = _find_role_axis(a_roles, "M", "a")
+        a_K_axis = _find_role_axis(a_roles, "K", "a")
+        b_K_axis = _find_role_axis(b_roles, "K", "b")
+        b_N_axis = _find_role_axis(b_roles, "N", "b")
+        for axis, name in (
+            (c_M_axis, "c.M"), (c_N_axis, "c.N"),
+            (a_M_axis, "a.M"), (a_K_axis, "a.K"),
+            (b_K_axis, "b.K"), (b_N_axis, "b.N"),
+        ):
+            if axis is None:
+                raise IsaEmissionError(
+                    f"plena.matmul: missing {name} axis in dim_roles; "
+                    f"a={a_roles!r} b={b_roles!r} c={c_roles!r}"
+                )
+
+        M = int(a_reg.extents[a_M_axis])
+        K = int(a_reg.extents[a_K_axis])
+        N = int(b_reg.extents[b_N_axis])
+        if int(b_reg.extents[b_K_axis]) != K:
             raise IsaEmissionError(
-                f"plena.matmul expects 7 scalar args (M_tiles, K_tiles, N, "
-                f"lhs_offset, rhs_offset, dst_offset, dst_row_stride); "
-                f"got {len(op.scalar_args)}"
+                f"plena.matmul: a.K extent {K} != b.K extent "
+                f"{int(b_reg.extents[b_K_axis])}"
+            )
+        if int(c_reg.extents[c_M_axis]) != M:
+            raise IsaEmissionError(
+                f"plena.matmul: c.M extent {int(c_reg.extents[c_M_axis])} "
+                f"!= a.M extent {M}"
+            )
+        if int(c_reg.extents[c_N_axis]) != N:
+            raise IsaEmissionError(
+                f"plena.matmul: c.N extent {int(c_reg.extents[c_N_axis])} "
+                f"!= b.N extent {N}"
             )
 
-        def _as_int(x, name):
-            if isinstance(x, tir.IntImm):
-                return int(x.value)
-            if isinstance(x, int):
-                return int(x)
+        if M % mlen != 0 or K % mlen != 0:
             raise IsaEmissionError(
-                f"plena.matmul {name} must be a compile-time int; got {x!r}"
+                f"plena.matmul: M ({M}) and K ({K}) must be multiples of "
+                f"MLEN ({mlen})"
             )
+        M_tiles = M // mlen
+        K_tiles = K // mlen
+        # transpose_b: standard layout has B = (K, N) row-major, i.e.
+        # K is the outer (slower-varying) dim and N is inner — in
+        # physical axis indices, ``K_axis < N_axis``. When the kernel
+        # author intends ``B = (N, K)`` (nn.Linear weight convention)
+        # the order flips: ``N_axis < K_axis``, and the emitter must
+        # swap M_MM for M_TMM so the systolic array sees the right
+        # operand orientation.
+        transpose_b = b_N_axis < b_K_axis
 
-        M_tiles = _as_int(op.scalar_args[0], "M_tiles")
-        K_tiles = _as_int(op.scalar_args[1], "K_tiles")
-        N = _as_int(op.scalar_args[2], "N")
-        dst_row_stride_raw = _as_int(op.scalar_args[6], "dst_row_stride")
-        dst_row_stride = dst_row_stride_raw if dst_row_stride_raw > 0 else None
+        # The legacy dst_row_stride was the product of every physical
+        # dim of dst strictly after the M axis (= "elements between
+        # consecutive rows of C"). With a 4D BSHD c_region we can
+        # derive it from the region's extents directly.
+        dst_row_stride = 1
+        for ax in range(c_M_axis + 1, len(c_reg.extents)):
+            dst_row_stride *= int(c_reg.extents[ax])
+        if dst_row_stride <= 0:
+            dst_row_stride = None
+
+        lhs_raw_off = self._region_origin_offset(lhs, a_reg)
+        rhs_raw_off = self._region_origin_offset(rhs, b_reg)
+        dst_raw_off = self._region_origin_offset(dst, c_reg)
 
         # Each of lhs / rhs / dst offsets supports either a compile-time
         # int (folded into the emitter's static residual) or an arbitrary
@@ -1427,9 +2198,9 @@ class IsaEmitterPass:
             ra.pin_gp(r)
 
         try:
-            lhs_off_static, lhs_off_reg = _resolve_offset(op.scalar_args[3], "lhs_offset")
-            rhs_off_static, rhs_off_reg = _resolve_offset(op.scalar_args[4], "rhs_offset")
-            dst_off_static, dst_off_reg = _resolve_offset(op.scalar_args[5], "dst_offset")
+            lhs_off_static, lhs_off_reg = _resolve_offset(lhs_raw_off, "lhs_offset")
+            rhs_off_static, rhs_off_reg = _resolve_offset(rhs_raw_off, "rhs_offset")
+            dst_off_static, dst_off_reg = _resolve_offset(dst_raw_off, "dst_offset")
 
             self.emitter.emit_matmul_general(
                 M_tiles=M_tiles,
@@ -1447,6 +2218,8 @@ class IsaEmitterPass:
                 dst_row_stride=dst_row_stride,
                 task_id=op.annotations.get("intrinsic", "matmul"),
                 scratch_regs=scratch_regs,
+                transpose_b=transpose_b,
+                unroll_loops=False,
             )
         finally:
             for m in materialised_handles:
@@ -1583,148 +2356,237 @@ class IsaEmitterPass:
             if lhs_addr_m is not None:
                 lhs_addr_m.release()
 
-    def _emit_tile_zero(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """Zero a VRAM buffer in-place. Loop count = buffer size in
-        MLEN-wide rows; passing the wrong count writes past the buffer
-        and corrupts whatever sits immediately after it in the VRAM
-        address map (we hit this with a (1, MLEN) per-row accumulator
-        sitting just before a (1, MLEN, 1, MLEN) C_loc tile — the
-        legacy MLEN-row default zeroed all of C_loc on every iteration)."""
-        arg0 = op.buffer_args[0]
-        if isinstance(arg0, _hlir.BufferSlice):
-            raise IsaEmissionError(
-                f"tile_zero: buffer_args[0] must be a whole-buffer name; got "
-                f"BufferSlice(parent={arg0.parent!r}, starts={list(arg0.starts)}, "
-                f"extents={list(arg0.extents)})"
-            )
-        dst = mod.get_buffer(arg0)
-        _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        mlen = self.shim.mlen
-        if dst.num_elements % mlen != 0:
-            raise IsaEmissionError(
-                f"tile_zero: {dst.name!r} has {dst.num_elements} elements, "
-                f"not a multiple of MLEN ({mlen})"
-            )
-        num_rows = dst.num_elements // mlen
-        self.emitter.emit_zero_vram_tile(dst.address, num_rows=num_rows)
+    def _emit_v_zero(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Region-based zero-fill on VRAM: ``dst[region] = 0``.
 
-    def _emit_tile_binary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
-                          *, binary_op: str) -> None:
-        """VRAM-VRAM whole-tile elementwise binary op (add / sub / mul).
+        Schema (region layer):
+            buffer_args = [dst_region]   (VramRegion with 4D BSHD)
+            scalar_args = []
 
-        ``binary_op`` selects the HW opcode via emit_tile_binary's table
-        ({"add": V_ADD_VV, "sub": V_SUB_VV, "mul": V_MUL_VV}).
-
-        The MLEN-wide row count is derived from each operand's actual
-        element count: a (rows, MLEN) buffer (post-expansion in
-        flash-attention's BTMM-style kernels) gives ``rows`` MLEN-rows;
-        a (1, …, MLEN) buffer gives 1 row. All three operands must
-        carry the same number of MLEN-rows — V_*_VV walks them in
-        lockstep — otherwise the inner loop would advance one operand
-        past its allocated end into the next buffer (silent VRAM
-        corruption).
+        Lowers to ``V_MUL_VF dst, dst, f0, 0`` per mlen-wide chunk
+        (f0 == 0 by convention).
         """
-        lhs = mod.get_buffer(op.buffer_args[0])
-        rhs = mod.get_buffer(op.buffer_args[1])
-        dst = mod.get_buffer(op.buffer_args[2])
+        if len(op.buffer_args) != 1:
+            raise IsaEmissionError(
+                f"v_zero expects 1 buffer_arg (dst region); "
+                f"got {len(op.buffer_args)}"
+            )
+        if not isinstance(op.buffer_args[0], _hlir.VramRegion):
+            raise IsaEmissionError(
+                f"v_zero dst: expected VramRegion, got "
+                f"{type(op.buffer_args[0]).__name__}"
+            )
+        if op.scalar_args:
+            raise IsaEmissionError(
+                f"v_zero expects 0 scalar_args; got {len(op.scalar_args)}"
+            )
+        dst_region: _hlir.VramRegion = op.buffer_args[0]
+        dst = mod.get_buffer(dst_region.parent)
+        _check_scope(dst, _scope.VRAM, op.kind, "dst")
+        self.shim.compiler.generated_code += (
+            f"; v_zero dst.parent={dst_region.parent} "
+            f"starts={list(dst_region.starts)!r} "
+            f"extents={list(dst_region.extents)!r}\n"
+        )
+        for d_off, _ in self._vram_region_iter_chunks(dst, dst_region):
+            dst_addr = tir.Add(
+                tir.IntImm("int32", int(dst.address)), d_off,
+            )
+            m_dst = self.materializer.materialize(dst_addr)
+            self.shim.compiler.generated_code += m_dst.isa
+            try:
+                self.shim.compiler.generated_code += (
+                    f"V_MUL_VF gp{m_dst.register}, gp{m_dst.register}, "
+                    f"f0, 0\n"
+                )
+            finally:
+                m_dst.release()
+
+    def _emit_v_binary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
+                       *, binary_op: str) -> None:
+        """Region-based vector binary op:
+        ``dst[region] = lhs[region] <binop> rhs[region]`` elementwise.
+
+        Schema (region layer):
+            buffer_args = [lhs_region, rhs_region, dst_region]
+                each is a ``VramRegion(parent, starts, extents)`` with
+                ``starts`` / ``extents`` length 4 in canonical BSHD
+                order. Every (b, s, h, d) cell within ``extents`` of
+                the three regions is paired up for the elementwise
+                op. The three regions must agree on ``extents``.
+            scalar_args = []  (region carries everything)
+
+        Emission walks each region with ``_vram_region_iter_chunks``,
+        which folds the cluster (packed-head) axis and unrolls the
+        d_tile axis automatically. One HLIR op may therefore emit
+        N V_*_VV instructions (N = product of non-cluster outer
+        extents × d_chunks).
+        """
+        op_to_insn = {
+            "add": "V_ADD_VV",
+            "sub": "V_SUB_VV",
+            "mul": "V_MUL_VV",
+        }
+        opcode = op_to_insn[binary_op]
+        if len(op.buffer_args) != 3:
+            raise IsaEmissionError(
+                f"{op.kind} expects 3 buffer_args (lhs/rhs/dst regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        for slot, name in enumerate(("lhs", "rhs", "dst")):
+            if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
+                raise IsaEmissionError(
+                    f"{op.kind} {name}: expected VramRegion, got "
+                    f"{type(op.buffer_args[slot]).__name__}"
+                )
+        if op.scalar_args:
+            raise IsaEmissionError(
+                f"{op.kind} expects 0 scalar_args (region carries shape); "
+                f"got {len(op.scalar_args)}"
+            )
+        lhs_region: _hlir.VramRegion = op.buffer_args[0]
+        rhs_region: _hlir.VramRegion = op.buffer_args[1]
+        dst_region: _hlir.VramRegion = op.buffer_args[2]
+        lhs = mod.get_buffer(lhs_region.parent)
+        rhs = mod.get_buffer(rhs_region.parent)
+        dst = mod.get_buffer(dst_region.parent)
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.VRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        mlen = self.shim.mlen
-        rows_per_buf = []
-        for buf, role in ((lhs, "lhs"), (rhs, "rhs"), (dst, "dst")):
-            if buf.num_elements % mlen != 0:
-                raise IsaEmissionError(
-                    f"tile_{binary_op}: {role} {buf.name!r} has "
-                    f"{buf.num_elements} elements, not a multiple of "
-                    f"MLEN ({mlen})"
-                )
-            rows_per_buf.append(buf.num_elements // mlen)
-        if len(set(rows_per_buf)) != 1:
+        if (tuple(lhs_region.extents) != tuple(dst_region.extents)
+                or tuple(rhs_region.extents) != tuple(dst_region.extents)):
             raise IsaEmissionError(
-                f"tile_{binary_op}: operand row counts disagree — "
-                f"lhs={rows_per_buf[0]} rhs={rows_per_buf[1]} "
-                f"dst={rows_per_buf[2]} (MLEN-wide rows). The walk "
-                f"advances all three pointers in lockstep, so they must "
-                f"share the same number of MLEN-rows."
+                f"{op.kind}: lhs/rhs/dst region extents must match; "
+                f"lhs={tuple(lhs_region.extents)} "
+                f"rhs={tuple(rhs_region.extents)} "
+                f"dst={tuple(dst_region.extents)}"
             )
-        self.emitter.emit_tile_binary(
-            lhs_vram_addr=lhs.address,
-            rhs_vram_addr=rhs.address,
-            dst_vram_addr=dst.address,
-            op=binary_op,
-            task_id=op.annotations.get("intrinsic", f"tile_{binary_op}"),
-            num_rows=rows_per_buf[0],
+
+        self.shim.compiler.generated_code += (
+            f"; v binary {op.kind} {opcode} "
+            f"dst.parent={dst_region.parent} "
+            f"starts={list(dst_region.starts)!r} "
+            f"extents={list(dst_region.extents)!r}\n"
         )
 
-    def _emit_tile_add(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """VRAM-VRAM tile add: dst = lhs + rhs."""
-        self._emit_tile_binary(mod, op, binary_op="add")
+        # Walk all three regions in lock-step. Each yield gives the
+        # ``(vram_offset_expr, fp_step_elems)`` for one mlen-wide
+        # chunk; we discard fp_step (no FPRAM here) and materialise
+        # the three per-operand absolute addresses.
+        lhs_iter = self._vram_region_iter_chunks(lhs, lhs_region)
+        rhs_iter = self._vram_region_iter_chunks(rhs, rhs_region)
+        dst_iter = self._vram_region_iter_chunks(dst, dst_region)
+        for (l_off, _), (r_off, _), (d_off, _) in zip(
+            lhs_iter, rhs_iter, dst_iter
+        ):
+            lhs_addr = tir.Add(
+                tir.IntImm("int32", int(lhs.address)), l_off,
+            )
+            rhs_addr = tir.Add(
+                tir.IntImm("int32", int(rhs.address)), r_off,
+            )
+            dst_addr = tir.Add(
+                tir.IntImm("int32", int(dst.address)), d_off,
+            )
+            m_lhs = self.materializer.materialize(lhs_addr)
+            self.shim.compiler.generated_code += m_lhs.isa
+            m_rhs = self.materializer.materialize(rhs_addr)
+            self.shim.compiler.generated_code += m_rhs.isa
+            m_dst = self.materializer.materialize(dst_addr)
+            self.shim.compiler.generated_code += m_dst.isa
+            try:
+                self.shim.compiler.generated_code += (
+                    f"{opcode} gp{m_dst.register}, gp{m_lhs.register}, "
+                    f"gp{m_rhs.register}, 0\n"
+                )
+            finally:
+                m_dst.release()
+                m_rhs.release()
+                m_lhs.release()
+        return
 
-    def _emit_tile_sub(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """VRAM-VRAM tile sub: dst = lhs - rhs."""
-        self._emit_tile_binary(mod, op, binary_op="sub")
+    def _emit_v_add(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_v_binary(mod, op, binary_op="add")
 
-    def _emit_tile_mul(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """VRAM-VRAM tile mul: dst = lhs * rhs (elementwise)."""
-        self._emit_tile_binary(mod, op, binary_op="mul")
+    def _emit_v_sub(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_v_binary(mod, op, binary_op="sub")
 
-    def _emit_tile_unary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
-                         *, opcode: str) -> None:
-        """VRAM whole-tile unary op (exp / reci / sqrt).
+    def _emit_v_mul(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_v_binary(mod, op, binary_op="mul")
 
-        ``opcode`` is the HW mnemonic (``V_EXP_V`` / ``V_RECI_V`` /
-        ``V_SQRT_V``). Mirrors ``_emit_tile_binary`` but with one
-        operand: the dst's MLEN-row count drives the loop, matching
-        the per-row natively-wide unary HW op.
+    def _emit_v_unary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
+                      *, opcode: str) -> None:
+        """Region-based vector unary op: ``dst[region] = op(src[region])``.
+
+        Schema (region layer):
+            buffer_args = [src_region, dst_region]
+                each is a ``VramRegion`` with 4D BSHD (starts, extents).
+                The two regions must agree on ``extents``.
+            scalar_args = []
         """
-        src = mod.get_buffer(op.buffer_args[0])
-        dst = mod.get_buffer(op.buffer_args[1])
+        if len(op.buffer_args) != 2:
+            raise IsaEmissionError(
+                f"{op.kind} expects 2 buffer_args (src/dst regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        for slot, name in enumerate(("src", "dst")):
+            if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
+                raise IsaEmissionError(
+                    f"{op.kind} {name}: expected VramRegion, got "
+                    f"{type(op.buffer_args[slot]).__name__}"
+                )
+        if op.scalar_args:
+            raise IsaEmissionError(
+                f"{op.kind} expects 0 scalar_args (region carries shape); "
+                f"got {len(op.scalar_args)}"
+            )
+        src_region: _hlir.VramRegion = op.buffer_args[0]
+        dst_region: _hlir.VramRegion = op.buffer_args[1]
+        src = mod.get_buffer(src_region.parent)
+        dst = mod.get_buffer(dst_region.parent)
         _check_scope(src, _scope.VRAM, op.kind, "src")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        mlen = self.shim.mlen
-        rows_per_buf = []
-        for buf, role in ((src, "src"), (dst, "dst")):
-            if buf.num_elements % mlen != 0:
-                raise IsaEmissionError(
-                    f"{op.kind}: {role} {buf.name!r} has {buf.num_elements} "
-                    f"elements, not a multiple of MLEN ({mlen})"
-                )
-            rows_per_buf.append(buf.num_elements // mlen)
-        if len(set(rows_per_buf)) != 1:
+        if tuple(src_region.extents) != tuple(dst_region.extents):
             raise IsaEmissionError(
-                f"{op.kind}: operand row counts disagree — "
-                f"src={rows_per_buf[0]} dst={rows_per_buf[1]} "
-                f"(MLEN-wide rows)."
+                f"{op.kind}: src/dst region extents must match; "
+                f"src={tuple(src_region.extents)} dst={tuple(dst_region.extents)}"
             )
-        ra = self.shim.compiler.register_allocator
-        gp_regs = ra.allocate_gp(3)
-        gp_src, gp_dst, gp_loop = gp_regs
-        lines = [
-            f"; tile unary task {op.annotations.get('intrinsic', op.kind)} "
-            f"opcode={opcode} rows={rows_per_buf[0]}",
-            f"S_ADDI_INT gp{gp_src}, gp0, {int(src.address)}",
-            f"S_ADDI_INT gp{gp_dst}, gp0, {int(dst.address)}",
-        ]
-        if rows_per_buf[0] == 1:
-            lines.append(f"{opcode} gp{gp_dst}, gp{gp_src}, 0")
-        else:
-            lines.append(f"C_LOOP_START gp{gp_loop}, {rows_per_buf[0]}")
-            lines.append(f"{opcode} gp{gp_dst}, gp{gp_src}, 0")
-            lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {mlen}")
-            lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {mlen}")
-            lines.append(f"C_LOOP_END gp{gp_loop}")
-        ra.free_gp(gp_regs)
-        self.shim.compiler.generated_code += "\n".join(lines) + "\n"
 
-    def _emit_tile_exp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_tile_unary(mod, op, opcode="V_EXP_V")
+        self.shim.compiler.generated_code += (
+            f"; v unary {op.kind} {opcode} "
+            f"dst.parent={dst_region.parent} "
+            f"starts={list(dst_region.starts)!r} "
+            f"extents={list(dst_region.extents)!r}\n"
+        )
+        src_iter = self._vram_region_iter_chunks(src, src_region)
+        dst_iter = self._vram_region_iter_chunks(dst, dst_region)
+        for (s_off, _), (d_off, _) in zip(src_iter, dst_iter):
+            src_addr = tir.Add(
+                tir.IntImm("int32", int(src.address)), s_off,
+            )
+            dst_addr = tir.Add(
+                tir.IntImm("int32", int(dst.address)), d_off,
+            )
+            m_src = self.materializer.materialize(src_addr)
+            self.shim.compiler.generated_code += m_src.isa
+            m_dst = self.materializer.materialize(dst_addr)
+            self.shim.compiler.generated_code += m_dst.isa
+            try:
+                self.shim.compiler.generated_code += (
+                    f"{opcode} gp{m_dst.register}, gp{m_src.register}, 0\n"
+                )
+            finally:
+                m_dst.release()
+                m_src.release()
 
-    def _emit_tile_reci(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_tile_unary(mod, op, opcode="V_RECI_V")
+    def _emit_v_exp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_v_unary(mod, op, opcode="V_EXP_V")
 
-    def _emit_tile_sqrt(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_tile_unary(mod, op, opcode="V_SQRT_V")
+    def _emit_v_reci(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_v_unary(mod, op, opcode="V_RECI_V")
+
+    def _emit_v_sqrt(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_v_unary(mod, op, opcode="V_SQRT_V")
 
     def _emit_fp_copy_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_fp_scalar_op_at(mod, op, kernel_op="copy")
@@ -1780,72 +2642,14 @@ class IsaEmitterPass:
     # maps (dim2, dim3) to a physical VRAM row and synthesizes a V_MASK
     # for narrow packed D tiles.
     def _emit_row_reduce_max_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_reduce_single(mod, op, opcode="V_RED_MAX")
+        self._emit_row_scalar_op_at(
+            mod, op, row_op="reduce_max", reduce=True, masked=True,
+        )
 
     def _emit_row_reduce_sum_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        self._emit_row_reduce_single(mod, op, opcode="V_RED_SUM")
-
-    def _emit_row_reduce_single(
-        self, mod: _hlir.HLIRModule, op: _hlir.Op, *, opcode: str,
-    ) -> None:
-        """Reduce ONE row of the VRAM src buffer into ONE FPRAM scalar slot.
-
-        Contract: one HLIR op = one HW instruction. Callers must wrap this
-        in an outer ``for row`` if they want to reduce every row.
-
-        scalar_args layout (built by to_plena._lower_bare_reduce):
-            [fp_dst_addr (BufferElement(buf, (lane, row))), row_var, lane_var]
-        """
-        src = mod.get_buffer(op.buffer_args[0])
-        _check_scope(src, _scope.VRAM, op.kind, "src")
-        if len(op.scalar_args) != 3:
-            raise IsaEmissionError(
-                f"{op.kind} expects 3 scalar args (fp_dst_addr, row, lane); "
-                f"got {len(op.scalar_args)}"
-            )
-        fp_addr_arg = op.scalar_args[0]
-        row_expr = op.scalar_args[1]
-        head_expr = op.scalar_args[2]
-        fp_addr_expr = self._resolve_fp_scalar_addr_arg(
-            mod, fp_addr_arg, op.kind, "fp",
+        self._emit_row_scalar_op_at(
+            mod, op, row_op="reduce_sum", reduce=True, masked=True,
         )
-        mlen = int(self.shim.mlen)
-        src_row_expr, mask_expr = self._resolve_row_at_coords(
-            src, op.kind, "src", row_expr, head_expr,
-        )
-        emit_v_mask = mask_expr is not None
-        use_mask_flag = 1 if emit_v_mask else 0
-
-        mats: List = []
-        src_addr_expr = tir.Add(
-            tir.IntImm("int32", int(src.address)),
-            tir.Mul(src_row_expr, tir.IntImm("int32", mlen)),
-        )
-        m_src = self.materializer.materialize(src_addr_expr)
-        self.shim.compiler.generated_code += m_src.isa
-        mats.append(m_src)
-        gp_src = m_src.register
-        m_dst = self.materializer.materialize(fp_addr_expr)
-        self.shim.compiler.generated_code += m_dst.isa
-        mats.append(m_dst)
-        gp_dst = m_dst.register
-        try:
-            lines = [
-                f"; row reduce task "
-                f"{op.annotations.get('intrinsic', op.kind)} opcode={opcode}"
-            ]
-            if emit_v_mask:
-                m_mask = self.materializer.materialize(mask_expr)
-                self.shim.compiler.generated_code += m_mask.isa
-                mats.append(m_mask)
-                lines.append(f"C_SET_V_MASK_REG gp{m_mask.register}")
-            lines.append(f"S_LD_FP f1, gp{gp_dst}, 0")
-            lines.append(f"{opcode} f1, gp{gp_src}, {use_mask_flag}")
-            lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
-            self.shim.compiler.generated_code += "\n".join(lines) + "\n"
-        finally:
-            for m in reversed(mats):
-                m.release()
 
     # Single-row VRAM × FPRAM-scalar ops. One HLIR op = one HW
     # instruction. Multi-row callers wrap in outer ``for row``.
@@ -1911,6 +2715,71 @@ class IsaEmitterPass:
                 f"starts={tuple(starts)} extents={tuple(extents)}; "
                 f"both must be 4-tuples"
             )
+        # Row-major-flat path: parent has no tile_layout AND no
+        # cluster_dim. This covers (a) author-pinned global.vram /
+        # global.mram tensor caches (testbench-loaded contiguous,
+        # not 7D-tile-padded) and (b) any small buffer that fits a
+        # single tile (logical extent ≤ mlen on every dim). Each
+        # mlen-wide region chunk maps directly to a flat row-major
+        # slice. Buffers with a non-None tile_layout keep the 7D path
+        # below — their physical layout walks mlen-row tiles.
+        cluster_dim_pre = getattr(parent, "cluster_dim", None)
+        if cluster_dim_pre is None and parent.tile_layout is None:
+            mlen = self.shim.mlen
+            shape = [int(d) for d in parent.shape]
+            # Row-major strides on the BSHD shape (rank-4).
+            row_strides = [1] * 4
+            for i in range(2, -1, -1):
+                row_strides[i] = row_strides[i + 1] * shape[i + 1]
+            eb, es, eh, ed = (int(x) for x in extents)
+            total_elems = eb * es * eh * ed
+            if total_elems % mlen != 0:
+                raise IsaEmissionError(
+                    f"VramRegion(parent={region.parent!r}, cluster-less): "
+                    f"total region elems={total_elems} not a multiple of "
+                    f"MLEN={mlen}"
+                )
+            chunks = total_elems // mlen
+
+            def _start_plus_simple(axis: int):
+                s = starts[axis]
+                if isinstance(s, int):
+                    return tir.IntImm("int32", int(s))
+                return s
+
+            def _mul_s(expr, k: int):
+                if k == 0:
+                    return tir.IntImm("int32", 0)
+                if k == 1:
+                    return expr
+                if isinstance(expr, tir.IntImm):
+                    return tir.IntImm("int32", int(expr.value) * k)
+                return tir.Mul(expr, tir.IntImm("int32", int(k)))
+
+            def _sum_s(terms):
+                nz = [t for t in terms if not (isinstance(t, tir.IntImm) and int(t.value) == 0)]
+                if not nz:
+                    return tir.IntImm("int32", 0)
+                acc = nz[0]
+                for t in nz[1:]:
+                    acc = tir.Add(acc, t)
+                return acc
+
+            base_off = _sum_s([
+                _mul_s(_start_plus_simple(0), row_strides[0]),
+                _mul_s(_start_plus_simple(1), row_strides[1]),
+                _mul_s(_start_plus_simple(2), row_strides[2]),
+                _start_plus_simple(3),
+            ])
+            fp_elems = 0
+            for c in range(chunks):
+                if c == 0:
+                    yield base_off, fp_elems
+                else:
+                    yield tir.Add(base_off, tir.IntImm("int32", c * mlen)), fp_elems
+                fp_elems += mlen
+            return
+
         tl = parent.tile_layout
         if tl is None:
             # ``make_tile_layout`` returns None for buffers that fit a
@@ -2127,45 +2996,69 @@ class IsaEmitterPass:
         self._emit_v_fp_transfer_slice(mod, op, direction="fp_to_v")
 
     def _emit_copy_v_to_v(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
-        """One MLEN-wide row copy in VRAM via ``V_ADD_VF dst, src, f0, 0``.
+        """Region-based VRAM→VRAM copy: ``dst[region] = src[region]``.
 
-        Relies on the convention that fp_reg[0] (i.e. ``f0``) is held at
-        zero. Same convention plena.tile_zero already depends on.
+        Schema (region layer):
+            buffer_args = [src_region, dst_region]   (VramRegion 4D BSHD)
+            scalar_args = []
+
+        Each mlen-wide chunk emits one ``V_ADD_VF dst, src, f0, 0`` —
+        f0 == 0 by convention so ``src + 0`` is just src.
         """
-        src = mod.get_buffer(op.buffer_args[0])
-        dst = mod.get_buffer(op.buffer_args[1])
-        _check_scope(src, _scope.VRAM, op.kind, "src")
-        _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        if len(op.scalar_args) != 2:
+        if len(op.buffer_args) != 2:
             raise IsaEmissionError(
-                f"plena.copy_v_to_v expects 2 scalar args (src_offset, dst_offset); "
+                f"copy_v_to_v expects 2 buffer_args (src/dst regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        for slot, name in enumerate(("src", "dst")):
+            if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
+                raise IsaEmissionError(
+                    f"copy_v_to_v {name}: expected VramRegion, got "
+                    f"{type(op.buffer_args[slot]).__name__}"
+                )
+        if op.scalar_args:
+            raise IsaEmissionError(
+                f"copy_v_to_v expects 0 scalar_args; "
                 f"got {len(op.scalar_args)}"
             )
-        src_offset_expr = op.scalar_args[0]
-        dst_offset_expr = op.scalar_args[1]
-
-        src_addr_expr = tir.Add(
-            tir.IntImm("int32", int(src.address)),
-            src_offset_expr,
+        src_region: _hlir.VramRegion = op.buffer_args[0]
+        dst_region: _hlir.VramRegion = op.buffer_args[1]
+        src = mod.get_buffer(src_region.parent)
+        dst = mod.get_buffer(dst_region.parent)
+        _check_scope(src, _scope.VRAM, op.kind, "src")
+        _check_scope(dst, _scope.VRAM, op.kind, "dst")
+        if tuple(src_region.extents) != tuple(dst_region.extents):
+            raise IsaEmissionError(
+                f"copy_v_to_v: src/dst region extents must match; "
+                f"src={tuple(src_region.extents)} "
+                f"dst={tuple(dst_region.extents)}"
+            )
+        self.shim.compiler.generated_code += (
+            f"; copy_v_to_v src.parent={src_region.parent} -> "
+            f"dst.parent={dst_region.parent} "
+            f"extents={list(dst_region.extents)!r}\n"
         )
-        dst_addr_expr = tir.Add(
-            tir.IntImm("int32", int(dst.address)),
-            dst_offset_expr,
-        )
-        m_src = self.materializer.materialize(src_addr_expr)
-        self.shim.compiler.generated_code += m_src.isa
-        m_dst = self.materializer.materialize(dst_addr_expr)
-        self.shim.compiler.generated_code += m_dst.isa
-        try:
-            lines = [
-                f"; v→v row copy via V_ADD_VF f0=0 task "
-                f"{op.annotations.get('intrinsic', op.kind)}",
-                f"V_ADD_VF gp{m_dst.register}, gp{m_src.register}, f0, 0",
-            ]
-            self.shim.compiler.generated_code += "\n".join(lines) + "\n"
-        finally:
-            m_src.release()
-            m_dst.release()
+        src_iter = self._vram_region_iter_chunks(src, src_region)
+        dst_iter = self._vram_region_iter_chunks(dst, dst_region)
+        for (s_off, _), (d_off, _) in zip(src_iter, dst_iter):
+            src_addr = tir.Add(
+                tir.IntImm("int32", int(src.address)), s_off,
+            )
+            dst_addr = tir.Add(
+                tir.IntImm("int32", int(dst.address)), d_off,
+            )
+            m_src = self.materializer.materialize(src_addr)
+            self.shim.compiler.generated_code += m_src.isa
+            m_dst = self.materializer.materialize(dst_addr)
+            self.shim.compiler.generated_code += m_dst.isa
+            try:
+                self.shim.compiler.generated_code += (
+                    f"V_ADD_VF gp{m_dst.register}, gp{m_src.register}, "
+                    f"f0, 0\n"
+                )
+            finally:
+                m_dst.release()
+                m_src.release()
 
     # ------------------------------------------------------------------
     # Structured ops: For
@@ -2252,14 +3145,18 @@ class IsaEmitterPass:
                         f"; ... unroll iter {i} -> {loop_var.name}={iter_val}\n"
                         f"S_ADDI_INT gp{gp_idx}, gp0, {iter_val}\n"
                     )
-                    for sub_op in op.body or []:
+                    for j, sub_op in enumerate(op.body or []):
                         handler = self._dispatch.get(sub_op.kind)
                         if handler is None:
                             raise IsaEmissionError(
                                 f"no ISA dispatcher for nested op kind "
                                 f"{sub_op.kind!r} inside unrolled for-loop"
                             )
-                        handler(mod, sub_op)
+                        ra.push_site(f"unroll[{i}].body[{j}] {sub_op.kind}")
+                        try:
+                            handler(mod, sub_op)
+                        finally:
+                            ra.pop_site()
             finally:
                 ra.unpin_gp(gp_idx)
                 del self.symbol_table[loop_var]
@@ -2301,14 +3198,18 @@ class IsaEmitterPass:
 
         self.symbol_table[loop_var] = ("ram", idx_addr)
         try:
-            for sub_op in op.body or []:
+            for j, sub_op in enumerate(op.body or []):
                 handler = self._dispatch.get(sub_op.kind)
                 if handler is None:
                     raise IsaEmissionError(
                         f"no ISA dispatcher for nested op kind {sub_op.kind!r} "
                         f"inside for-loop"
                     )
-                handler(mod, sub_op)
+                ra.push_site(f"for[{loop_var.name}].body[{j}] {sub_op.kind}")
+                try:
+                    handler(mod, sub_op)
+                finally:
+                    ra.pop_site()
         finally:
             del self.symbol_table[loop_var]
 

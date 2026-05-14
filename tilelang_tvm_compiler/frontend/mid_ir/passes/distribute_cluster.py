@@ -102,6 +102,9 @@ def _clone_cluster_with_body(template: ParallelAxis,
         kind=ParallelKind.CLUSTER,
         thread_tag=template.thread_tag,         # always None for CLUSTER, but copy anyway
         parent_grid_axis_name=template.parent_grid_axis_name,
+        original_axis_name=template.original_axis_name,
+        axis_var=template.axis_var,
+        original_axis_var=template.original_axis_var,
     )
 
 
@@ -137,6 +140,7 @@ def _distribute_one_cluster(cluster: ParallelAxis) -> List[Stmt]:
                 extent=child.extent,
                 body=[_clone_cluster_with_body(cluster, inner_body)],
                 kind=child.kind,
+                loop_var_var=child.loop_var_var,
             )
             out.append(new_for)
         else:
@@ -182,6 +186,9 @@ def _walk_stmt(stmt: Stmt) -> Stmt:
             kind=stmt.kind,
             thread_tag=stmt.thread_tag,
             parent_grid_axis_name=stmt.parent_grid_axis_name,
+            original_axis_name=stmt.original_axis_name,
+            axis_var=stmt.axis_var,
+            original_axis_var=stmt.original_axis_var,
         )
     if isinstance(stmt, For):
         return For(
@@ -189,6 +196,7 @@ def _walk_stmt(stmt: Stmt) -> Stmt:
             extent=stmt.extent,
             body=_walk_stmts(stmt.body),
             kind=stmt.kind,
+            loop_var_var=stmt.loop_var_var,
         )
     if isinstance(stmt, Async):
         return Async(body=_walk_stmts(stmt.body), scope_id=stmt.scope_id)
@@ -196,6 +204,7 @@ def _walk_stmt(stmt: Stmt) -> Stmt:
         return MultiLaneOp(
             inner=_walk_stmt(stmt.inner),
             cluster_axis_names=list(stmt.cluster_axis_names),
+            cluster_axis_vars=list(stmt.cluster_axis_vars),
             dim_map=dict(stmt.dim_map),
         )
     # Leaf op: pass through unchanged.
@@ -220,6 +229,9 @@ def _walk_stmts(stmts: List[Stmt]) -> List[Stmt]:
                 kind=s.kind,
                 thread_tag=s.thread_tag,
                 parent_grid_axis_name=s.parent_grid_axis_name,
+                original_axis_name=s.original_axis_name,
+                axis_var=s.axis_var,
+                original_axis_var=s.original_axis_var,
             )
             out.extend(_distribute_one_cluster(child))
         else:

@@ -186,6 +186,7 @@ def hbm_strides_for_layout(shape, layout: str = DEFAULT_LAYOUT):
 
 def make_tile_layout(
     *, shape=None, layout: str = DEFAULT_LAYOUT, mlen: int, hlen: int,
+    cluster_dim: Optional[int] = None,
     # Legacy keyword form (b/s/h/d) kept for back-compat with any older
     # caller. New callers should pass ``shape=...`` plus ``layout=...``.
     b: Optional[int] = None, s: Optional[int] = None,
@@ -292,6 +293,14 @@ class Buffer:
     # logical→physical mapping.
     tile_layout: Optional[TileLayout] = None
 
+    # Author-pinned ``global.vram`` / ``global.mram`` tensor caches. The
+    # testbench (or a pre-kernel stub) loads these row-major-contiguous,
+    # NOT in the 7D mlen-tile-padded layout the compiler uses for its
+    # own VRAM allocations. AddressAllocationPass therefore skips
+    # ``make_tile_layout`` for them, and the offset-walking iterators
+    # branch on this flag to compute addresses as flat row-major.
+    is_pinned_global: bool = False
+
     # 4D-buffer layout hint, used to resolve which axis is the row /
     # channel / col dim. ``BSHD`` (the default) means axes are already
     # in canonical batch-row-channel-col order; ``NCHW`` means
@@ -361,7 +370,7 @@ class BufferSlice:
 
 @dataclass
 class VramRegion:
-    """A logical sub-region of a VRAM (or MRAM) on-chip buffer.
+    """A logical sub-region of a VRAM on-chip buffer.
 
     Mirrors :class:`BufferSlice` but for on-chip buffers — used by ops
     whose lowering needs to know the multi-dim shape of the region (to
@@ -372,6 +381,22 @@ class VramRegion:
     shape. Each ``starts`` entry is either a Python int or a
     ``tir.PrimExpr`` (loop-derived; materialised at ISA emit time).
     Each ``extents`` entry is a Python int.
+    """
+    parent: str
+    starts: Tuple[Any, ...]
+    extents: Tuple[int, ...]
+
+
+@dataclass
+class MramRegion:
+    """A logical sub-region of an MRAM on-chip buffer.
+
+    Same shape contract as :class:`VramRegion` — ``starts`` /
+    ``extents`` are per-dim against the parent buffer's logical 4D
+    BSHD shape, and the same 7D tile-layout addressing applies. Kept
+    as a distinct type so emitters can statically tell which on-chip
+    backing store an operand lives in (matmul's LHS is VRAM, RHS is
+    MRAM; mixing them up would target the wrong HW unit).
     """
     parent: str
     starts: Tuple[Any, ...]
@@ -417,6 +442,23 @@ class Op:
     annotations: Dict[str, Any] = field(default_factory=dict)  # debug/passes
     # Only set for structured ops (currently just "for"). Leaves leave it None.
     body: Optional[List["Op"]] = None
+    # Per-buffer-arg axes. Parallel to ``buffer_args``: the i-th entry
+    # is the per-dim ``(role_name, extent)`` tuple for ``buffer_args[i]``.
+    # ``role_name`` is a string identifying the dim's algebra role
+    # (``"batch"`` / ``"simd"`` / ``"cluster"`` / ``"reduce"`` /
+    # ``"broadcast"`` / ``"gemm_m"`` / ``"gemm_n"`` / ``"gemm_k"``);
+    # the values mirror mid_ir's ``AxisRole`` enum-value strings so a
+    # mid_ir → HLIR translator can pass them through verbatim.
+    #
+    # Filled by ``mid_ir.to_plena`` for ops whose ISA emit needs to
+    # locate dims by role (e.g. ``row_*_at`` family — which dim is the
+    # rows axis, which is the cluster lane). Leaf ops that don't need
+    # this leave the slot ``None``. Slot count must equal
+    # ``len(buffer_args)``; default empty for back-compat with
+    # constructors that haven't migrated.
+    buffer_axes: List[Optional[Tuple[Tuple[str, int], ...]]] = field(
+        default_factory=list,
+    )
 
 
 def make_for_op(
@@ -543,6 +585,10 @@ def _fmt_buf_arg(a) -> str:
         starts = ",".join(_fmt_idx_item(s) for s in a.starts)
         extents = ",".join(str(e) for e in a.extents)
         return f"{a.parent}<vram>[starts=({starts}), ext=({extents})]"
+    if isinstance(a, MramRegion):
+        starts = ",".join(_fmt_idx_item(s) for s in a.starts)
+        extents = ",".join(str(e) for e in a.extents)
+        return f"{a.parent}<mram>[starts=({starts}), ext=({extents})]"
     return str(a)
 
 
@@ -569,7 +615,9 @@ def assert_addresses_resolved(mod: HLIRModule) -> None:
 
 
 __all__ = [
-    "Buffer", "BufferSlice", "VramRegion", "BufferElement", "Op", "HLIRModule",
+    "Buffer", "BufferSlice",
+    "VramRegion", "MramRegion",
+    "BufferElement", "Op", "HLIRModule",
     "make_for_op",
     "assert_addresses_resolved", "format_hlir",
 ]

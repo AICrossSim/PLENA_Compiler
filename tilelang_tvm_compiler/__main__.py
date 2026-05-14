@@ -280,6 +280,25 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     if args.dump_hlir:
         Path(args.dump_hlir).write_text(format_hlir(compiled.hlir))
 
+    # GP allocator trace: side-by-side TSV that any reader can align with
+    # the ASM dump via the ``asm_line`` column. Column order is fixed so
+    # consumers (humans, scripts) don't have to discover it. Always
+    # written into the same dir as ``--dump-hlir`` so step kernels'
+    # traces stay next to their ASM.
+    if args.dump_hlir and compiled.gp_trace:
+        trace_path = Path(args.dump_hlir).with_name(
+            f"{args.asm_name}.gp_trace.tsv"
+        )
+        cols = [
+            "asm_line", "event", "site",
+            "regs", "n", "slot", "addr", "spilled",
+            "free", "in_use", "pinned",
+        ]
+        lines = ["\t".join(cols)]
+        for row in compiled.gp_trace:
+            lines.append("\t".join(str(row.get(c, "")) for c in cols))
+        trace_path.write_text("\n".join(lines) + "\n")
+
     if args.dump_buffer_addrs:
         # Single source of truth for buffer addresses: dump the post
         # AddressAllocationPass HLIR addresses as JSON for testbenches /

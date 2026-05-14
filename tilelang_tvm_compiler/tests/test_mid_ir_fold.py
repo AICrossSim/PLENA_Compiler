@@ -548,12 +548,13 @@ def test_fold_preserves_blockidx() -> int:
         var=by, iter_type=tir.IterVar.ThreadIndex,
         thread_tag="blockIdx.y",
     )
+    col = tir.Var("col", "int32")
     body = tir.AttrStmt(
         by_iv, "thread_extent", _ii(4),
         tir.For(
-            tir.Var("col", "int32"), _ii(0), _ii(16), tir.ForKind.PARALLEL,
+            col, _ii(0), _ii(16), tir.ForKind.PARALLEL,
             tir.BufferStore(Z, tir.FloatImm(f16, 0.0),
-                            [tir.IntImm("int32", 0), tir.Var("col", "int32")]),
+                            [tir.IntImm("int32", 0), col]),
         ),
     )
     func = _wrap(body)

@@ -66,7 +66,8 @@ from tvm import tir
 
 from ..ir import (
     BinOp, UnaryOp, ReduceOp,
-    BufferDef, BufferRef, Slice,
+    AxisRole, AxisInfo,
+    BufferDef, BufferRef, Slice, VarRef,
     Elementwise, Broadcast, Reduce,
     Gemm, Dma, RawStore, For, MidFunc,
     ParallelAxis, ParallelKind,
@@ -83,6 +84,111 @@ _LANE_AXIS_FUNC_ATTR = "plena.lane_axis"
 
 class FoldError(RuntimeError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Per-fold Var registry
+# ---------------------------------------------------------------------------
+#
+# Canonicalises ``tir.Var`` -> ``VarRef`` within one fold call.
+#
+# Keyed by ``id(var)`` so a given ``tir.Var`` object always yields the
+# same ``VarRef`` instance — identity comparisons on ``VarRef`` are
+# stable across multiple visits of the same underlying var.
+#
+# Same-name different-object vars are explicitly *allowed*. That's the
+# whole point of moving off bare-string indices: each ``tir.Var`` keeps
+# its own identity even when ``name_hint`` collides (e.g. two unrelated
+# ``row`` vars in the same PrimFunc). Two ``VarRef``s wrapping
+# different ``tir.Var``s with the same name will compare unequal via
+# ``var.same_as`` — exactly the contract we want.
+#
+# Reset at every call to :func:`run`.
+
+
+class _VarRegistry:
+    def __init__(self) -> None:
+        self._by_id: Dict[int, VarRef] = {}
+        # Keep a strong reference to each Var so its id() can't be
+        # recycled inside this fold call.
+        self._anchor: List[object] = []
+
+    def ref(self, var) -> VarRef:
+        existing = self._by_id.get(id(var))
+        if existing is not None:
+            return existing
+        new_ref = VarRef(var)
+        self._by_id[id(var)] = new_ref
+        self._anchor.append(var)
+        return new_ref
+
+
+# Active registry for the current ``run`` invocation. Module-level
+# (vs threaded through every helper) because the recursion already
+# fans out through many small functions; passing it would force a
+# wide signature change for no benefit. Reset at the top of ``run``.
+_active_registry: Optional[_VarRegistry] = None
+
+
+def _vref(var) -> VarRef:
+    """Canonical ``VarRef`` for ``var`` in the active fold call."""
+    if _active_registry is None:
+        raise FoldError(
+            "_vref called outside a fold ``run`` — registry not active"
+        )
+    return _active_registry.ref(var)
+
+
+def _assert_no_str_in_indices(stmts) -> None:
+    """Walk ``stmts`` and assert no BufferRef.indices entry is a bare
+    ``str``. Bare-string indices were the pre-VarRef cheat; fold output
+    must be VarRef-only."""
+    def visit_ref(ref: BufferRef) -> None:
+        for i, idx in enumerate(ref.indices):
+            _check_idx(idx, ref.buffer.name, i)
+
+    def _check_idx(idx, buf_name, pos) -> None:
+        if isinstance(idx, str):
+            raise FoldError(
+                f"fold produced a bare-string index in BufferRef "
+                f"{buf_name}[..pos {pos}..] = {idx!r}. mid_ir now requires "
+                f"VarRef; investigate the producer."
+            )
+        if isinstance(idx, dict):
+            for a in idx.get("args", []):
+                _check_idx(a, buf_name, pos)
+
+    def visit_src(src) -> None:
+        if isinstance(src, Broadcast):
+            visit_ref(src.src)
+        else:
+            visit_ref(src)
+
+    def walk(s) -> None:
+        if isinstance(s, Elementwise):
+            visit_ref(s.dst)
+            for x in s.srcs:
+                visit_src(x)
+        elif isinstance(s, Reduce):
+            visit_ref(s.dst)
+            visit_ref(s.src)
+        elif isinstance(s, Dma):
+            visit_ref(s.src)
+            visit_ref(s.dst)
+        elif isinstance(s, Gemm):
+            visit_ref(s.a)
+            visit_ref(s.b)
+            visit_ref(s.c)
+        elif isinstance(s, RawStore):
+            visit_ref(s.dst)
+        # Recurse into structural nodes.
+        body = getattr(s, "body", None)
+        if isinstance(body, list):
+            for c in body:
+                walk(c)
+
+    for s in stmts:
+        walk(s)
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +279,9 @@ def _buffer_def(buf: tir.Buffer, default_scope: str = "global") -> BufferDef:
 # ---------------------------------------------------------------------------
 
 
-def _index_expr(expr) -> Union[int, str, dict]:
+def _index_expr(expr) -> Union[int, VarRef, dict]:
     """Convert a TIR PrimExpr appearing as an index into a mid_ir
-    IndexExpr (int / str / dict). Compound arithmetic becomes a
+    IndexExpr (int / VarRef / dict). Compound arithmetic becomes a
     ``{"op": "<add/mul/...>", "args": [...]}`` dict; passes that need
     to manipulate it can parse the dict.
 
@@ -185,13 +291,17 @@ def _index_expr(expr) -> Union[int, str, dict]:
     can collapse a full-range ramp (base=0, stride=1, lanes=buffer_dim)
     into a ``Slice`` should do so before calling here, but the encoding
     survives if they don't.
+
+    ``tir.Var`` -> ``VarRef`` (identity-typed). The active fold-call
+    registry canonicalises so visits of the same Var object always
+    yield the same VarRef, and two distinct Vars sharing a name raise.
     """
     if isinstance(expr, (int,)):
         return int(expr)
     if isinstance(expr, tir.IntImm):
         return int(expr.value)
     if isinstance(expr, tir.Var):
-        return expr.name
+        return _vref(expr)
     if isinstance(expr, tir.Add):
         return {"op": "add", "args": [_index_expr(expr.a), _index_expr(expr.b)]}
     if isinstance(expr, tir.Sub):
@@ -483,8 +593,10 @@ def _index_exprs_equal(a, b) -> bool:
     is how we detect a broadcast)."""
     if isinstance(a, Slice) and isinstance(b, Slice):
         return True
-    if isinstance(a, (int, str)) and isinstance(b, (int, str)):
+    if isinstance(a, int) and isinstance(b, int):
         return a == b
+    if isinstance(a, VarRef) and isinstance(b, VarRef):
+        return a == b   # identity-based equality
     if isinstance(a, dict) and isinstance(b, dict):
         if a.get("op") != b.get("op"):
             return False
@@ -559,6 +671,83 @@ def _to_raw_store(store: tir.BufferStore,
     )
 
 
+def _axes_for_ref(ref: BufferRef,
+                  simd_axis: Optional[int],
+                  simd_size: int) -> List[AxisInfo]:
+    """Build per-axis AxisInfo for a BufferRef given the op's SIMD context.
+
+    Each axis carries its **buffer-declared extent** plus a role:
+      * SIMD with extent ``simd_size`` for the axis the op vectorises
+        along (``simd_axis`` index, negative wraps).
+      * BATCH with the buffer's declared extent for every other axis.
+        The op fan-outs that many times along that dim; whether or
+        not an outer for-loop is currently in scope at fold time is
+        a fold detail (the for may even get absorbed) — the axis's
+        fan-out cardinality stays the same regardless. Lower wraps
+        outer fors based on this extent.
+
+    ``simd_axis is None`` → whole-buffer SIMD: every dim is SIMD at
+    its full extent.
+
+    CLUSTER role is never assigned at this point — the cluster axis
+    is prepended later by pass_3_split / pass_4b_view alongside the
+    indices change.
+    """
+    out: List[AxisInfo] = []
+    rank = len(ref.indices)
+    normalised_simd = (
+        simd_axis + rank if (simd_axis is not None and simd_axis < 0)
+        else simd_axis
+    )
+    for dim, extent_decl in enumerate(ref.buffer.shape):
+        full = int(extent_decl)
+        if normalised_simd is not None and dim == normalised_simd:
+            out.append(AxisInfo(role=AxisRole.SIMD, extent=int(simd_size)))
+        elif simd_axis is None:
+            out.append(AxisInfo(role=AxisRole.SIMD, extent=full))
+        else:
+            out.append(AxisInfo(role=AxisRole.BATCH, extent=full))
+    return out
+
+
+def _axes_for_broadcast_src(
+    bc: Broadcast,
+    simd_axis: Optional[int],
+    simd_size: int,
+) -> List[AxisInfo]:
+    """Per-axis AxisInfo for the inner ref of a Broadcast.
+
+    The dst rank exceeds the src rank by ``len(bc.broadcast_dims)``;
+    those dst-side axes are tagged BROADCAST and don't appear in the
+    src's axes list at all. The src's own axes use the same rules as
+    ``_axes_for_ref`` but with the SIMD axis index translated to its
+    position inside the src's (shorter) shape, if applicable.
+    """
+    # Dst-side SIMD axis index. If it lives in a broadcast_dim, the
+    # src side has no corresponding axis to be SIMD; we leave all of
+    # the src's axes as BATCH (its values are broadcast onto the SIMD
+    # dim from outside).
+    rank_src = len(bc.src.indices)
+    if simd_axis is None:
+        return [
+            AxisInfo(role=AxisRole.SIMD, extent=int(d))
+            for d in bc.src.buffer.shape
+        ]
+    # Map dst-side simd index → src-side index by counting how many
+    # broadcast_dims sit at or before it.
+    bd_set = set(bc.broadcast_dims)
+    if simd_axis in bd_set:
+        src_simd: Optional[int] = None
+    else:
+        # Number of broadcast_dims with smaller index — drop them from
+        # the dst index to land on the matching src dim.
+        offset = sum(1 for b in bd_set if b < simd_axis)
+        src_simd = simd_axis - offset
+        if not (0 <= src_simd < rank_src):
+            src_simd = None
+    return _axes_for_ref(bc.src, src_simd, simd_size)
+
+
 def _try_fold_store(store: tir.BufferStore,
                     parallel_var: Optional[tir.Var],
                     buf_table: Dict[str, BufferDef],
@@ -588,12 +777,28 @@ def _try_fold_store(store: tir.BufferStore,
     # matchers below see a clean fp16 expression tree.
     expr = _peel_cast_roundtrip(store.value, target_dtype=str(store.buffer.dtype))
 
+    def _build_axes(srcs):
+        return (
+            _axes_for_ref(dst, axis, size),
+            [
+                _axes_for_broadcast_src(s, axis, size)
+                if isinstance(s, Broadcast)
+                else _axes_for_ref(s, axis, size)
+                for s in srcs
+            ],
+        )
+
     # Constant fill: only 0 maps cleanly to a HW vector op. Anything
     # else falls back to RawStore (the caller wraps it).
     if isinstance(expr, (tir.IntImm, tir.FloatImm)):
         if float(expr.value) != 0.0:
             return None
-        return Elementwise(dst=dst, srcs=[], op=UnaryOp.COPY, axis=axis, size=size)
+        dst_axes, src_axes = _build_axes([])
+        return Elementwise(
+            dst=dst, srcs=[], op=UnaryOp.COPY,
+            axis=axis, size=size,
+            dst_axes=dst_axes, src_axes=src_axes,
+        )
 
     # Unary: T.exp(x), T.sqrt(x).
     unary = _try_unary_call(expr)
@@ -606,7 +811,12 @@ def _try_fold_store(store: tir.BufferStore,
         wrapped = _wrap_src(a, dst.indices, buf_table, dst_buf=dst.buffer)
         if wrapped is None:
             return None
-        return Elementwise(dst=dst, srcs=[wrapped], op=unary, axis=axis, size=size)
+        dst_axes, src_axes = _build_axes([wrapped])
+        return Elementwise(
+            dst=dst, srcs=[wrapped], op=unary,
+            axis=axis, size=size,
+            dst_axes=dst_axes, src_axes=src_axes,
+        )
 
     # Reciprocal: 1.0 / x.
     if isinstance(expr, tir.Div):
@@ -618,8 +828,11 @@ def _try_fold_store(store: tir.BufferStore,
             wrapped = _wrap_src(b, dst.indices, buf_table, dst_buf=dst.buffer)
             if wrapped is None:
                 return None
+            dst_axes, src_axes = _build_axes([wrapped])
             return Elementwise(
-                dst=dst, srcs=[wrapped], op=UnaryOp.RECI, axis=axis, size=size,
+                dst=dst, srcs=[wrapped], op=UnaryOp.RECI,
+                axis=axis, size=size,
+                dst_axes=dst_axes, src_axes=src_axes,
             )
         return None
 
@@ -628,8 +841,11 @@ def _try_fold_store(store: tir.BufferStore,
         wrapped = _wrap_src(expr, dst.indices, buf_table, dst_buf=dst.buffer)
         if wrapped is None:
             return None
+        dst_axes, src_axes = _build_axes([wrapped])
         return Elementwise(
-            dst=dst, srcs=[wrapped], op=UnaryOp.COPY, axis=axis, size=size,
+            dst=dst, srcs=[wrapped], op=UnaryOp.COPY,
+            axis=axis, size=size,
+            dst_axes=dst_axes, src_axes=src_axes,
         )
 
     # Binary: A op B (each a BufferLoad — may broadcast independently).
@@ -646,7 +862,12 @@ def _try_fold_store(store: tir.BufferStore,
             else:
                 # Scalar literal / compound expr in binop → not foldable.
                 return None
-        return Elementwise(dst=dst, srcs=srcs, op=binop, axis=axis, size=size)
+        dst_axes, src_axes = _build_axes(srcs)
+        return Elementwise(
+            dst=dst, srcs=srcs, op=binop,
+            axis=axis, size=size,
+            dst_axes=dst_axes, src_axes=src_axes,
+        )
 
     return None
 
@@ -702,7 +923,28 @@ def _fold_reduce(call: tir.Call,
     op = _REDUCE_OPS_BY_NAME.get(op_name)
     if op is None:
         raise FoldError(f"unknown reduce op {op_name!r}")
-    return Reduce(dst=dst_ref, src=src_ref, op=op, axis=axis)
+    # Build axes: dst is one rank lower than src; the collapsed
+    # axis is tagged REDUCE on src, every other axis is BATCH.
+    src_rank = len(src_ref.indices)
+    normalised_axis = axis + src_rank if axis < 0 else axis
+    src_axes: List[AxisInfo] = []
+    for dim, ext in enumerate(src_ref.buffer.shape):
+        full = int(ext)
+        if dim == normalised_axis:
+            src_axes.append(AxisInfo(role=AxisRole.REDUCE, extent=full))
+        else:
+            src_axes.append(_axes_for_ref(src_ref, None, 0)[dim])
+            # ``_axes_for_ref(..., None, 0)`` returned SIMD across every dim;
+            # we only want SIMD treatment when dim is REDUCE's neighbor on the
+            # SIMD axis, which Reduce doesn't have. Force BATCH instead.
+            src_axes[-1] = AxisInfo(role=AxisRole.BATCH, extent=full)
+    dst_axes: List[AxisInfo] = []
+    for dim, ext in enumerate(dst_ref.buffer.shape):
+        dst_axes.append(AxisInfo(role=AxisRole.BATCH, extent=int(ext)))
+    return Reduce(
+        dst=dst_ref, src=src_ref, op=op, axis=axis,
+        dst_axes=dst_axes, src_axes=src_axes,
+    )
 
 
 def _fold_dma(call: tir.Call,
@@ -712,7 +954,24 @@ def _fold_dma(call: tir.Call,
         raise FoldError(f"tl.tileop.copy: expected 2 args, got {len(args)}")
     src_ref = _region_to_ref(args[0], buf_table)
     dst_ref = _region_to_ref(args[1], buf_table)
-    return Dma(src=src_ref, dst=dst_ref)
+    # Default DMA axis tagging: the innermost dim is SIMD (one HW
+    # vector load/store moves a contiguous mlen-aligned run along it),
+    # every other dim is BATCH (the kernel fans out one HW issue per
+    # index along it). View pass prepends a CLUSTER axis when the
+    # buffer is lane-aware. This matches the per-axis story Elementwise
+    # uses for default ``axis=-1, size=last_dim``.
+    def _default_axes(ref: BufferRef) -> List[AxisInfo]:
+        shape = ref.buffer.shape
+        out: List[AxisInfo] = []
+        for i, d in enumerate(shape):
+            role = AxisRole.SIMD if i == len(shape) - 1 else AxisRole.BATCH
+            out.append(AxisInfo(role=role, extent=int(d)))
+        return out
+    return Dma(
+        src=src_ref, dst=dst_ref,
+        src_axes=_default_axes(src_ref),
+        dst_axes=_default_axes(dst_ref),
+    )
 
 
 def _fold_gemm(call: tir.Call,
@@ -733,7 +992,41 @@ def _fold_gemm(call: tir.Call,
         ta = bool(int(flags[0].value))
     if len(flags) >= 2:
         tb = bool(int(flags[1].value))
-    return Gemm(a=a, b=b, c=c, transpose_a=ta, transpose_b=tb, kind=kind)
+    # Tag Gemm operand axes with their algebra roles. At fold time the
+    # refs are rank-2 (pre-split lane prepend), so the labelling is
+    # unambiguous from the matmul algebra:
+    #
+    #     c = a @ b            -> c is [M, N]
+    #     a is [M, K]  (transpose_a flips to [K, M])
+    #     b is [K, N]  (transpose_b flips to [N, K])
+    #
+    # split prepends an extra CLUSTER axis on lane-aware operands;
+    # view/burn_view permute the axes alongside indices. Downstream
+    # lowering (e.g. ``_lower_bare_per_head_gemm``) reads ``c_axes`` to
+    # locate GEMM_M without scanning shape extents.
+    def _pair(ref, roles):
+        rank = len(ref.buffer.shape)
+        if rank != 2:
+            # Fold sees pre-split rank-2 operands. If a kernel author
+            # ever hands us a rank-3 tile (unlikely but possible),
+            # leave axes empty — downstream paths will need to handle
+            # it explicitly.
+            return []
+        return [
+            AxisInfo(role=roles[i], extent=int(ref.buffer.shape[i]))
+            for i in range(rank)
+        ]
+
+    a_roles = (AxisRole.GEMM_K, AxisRole.GEMM_M) if ta else (AxisRole.GEMM_M, AxisRole.GEMM_K)
+    b_roles = (AxisRole.GEMM_N, AxisRole.GEMM_K) if tb else (AxisRole.GEMM_K, AxisRole.GEMM_N)
+    c_roles = (AxisRole.GEMM_M, AxisRole.GEMM_N)
+    return Gemm(
+        a=a, b=b, c=c,
+        transpose_a=ta, transpose_b=tb, kind=kind,
+        a_axes=_pair(a, a_roles),
+        b_axes=_pair(b, b_roles),
+        c_axes=_pair(c, c_roles),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -764,19 +1057,59 @@ def _mid_for_kind(name: str) -> str:
 def _outer_loop_matches_buffer_axis(dst: BufferRef,
                                     loop_var: tir.Var,
                                     extent: int) -> bool:
-    """True when ``dst.indices`` references ``loop_var`` (by name) on
-    a non-last axis whose buffer extent equals ``extent``. Used to
+    """True when ``dst.indices`` references ``loop_var`` (by identity)
+    on a non-last axis whose buffer extent equals ``extent``. Used to
     decide whether an outer ``for row`` is redundant on top of an
     already-whole-buffer Elementwise."""
-    name = loop_var.name
+    target = _vref(loop_var)
     shape = dst.buffer.shape
     if len(dst.indices) != len(shape):
         return False
     for axis, idx in enumerate(dst.indices):
         if axis == len(dst.indices) - 1:
             continue  # inner axis = the one Elementwise(axis=-1) already covers
-        if isinstance(idx, str) and idx == name and int(shape[axis]) == extent:
+        if (isinstance(idx, VarRef) and idx == target
+                and int(shape[axis]) == extent):
             return True
+    return False
+
+
+def _index_expr_uses_varref(idx, target: VarRef) -> bool:
+    """Recursively look for ``target`` (by identity) inside an IndexExpr.
+
+    Used to decide whether an outer ``for row`` can be absorbed into an
+    already-folded inner Elementwise: if any Broadcast src still
+    references the outer var, absorbing the for would leave the var
+    unbound.
+    """
+    if isinstance(idx, VarRef):
+        return idx == target
+    if isinstance(idx, dict):
+        return any(_index_expr_uses_varref(a, target)
+                   for a in idx.get("args", []))
+    return False
+
+
+def _elementwise_refs_var(ew, target: VarRef) -> bool:
+    """True if any ``Broadcast`` src of ``ew`` references ``target``
+    (by identity) in its indices.
+
+    Only the broadcast case is problematic: ``_wrap_src`` keeps the
+    Broadcast's indices as a prefix of dst's, so the outer var
+    is preserved literally in the source. Absorbing the outer for then
+    leaves the var referenced but unbound.
+
+    Same-rank BufferRef srcs already have indices that match dst's one
+    for one, so absorbing the outer for is symmetric — both dst and
+    src lose their reference to the var simultaneously and the
+    whole-buffer Elementwise stands on its own.
+    """
+    for src in ew.srcs:
+        if not isinstance(src, Broadcast):
+            continue
+        for idx in src.src.indices:
+            if _index_expr_uses_varref(idx, target):
+                return True
     return False
 
 
@@ -829,6 +1162,7 @@ def _walk_stmt(stmt,
                 body=inner,
                 kind=ParallelKind.BLOCK_IDX,
                 thread_tag=str(iv.thread_tag) if iv.thread_tag else None,
+                axis_var=_vref(iv.var),
             )]
         # Unknown attr — pass through.
         return _walk_stmt(stmt.body, buf_table, current_kind)
@@ -871,6 +1205,18 @@ def _walk_stmt(stmt,
                         and isinstance(stmt.extent, tir.IntImm)
                         and _outer_loop_matches_buffer_axis(
                             inner_ew.dst, stmt.loop_var, int(stmt.extent.value),
+                        )
+                        # Don't absorb if any Broadcast src still uses
+                        # the outer loop var — e.g. ``dst[row,col] =
+                        # a[row,col] * b[row]`` folds the parallel ``col``
+                        # away but the ``b[row]`` Broadcast still needs
+                        # ``row`` bound by an enclosing for. Absorbing it
+                        # would leave ``row`` referenced but unbound,
+                        # crashing ExprMaterializer later. Pass through
+                        # as a regular For instead so the outer loop
+                        # keeps its scope.
+                        and not _elementwise_refs_var(
+                            inner_ew, _vref(stmt.loop_var),
                         )):
                     return [inner_ew]
         # Pass through as a regular For. Body is recursively walked;
@@ -895,12 +1241,14 @@ def _walk_stmt(stmt,
                 body=body,
                 kind=ParallelKind.LOGICAL_GRID,
                 thread_tag=None,
+                axis_var=_vref(stmt.loop_var),
             )]
         return [For(
             loop_var=stmt.loop_var.name,
             extent=int(stmt.extent.value),
             body=body,
             kind=_mid_for_kind(kind_name),
+            loop_var_var=_vref(stmt.loop_var),
         )]
     if isinstance(stmt, tir.LetStmt):
         # Should be eliminated by inline_let_stmts; if it lingers,
@@ -961,6 +1309,15 @@ def _walk_stmt(stmt,
 
 def run(func: tir.PrimFunc, name: str = "kernel") -> MidFunc:
     """Fold a raw tir.PrimFunc into mid_ir."""
+    global _active_registry
+    _active_registry = _VarRegistry()
+    try:
+        return _run_locked(func, name)
+    finally:
+        _active_registry = None
+
+
+def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
     buf_table: Dict[str, BufferDef] = {}
 
     # Seed param buffers (always global by convention).
@@ -976,6 +1333,12 @@ def run(func: tir.PrimFunc, name: str = "kernel") -> MidFunc:
         params.append(bd)
 
     body = _walk_stmt(func.body, buf_table, current_kind=None)
+
+    # Fold output invariant: no ``str`` may appear in any BufferRef
+    # indices. Bare-string indices were the cheat the VarRef rewrite
+    # exists to remove. If something slipped through, fail loudly here
+    # rather than letting fuse/to_plena silently mishandle it.
+    _assert_no_str_in_indices(body)
 
     # Allocs are everything in buf_table that isn't a param.
     param_names = {p.name for p in params}

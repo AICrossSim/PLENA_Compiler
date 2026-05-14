@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import sys
 
+from tvm import tir as _tir
+
 from tilelang_tvm_compiler.frontend.mid_ir import ir
 from tilelang_tvm_compiler.frontend.mid_ir.passes.mark import run as mark_run
 from tilelang_tvm_compiler.frontend.mid_ir.passes.split import (
@@ -52,6 +54,7 @@ def _block_idx(name, extent, body, tag="blockIdx.y"):
     return ir.ParallelAxis(
         axis_name=name, extent=extent, body=body,
         kind=ir.ParallelKind.BLOCK_IDX, thread_tag=tag,
+        axis_var=ir.VarRef(_tir.Var(name, "int32")),
     )
 
 
@@ -249,6 +252,7 @@ def test_split_logical_grid_axis() -> int:
             axis_name="m", extent=LANE, kind=ir.ParallelKind.LOGICAL_GRID,
             thread_tag=None,
             body=[ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q))],
+            axis_var=ir.VarRef(_tir.Var("m", "int32")),
         )],
         lane_axes=["m"],
     )

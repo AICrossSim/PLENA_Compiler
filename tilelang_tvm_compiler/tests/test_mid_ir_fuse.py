@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import sys
 
+from tvm import tir as _tir
+
 from tilelang_tvm_compiler.frontend.mid_ir import ir
 from tilelang_tvm_compiler.frontend.mid_ir.passes.fuse import (
     FuseError,
@@ -49,11 +51,32 @@ def _check(label, actual, expected) -> int:
     return 1
 
 
+# Build a coherent ``by`` lane-axis nest with all the VarRef identity
+# fields populated, the way split would emit it. Exposes the wrapped
+# tir.Vars so test bodies that need to reference ``by`` in indices can
+# use the matching VarRef.
+def _lane_vars():
+    by = _tir.Var("by", "int32")
+    by_number = _tir.Var("by_number", "int32")
+    by_phase = _tir.Var("by_phase", "int32")
+    return {
+        "original": ir.VarRef(by),
+        "number": ir.VarRef(by_number),
+        "phase": ir.VarRef(by_phase),
+    }
+
+
+_LANE = _lane_vars()
+
+
 def _cluster(body, axis_name="by_phase", parent="by_number"):
     return ir.ParallelAxis(
         axis_name=axis_name, extent=LANE, body=body,
         kind=ir.ParallelKind.CLUSTER, thread_tag=None,
         parent_grid_axis_name=parent,
+        original_axis_name="by",
+        axis_var=_LANE["phase"],
+        original_axis_var=_LANE["original"],
     )
 
 
@@ -61,6 +84,9 @@ def _grid(body, axis_name="by_number", tag="blockIdx.y"):
     return ir.ParallelAxis(
         axis_name=axis_name, extent=1, body=body,
         kind=ir.ParallelKind.BLOCK_IDX, thread_tag=tag,
+        original_axis_name="by",
+        axis_var=_LANE["number"],
+        original_axis_var=_LANE["original"],
     )
 
 
@@ -83,7 +109,7 @@ def test_async_dma_collapses_to_multi_lane() -> int:
     fn = _wrap([_grid([_cluster([
         ir.Async(body=[
             ir.Dma(
-                src=_ref(Q_hbm, [0, ir.Slice(), "by", ir.Slice()]),
+                src=_ref(Q_hbm, [0, ir.Slice(), _LANE["original"], ir.Slice()]),
                 dst=_slice_ref(Q_sh, 3),
                 marker=ir.Marker.DMA, can_async=True,
             ),
@@ -224,6 +250,50 @@ def test_skip_no_lane_axes() -> int:
     return _check("body unchanged", type(out.body[0]).__name__, "Dma")
 
 
+def test_index_var_identity_not_name() -> int:
+    """Two ``tir.Var`` objects sharing the same ``name_hint`` must not
+    collide as cluster-axis references — the pre-VarRef cheat compared
+    by name and would have silently replaced the unrelated one. With
+    VarRef identity, ``_collapse_lane_axis`` must skip the unrelated
+    var.
+    """
+    print("test_index_var_identity_not_name")
+    # ``by`` here is a completely unrelated tir.Var that just happens
+    # to share the lane-axis name. It must NOT be collapsed.
+    unrelated_by = _tir.Var("by", "int32")
+    unrelated_ref = ir.VarRef(unrelated_by)
+
+    Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
+    Q_sh = _mk_buf("Q_sh", [LANE, 64, 16], scope="shared")
+    fn = _wrap([_grid([_cluster([
+        ir.Async(body=[
+            ir.Dma(
+                src=_ref(Q_hbm, [0, ir.Slice(), unrelated_ref, ir.Slice()]),
+                dst=_slice_ref(Q_sh, 3),
+                marker=ir.Marker.DMA, can_async=True,
+            ),
+        ], scope_id=0),
+    ])])], allocs=[Q_sh])
+    out = fuse_run(fn)
+    mlo = out.body[0].body[0].body[0]
+    failures = 0
+    if not isinstance(mlo, ir.MultiLaneOp):
+        failures += _check("inner is MultiLaneOp",
+                           type(mlo).__name__, "MultiLaneOp")
+        return failures
+    # The unrelated ``by`` at index slot 2 must stay a bare VarRef
+    # (NOT be collapsed to a ranged_slice). The pre-VarRef code would
+    # have name-matched ``"by"`` and replaced it.
+    src_indices = mlo.inner.src.indices
+    failures += _check("unrelated by preserved as VarRef",
+                       isinstance(src_indices[2], ir.VarRef), True)
+    if isinstance(src_indices[2], ir.VarRef):
+        # Must be the exact unrelated var, not the lane's original.
+        failures += _check("identity preserved",
+                           src_indices[2].var is unrelated_by, True)
+    return failures
+
+
 def test_skip_d_ge_mlen() -> int:
     print("test_skip_d_ge_mlen")
     A = _mk_buf("A", [4, 64], scope="shared")  # D=64=MLEN → skip
@@ -253,6 +323,7 @@ def main() -> int:
     failures += test_global_buffer_not_in_dim_map()
     failures += test_async_outside_cluster_raises()
     failures += test_skip_no_lane_axes()
+    failures += test_index_var_identity_not_name()
     failures += test_skip_d_ge_mlen()
     print()
     if failures == 0:

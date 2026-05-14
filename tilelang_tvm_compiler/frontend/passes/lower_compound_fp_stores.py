@@ -62,6 +62,51 @@ def _is_fragment_buffer(buf: tir.Buffer) -> bool:
     return declared == "local.fragment"
 
 
+_PEEL_BINOPS = (tir.Add, tir.Sub, tir.Mul, tir.Div, tir.Max, tir.Min)
+
+
+def _peel_cast(expr, target_dtype: str):
+    """Recursively strip TVM's fp16↔fp32 widening Casts so the whole
+    subtree is rebuilt at ``target_dtype``.
+
+    TVM lowers ``fp16_a op fp16_b`` to
+    ``Cast(fp16, Cast(fp32, fp16_a) op Cast(fp32, fp16_b))`` and the
+    same widening propagates through nested calls (``T.exp``,
+    reciprocal, …). For decomposition we want to see the math as the
+    kernel author wrote it — purely at the dst's dtype. This walker
+    descends through both layers (outer narrow Cast and inner widen
+    Casts) and reconstructs binops / unary calls / leaves at the target
+    dtype. Anything it can't normalise is returned unchanged.
+
+    A subtree returned by this function is invariant: it does not
+    contain any Cast nodes that change dtype, all literals are at
+    ``target_dtype``, and every BufferLoad already at ``target_dtype``
+    is exposed as a leaf for ``_is_leaf`` to pick up.
+    """
+
+    def _rebuild(e):
+        # Drop redundant Cast wrappers regardless of nesting depth.
+        if isinstance(e, tir.Cast):
+            return _rebuild(e.value)
+        if isinstance(e, tir.IntImm):
+            return tir.IntImm(target_dtype, int(e.value))
+        if isinstance(e, tir.FloatImm):
+            return tir.FloatImm(target_dtype, float(e.value))
+        if isinstance(e, tir.BufferLoad):
+            return e
+        cls = type(e)
+        if cls in _PEEL_BINOPS:
+            return cls(_rebuild(e.a), _rebuild(e.b))
+        if isinstance(e, tir.Call) and len(e.args) == 1:
+            return tir.Call(target_dtype, e.op, [_rebuild(e.args[0])])
+        # Unknown node — bail out by returning as-is. The caller falls
+        # back to leaving the store untouched, surfacing the unknown
+        # shape downstream rather than silently lowering it wrong.
+        return e
+
+    return _rebuild(expr)
+
+
 def _is_leaf(expr) -> bool:
     """A leaf expression doesn't need decomposition: it can sit directly
     inside the recognised single-op pattern."""
@@ -141,6 +186,7 @@ def _to_leaf(expr, dst: tir.Buffer, indices, pre: List[tir.Stmt],
     auto-allocated fragment has the same shape as ``dst`` so it accepts the
     same indexing.
     """
+    expr = _peel_cast(expr, str(dst.dtype))
     if _is_leaf(expr):
         return expr
     if isinstance(expr, _BINOPS):
@@ -181,11 +227,19 @@ def _decompose_store(store: tir.BufferStore, ctx: _Ctx) -> tir.Stmt:
         # FPRAM fragments are declared rank-1 by convention; anything else is
         # left to the existing passes.
         return store
-    if _is_already_single_op(store.value):
-        return store
 
     pre: List[tir.Stmt] = []
-    value = store.value
+    target_dtype = str(store.buffer.dtype)
+    # Peel fp16↔fp32 cast roundtrips so the dispatch below matches the
+    # actual op shape regardless of TVM's widening artifacts.
+    value = _peel_cast(store.value, target_dtype)
+
+    if _is_already_single_op(value):
+        # Rebuild the store so the RHS reflects the peeled form even when
+        # no decomposition is required.
+        if value is store.value:
+            return store
+        return tir.BufferStore(store.buffer, value, list(store.indices))
 
     if isinstance(value, _BINOPS):
         lhs = _to_leaf(value.a, store.buffer, store.indices, pre, ctx)

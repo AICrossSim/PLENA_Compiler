@@ -59,7 +59,8 @@ def _collect_op_refs(op: _hlir.Op, out: Set[str]) -> None:
     for ba in op.buffer_args:
         if isinstance(ba, str):
             out.add(ba)
-        elif isinstance(ba, _hlir.BufferSlice):
+        elif isinstance(ba, (_hlir.BufferSlice, _hlir.VramRegion,
+                             _hlir.MramRegion)):
             out.add(ba.parent)
     for sa in op.scalar_args:
         _collect_from_primexpr(sa, out)

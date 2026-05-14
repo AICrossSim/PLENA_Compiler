@@ -74,6 +74,46 @@ class Marker(Enum):
     LANE_OP = "lane_op"  # an elementwise/reduce that lives inside the cluster
 
 
+class AxisRole(Enum):
+    """The role a single axis plays for one op operand.
+
+    Every op carries, for every operand BufferRef, a per-axis tag
+    saying *why* that axis is there. Downstream passes (lower,
+    codegen) read these directly instead of inferring from buffer
+    shape and cluster_dim — that "infer" path is the source of every
+    silent off-by-vlen / off-by-lane bug we've hit.
+
+    BATCH       outer fan-out: lower wraps the op in a ``for`` over
+                this axis (one HLIR issue per index).
+    SIMD        inner vector axis: one HW vector instruction covers
+                a contiguous run along it; extent is per-issue length.
+    REDUCE      axis collapsed by a Reduce; appears only on the src.
+    BROADCAST   axis only on the dst — the src has no corresponding
+                dim and is replayed across all index values here.
+    CLUSTER     HW lane axis: a single multi-lane instruction covers
+                every index along it; not wrapped in a for at lower.
+    GEMM_M / GEMM_N / GEMM_K
+                Gemm operand roles, the matmul HW knows how to walk
+                them natively; one HW instruction covers their full
+                extents (modulo BATCH outer fan-out wrap, if any).
+    """
+    BATCH = "batch"
+    SIMD = "simd"
+    REDUCE = "reduce"
+    BROADCAST = "broadcast"
+    CLUSTER = "cluster"
+    GEMM_M = "gemm_m"
+    GEMM_N = "gemm_n"
+    GEMM_K = "gemm_k"
+
+
+@dataclass
+class AxisInfo:
+    """Per-axis metadata for a BufferRef on one op operand."""
+    role: AxisRole
+    extent: int
+
+
 # ---------------------------------------------------------------------------
 # Buffer references
 # ---------------------------------------------------------------------------
@@ -148,12 +188,70 @@ class Slice:
     pass
 
 
+class VarRef:
+    """Identity-based reference to a ``tir.Var`` used as a mid_ir index.
+
+    Equality is ``var.same_as(other.var)`` — two ``VarRef`` instances
+    compare equal iff they wrap the same underlying TIR object. Hash is
+    ``id(var)``. The wrapped Var's ``name_hint`` is kept for dump and
+    debugging only; it has no role in comparison.
+
+    Why this exists: prior versions stored bare ``str`` names inside
+    ``BufferRef.indices`` and downstream passes did string-equality to
+    decide whether an index referenced the cluster lane axis. Two
+    distinct ``tir.Var`` objects sharing a ``name_hint`` would silently
+    collide. ``VarRef`` makes identity the contract so a name collision
+    can't masquerade as a real reference.
+
+    Constructed with a bare ``tir.Var`` object:
+
+        VarRef(some_tir_var)
+
+    We intentionally do *not* import ``tvm`` at module scope — mid_ir
+    is supposed to stay TVM-agnostic so unit tests can build refs by
+    hand. The wrapped object only needs ``same_as(other)`` and a
+    ``name`` attribute (real ``tir.Var`` already satisfies this; tests
+    can pass any duck-type).
+    """
+    __slots__ = ("var",)
+
+    def __init__(self, var):
+        # tir.Var supports same_as; duck-typed test fakes need to too.
+        self.var = var
+
+    def __eq__(self, other):
+        if not isinstance(other, VarRef):
+            return False
+        # Prefer same_as (TIR's identity check); fall back to ``is`` for
+        # plain test doubles that don't implement it.
+        same_as = getattr(self.var, "same_as", None)
+        if same_as is not None:
+            return bool(same_as(other.var))
+        return self.var is other.var
+
+    def __hash__(self):
+        return id(self.var)
+
+    def __repr__(self):
+        return f"VarRef({self.name!r})"
+
+    @property
+    def name(self) -> str:
+        # ``tir.Var.name`` is the ``name_hint`` — fine for dump.
+        return str(getattr(self.var, "name", self.var))
+
+
 # An IndexExpr is one of: int (concrete index / extent literal),
-# str (variable name), Slice (whole axis), or a compound dict
-# {"op": "add", "args": [...]} for things like ``by_phase + by_number*C``.
-# We keep the compound form opaque to start with — passes that need to
-# manipulate the arithmetic can parse the dict.
-IndexExpr = Union[int, str, Slice, dict]
+# VarRef (identity-typed variable reference), Slice (whole axis), or a
+# compound dict {"op": "add", "args": [...]} for things like
+# ``by_phase + by_number*C``.
+#
+# ``str`` was previously allowed as a stand-in for "variable named X",
+# but two distinct ``tir.Var`` objects sharing a name then silently
+# collided in passes that compared by name. ``VarRef`` is the
+# replacement — it carries the wrapped ``tir.Var`` and compares by
+# identity (``var.same_as``). ``str`` is no longer permitted.
+IndexExpr = Union[int, VarRef, Slice, dict]
 
 
 # ---------------------------------------------------------------------------
@@ -165,36 +263,34 @@ IndexExpr = Union[int, str, Slice, dict]
 class Elementwise:
     """``dst[idx] = op(src_0[idx], src_1[idx], ...)`` over matching axes.
 
-    ``op`` is BinOp for 2+ srcs, UnaryOp for 1 src. All srcs and dst
-    must have matching shapes on the axes participating in the
-    operation (a Broadcast wraps a src whose shape is smaller).
+    ``op`` is BinOp for 2+ srcs, UnaryOp for 1 src.
 
-    ``axis`` is None for full-shape elementwise. When set, only the
-    given axis (or list of axes) is "active" — other axes are
-    independent and the op fires once per element along them. This
-    covers the "row op" family (axis=-1 means "act on last dim,
-    broadcast over the others").
+    Per-axis roles (the only source of truth for lower):
+      * ``dst_axes`` — one ``AxisInfo`` per dst dim, in dst-axis order.
+      * ``src_axes`` — list parallel to ``srcs``; each entry is per-axis
+        info for that src in src-axis order. A src wrapped in
+        Broadcast has fewer axes than dst — its ``src_axes`` entry is
+        shorter and the corresponding dst-axes carry ``BROADCAST`` role.
 
-    ``size`` is the per-issue element count: how many elements ONE
-    invocation of the op processes. Critical signal for downstream
-    lowering — the fold pass merges some forms of element loop into
-    an Elementwise, and ``size`` is what tells the lowering whether
-    that fold represents a vector (``size == MLEN``, one
-    ``V_*_VV/V_*_VF`` instruction per call) or a scalar
-    (``size == 1``, one ``S_*_FP``). Without it, SIMD and SISD
-    elementwise dst patterns collapse to the same mid_ir node and
-    the lowering can't tell which ISA op family applies.
+    Legacy fields ``axis``, ``size``, ``outer_extents`` are kept
+    transitionally for code that hasn't migrated; new lowering code
+    must read ``dst_axes`` / ``src_axes`` only.
 
     ``can_async`` is True when the HW lowering is a single multi-lane
-    vector instruction (``v_add`` / ``v_exp_v`` / ``v_reci_v`` etc.).
-    False when the lowering is per-row (``row_sub_fp_at`` and friends —
-    typically the case when one src is a Broadcast wrapping a smaller-
-    rank fp scalar). pass_2_mark sets this; pass_4_async only wraps
-    ops with can_async=True in Async regions.
+    vector instruction (``v_add`` / ``v_exp_v`` etc.). False when the
+    lowering is per-row (``row_sub_fp_at`` and friends — typically
+    the case when one src is a Broadcast wrapping a smaller-rank fp
+    scalar). pass_2_mark sets this; pass_4_async only wraps ops with
+    can_async=True in Async regions.
     """
     dst: BufferRef
     srcs: List[Union[BufferRef, "Broadcast"]]
     op: Union[BinOp, UnaryOp]
+    # Per-axis roles + extents (authoritative source for lower).
+    dst_axes: List[AxisInfo] = field(default_factory=list)
+    src_axes: List[List[AxisInfo]] = field(default_factory=list)
+    # Legacy fields kept transitionally for code that hasn't migrated
+    # to axes; new lowering paths must read dst_axes / src_axes only.
     axis: Optional[Union[int, List[int]]] = None
     size: int = 1
     marker: Optional[Marker] = None
@@ -217,9 +313,13 @@ class Broadcast:
 class Reduce:
     """``dst[idx_without_axis] = reduce(src[idx], op, axis)``.
 
-    ``axis`` is the single axis being collapsed (we don't fold
-    multi-axis reductions at the mid-IR level). Use ``axis=-1`` for
-    "reduce along the last dim", which is how row-reduce maps in.
+    Per-axis roles (authoritative):
+      * ``dst_axes`` — one per dst dim (the collapsed axis is gone).
+      * ``src_axes`` — one per src dim; the collapsed dim is tagged
+        ``REDUCE``; the others mirror their dst counterpart.
+
+    Legacy ``axis`` carried the collapsed-axis index; transitionally
+    kept for old code paths.
 
     ``can_async`` is always False — reduce on PLENA is per-row
     (``row_reduce_max_at`` / ``row_reduce_sum_at``), one row at a time
@@ -229,6 +329,8 @@ class Reduce:
     src: BufferRef
     op: ReduceOp
     axis: int
+    dst_axes: List[AxisInfo] = field(default_factory=list)
+    src_axes: List[AxisInfo] = field(default_factory=list)
     marker: Optional[Marker] = None
     can_async: bool = False
 
@@ -242,6 +344,10 @@ class Reduce:
 @dataclass
 class Gemm:
     """``c = a @ b`` (transpose flags carried).
+
+    Per-axis roles:
+      * ``a_axes`` / ``b_axes`` / ``c_axes`` tag every axis on each
+        operand with one of {BATCH, GEMM_M, GEMM_N, GEMM_K, CLUSTER}.
 
     The ``kind`` matches the kernel's ``T.attr(0, KIND, ...)`` — most
     importantly ``"btmm"`` for head-fused vs the default per-head form.
@@ -257,6 +363,9 @@ class Gemm:
     transpose_a: bool = False
     transpose_b: bool = False
     kind: str = "overwrite"
+    a_axes: List[AxisInfo] = field(default_factory=list)
+    b_axes: List[AxisInfo] = field(default_factory=list)
+    c_axes: List[AxisInfo] = field(default_factory=list)
     marker: Optional[Marker] = None
     can_async: bool = False
 
@@ -269,11 +378,20 @@ class Dma:
     slice being transferred. Direction is implicit from src.scope /
     dst.scope.
 
+    Per-axis roles: ``src_axes`` / ``dst_axes`` tag each axis with
+    ``BATCH`` / ``SIMD`` / ``CLUSTER`` per the same conventions as
+    Elementwise. The slice indices themselves are still in
+    ``BufferRef.indices``; the axes table is the lower-time view of
+    "what role does this dim play for this transfer", independent of
+    static-vs-dynamic-slice rendering.
+
     ``can_async`` is always True — DMA is always a single multi-lane
     HW instruction (``H_LOAD_V`` / ``H_STORE_V`` etc.).
     """
     src: BufferRef
     dst: BufferRef
+    src_axes: List[AxisInfo] = field(default_factory=list)
+    dst_axes: List[AxisInfo] = field(default_factory=list)
     marker: Optional[Marker] = None
     can_async: bool = False
 
@@ -354,6 +472,27 @@ class ParallelAxis:
     pass_3 when it splits a lane axis. A CLUSTER axis carries the
     name of the grid-number axis it was split out of (e.g. cluster
     ``by_phase`` has parent ``by_number``). None for grid kinds.
+
+    ``original_axis_name`` is the user-visible name the kernel
+    originally bound this axis to *before* pass_3 split it into
+    phase + number (e.g. CLUSTER ``by_phase`` originated from ``by``).
+    Set by pass_3 on the CLUSTER side and on the matching grid number
+    side too so consumers can look up either half without parsing
+    name suffixes like ``"_phase"`` / ``"_number"``.
+
+    Identity channels (separate from the string-named channels):
+
+    ``axis_var`` carries the same axis as a :class:`VarRef` — the
+    identity used by ``BufferRef.indices`` consumers to recognise
+    references to this axis. Optional during the transitional period
+    while passes are still being migrated off bare-string indices;
+    will become required.
+
+    ``original_axis_var`` mirrors ``original_axis_name`` but as a
+    ``VarRef``: the identity of the kernel-author lane var ``by``
+    before pass_3 split it. The CLUSTER and matching number axes
+    both carry it so HBM-lane-substitution / cluster-collapse can
+    identify the pre-split var without name matching.
     """
     axis_name: str
     extent: int
@@ -361,6 +500,9 @@ class ParallelAxis:
     kind: ParallelKind
     thread_tag: Optional[str] = None
     parent_grid_axis_name: Optional[str] = None
+    original_axis_name: Optional[str] = None
+    axis_var: Optional[VarRef] = None
+    original_axis_var: Optional[VarRef] = None
 
 
 @dataclass
@@ -375,11 +517,16 @@ class For:
     ``kind`` is one of ``"serial"`` (default) or ``"unroll"`` (pass_8
     asks the lowering to fully unroll the loop body — used for tiny
     KW/KH loops in conv2d).
+
+    ``loop_var_var`` is the same loop var as a :class:`VarRef` —
+    identity-based handle that downstream passes can match against
+    ``BufferRef.indices`` entries. Optional during transitional period.
     """
     loop_var: str
     extent: int
     body: List["Stmt"]
     kind: str = "serial"                # "serial" | "unroll"
+    loop_var_var: Optional[VarRef] = None
 
 
 @dataclass
@@ -411,6 +558,12 @@ class MultiLaneOp:
                                 across, e.g. ``["by_phase"]`` or
                                 ``["by_phase", "qb_phase"]``. Order
                                 matches the entries in ``dim_map``.
+      * ``cluster_axis_vars``   parallel list of :class:`VarRef` for
+                                each entry in ``cluster_axis_names``.
+                                Lowering uses these to identify
+                                phase-shorthand indices by identity
+                                (vs ``cluster_axis_names`` which is
+                                kept for HLIR dump / loop_var minting).
       * ``dim_map``             ``buf_name -> [dim_idx_for_axis_0,
                                 dim_idx_for_axis_1, ...]``. Length of
                                 each list matches ``len(cluster_axis_names)``.
@@ -420,6 +573,7 @@ class MultiLaneOp:
     inner: "Op"
     cluster_axis_names: List[str]
     dim_map: Dict[str, List[int]]
+    cluster_axis_vars: List[VarRef] = field(default_factory=list)
 
 
 # A "statement" is anything that appears in a body list.
@@ -473,6 +627,8 @@ class MidFunc:
 def _fmt_idx(i: IndexExpr) -> str:
     if isinstance(i, Slice):
         return ":"
+    if isinstance(i, VarRef):
+        return i.name
     if isinstance(i, dict):
         op = i.get("op", "?")
         args = i.get("args", [])
@@ -500,6 +656,16 @@ def _fmt_marker(m: Optional[Marker], can_async: bool = False) -> str:
         return ""
     suffix = " async" if can_async else ""
     return f" #{m.value}{suffix}"
+
+
+def _fmt_axes(axes: List[AxisInfo]) -> str:
+    """Compact ``[role:extent, role:extent, ...]`` dump for a per-op
+    axes list. Empty list returns ``[]`` (so a missing-axes case is
+    visually obvious)."""
+    if not axes:
+        return "[]"
+    parts = [f"{a.role.value}:{int(a.extent)}" for a in axes]
+    return "[" + ", ".join(parts) + "]"
 
 
 def _print_stmt(s: Stmt, indent: int, out: List[str]) -> None:
@@ -546,6 +712,10 @@ def _print_stmt(s: Stmt, indent: int, out: List[str]) -> None:
             f"{pad}dma {_fmt_ref(s.src)} -> {_fmt_ref(s.dst)}"
             f"{_fmt_marker(s.marker, s.can_async)}"
         )
+        out.append(
+            f"{pad}  src_axes={_fmt_axes(s.src_axes)} "
+            f"dst_axes={_fmt_axes(s.dst_axes)}"
+        )
         return
     if isinstance(s, Gemm):
         ta = "ᵀ" if s.transpose_a else ""
@@ -555,6 +725,10 @@ def _print_stmt(s: Stmt, indent: int, out: List[str]) -> None:
             f"{_fmt_ref(s.a)}{ta} @ {_fmt_ref(s.b)}{tb}"
             f"{_fmt_marker(s.marker, s.can_async)}"
         )
+        out.append(
+            f"{pad}  a_axes={_fmt_axes(s.a_axes)} "
+            f"b_axes={_fmt_axes(s.b_axes)} c_axes={_fmt_axes(s.c_axes)}"
+        )
         return
     if isinstance(s, Elementwise):
         srcs = ", ".join(_fmt_src(x) for x in s.srcs)
@@ -563,12 +737,21 @@ def _print_stmt(s: Stmt, indent: int, out: List[str]) -> None:
             f"{pad}elementwise[{s.op.value}] {_fmt_ref(s.dst)} = "
             f"f({srcs}){axis}{_fmt_marker(s.marker, s.can_async)}"
         )
+        src_axes_strs = [_fmt_axes(sa) for sa in (s.src_axes or [])]
+        out.append(
+            f"{pad}  dst_axes={_fmt_axes(s.dst_axes)} "
+            f"src_axes=[{', '.join(src_axes_strs)}]"
+        )
         return
     if isinstance(s, Reduce):
         out.append(
             f"{pad}reduce[{s.op.value} axis={s.axis}] "
             f"{_fmt_ref(s.dst)} = R({_fmt_ref(s.src)})"
             f"{_fmt_marker(s.marker, s.can_async)}"
+        )
+        out.append(
+            f"{pad}  src_axes={_fmt_axes(s.src_axes)} "
+            f"dst_axes={_fmt_axes(s.dst_axes)}"
         )
         return
     if isinstance(s, RawStore):
@@ -607,7 +790,8 @@ def format_func(fn: MidFunc) -> str:
 
 __all__ = [
     "BinOp", "UnaryOp", "ReduceOp", "Marker",
-    "BufferDef", "BufferRef", "Slice", "IndexExpr",
+    "AxisRole", "AxisInfo",
+    "BufferDef", "BufferRef", "Slice", "VarRef", "IndexExpr",
     "Elementwise", "Broadcast", "Reduce",
     "Gemm", "Dma", "RawStore",
     "ParallelKind", "ParallelAxis",
