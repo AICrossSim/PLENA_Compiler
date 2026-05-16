@@ -307,13 +307,22 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         # L_INIT addresses the testbench used were a hand-rolled mirror
         # of `_slot_addresses`, off by 64 words from what TVM actually
         # allocated, leading to head-1/2 numerical drift).
-        addr_table = {
-            buf.name: {
+        def _buf_entry(buf):
+            entry = {
                 "scope": buf.scope,
                 "address": buf.address,
                 "shape": [int(s) for s in buf.shape],
                 "dtype": str(buf.dtype),
             }
+            # Auto-hoisted FP constants carry their compile-time value
+            # so the testbench harness can preload it without per-kernel
+            # boilerplate. See frontend/passes/hoist_float_constants.py.
+            if buf.constant_value is not None:
+                entry["value"] = float(buf.constant_value)
+            return entry
+
+        addr_table = {
+            buf.name: _buf_entry(buf)
             for buf in compiled.hlir.buffers.values()
         }
         Path(args.dump_buffer_addrs).write_text(

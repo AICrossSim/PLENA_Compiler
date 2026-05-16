@@ -28,6 +28,7 @@ def make_rmsnorm_min(
     head_count: int = 8,
     num_s_blocks: int = 2,
     batch: int = 1,
+    eps: float = 1e-6,
 ):
     MLEN = 64
     if rows != MLEN:
@@ -44,6 +45,10 @@ def make_rmsnorm_min(
         raise ValueError(f"num_s_blocks must be >= 1, got {num_s_blocks}")
 
     seq_len = num_s_blocks * rows
+    # Constants inlined as T.float16(...) literals below; the
+    # hoist_float_constants pre-pass synthesises 1-slot global.fpram
+    # buffers for each unique value.
+    inv_n_val = 1.0 / hlen
 
     @T.prim_func
     def rmsnorm_min(
@@ -72,13 +77,11 @@ def make_rmsnorm_min(
             NORM   = T.alloc_fragment((rows,), "float16")
             INV    = T.alloc_fragment((rows,), "float16")
 
-            # Preloaded FP scalar constants.
-            INV_N = T.alloc_fragment((rows,), "float16")   # 1/hlen
-            EPS   = T.alloc_fragment((rows,), "float16")   # eps
-            # Preloaded zero — copied into SS before reduce_sum so the
-            # accumulating V_RED_SUM starts from a clean slot. Mirrors
-            # flash_attention_min's ``L_INIT``.
-            SS_INIT = T.alloc_fragment((rows,), "float16")
+            # 1/hlen and eps are inlined as T.float16(...) literals
+            # below; auto-hoisted into 1-slot global.fpram buffers.
+            # The zero seed for SS (``SS = SS_INIT[row]``) is also
+            # inlined; T.float16(0) takes fold's zero-fill path and
+            # doesn't go through FPRAM at all.
 
             T.copy(
                 X_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
@@ -100,14 +103,14 @@ def make_rmsnorm_min(
             for row in T.serial(rows):
                 for col in T.Parallel(hlen):
                     SQ_loc[row, col] = X_loc[row, col] * X_loc[row, col]
-                SS[row] = SS_INIT[row]
+                SS[row] = T.float16(0)
 
             # ss[i] = sum_j sq[i,j]
             T.reduce_sum(SQ_loc, SS, dim=1)
 
             for row in T.serial(rows):
-                SS_N[row]   = SS[row] * INV_N[row]
-                SS_EPS[row] = SS_N[row] + EPS[row]
+                SS_N[row]   = SS[row] * T.float16(inv_n_val)
+                SS_EPS[row] = SS_N[row] + T.float16(eps)
                 NORM[row]   = T.sqrt(SS_EPS[row])
                 # literal-1 numerator so fold picks the reci pattern
                 INV[row]    = T.float16(1.0) / NORM[row]

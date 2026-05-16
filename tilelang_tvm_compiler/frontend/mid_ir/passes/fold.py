@@ -1361,7 +1361,7 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
     # Carry select prim_func attrs forward so downstream passes (e.g.
     # to_plena reading ``plena.layout``) can find them. We unwrap TVM
     # ObjectRef strings to plain Python so dict access works uniformly.
-    attrs_out: Dict[str, str] = {}
+    attrs_out: Dict[str, object] = {}
     if func.attrs is not None:
         for k in ("plena.layout",):
             if k in func.attrs:
@@ -1370,6 +1370,16 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
                     attrs_out[k] = str(v.value)
                 else:
                     attrs_out[k] = str(v)
+        # ``plena.hoisted_constants`` is a {buffer_name: value} map
+        # stamped by the ``hoist_float_constants`` pre-pass. Unwrap to
+        # a plain ``Dict[str, float]`` so to_plena can iterate it
+        # without TVM-side type acrobatics.
+        if "plena.hoisted_constants" in func.attrs:
+            raw = func.attrs["plena.hoisted_constants"]
+            attrs_out["plena.hoisted_constants"] = {
+                str(name): float(val.value if hasattr(val, "value") else val)
+                for name, val in raw.items()
+            }
 
     return MidFunc(
         name=name,

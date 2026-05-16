@@ -52,8 +52,9 @@ def make_silu_min(
             X_FP = T.alloc_fragment((hlen,), "float16")
             Y_FP = T.alloc_fragment((hlen,), "float16")
 
-            ONE     = T.alloc_fragment((hlen,), "float16")   #  1.0
-            NEG_ONE = T.alloc_fragment((hlen,), "float16")   # -1.0
+            # 1.0 / -1.0 are inlined as T.float16(...) literals below.
+            # The hoist_float_constants pre-pass synthesises one 1-slot
+            # global.fpram buffer per unique value.
 
             neg_x   = T.alloc_fragment((hlen,), "float16")   # -x
             e_negx  = T.alloc_fragment((hlen,), "float16")   # exp(-x)
@@ -69,9 +70,9 @@ def make_silu_min(
                 T.copy(X_sh[row, 0], X_FP)
 
                 for i in T.unroll(hlen):
-                    neg_x[i]  = NEG_ONE[i] * X_FP[i]
+                    neg_x[i]  = T.float16(-1.0) * X_FP[i]
                     e_negx[i] = T.exp(neg_x[i])
-                    denom[i]  = ONE[i] + e_negx[i]
+                    denom[i]  = T.float16(1.0) + e_negx[i]
                     # ``1.0 / x`` literal numerator — fold lowers this
                     # to fp_reci_at. A BufferLoad/BufferLoad div would
                     # not match the reci pattern.

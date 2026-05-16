@@ -61,7 +61,20 @@ def make_linear_min(
     n_blocks: int = 1,
     k_blocks: int = 1,
     with_bias: bool = False,
+    c_wide_n: int | None = None,
+    c_col_offset: int = 0,
 ):
+    """``c_wide_n`` / ``c_col_offset`` let the kernel write its result
+    into a column-slice of a WIDER output tensor — used by the
+    single-stream-block chain to drop the MLP-in projection straight
+    into the left part of ``concat([mlp, attn])`` with no separate
+    concat kernel (mirrors flash_attention_min's ``o_head_offset``).
+
+    ``C_hbm`` is declared with ``c_wide_n`` columns (default: ``N``, the
+    standalone-kernel behaviour); each tile writes columns
+    ``bx*MLEN + c_col_offset``. ``c_col_offset`` must be a multiple of
+    MLEN so the 64-wide tile lands on an aligned column block.
+    """
     MLEN = 64
     if m_blocks < 1 or n_blocks < 1 or k_blocks < 1:
         raise ValueError(
@@ -71,6 +84,24 @@ def make_linear_min(
     M = m_blocks * MLEN
     N = n_blocks * MLEN
     K = k_blocks * MLEN
+
+    if c_wide_n is None:
+        c_wide_n = N
+    C_WIDE_N = c_wide_n
+    if C_WIDE_N < N:
+        raise ValueError(
+            f"c_wide_n ({C_WIDE_N}) must be >= N ({N})"
+        )
+    if c_col_offset % MLEN != 0:
+        raise ValueError(
+            f"c_col_offset ({c_col_offset}) must be a multiple of MLEN "
+            f"({MLEN})"
+        )
+    if c_col_offset + N > C_WIDE_N:
+        raise ValueError(
+            f"c_col_offset ({c_col_offset}) + N ({N}) must fit within "
+            f"c_wide_n ({C_WIDE_N})"
+        )
 
     # PLENA's DMA-slice lowering expects HBM tensors to carry the full
     # 4D BSHD shape (batch, seq, head, hlen). Linear has no real head
@@ -83,7 +114,7 @@ def make_linear_min(
             A_hbm:    T.Tensor((1, M, 1, K), "float16"),
             B_hbm:    T.Tensor((1, N, 1, K), "float16"),
             BIAS_hbm: T.Tensor((1, M, 1, N), "float16"),
-            C_hbm:    T.Tensor((1, M, 1, N), "float16"),
+            C_hbm:    T.Tensor((1, M, 1, C_WIDE_N), "float16"),
         ):
             # Grid: one program per (n_block, m_block) tile — same axis
             # order tilelang_kernels/linear.py uses (bx along N, by along
@@ -143,19 +174,22 @@ def make_linear_min(
                         C_loc[row, col] = C_loc[row, col] + BIAS_sh[row, col]
 
                 T.copy(C_loc, C_sh)
+                # Write into a column-slice of the (possibly wider)
+                # C_hbm: shift the col block by c_col_offset.
                 T.copy(
                     C_sh,
                     C_hbm[0,
                           by * MLEN : (by + 1) * MLEN,
                           0,
-                          bx * MLEN : (bx + 1) * MLEN],
+                          bx * MLEN + c_col_offset
+                          : bx * MLEN + c_col_offset + MLEN],
                 )
     else:
         @T.prim_func
         def linear_min(
             A_hbm: T.Tensor((1, M, 1, K), "float16"),
             B_hbm: T.Tensor((1, N, 1, K), "float16"),
-            C_hbm: T.Tensor((1, M, 1, N), "float16"),
+            C_hbm: T.Tensor((1, M, 1, C_WIDE_N), "float16"),
         ):
             with T.Kernel(n_blocks, m_blocks, threads=128) as (bx, by):
                 A_sh = T.alloc_shared((MLEN, MLEN), "float16")
@@ -192,12 +226,15 @@ def make_linear_min(
                             C_loc[row, col] = C_loc[row, col] + SCR_loc[row, col]
 
                 T.copy(C_loc, C_sh)
+                # Write into a column-slice of the (possibly wider)
+                # C_hbm: shift the col block by c_col_offset.
                 T.copy(
                     C_sh,
                     C_hbm[0,
                           by * MLEN : (by + 1) * MLEN,
                           0,
-                          bx * MLEN : (bx + 1) * MLEN],
+                          bx * MLEN + c_col_offset
+                          : bx * MLEN + c_col_offset + MLEN],
                 )
 
     lowered = linear_min
@@ -205,6 +242,7 @@ def make_linear_min(
         "M": M, "N": N, "K": K, "MLEN": MLEN,
         "M_BLOCKS": m_blocks, "N_BLOCKS": n_blocks, "K_BLOCKS": k_blocks,
         "WITH_BIAS": with_bias,
+        "C_WIDE_N": C_WIDE_N, "C_COL_OFFSET": c_col_offset,
     }
     return lowered, constants
 

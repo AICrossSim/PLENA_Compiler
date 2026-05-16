@@ -2687,6 +2687,17 @@ def run(func: MidFunc,
                     mode, buf.cluster_dim, tuple(hlir_buf.shape),
                 )
 
+    # Copy hoisted-constant values onto the matching HLIR buffers so
+    # ``--dump-buffer-addrs`` can emit them and the test harness can
+    # auto-preload. The pre-pass (frontend/passes/hoist_float_constants.py)
+    # stashes ``{buffer_name: value}`` on PrimFunc.attrs; mid_ir passes
+    # carry that attr forward to ``func.attrs`` unchanged.
+    if func.attrs is not None and "plena.hoisted_constants" in func.attrs:
+        for name, value in func.attrs["plena.hoisted_constants"].items():
+            hlir_buf = buf_name_to_hlir.get(str(name))
+            if hlir_buf is not None:
+                hlir_buf.constant_value = float(value)
+
     # Walk the body.
     ops = _walk_stmts(func.body, buf_name_to_hlir, cluster_extent=None)
 

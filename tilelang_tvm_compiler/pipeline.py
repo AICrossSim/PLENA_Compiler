@@ -31,6 +31,7 @@ from . import dead_buffer_elim as _dead_buffer_elim
 # ..pipeline.PlenaTarget, a circular import once we land here).
 from .frontend.passes import inline_let_stmts as _stmt_inline_let
 from .frontend.passes import lower_compound_fp_stores as _stmt_lower_compound
+from .frontend.passes import hoist_float_constants as _stmt_hoist_consts
 from .frontend.mid_ir.passes import infer_lane_axis as _mid_infer_lane_axis
 from .frontend.mid_ir.passes import fold as _mid_fold
 from .frontend.mid_ir.passes import mark as _mid_mark
@@ -83,16 +84,28 @@ def compile_kernel(
     target: PlenaTarget,
     name: str = "kernel",
     midir_dump_dir: Optional[Path] = None,
+    addr_config_override: Optional[AddressAllocConfig] = None,
 ) -> CompiledKernel:
     """Lower a raw TIR PrimFunc through the mid_ir pipeline + downstream
     address-alloc + ISA-emit passes.
 
     ``midir_dump_dir`` (when set): pass_6_to_plena will write a
     human-readable ``<name>.midir.txt`` snapshot there for debugging.
+
+    ``addr_config_override`` (when set): use this AddressAllocConfig
+    verbatim for the address-alloc pass instead of building a default
+    one from ``target``. Used by multi-kernel drivers that stitch
+    several kernels into one continuous ASM run and need to control
+    the FPRAM / HBM bases per kernel (e.g. tvm_single_stream_block_test).
     """
     # ---------- 0. stmt prep ----------
     func = _stmt_inline_let.run(prim_func)
     func = _stmt_lower_compound.run(func)
+    # Hoist FP literals (T.float16(c) etc.) into auto-synthesised
+    # ``global.fpram`` 1-slot buffers so the kernel author doesn't have
+    # to declare a SCALE / NEG_INF / etc. fragment + a testbench
+    # preload by hand. See hoist_float_constants.py for the contract.
+    func = _stmt_hoist_consts.run(func)
 
     # ---------- 1. mid_ir pipeline ----------
     func = _mid_infer_lane_axis.run(func)
@@ -121,11 +134,15 @@ def compile_kernel(
     _dead_buffer_elim.run(mod)
 
     # ---------- 2. address alloc ----------
-    addr_pass = AddressAllocationPass(AddressAllocConfig(
-        mlen=target.mlen,
-        blen=target.blen,
-        hlen=target.btmm_hlen,
-    ))
+    if addr_config_override is not None:
+        addr_cfg = addr_config_override
+    else:
+        addr_cfg = AddressAllocConfig(
+            mlen=target.mlen,
+            blen=target.blen,
+            hlen=target.btmm_hlen,
+        )
+    addr_pass = AddressAllocationPass(addr_cfg)
     addr_pass.run(mod)
 
     # ---------- 3. ISA emit ----------

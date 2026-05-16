@@ -45,6 +45,8 @@ The kernel does NOT write back to HBM. The output ends up in FPRAM at
 (``compare_fpsram_output=True`` in comparison_params).
 """
 
+import math
+
 import tilelang.language as T
 
 from ..address_alloc import FPRAM_USER_BASE
@@ -77,6 +79,11 @@ def make_flash_decode_min(
         raise ValueError(f"num_kv_blocks must be >= 1, got {num_kv_blocks}")
 
     kv_seq = num_kv_blocks * rows
+    # Softmax scale 1/sqrt(d_k). Embedded directly as a FloatImm via
+    # ``T.float16(...)`` in the kernel body — the ``hoist_float_constants``
+    # pre-pass turns it into a 1-slot global.fpram buffer at compile
+    # time, no SCALE alloc / SCALE preload required.
+    scale_val = 1.0 / math.sqrt(hlen)
 
     @T.prim_func
     def flash_decode_min(
@@ -117,10 +124,14 @@ def make_flash_decode_min(
             L_OLD  = T.alloc_fragment((1,), "float16")
             L_NEW  = T.alloc_fragment((1,), "float16")
             P_SUM  = T.alloc_fragment((1,), "float16")
-            SCALE  = T.alloc_fragment((1,), "float16")
             L_INV  = T.alloc_fragment((1,), "float16")
-            M_INIT = T.alloc_fragment((1,), "float16")
-            L_INIT = T.alloc_fragment((1,), "float16")
+            # SCALE / M_INIT / L_INIT are no longer declared buffers —
+            # the kernel body embeds the literals directly as
+            # ``T.float16(...)`` and the ``hoist_float_constants``
+            # pre-pass synthesises an equivalent ``global.fpram``
+            # 1-slot buffer per unique constant at compile time.
+            # ``test_helper`` auto-preloads the values from the
+            # buffer-addrs dump.
 
             # VRAM cache → VRAM staging: pull this by_o's MLEN-wide chunk
             # of Q into Q_sh. Lowers to one V_ADD_VF (f0=0) row copy.
@@ -137,10 +148,11 @@ def make_flash_decode_min(
             for col in T.Parallel(hlen):
                 O_loc[0, col] = T.float16(0)
 
-            # Init online softmax state from preloaded -inf / 0.
+            # Init online softmax state from -inf / 0 literals; the
+            # pre-pass hoists -1e4 into a shared global.fpram slot.
             for row in T.serial(1):
-                M_OLD[row] = M_INIT[row]
-                L_OLD[row] = L_INIT[row]
+                M_OLD[row] = T.float16(-1.0e4)
+                L_OLD[row] = T.float16(0)
 
             for kv_block in T.unroll(num_kv_blocks):
                 # K, V DMAs — sync, multi-lane. Explicit slice form so
@@ -162,7 +174,7 @@ def make_flash_decode_min(
                 # Scale + grab current max baseline.
                 for row in T.serial(1):
                     for col in T.Parallel(MLEN):
-                        S_loc[row, col] = S_loc[row, col] * SCALE[row]
+                        S_loc[row, col] = S_loc[row, col] * T.float16(scale_val)
                     M_CURR[row] = M_OLD[row]
 
                 T.reduce_max(S_loc, M_CURR, dim=1, clear=False)
@@ -174,7 +186,7 @@ def make_flash_decode_min(
                         S_loc[row, col] = S_loc[row, col] - M_CURR[row]
                     for col in T.Parallel(MLEN):
                         S_loc[row, col] = T.exp(S_loc[row, col])
-                    P_SUM[row] = L_INIT[row]
+                    P_SUM[row] = T.float16(0)
 
                 T.reduce_sum(S_loc, P_SUM, dim=1, clear=False)
 

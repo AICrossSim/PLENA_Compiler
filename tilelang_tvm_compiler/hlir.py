@@ -299,7 +299,24 @@ class Buffer:
     # own VRAM allocations. AddressAllocationPass therefore skips
     # ``make_tile_layout`` for them, and the offset-walking iterators
     # branch on this flag to compute addresses as flat row-major.
+    #
+    # Lane-shared FPRAM scalars also ride this path: declaring a scalar
+    # with ``scope="global.fpram"`` bypasses cluster-fusion lane
+    # expansion, so a ``(1,)`` buffer occupies exactly 1 FPRAM slot
+    # (every lane reads the same address) instead of lane_count slots.
     is_pinned_global: bool = False
+
+    # Compile-time-known value for a constant scalar buffer synthesised
+    # by the ``hoist_float_constants`` TIR pre-pass (frontend/passes/
+    # hoist_float_constants.py). The pre-pass scans the PrimFunc for
+    # ``T.float16(c)`` (FloatImm) uses, allocates one ``global.fpram``
+    # buffer per unique (dtype, value) pair, and rewrites the uses to
+    # BufferLoads of that buffer. The compiler proper sees a plain
+    # ``alloc_shared(global.fpram)`` and lowers it normally. This field
+    # only exists so ``--dump-buffer-addrs`` can emit the value the
+    # test harness needs to preload — nothing else in the compiler
+    # reads it.
+    constant_value: Optional[float] = None
 
     # 4D-buffer layout hint, used to resolve which axis is the row /
     # channel / col dim. ``BSHD`` (the default) means axes are already

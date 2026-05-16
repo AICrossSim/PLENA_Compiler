@@ -21,9 +21,9 @@ emitter will actually use.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from typing import Tuple
+from typing import Dict, Tuple
 
 from . import hlir as _hlir
 from . import scope as _scope
@@ -105,6 +105,16 @@ class AddressAllocConfig:
     hbm_scale_bits: int = 8    # 1 byte per scale (Fp(s=0,e=8,m=0))
     hbm_block_size: int = 8    # 1 scale per 8 elements
 
+    # Per-buffer address pins. Used by multi-kernel drivers (e.g.
+    # tvm_single_stream_block_test) that pre-plan a global HBM layout
+    # and need each kernel's HBM tensors to land on specific bytes so
+    # producer.output_addr == consumer.input_addr. Buffer names not in
+    # the dict fall back to the bump allocator. Pinned addresses do NOT
+    # advance the bump cursor — the driver is responsible for not
+    # double-booking bytes.
+    hbm_address_overrides: Dict[str, int] = field(default_factory=dict)
+    fpram_address_overrides: Dict[str, int] = field(default_factory=dict)
+
     @property
     def tile_elems(self) -> int:
         return self.mlen * self.mlen
@@ -149,14 +159,19 @@ class AddressAllocationPass:
             # affects lane-fusion expansion (in allocate_group_memory).
             phys = _scope.physical_scope(buf.scope)
             if phys == _scope.HBM:
-                buf.address = hbm_cur
-                # IMPORTANT: increment by the MXFP-packed byte size, not by
-                # the raw fp16 buf.byte_size. `create_mem_for_sim` packs
-                # tensors into hbm_for_behave_sim.bin using FP4 elements
-                # (1 byte each) plus 1/8 byte scales, padded to row width.
-                # If we use buf.byte_size here our HBM addresses won't match
-                # what's actually on disk and H_PREFETCH_M reads garbage.
-                hbm_cur += _hbm_packed_byte_size(buf.num_elements, self.cfg)
+                override = self.cfg.hbm_address_overrides.get(buf.name)
+                if override is not None:
+                    # Pinned by the driver — don't advance the bump cursor.
+                    buf.address = int(override)
+                else:
+                    buf.address = hbm_cur
+                    # IMPORTANT: increment by the MXFP-packed byte size, not by
+                    # the raw fp16 buf.byte_size. `create_mem_for_sim` packs
+                    # tensors into hbm_for_behave_sim.bin using FP4 elements
+                    # (1 byte each) plus 1/8 byte scales, padded to row width.
+                    # If we use buf.byte_size here our HBM addresses won't match
+                    # what's actually on disk and H_PREFETCH_M reads garbage.
+                    hbm_cur += _hbm_packed_byte_size(buf.num_elements, self.cfg)
                 rows, cols = _logical_2d(buf.shape, buf.layout)
                 # stride = HBM-row-major distance from canonical row r
                 # to row r+1 of the same channel (NOT cols, when those
@@ -219,8 +234,12 @@ class AddressAllocationPass:
             elif phys == _scope.FPRAM:
                 # FPRAM stores scalar FP values; address them in element units
                 # to match S_LD_FP / S_ST_FP and the emulator's fpsram indexing.
-                buf.address = fpram_cur
-                fpram_cur += buf.num_elements
+                override = self.cfg.fpram_address_overrides.get(buf.name)
+                if override is not None:
+                    buf.address = int(override)
+                else:
+                    buf.address = fpram_cur
+                    fpram_cur += buf.num_elements
             else:
                 raise ValueError(f"buffer {buf.name!r}: unknown scope {buf.scope!r}")
 

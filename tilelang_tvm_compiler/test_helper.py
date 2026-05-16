@@ -327,6 +327,31 @@ def run(spec: TvmTestbenchSpec) -> int:
     if spec.build_fp_preload is not None:
         fp_preload = spec.build_fp_preload(io, addrs)
 
+    # Auto-preload hoisted FP constants. The compiler's
+    # ``hoist_float_constants`` pre-pass turns every ``T.float16(c)``
+    # use into a 1-slot ``global.fpram`` buffer; the buffer-addrs dump
+    # carries each one's slot address and value. Write those slots
+    # here so per-kernel testbenches don't have to enumerate them.
+    if addrs_path is not None and raw_addrs:
+        import torch  # local — testbench venv has torch on sys.path here
+        const_entries = [
+            (int(entry["address"]), float(entry["value"]))
+            for entry in raw_addrs.values()
+            if isinstance(entry, dict) and "value" in entry
+        ]
+        if const_entries:
+            max_const_addr = max(addr for addr, _ in const_entries)
+            needed = max_const_addr + 1
+            if fp_preload is None:
+                fp_preload = torch.zeros(needed, dtype=torch.float16)
+            elif fp_preload.numel() < needed:
+                grown = torch.zeros(needed, dtype=fp_preload.dtype)
+                grown[: fp_preload.numel()] = fp_preload
+                fp_preload = grown
+            for addr, value in const_entries:
+                fp_preload[addr] = value
+            print(f"           auto-preloaded {len(const_entries)} FP constant(s)")
+
     input_feed = {
         name: t.contiguous().reshape(1, -1) for name, t in hbm_inputs.items()
     }

@@ -226,6 +226,52 @@ def _walk(stmt: Stmt, cluster_stack: List[_ClusterAxis]) -> Stmt:
     return stmt
 
 
+def _match_lane_composite(idx, axes: List[_ClusterAxis]):
+    """If ``idx`` is exactly a lane index — either the bare original
+    lane var, or the ``add(phase, mul(number, count))`` split form
+    pass_4b_view produces — return its matching ``_ClusterAxis``.
+    Otherwise return ``None``.
+
+    This is the recogniser for "this expression IS one lane axis";
+    ``_collapse_lane_axis`` uses it both for whole-axis indices and as
+    the kernel of the ``lane ± const`` head-offset case.
+    """
+    if isinstance(idx, VarRef):
+        for ax in axes:
+            if idx == ax.original_var:
+                return ax
+        return None
+    if isinstance(idx, dict) and idx.get("op") == "add":
+        args = idx.get("args", [])
+        if len(args) == 2 and isinstance(args[0], VarRef):
+            phase = args[0]
+            inner = args[1]
+            if isinstance(inner, dict) and inner.get("op") == "mul":
+                m_args = inner.get("args", [])
+                if (len(m_args) == 2 and isinstance(m_args[0], VarRef)
+                        and isinstance(m_args[1], int)):
+                    number, count = m_args[0], m_args[1]
+                    for ax in axes:
+                        if (phase == ax.phase_var
+                                and number == ax.number_var
+                                and count == ax.count):
+                            return ax
+    return None
+
+
+def _ranged_slice_for_axis(ax: "_ClusterAxis", extra_offset=None):
+    """Build ``ranged_slice(mul(number, count) [+ extra_offset], count)``
+    for one cluster axis. ``extra_offset`` (a constant head offset, or
+    None) is folded into the slice's START so the ranged_slice stays at
+    the TOP of the index expression — downstream ``_ref_extents`` and
+    ``_render_idx_as_primexpr`` only recognise a top-level ranged_slice.
+    """
+    base = {"op": "mul", "args": [ax.number_var, ax.count]}
+    if extra_offset is not None:
+        base = {"op": "add", "args": [base, extra_offset]}
+    return {"op": "ranged_slice", "args": [base, ax.count]}
+
+
 def _collapse_lane_axis(idx, axes: List[_ClusterAxis]):
     """Fold a per-lane index expression back into a cluster-wide
     ``ranged_slice``.
@@ -239,50 +285,39 @@ def _collapse_lane_axis(idx, axes: List[_ClusterAxis]):
     of ``count`` consecutive lane indices starting at the cluster's
     base — encoded as ``ranged_slice(mul(number_var, count), count)``.
 
-    Match the exact shape produced by ``_subst_lane_var``:
-        ``{"op": "add", "args": [phase_var (VarRef),
-                                 {"op": "mul", "args":
-                                  [number_var (VarRef), count_int]}]}``
-    OR a bare ``VarRef`` equal (by identity) to ``ax.original_var``
-    (kept on global / global.* refs whose indices view skipped).
-    Anything else is left alone.
+    Three cases handled:
+      1. The bare original lane var, or the ``add(phase, mul(number,
+         count))`` split form — collapse straight to a ranged_slice.
+      2. ``lane_composite ± const`` (a head-offset write, e.g.
+         ``Y_hbm[..., by + 8, ...]``) — the constant is folded INTO
+         the ranged_slice's start so the ranged_slice stays top-level
+         and keeps ``extent == count``. Without this the constant add
+         buries the ranged_slice one level down and ``_ref_extents``
+         falls back to extent 1, writing only one lane's worth.
+      3. Anything else — recurse into children (the lane composite may
+         live deep inside a compound, e.g. ``mul(by_expr, stride)``).
     """
-    if isinstance(idx, VarRef):
-        for ax in axes:
-            if idx == ax.original_var:
-                return {
-                    "op": "ranged_slice",
-                    "args": [
-                        {"op": "mul", "args": [ax.number_var, ax.count]},
-                        ax.count,
-                    ],
-                }
-        return idx
+    # Case 1: idx is itself a lane axis.
+    ax = _match_lane_composite(idx, axes)
+    if ax is not None:
+        return _ranged_slice_for_axis(ax)
+
     if not isinstance(idx, dict):
         return idx
+
+    # Case 2: ``lane_composite + const`` or ``const + lane_composite``.
+    # (Subtraction of a const is normalised by upstream IR builders to
+    # an add of a negative IntImm, so matching ``add`` covers both.)
     if idx.get("op") == "add":
         args = idx.get("args", [])
-        if len(args) == 2 and isinstance(args[0], VarRef):
-            phase = args[0]
-            inner = args[1]
-            if (isinstance(inner, dict) and inner.get("op") == "mul"):
-                m_args = inner.get("args", [])
-                if (len(m_args) == 2 and isinstance(m_args[0], VarRef)
-                        and isinstance(m_args[1], int)):
-                    number, count = m_args[0], m_args[1]
-                    for ax in axes:
-                        if (phase == ax.phase_var
-                                and number == ax.number_var
-                                and count == ax.count):
-                            return {
-                                "op": "ranged_slice",
-                                "args": [
-                                    {"op": "mul", "args": [number, count]},
-                                    count,
-                                ],
-                            }
-    # Recurse into children — the lane composite may live deep inside
-    # a compound (e.g. mul(by_expr, stride)).
+        if len(args) == 2:
+            a0, a1 = args
+            for lane_arg, other in ((a0, a1), (a1, a0)):
+                lane_ax = _match_lane_composite(lane_arg, axes)
+                if lane_ax is not None and isinstance(other, int):
+                    return _ranged_slice_for_axis(lane_ax, extra_offset=other)
+
+    # Case 3: recurse into children.
     return {
         "op": idx.get("op"),
         "args": [_collapse_lane_axis(a, axes) for a in idx.get("args", [])],

@@ -44,6 +44,7 @@ def make_layernorm_min(
     hidden_size: int = 128,
     num_s_blocks: int = 2,
     batch: int = 1,
+    eps: float = 1e-6,
 ):
     MLEN = 64
     if rows != MLEN:
@@ -60,6 +61,9 @@ def make_layernorm_min(
 
     seq_len = num_s_blocks * rows
     H = hidden_size
+    # INV_N (= 1/hidden_size) and eps are inlined as T.float16(...)
+    # literals; auto-hoisted into 1-slot global.fpram buffers.
+    inv_n_val = 1.0 / hidden_size
 
     @T.prim_func
     def layernorm_min(
@@ -92,10 +96,9 @@ def make_layernorm_min(
             NORM     = T.alloc_fragment((rows,), "float16")
             INV      = T.alloc_fragment((rows,), "float16")
 
-            # Preloaded FP scalars.
-            INV_N   = T.alloc_fragment((rows,), "float16")  # 1/hidden_size
-            EPS     = T.alloc_fragment((rows,), "float16")  # eps
-            SS_INIT = T.alloc_fragment((rows,), "float16")  # zero seed
+            # INV_N (1/hidden_size) and eps are inlined as
+            # T.float16(...) literals below; the zero seed is
+            # T.float16(0) which takes fold's zero-fill path.
 
             T.copy(
                 X_hbm[0, s_block * rows : (s_block + 1) * rows, 0, 0:H],
@@ -113,17 +116,17 @@ def make_layernorm_min(
             T.copy(SCALE_sh, SC_loc)
             T.copy(BIAS_sh, BI_loc)
 
-            # Seed mean accumulator from preloaded zero before reduce —
+            # Seed mean accumulator from zero before reduce —
             # V_RED_SUM accumulates into its FPRAM slot.
             for row in T.serial(rows):
-                MEAN_SUM[row] = SS_INIT[row]
+                MEAN_SUM[row] = T.float16(0)
 
             # mean_sum[i] = sum_j(X[i, j])
             T.reduce_sum(X_loc, MEAN_SUM, dim=1)
 
             # mu[i] = mean_sum[i] * INV_N[i]
             for row in T.serial(rows):
-                MU[row] = MEAN_SUM[row] * INV_N[row]
+                MU[row] = MEAN_SUM[row] * T.float16(inv_n_val)
 
             # XC = X - mu  (in-place on X_loc to avoid extra fragment).
             for row in T.serial(rows):
@@ -134,13 +137,13 @@ def make_layernorm_min(
             for row in T.serial(rows):
                 for col in T.Parallel(H):
                     SQ_loc[row, col] = X_loc[row, col] * X_loc[row, col]
-                VAR_SUM[row] = SS_INIT[row]
+                VAR_SUM[row] = T.float16(0)
 
             T.reduce_sum(SQ_loc, VAR_SUM, dim=1)
 
             for row in T.serial(rows):
-                VAR[row]     = VAR_SUM[row] * INV_N[row]
-                VAR_EPS[row] = VAR[row] + EPS[row]
+                VAR[row]     = VAR_SUM[row] * T.float16(inv_n_val)
+                VAR_EPS[row] = VAR[row] + T.float16(eps)
                 NORM[row]    = T.sqrt(VAR_EPS[row])
                 INV[row]     = T.float16(1.0) / NORM[row]
 

@@ -34,6 +34,8 @@ the read-only slots:
   L_init[h, :] = 0
 """
 
+import math
+
 import tilelang.language as T
 
 from ..address_alloc import FPRAM_USER_BASE
@@ -49,7 +51,20 @@ def make_flash_attention_min(
     active_lane: int = 0,
     num_kv_blocks: int = 1,
     num_q_blocks: int = 2,
+    o_head_count: int | None = None,
+    o_head_offset: int = 0,
 ):
+    """Flash attention with online softmax.
+
+    ``o_head_count`` / ``o_head_offset`` let the kernel write its output
+    into a head-slice of a WIDER output tensor — used by the
+    single-stream-block chain to drop attention's result straight into
+    the left half of ``concat([attn, mlp])`` with no separate concat
+    kernel. ``O_hbm`` is declared with ``o_head_count`` heads (default:
+    same as ``head_count``, the standalone-kernel behaviour), and each
+    program writes head ``by + o_head_offset``. The grid still iterates
+    ``head_count`` heads; only the destination head index shifts.
+    """
     MLEN = 64
     if rows != MLEN:
         raise ValueError(
@@ -85,18 +100,35 @@ def make_flash_attention_min(
     if num_q_blocks < 1:
         raise ValueError(f"num_q_blocks must be >= 1, got {num_q_blocks}")
 
+    if o_head_count is None:
+        o_head_count = head_count
+    if o_head_count < head_count:
+        raise ValueError(
+            f"o_head_count ({o_head_count}) must be >= head_count "
+            f"({head_count})"
+        )
+    if not (0 <= o_head_offset <= o_head_count - head_count):
+        raise ValueError(
+            f"o_head_offset ({o_head_offset}) + head_count ({head_count}) "
+            f"must fit within o_head_count ({o_head_count})"
+        )
+
     grouped = hlen < MLEN
     kv_seq = num_kv_blocks * rows
     q_seq = num_q_blocks * rows
 
     fp_state_elems = hardware_lane_count * rows
+    # Softmax scale 1/sqrt(d_k). Embedded directly as a FloatImm via
+    # ``T.float16(...)``; ``hoist_float_constants`` turns it into a
+    # 1-slot ``global.fpram`` buffer at compile time.
+    scale_val = 1.0 / math.sqrt(hlen)
 
     @T.prim_func
     def flash_attention_min(
         Q_hbm: T.Tensor((1, q_seq,  head_count, hlen), "float16"),
         K_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
         V_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
-        O_hbm: T.Tensor((1, q_seq,  head_count, hlen), "float16"),
+        O_hbm: T.Tensor((1, q_seq,  o_head_count, hlen), "float16"),
     ):
         with T.Kernel(num_q_blocks, head_count, threads=128) as (q_block, by):
             # Per-lane (rows, hlen) — col-pack expanded to 4D BSHD-packed.
@@ -116,10 +148,12 @@ def make_flash_attention_min(
             L_OLD = T.alloc_fragment((rows,), "float16")
             L_NEW = T.alloc_fragment((rows,), "float16")
             P_SUM = T.alloc_fragment((rows,), "float16")
-            SCALE = T.alloc_fragment((rows,), "float16")
             L_INV = T.alloc_fragment((rows,), "float16")
-            M_INIT = T.alloc_fragment((rows,), "float16")
-            L_INIT = T.alloc_fragment((rows,), "float16")
+            # SCALE / M_INIT / L_INIT are no longer declared buffers —
+            # the kernel body embeds the literals directly as
+            # ``T.float16(...)``; the ``hoist_float_constants`` pre-pass
+            # synthesises a 1-slot ``global.fpram`` buffer per unique
+            # value, and ``test_helper`` auto-preloads them.
 
             # Q DMA — sync, fires once per q_block (multi-lane).
             T.copy(
@@ -134,8 +168,8 @@ def make_flash_attention_min(
 
             # Reset per-lane FP softmax state for this q tile.
             for row in T.serial(rows):
-                M_OLD[row] = M_INIT[row]
-                L_OLD[row] = L_INIT[row]
+                M_OLD[row] = T.float16(-1.0e4)
+                L_OLD[row] = T.float16(0)
 
             for kv_block in T.serial(num_kv_blocks):
                 # K, V DMAs — sync, multi-lane.
@@ -155,7 +189,7 @@ def make_flash_attention_min(
                 # Scale S_loc by 1/sqrt(d_k) per row.
                 for row in T.serial(rows):
                     for col in T.Parallel(MLEN):
-                        S_loc[row, col] = S_loc[row, col] * SCALE[row]
+                        S_loc[row, col] = S_loc[row, col] * T.float16(scale_val)
                     M_CURR[row] = M_OLD[row]
 
                 # M_CURR = max(M_OLD, rowmax(S_loc)).
@@ -168,7 +202,7 @@ def make_flash_attention_min(
                         S_loc[row, col] = S_loc[row, col] - M_CURR[row]
                     for col in T.Parallel(MLEN):
                         S_loc[row, col] = T.exp(S_loc[row, col])
-                    P_SUM[row] = L_INIT[row]
+                    P_SUM[row] = T.float16(0)
 
                 # P_SUM = rowsum(exp(S - M_CURR)).
                 T.reduce_sum(S_loc, P_SUM, dim=1, clear=False)
@@ -194,10 +228,13 @@ def make_flash_attention_min(
                 for col in T.Parallel(hlen):
                     O_loc[row, col] = O_loc[row, col] * L_INV[row]
 
-            # Write O back to HBM at this q_block slot.
+            # Write O back to HBM at this q_block slot. The destination
+            # head index is shifted by o_head_offset so the result can
+            # land in a head-slice of a wider output tensor (concat).
             T.copy(
                 O_loc,
-                O_hbm[0, q_block * rows : (q_block + 1) * rows, by, 0:hlen],
+                O_hbm[0, q_block * rows : (q_block + 1) * rows,
+                      by + o_head_offset, 0:hlen],
             )
 
     # Return the raw PrimFunc. ``compile_kernel`` runs stmt prep + the
