@@ -1,7 +1,5 @@
 """Reset/initialization assembly code generation for Flash Attention."""
 
-from typing import List
-
 IMM2_BOUND = 2**18 - 1
 
 
@@ -11,8 +9,9 @@ def reset_fpsram_code(
     stride_dist: int,
     reset_amount: int,
     reset_val_address: int,
-    alive_registers_fp: List[int],
-    alive_registers_int: List[int],
+    alive_registers_fp: list[int],
+    alive_registers_int: list[int],
+    use_zero_reg: bool = False,
 ) -> str:
     """
     Args:
@@ -20,9 +19,11 @@ def reset_fpsram_code(
     per_stride_dim: the dimension of the reset per stride
     stride_dist: the stride distance between two consecutive resets
     reset_amount: the amount of the consecutive resets
-    reset_val_address: the address of the reset value
+    reset_val_address: FP SRAM slot to load the fill value from
+    use_zero_reg: if True, use f0 (hardware zero = 0.0) instead of loading from FP SRAM
     """
-    generated_code = f"; Reset FPSRAM Code from {reset_start_address} to {reset_start_address + reset_amount * per_stride_dim} with value {reset_val_address}\n"
+    val_label = "f0(0.0)" if use_zero_reg else f"fp_sram[{reset_val_address}]"
+    generated_code = f"; Reset FPSRAM Code from {reset_start_address} to {reset_start_address + reset_amount * per_stride_dim} with value {val_label}\n"
 
     addr_register = alive_registers_int[0]
     outer_loop_register = alive_registers_int[1]
@@ -31,8 +32,11 @@ def reset_fpsram_code(
     fp_val_register = alive_registers_fp[0]
 
     generated_code += f"S_ADDI_INT gp{addr_register}, gp0, {reset_start_address} \n"
-    generated_code += f"S_ADDI_INT gp{offset_register}, gp0, {stride_dist} \n"
-    generated_code += f"S_LD_FP f{fp_val_register}, gp0, {reset_val_address} \n"
+    generated_code += f"S_ADDI_INT gp{offset_register}, gp0, {reset_start_address + stride_dist} \n"
+    if use_zero_reg:
+        fp_val_register = 0  # f0 = hardware zero
+    else:
+        generated_code += f"S_LD_FP f{fp_val_register}, gp0, {reset_val_address} \n"
 
     # Total iterations = reset_amount * per_stride_dim
     if reset_amount > 1:
@@ -45,7 +49,7 @@ def reset_fpsram_code(
         else:
             generated_code += f"S_ST_FP f{fp_val_register}, gp{addr_register}, 0 \n"
             generated_code += f"S_ADDI_INT gp{addr_register}, gp{addr_register}, 1 \n"
-        
+
         generated_code += f"S_ADDI_INT gp{offset_register}, gp{offset_register}, {stride_dist} \n"
         generated_code += f"S_ADD_INT gp{addr_register}, gp0, gp{offset_register} \n"
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
@@ -68,7 +72,7 @@ def reset_vssram_code(
     per_stride_dim: int,
     reset_stride: int,
     reset_amount: int,
-    alive_registers_int: List[int],
+    alive_registers_int: list[int],
 ) -> str:
     """
     Args:
@@ -104,9 +108,9 @@ def reset_kv_prefetch(
     kv_len: int,
     batch: int,
     mlen: int,
-    alive_registers_int: List[int],
+    alive_registers_int: list[int],
 ) -> str:
-    generated_code = f"; Reset KV Prefetch Code \n"
+    generated_code = "; Reset KV Prefetch Code \n"
     assert hkv * d * kv_len * batch < IMM2_BOUND, f"hkv * d * kv_len * batch must be less than {IMM2_BOUND}"
     assert hkv * d * kv_len * batch < IMM2_BOUND, f"hkv * d * kv_len * batch must be less than {IMM2_BOUND}"
 

@@ -1,16 +1,15 @@
-import os
-from typing import Dict, List, Any, Optional
-from pathlib import Path
+from ._imm import load_large_int_str as _load_large_int
+
 
 def rms_norm_asm(
     _eps_offset: int,
     reci_hid_offset: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     activation_base_address: int,
     scratchpad_base_address: int,
     vlen: int,
     batch_size: int,
-    hidden_dim: int
+    hidden_dim: int,
 ) -> str:
     """
     Generate assembly code for RMS normalization.
@@ -20,7 +19,7 @@ def rms_norm_asm(
     stats_addr = alive_registers[2]
 
     generated_code = "; RMS Norm generation \n"
-    generated_code += f"S_ADDI_INT gp{scratchpad_addr}, gp0, {scratchpad_base_address} \n"
+    generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
 
     # Load eps into f1
     generated_code += f"S_LD_FP f1, gp0, {_eps_offset} \n"
@@ -31,9 +30,9 @@ def rms_norm_asm(
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch
-        generated_code += f"S_ADDI_INT gp{act_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
         # Set stats_addr to same position for iteration
-        generated_code += f"S_ADDI_INT gp{stats_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
 
         # First loop: compute sum of squares using stats_addr
         for i in range(hidden_dim // vlen):
@@ -45,10 +44,10 @@ def rms_norm_asm(
             generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
 
         # Taking the avg
-        generated_code += f"S_MUL_FP f2, f2, f3 \n"
+        generated_code += "S_MUL_FP f2, f2, f3 \n"
 
         # Plus epsilon
-        generated_code += f"S_ADD_FP f2, f2, f1 \n"
+        generated_code += "S_ADD_FP f2, f2, f1 \n"
 
         # Compute square root
         generated_code += "S_SQRT_FP f2, f2 \n"
@@ -69,15 +68,16 @@ def rms_norm_asm(
 
     return generated_code
 
+
 def layer_norm_asm(
     _eps_offset: int,
     reci_hid_offset: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     activation_base_address: int,
     scratchpad_base_address: int,
     vlen: int,
     batch_size: int,
-    hidden_dim: int
+    hidden_dim: int,
 ) -> str:
     """
     Generate assembly code for layer normalization.
@@ -87,19 +87,19 @@ def layer_norm_asm(
     stats_addr = alive_registers[2]
 
     generated_code = "; Layer Norm generation \n"
-    generated_code += f"S_ADDI_INT gp{scratchpad_addr}, gp0, {scratchpad_base_address} \n"
+    generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
 
     # Load constants
-    generated_code += f"S_LD_FP f1, gp0, {_eps_offset} \n"          # epsilon
-    generated_code += "S_ADD_FP f2, f0, f0 \n"                      # sum(x) accumulator
-    generated_code += "S_ADD_FP f3, f0, f0 \n"                      # sum(x^2) accumulator
-    generated_code += f"S_LD_FP f4, gp0, {reci_hid_offset} \n"      # 1/hidden_dim
+    generated_code += f"S_LD_FP f1, gp0, {_eps_offset} \n"  # epsilon
+    generated_code += "S_ADD_FP f2, f0, f0 \n"  # sum(x) accumulator
+    generated_code += "S_ADD_FP f3, f0, f0 \n"  # sum(x^2) accumulator
+    generated_code += f"S_LD_FP f4, gp0, {reci_hid_offset} \n"  # 1/hidden_dim
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch
-        generated_code += f"S_ADDI_INT gp{act_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
         # Set stats_addr to same position for iteration
-        generated_code += f"S_ADDI_INT gp{stats_addr}, gp0, {activation_base_address + vlen * batch} \n"
+        generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
 
         # First loop: compute sum(x) and sum(x^2) using stats_addr
         for i in range(hidden_dim // vlen):
@@ -114,25 +114,25 @@ def layer_norm_asm(
             generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
 
         # f2 = sum(x) * (1/hidden_dim) = mean(x)
-        generated_code += f"S_MUL_FP f2, f2, f4 \n"
+        generated_code += "S_MUL_FP f2, f2, f4 \n"
 
         # f3 = sum(x^2) * (1/hidden_dim) = mean(x^2)
-        generated_code += f"S_MUL_FP f3, f3, f4 \n"
+        generated_code += "S_MUL_FP f3, f3, f4 \n"
 
         # f5 = mean(x)^2
-        generated_code += f"S_MUL_FP f5, f2, f2 \n"
+        generated_code += "S_MUL_FP f5, f2, f2 \n"
 
         # f5 = mean(x^2) - mean(x)^2 = variance
-        generated_code += f"S_SUB_FP f5, f3, f5 \n"
+        generated_code += "S_SUB_FP f5, f3, f5 \n"
 
         # f5 = variance + epsilon
-        generated_code += f"S_ADD_FP f5, f5, f1 \n"
+        generated_code += "S_ADD_FP f5, f5, f1 \n"
 
         # f5 = sqrt(variance + epsilon) = std
-        generated_code += f"S_SQRT_FP f5, f5 \n"
+        generated_code += "S_SQRT_FP f5, f5 \n"
 
         # f5 = 1/std
-        generated_code += f"S_RECI_FP f5, f5 \n"
+        generated_code += "S_RECI_FP f5, f5 \n"
 
         # Second loop: normalize using act_addr (still at batch start)
         for i in range(hidden_dim // vlen):

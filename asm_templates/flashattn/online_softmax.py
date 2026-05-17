@@ -1,7 +1,5 @@
 """Online softmax assembly code generation for Flash Attention."""
 
-from typing import List
-
 IMM2_BOUND = 2**18 - 1
 
 """
@@ -12,15 +10,15 @@ Memory Layout in FP SRAM:
 """
 
 
-
 def online_softmax_code(
     mlen: int,
     stage: str,
-    alive_registers_int: List[int],
-    alive_registers_fp: List[int],
+    alive_registers_int: list[int],
+    alive_registers_fp: list[int],
     s_address: int,
     m_start_address: int,
-    qk_scale_address: int = 1,
+    qk_scale_address: int = 5,
+    causal_mask: bool = True,
 ) -> str:
     """
     Args:
@@ -28,7 +26,11 @@ def online_softmax_code(
     alive_registers_int: the list of alive registers for fix point operations
     alive_registers_fp: the list of alive registers for floating point operations
     mlen: also Br: the number of row of the QKT result
-    qk_scale_address: the FP SRAM address containing qk_scale (default 1)
+    qk_scale_address: the FP SRAM address containing qk_scale (default 5)
+    causal_mask: if True, causal (decoder) attention; if False, bidirectional
+        (SigLIP/ViT). Currently the online softmax kernel does not emit explicit
+        upper-triangle masking — causal behaviour is enforced by tiling order.
+        This parameter is accepted for forward-compatibility.
     Description:
         This part of asm is for the inner loop of the flash attention, mapping to line 9 to line 10 process,
         which requires per row level computation, hence with the loop mlen times.
@@ -41,11 +43,11 @@ def online_softmax_code(
     qk_scale_register = alive_registers_fp[4]
 
     # get a general address register
-    s_address_register      = alive_registers_int[0] # general address register
+    s_address_register = alive_registers_int[0]  # general address register
     m_last_address_register = alive_registers_int[1]
-    m_res_address_register  = alive_registers_int[2] # m_res address register
-    l_old_address_register  = alive_registers_int[3] # l_old address register
-    loop_register           = alive_registers_int[4] # loop counter register
+    m_res_address_register = alive_registers_int[2]  # m_res address register
+    l_old_address_register = alive_registers_int[3]  # l_old address register
+    loop_register = alive_registers_int[4]  # loop counter register
 
     generated_code = "; Online Softmax Code \n"
 
@@ -58,7 +60,7 @@ def online_softmax_code(
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {mlen} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {mlen} \n"
 
-        # Load qk_scale from FP SRAM (preloaded at address 1)
+        # Load qk_scale from FP SRAM (preloaded at FP SRAM address 5)
         generated_code += f"S_LD_FP f{qk_scale_register}, gp0, {qk_scale_address} \n"
 
         # Hardware loop over mlen rows
@@ -130,9 +132,8 @@ def online_softmax_code(
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {1} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {1} \n"
 
-        # Load qk_scale from FP SRAM (preloaded at address 1)
+        # Load qk_scale from FP SRAM (preloaded at FP SRAM address 5)
         generated_code += f"S_LD_FP f{qk_scale_register}, gp0, {qk_scale_address} \n"
-
 
         # Scale S row by qk_scale: S = S * qk_scale
         generated_code += f"V_MUL_VF gp{s_address_register}, gp{s_address_register}, f{qk_scale_register}, 0 \n"

@@ -1,7 +1,5 @@
 """PV multiplication assembly code generation for Flash Attention."""
 
-from typing import List
-
 IMM2_BOUND = 2**18 - 1
 
 
@@ -11,7 +9,7 @@ def computing_pv_code(
     mlen: int,
     vlen: int,
     stage: str,
-    alive_registers: List[int],
+    alive_registers: list[int],
     p_base_address: int,
     v_base_hbm_offset_reg: int,
     q_head_index: int,
@@ -74,13 +72,12 @@ def computing_pv_code(
     # Output starts at output_base + head_offset (for this head's column position)
     generated_code += f"S_ADDI_INT gp{out_base_register}, gp0, {output_base_address + head_offset * head_dim} \n"
 
-
     if stage == "prefill":
         # Loop structure:
         # - outer loop over column blocks of V (head_dim // blen iterations)
         # - inner loop over row blocks (mlen // blen iterations)
         outer_loop_count = head_dim // blen  # Number of column blocks
-        inner_loop_count = mlen // blen      # Number of row blocks
+        inner_loop_count = mlen // blen  # Number of row blocks
         generated_code += f"S_ADDI_INT gp{out_col_register}, gp0, {output_base_address + head_offset * head_dim} \n"
         generated_code += f"C_LOOP_START gp{outer_loop_register}, {outer_loop_count} \n"
         generated_code += f"C_LOOP_START gp{inner_loop_register}, {inner_loop_count} \n"
@@ -106,7 +103,7 @@ def computing_pv_code(
         generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen} \n"
 
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
-    
+
     else:
         # Loop structure:
         loop_count = head_dim // blen  # Number of column blocks

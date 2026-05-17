@@ -1,8 +1,7 @@
-from compiler.assembler.parser import load_isa_definitions, load_isa_settings, parse_asm_file
 from utils.load_config import load_svh_settings
-import torch
-from pathlib import Path
-import argparse
+
+from .parser import load_isa_definitions, parse_asm_file
+
 
 class AssemblyToBinary:
     def __init__(self, isa_definition_file: str, config_file: str):
@@ -14,15 +13,14 @@ class AssemblyToBinary:
         self.isa_definitions = load_isa_definitions(isa_definition_file)
         self.isa_definition_file = isa_definition_file
         config_settings = load_svh_settings(config_file)
-        self.opcode_width    = config_settings.get("OPCODE_WIDTH", 0)
-        self.operands_width  = config_settings.get("OPERAND_WIDTH", 0)
-        self.imm_width       = config_settings.get("IMM_WIDTH", 0)
-        self.imm2_width      = config_settings.get("IMM_2_WIDTH", 0)
+        self.opcode_width = config_settings.get("OPCODE_WIDTH", 0)
+        self.operands_width = config_settings.get("OPERAND_WIDTH", 0)
+        self.imm_width = config_settings.get("IMM_WIDTH", 0)
+        self.imm2_width = config_settings.get("IMM_2_WIDTH", 0)
         self.instruction_length = config_settings.get("INSTRUCTION_LENGTH", 0)
         self.funct_width = config_settings.get("FUNCT_WIDTH", 0)
         self.funct_dist = self.instruction_length - 2 * self.funct_width
-
-
+        
     def _convert_to_binary(self, instruction):
         """
         Convert an instruction to its binary representation.
@@ -32,12 +30,11 @@ class AssemblyToBinary:
         """
         # Example conversion logic (to be replaced with actual logic)
         opcode = self.isa_definitions[instruction.opcode]
-        rd =  instruction.rd
+        rd = instruction.rd
         rs1 = instruction.rs1
         rs2 = instruction.rs2
         rstride = instruction.rstride
         funct1 = instruction.funct1
-        funct2 = instruction.funct2
         imm = instruction.imm
         rmask = instruction.rmask
         binary_instruction = 0
@@ -80,19 +77,15 @@ class AssemblyToBinary:
             )
         elif instruction.opcode in ["C_LOOP_START"]:
             # C_LOOP_START rd, imm - uses 22-bit immediate like S_LUI_INT
-            binary_instruction = (
-                (imm << (opw + ow)) +
-                (rd << opw) +
-                opcode
-            )
+            binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in ["H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"]:
             binary_instruction = (
-                (funct1 << (opw + 4 * ow)) +
-                (rstride << (opw + 3 * ow)) +
-                (rs2 << (opw + 2 * ow)) +
-                (rs1 << (opw + ow)) +
-                (rd << opw) +
-                opcode
+                (funct1 << (opw + 4 * ow))
+                + (rstride << (opw + 3 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
             )
         elif instruction.opcode in ["V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"]:
             binary_instruction = (
@@ -104,23 +97,41 @@ class AssemblyToBinary:
             )
         elif instruction.opcode in ["V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF"]:
             binary_instruction = (
-                (rmask << (opw + 3 * ow)) +
-                (rs2 << (opw + 2 * ow)) +
-                (rs1 << (opw + ow)) +
-                (rd << opw) +
-                opcode
+                (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
             )
+        elif instruction.opcode in [
+            # Scalar arithmetic (rd, rs1, rs2) — no rmask
+            "S_ADD_INT",
+            "S_ADD_FP",
+            "S_SUB_INT",
+            "S_SUB_FP",
+            "S_MUL_INT",
+            "S_MUL_FP",
+            "S_MAX_FP",
+            # Matrix ops without write-out (rd, rs1, rs2)
+            "M_MM",
+            "M_MV",
+            "M_BMM",
+            "M_BMV",
+            "M_TMM",
+            "M_TMV",
+            "M_BTMM",
+            "M_BTMV",
+            # CSR: addr reg destination + 2 GP sources (a{N}, gp{X}, gp{Y} → rd, rs1, rs2)
+            "C_SET_ADDR_REG",
+        ]:
+            binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         else:
-            binary_instruction = (
-                (rs2 << (opw + 2 * ow)) +
-                (rs1 << (opw + ow)) +
-                (rd << opw) +
-                opcode
-            )
+            binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
 
-        # Print in hex with fixed 16-bit width
+        if binary_instruction > 0xFFFFFFFF:
+            raise ValueError(
+                f"Instruction encoding overflow (0x{binary_instruction:X} > 32 bits): "
+                f"mnemonic={instruction.opcode}, rd={rd}, rs1={rs1}, rs2={rs2}, imm={imm}. "
+                f"Use load_large_int from asm_templates._imm for immediates >= {1 << 18}."
+            )
         return binary_instruction
-    
+
     def write_binary_to_file(self, binary_instructions, output_file: str):
         instr_mask = (1 << self.instruction_length) - 1 if self.instruction_length > 0 else 0xFFFFFFFF
         with open(output_file, 'w') as file:
@@ -146,15 +157,7 @@ class AssemblyToBinary:
         # Write the binary instructions to a file
         self.write_binary_to_file(binary_instructions, output_file)
         return binary_instructions
-    
 
-# if __name__ == "__main__":
-#     import os
-#     from pathlib import Path
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('--layer', type=str, required=True, help='Input file name')
-#     parser.add_argument('--test_type', type=str, default='Layerwise_Benchmark', help='Input file name (default: basic)')
-#     args = parser.parse_args()
 
 #     isa_file_path = '../../src/definitions/operation.svh'
 #     config_file_path = '../../src/definitions/configuration.svh'

@@ -3,12 +3,15 @@
 Test script for attention code generation
 """
 
-import sys
 import os
+import sys
 from pathlib import Path
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from passes.code_gen import _generate_embedding_code
 from assembler import AssemblyToBinary
+
+from passes.code_gen import _generate_embedding_code
+
 
 def test_embeddings_code_generation():
     """Test the embeddings code generation function"""
@@ -17,36 +20,31 @@ def test_embeddings_code_generation():
     test_node = {
         "name": "embeddings",
         "operation_type": "embeddings",
-        "dimensions": {
-            "hidden_size": 4096,
-            "num_attention_heads": 32,
-            "head_dim": 128,
-            "num_key_value_heads": 8
-        }
+        "dimensions": {"hidden_size": 64, "num_attention_heads": 1, "head_dim": 64, "num_key_value_heads": 1},
     }
     hardware_config = {
-        "mlen" : 256,
-        "blen" : 4
+        "MLEN": 64,
+        "VLEN": 64,
+        "BLEN": 4,
+        "block_dim": 4,
+        "act_block_width": 32,
+        "scale_width": 8,
+        "alive_registers": [1, 2],
     }
-    model_info = {
-        "batch_size" : 4,
-        "vocab_size" : 128256
-    }
+    model_info = {"batch_size": 1, "seq_len": 4, "vocab_size": 1024}
     scheduler = {
-        "activation_base_address": 0,
+        "memory_layout": {
+            "vector_sram_addr": {"block1": 0},
+            "fp_sram": {},
+        },
         "register_assignment": {
-            "hbm_addr_reg": {
-                "token_table_offset": 0
-            }
-        }
+            "hbm_addr_reg": {"token_table_offset": 1},
+        },
     }
 
     # Generate the assembly code
     generated_code = _generate_embedding_code(
-        test_node,
-        model_info=model_info,
-        hardware_config=hardware_config,
-        scheduler=scheduler
+        test_node, model_info=model_info, hardware_config=hardware_config, scheduler=scheduler
     )
 
     # Write out assembly
@@ -62,8 +60,7 @@ def test_embeddings_code_generation():
 
 if __name__ == "__main__":
     test_embeddings_code_generation()
-    config_path = Path(__file__).resolve().parents[2] / "src" / "definitions" / "configuration.svh"
-    isa_def_path = Path(__file__).resolve().parents[2] / "src" / "definitions" / "operation.svh"
+    config_path = Path(__file__).resolve().parents[2] / "doc" / "configuration.svh"
+    isa_def_path = Path(__file__).resolve().parents[2] / "doc" / "operation.svh"
     assembler = AssemblyToBinary(isa_def_path, config_path)
     assembler.generate_binary("generated_embedding_assembly.asm", "generated_embedding_assembly.mem")
-    

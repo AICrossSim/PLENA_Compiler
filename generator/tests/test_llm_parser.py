@@ -1,8 +1,8 @@
-import sys
 import os
+import sys
+
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
-from typing import Dict, Any, List
 
 # Add the parent directory to the path so we can import the parser
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -92,7 +92,7 @@ def get_actual_execution_shapes(model, input_ids, num_layers, hidden_size):
 
     # Forward pass
     with torch.no_grad():
-        output = model(input_ids)
+        _output = model(input_ids)
 
     # Remove hooks
     for hook in hooks:
@@ -299,12 +299,13 @@ def test_model():
         "layer_1_mlp",
         "layer_1_ffn_residual",
         "final_layernorm",
+        "lm_head",
     ]
 
     if execution_order == expected_sequence:
         print("✅ Execution order is correct")
     else:
-        print(f"❌ Execution order mismatch:")
+        print("❌ Execution order mismatch:")
         print(f"   Expected: {expected_sequence}")
         print(f"   Actual:   {execution_order}")
         all_passed = False
@@ -345,7 +346,6 @@ def test_model():
             print(f"❌ Embedding output shape incorrect for ({test_batch_size}, {test_seq_len})")
             all_passed = False
 
-    # Summary
     print("\n" + "=" * 50)
     if all_passed:
         print("🎉 ALL TESTS PASSED! create_symbolic_graph is correct for LlamaForCausalLM architecture")
@@ -353,6 +353,7 @@ def test_model():
         print("❌ SOME TESTS FAILED! create_symbolic_graph needs fixes")
     print("=" * 50)
 
+    assert all_passed, "create_symbolic_graph shape/order checks failed; see printed diff above"
     return all_passed
 
 

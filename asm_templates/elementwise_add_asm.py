@@ -1,17 +1,14 @@
-import os
-from typing import Dict, List, Any, Optional
-from pathlib import Path
-
+from ._imm import load_large_int_str as _load_large_int
 
 
 def elementwise_add_asm(
     vlen: int,
     batch: int,
     hidden_size: int,
-    alive_registers: List[int],
+    alive_registers: list[int],
     stored_activation_base_address: int,
     previous_activation_base_address: int,
-    previous_act_on_chip_addr_reg_index: int
+    previous_act_on_chip_addr_reg_index: int,
 ) -> str:
     """
     Generates assembly code for vector elementwise add operation.
@@ -22,21 +19,23 @@ def elementwise_add_asm(
         str: elementwise add, previous layer's activation add with the current layer's activation.
     """
     generated_code = "; Elementwise_add_asm generation \n"
-    
+
     per_tile_offset = hidden_size
     previous_act_offset = alive_registers[0]
-    previous_act_on_chip_addr = alive_registers[1]  
+    previous_act_on_chip_addr = alive_registers[1]
     load_v_on_chip_addr = alive_registers[2]
     loop_iteration = hidden_size // vlen
 
     generated_code += f"S_ADDI_INT gp{previous_act_offset}, gp0, 0 \n"
-    generated_code += f"S_ADDI_INT gp{load_v_on_chip_addr}, gp0, {stored_activation_base_address} \n"
-    generated_code += f"S_ADDI_INT gp{previous_act_on_chip_addr}, gp0, {previous_activation_base_address} \n"
+    generated_code += _load_large_int(load_v_on_chip_addr, stored_activation_base_address)
+    generated_code += _load_large_int(previous_act_on_chip_addr, previous_activation_base_address)
 
     for i in range(batch * loop_iteration):
-        generated_code += f"H_PREFETCH_V gp{previous_act_on_chip_addr}, gp{previous_act_offset}, a{previous_act_on_chip_addr_reg_index}, 0, 0 \n" 
-        generated_code += f"V_ADD_VV gp{load_v_on_chip_addr}, gp{previous_act_on_chip_addr}, {load_v_on_chip_addr} \n"
+        generated_code += f"H_PREFETCH_V gp{previous_act_on_chip_addr}, gp{previous_act_offset}, a{previous_act_on_chip_addr_reg_index}, 0, 0 \n"
+        generated_code += f"V_ADD_VV gp{load_v_on_chip_addr}, gp{previous_act_on_chip_addr}, gp{load_v_on_chip_addr}, 0 \n"
         generated_code += f"S_ADDI_INT gp{previous_act_offset}, gp{previous_act_offset}, {per_tile_offset} \n"
-        generated_code += f"S_ADDI_INT gp{previous_act_on_chip_addr}, gp{previous_act_on_chip_addr}, {per_tile_offset} \n"
+        generated_code += (
+            f"S_ADDI_INT gp{previous_act_on_chip_addr}, gp{previous_act_on_chip_addr}, {per_tile_offset} \n"
+        )
 
     return generated_code

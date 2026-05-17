@@ -1,7 +1,5 @@
-from typing import Dict, List
-
 def reset_reg_asm(
-    alive_registers: List[int],
+    alive_registers: list[int],
 ) -> str:
     """
     Generates assembly code for resetting registers.
@@ -13,7 +11,7 @@ def reset_reg_asm(
 
 
 def reset_fpreg_asm(
-    alive_registers: List[int],
+    alive_registers: list[int],
 ) -> str:
     """
     Generates assembly code for resetting floating point registers.
@@ -22,6 +20,7 @@ def reset_fpreg_asm(
     for register in alive_registers:
         generated_code += f"S_ADD_FP f{register}, f0, f0 \n"
     return generated_code
+
 
 def reset_vmask_asm(
     alive_register: int,

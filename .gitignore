@@ -6,3 +6,15 @@
 *.dir
 
 __pycache__
+
+# Generated assembly / machine-code artifacts from codegen tests and runs
+generated_*.asm
+generated_*.mem
+*.asm
+*.mem
+
+# Allow hand-authored assembly templates / fixtures that live inside source dirs
+!asm_templates/**/*.asm
+!asm_templates/**/*.mem
+!**/tests/**/*.asm
+!**/tests/**/*.mem

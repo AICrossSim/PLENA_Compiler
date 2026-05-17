@@ -5,7 +5,9 @@
         "k_weight_offset"       : 3,
         "v_weight_offset"       : 4,
         "rope_params_offset"    : 5,
-        "ffn_weight_offset"     : 6,
-        "previous_activation_offset"    : 7
+        "ffn_gate_offset"       : 6,
+        "ffn_up_offset"         : 7,
+        "ffn_down_offset"       : 8,
+        "previous_activation_offset"    : 9
     }
 }
