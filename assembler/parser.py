@@ -109,6 +109,9 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
     """
     instructions = []
 
+    vector_masked_unary_or_reduction_ops = {"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"}
+    vector_masked_binary_ops = {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF"}
+
     with open(file_path) as file:
         for line in file:
             # Remove comments and strip whitespace
@@ -190,6 +193,12 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                         imm = int(operand_2)
                     except ValueError:
                         pass
+                if opcode in vector_masked_unary_or_reduction_ops:
+                    # Keep rmask/rstride aligned for 3-operand masked unary/reduction forms.
+                    rstride = imm
+                elif opcode in vector_masked_binary_ops:
+                    # Allow 3-operand vector ALU forms by defaulting omitted rmask to 0.
+                    rstride = 0
             elif len(operands) == 4:
                 operand_0, operand_1, operand_2, operand_3 = operands
                 rd = parse_reg_or_int(operand_0)
