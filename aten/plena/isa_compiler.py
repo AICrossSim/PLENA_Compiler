@@ -42,6 +42,7 @@ class IsaCompiler(
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
         self.generated_code = ""
+        self.unroll_attention = unroll_loops
 
     def load_batch(
         self,
