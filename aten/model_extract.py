@@ -49,7 +49,9 @@ class LayerWeights:
             (f"W_q_{layer_idx}", self.w_q),
             (f"W_o_{layer_idx}", self.w_o),
         ]
-        for kv_h, (w_k, w_v) in enumerate(zip(self.w_k_heads, self.w_v_heads, strict=True)):
+        for kv_h, (w_k, w_v) in enumerate(
+            zip(self.w_k_heads, self.w_v_heads, strict=True)
+        ):
             entries.extend(
                 [
                     (f"W_k_{layer_idx}_h{kv_h}", w_k),
@@ -67,14 +69,35 @@ class LayerWeights:
 
 
 def find_model_root(model: Any) -> Any:
-    """Find the transformer backbone (model.model or model.model.text_model)."""
+    """Find the transformer backbone (model.model or model.model.text_model).
+
+    Handles standard CausalLM models, VLMs like SmolVLM2, and diffusion models like LLaDA.
+    For LLaDA-style models, wraps transformer.blocks under a .layers attribute for compatibility.
+    """
     for candidate in [
         getattr(model, "model", None),
         getattr(getattr(model, "model", None), "text_model", None),
         getattr(model, "language_model", getattr(model, "text_model", None)),
     ]:
-        if candidate is not None and hasattr(candidate, "layers"):
-            return candidate
+        if candidate is not None:
+            # Standard case: .layers attribute
+            if hasattr(candidate, "layers"):
+                return candidate
+            # LLaDA-style: transformer.blocks instead of layers
+            if hasattr(candidate, "transformer") and hasattr(
+                candidate.transformer, "blocks"
+            ):
+                # Create a wrapper that exposes .layers for compatibility
+                class LayersWrapper:
+                    def __init__(self, obj):
+                        self._obj = obj
+
+                    def __getattr__(self, name):
+                        if name == "layers":
+                            return self._obj.transformer.blocks
+                        return getattr(self._obj, name)
+
+                return LayersWrapper(candidate)
     raise ValueError(f"Cannot find decoder layers on {type(model).__name__}")
 
 
@@ -102,7 +125,22 @@ def extract_model_config(model: Any) -> ModelConfig:
 
 
 def extract_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
-    """Extract one decoder layer in PLENA's (in, out) convention."""
+    """Extract one decoder layer in PLENA's (in, out) convention.
+    
+    Supports both standard Llama layers (with self_attn and mlp) and
+    LLaDA-style layers (with direct projections).
+    """
+    # Detect layer type
+    is_llada = hasattr(layer, "q_proj") and not hasattr(layer, "self_attn")
+    
+    if is_llada:
+        return _extract_llada_layer_weights(layer, config)
+    else:
+        return _extract_llama_layer_weights(layer, config)
+
+
+def _extract_llama_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
+    """Extract standard Llama layer weights."""
     hidden = config.hidden_size
     total_kv_dim = config.num_kv_heads * config.head_dim
     w_k_full = _linear_weight(layer.self_attn.k_proj, hidden, total_kv_dim)
@@ -121,10 +159,42 @@ def extract_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
     )
 
 
+def _extract_llada_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
+    """Extract LLaDA-style layer weights.
+    
+    LLaDA uses ff_proj and up_proj both mapping to intermediate dimension,
+    with ff_out as the down projection. We treat ff_proj as gate and up_proj
+    as the traditional up projection for compatibility with PLENA's FFN ops.
+    """
+    hidden = config.hidden_size
+    total_kv_dim = config.num_kv_heads * config.head_dim
+    w_k_full = _linear_weight(layer.k_proj, hidden, total_kv_dim)
+    w_v_full = _linear_weight(layer.v_proj, hidden, total_kv_dim)
+    
+    # Get epsilon from either attn_norm or ff_norm
+    norm = getattr(layer, "attn_norm", getattr(layer, "ff_norm", None))
+
+    return LayerWeights(
+        w_q=_linear_weight(layer.q_proj, hidden, config.total_q_dim),
+        w_o=_linear_weight(layer.attn_out, config.total_q_dim, hidden),
+        w_k_heads=_split_heads(w_k_full, config.head_dim, config.num_kv_heads),
+        w_v_heads=_split_heads(w_v_full, config.head_dim, config.num_kv_heads),
+        w_gate=_linear_weight(layer.ff_proj, hidden, config.inter_dim),
+        w_up=_linear_weight(layer.up_proj, hidden, config.inter_dim),
+        w_down=_linear_weight(layer.ff_out, config.inter_dim, hidden),
+        eps=getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-5)) if norm else 1e-5,
+    )
+
+
 def _linear_weight(module: Any, rows: int, cols: int) -> torch.Tensor:
     """HF Linear stores (out, in); PLENA uses (in, out)."""
     return module.weight.detach().T.contiguous()[:rows, :cols]
 
 
-def _split_heads(weight: torch.Tensor, head_dim: int, num_heads: int) -> list[torch.Tensor]:
-    return [weight[:, h * head_dim:(h + 1) * head_dim].contiguous() for h in range(num_heads)]
+def _split_heads(
+    weight: torch.Tensor, head_dim: int, num_heads: int
+) -> list[torch.Tensor]:
+    return [
+        weight[:, h * head_dim : (h + 1) * head_dim].contiguous()
+        for h in range(num_heads)
+    ]
