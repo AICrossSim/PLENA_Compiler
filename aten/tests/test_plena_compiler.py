@@ -196,6 +196,45 @@ def test_linear_projection_uses_runtime_mram_tile_capacity():
     print("  PASS test_linear_projection_uses_runtime_mram_tile_capacity")
 
 
+def test_vram_layout_tracks_logical_and_physical_shape():
+    """Layouts should keep native logical rows while allocating physical BLEN row storage."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=256, blen=64)
+    x = prog.alloc("X", 4, 256, strict=False, physical_shape=(64, 256))
+    layout = prog.get_vram_layout(x.name)
+
+    assert layout.full_shape == (4, 256)
+    assert layout.physical_shape == (64, 256)
+    block = layout.get_sub_block(0, 0)
+    assert block.valid_shape == (4, 256)
+    assert x.shape == (4, 256)
+    assert x.physical_shape == (64, 256)
+
+    print("  PASS test_vram_layout_tracks_logical_and_physical_shape")
+
+
+def test_partial_row_linear_uses_one_blen_row_group():
+    """M < BLEN on a large-MLEN config should emit one row group, not force MLEN rows."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=256, blen=64)
+    x_input = prog.input("X", shape=(4, 256), physical_shape=(64, 256))
+    w = prog.input("W", shape=(256, 256), physical_shape=(256, 256))
+    x = prog.load_batch(x_input, name="X")
+    y = prog.linear_projection(x, w, name="Y")
+    code = prog.get_code()
+
+    assert y.shape == (4, 256)
+    assert y.physical_shape == (64, 256)
+    assert "M_MM" in code
+    # The projection template receives valid_rows=4 and BLEN=64, so the
+    # middle row-group loop should run once.
+    assert ", 1" in code
+
+    print("  PASS test_partial_row_linear_uses_one_blen_row_group")
+
+
 def test_fix_large_immediates_roundtrip():
     """_fix_large_immediates must preserve exact address values."""
     from compiler.aten.plena_frontend import _fix_large_immediates
@@ -250,6 +289,101 @@ def test_rotate_half_matrix_identity():
     expected = -torch.eye(64)
     assert torch.allclose(RR, expected, atol=1e-6), f"R @ R should be -I, got max diff {(RR - expected).abs().max()}"
     print("  PASS test_rotate_half_matrix_identity")
+
+
+def test_grouped_attention_weight_padding_preserves_head_slots():
+    """Padded Q/O weights must keep native head lanes in padded per-head slots."""
+    from compiler.aten.plena_frontend import _pad_o_weight_grouped, _pad_q_weight_grouped
+
+    w_q = torch.arange(2 * 6, dtype=torch.float32).reshape(2, 6)
+    padded_q = _pad_q_weight_grouped(w_q, num_heads=3, head_dim=2, padded_hidden=4, padded_head_dim=4)
+
+    assert padded_q.shape == (4, 12)
+    assert torch.equal(padded_q[:2, 0:2], w_q[:, 0:2])
+    assert torch.equal(padded_q[:2, 4:6], w_q[:, 2:4])
+    assert torch.equal(padded_q[:2, 8:10], w_q[:, 4:6])
+    assert torch.count_nonzero(padded_q[:2, 2:4]) == 0
+    assert torch.count_nonzero(padded_q[:2, 6:8]) == 0
+    assert torch.count_nonzero(padded_q[:2, 10:12]) == 0
+    assert torch.count_nonzero(padded_q[2:, :]) == 0
+
+    w_o = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2)
+    padded_o = _pad_o_weight_grouped(w_o, num_heads=3, head_dim=2, padded_head_dim=4, padded_hidden=4)
+
+    assert padded_o.shape == (12, 4)
+    assert torch.equal(padded_o[0:2, :2], w_o[0:2, :])
+    assert torch.equal(padded_o[4:6, :2], w_o[2:4, :])
+    assert torch.equal(padded_o[8:10, :2], w_o[4:6, :])
+    assert torch.count_nonzero(padded_o[2:4, :]) == 0
+    assert torch.count_nonzero(padded_o[6:8, :]) == 0
+    assert torch.count_nonzero(padded_o[10:12, :]) == 0
+    assert torch.count_nonzero(padded_o[:, 2:]) == 0
+
+    print("  PASS test_grouped_attention_weight_padding_preserves_head_slots")
+
+
+def test_kv_grouped_head_packing_preserves_slots():
+    """Packed attention should place Q/O heads in KV-group HLEN slots."""
+    from compiler.aten.plena_frontend import (
+        _pad_o_weight_grouped_by_kv,
+        _pad_q_weight_grouped_by_kv,
+        _pad_rope_inputs_for_head_slots,
+    )
+
+    w_q = torch.arange(2 * 6, dtype=torch.float32).reshape(2, 6)
+    padded_q = _pad_q_weight_grouped_by_kv(
+        w_q,
+        num_heads=3,
+        num_kv_heads=1,
+        head_dim=2,
+        padded_hidden=4,
+        group_width=8,
+        head_slot_dim=2,
+    )
+    assert padded_q.shape == (4, 8)
+    assert torch.equal(padded_q[:2, 0:2], w_q[:, 0:2])
+    assert torch.equal(padded_q[:2, 2:4], w_q[:, 2:4])
+    assert torch.equal(padded_q[:2, 4:6], w_q[:, 4:6])
+    assert torch.count_nonzero(padded_q[:2, 6:8]) == 0
+    assert torch.count_nonzero(padded_q[2:, :]) == 0
+
+    w_o = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2)
+    padded_o = _pad_o_weight_grouped_by_kv(
+        w_o,
+        num_heads=3,
+        num_kv_heads=1,
+        head_dim=2,
+        group_width=8,
+        head_slot_dim=2,
+        padded_hidden=4,
+    )
+    assert padded_o.shape == (8, 4)
+    assert torch.equal(padded_o[0:2, :2], w_o[0:2, :])
+    assert torch.equal(padded_o[2:4, :2], w_o[2:4, :])
+    assert torch.equal(padded_o[4:6, :2], w_o[4:6, :])
+    assert torch.count_nonzero(padded_o[6:8, :]) == 0
+    assert torch.count_nonzero(padded_o[:, 2:]) == 0
+
+    rope = torch.eye(2)
+    cos = torch.ones(3, 2)
+    sin = torch.full((3, 2), 2.0)
+    packed_rope, packed_cos, packed_sin = _pad_rope_inputs_for_head_slots(
+        rope,
+        cos,
+        sin,
+        padded_seq_len=4,
+        group_width=8,
+        head_slot_dim=2,
+        broadcast_amount=4,
+    )
+    assert packed_rope.shape == (8, 8)
+    assert torch.equal(packed_rope[0:2, 0:2], rope)
+    assert torch.equal(packed_rope[2:4, 2:4], rope)
+    assert torch.equal(packed_cos[:3, 4:6], cos)
+    assert torch.equal(packed_sin[:3, 6:8], sin)
+    assert torch.count_nonzero(packed_cos[3, :]) == 0
+
+    print("  PASS test_kv_grouped_head_packing_preserves_slots")
 
 
 def test_compile_native_hf_decoder_golden_vs_hf():
@@ -332,9 +466,13 @@ if __name__ == "__main__":
         test_mram_allocator_scales_with_runtime_mlen,
         test_compiler_threads_runtime_memory_geometry,
         test_linear_projection_uses_runtime_mram_tile_capacity,
+        test_vram_layout_tracks_logical_and_physical_shape,
+        test_partial_row_linear_uses_one_blen_row_group,
         test_fix_large_immediates_roundtrip,
         test_fix_large_immediates_preserves_relative_adds,
         test_rotate_half_matrix_identity,
+        test_grouped_attention_weight_padding_preserves_head_slots,
+        test_kv_grouped_head_packing_preserves_slots,
         test_compile_native_hf_decoder_golden_vs_hf,
         test_native_compile_assembles,
     ]

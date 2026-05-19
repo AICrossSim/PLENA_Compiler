@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from ._imm import addi_large_int_str as _addi_large_int
 from ._imm import load_large_int_str as _load_large_int
 from ._k_split import k_chunks as _k_chunks

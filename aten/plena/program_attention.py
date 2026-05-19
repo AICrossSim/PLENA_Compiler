@@ -33,15 +33,17 @@ class ProgramAttentionMixin:
         if scale is None:
             scale = 1.0 / math.sqrt(head_dim)
 
-        num_q_blocks = seq_len // mlen
-        num_k_blocks = seq_len // mlen
+        num_q_blocks = math.ceil(seq_len / mlen)
+        num_k_blocks = math.ceil(seq_len / mlen)
 
         S_block = self.alloc("S", mlen, mlen)
-        PV = self.alloc("PV", mlen, head_dim)
-        O = self.alloc("O", seq_len, head_dim)
+        pv_rows = min(mlen, seq_len)
+        PV = self.alloc("PV", pv_rows, head_dim, strict=False)
+        O = self.alloc("O", seq_len, head_dim, strict=False)
 
         for q_idx in range(num_q_blocks):
-            self.init_online_softmax(q_idx, O)
+            block_rows = min(mlen, seq_len - q_idx * mlen)
+            self.init_online_softmax(q_idx, O, rows=block_rows)
 
             for k_idx in range(num_k_blocks):
                 self.vram_sub_projection_T_to(
@@ -55,12 +57,12 @@ class ProgramAttentionMixin:
                 )
                 if causal_mask is not None:
                     self.vram_add(S_block, causal_mask)
-                self.online_softmax_block(S_block, scale)
-                self.compute_pv(S_block, V, k_idx, PV, head_dim)
-                self.scale_o_row(O, q_idx)
-                self.vram_add(O, PV, dst_row_offset=q_idx * mlen)
+                self.online_softmax_block(S_block, scale, rows=block_rows)
+                self.compute_pv(S_block, V, k_idx, PV, head_dim, rows=block_rows)
+                self.scale_o_row(O, q_idx, rows=block_rows)
+                self.vram_add(O, PV, dst_row_offset=q_idx * mlen, num_rows=block_rows)
 
-            self.final_scale_o(q_idx, O)
+            self.final_scale_o(q_idx, O, rows=block_rows)
 
         return O
 
@@ -139,7 +141,85 @@ class ProgramAttentionMixin:
         self._tensors[o_name] = O
         return O
 
-    def init_online_softmax(self, q_idx: int, o_matrix: VRAMMatrixVar):
+    def flash_attention_packed_group(
+        self,
+        Q_group: VRAMMatrixVar,
+        K: InputVar,
+        V: InputVar,
+        *,
+        group_heads: int,
+        head_slot_dim: int,
+        output_base_address: int,
+        scratch_base_address: int,
+        broadcast_amount: int,
+        scale=None,
+        causal_mask: bool = True,
+    ) -> None:
+        """Emit one KV group's packed-head flash-attention body.
+
+        Q_group and the output use an MLEN-wide row where active Q heads occupy
+        HLEN-sized lanes. K/V are one KV head stored as MLEN-padded HBM rows.
+        """
+        seq_len, q_width = Q_group.shape
+        mlen = self.mlen
+        vlen = mlen
+        if q_width != mlen:
+            raise ValueError(f"packed Q group must be one MLEN row wide, got {q_width}")
+        if group_heads > broadcast_amount:
+            raise ValueError(
+                f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}"
+            )
+        if broadcast_amount * head_slot_dim != mlen:
+            raise ValueError(
+                f"broadcast_amount*head_slot_dim must equal MLEN "
+                f"({broadcast_amount}*{head_slot_dim} != {mlen})"
+            )
+        if scale is None:
+            scale = 1.0 / math.sqrt(head_slot_dim)
+
+        self._ensure_hbm_sub_matrix_registered(K)
+        self._ensure_hbm_sub_matrix_registered(V)
+        alloc = self.register_allocator
+        k_addr, v_addr = alloc.allocate_addr(2)
+        gp_for_preload = alloc.allocate_gp(2)
+        setup = preload_addr_reg_asm(
+            addr_reg_to_set=[k_addr, v_addr],
+            available_registers=gp_for_preload,
+            addr_reg_val=[K.hbm_addr, V.hbm_addr],
+        )
+        alloc.free_gp(gp_for_preload)
+        self.emit(setup)
+
+        self.emit(
+            flash_attn_asm(
+                mlen=mlen,
+                vlen=vlen,
+                blen=self.blen,
+                batch=1,
+                hq=group_heads,
+                hkv=1,
+                d=head_slot_dim,
+                q_len=seq_len,
+                kv_len=seq_len,
+                alive_registers_int=list(range(1, 16)),
+                alive_registers_fp=list(range(1, 8)),
+                vector_sram_base_address=self.get_vram_addr(Q_group.name),
+                fp_sram_start_address=self._ONLINE_SOFTMAX_FPSRAM_BASE,
+                k_base_hbm_offset_reg=k_addr,
+                v_base_hbm_offset_reg=v_addr,
+                scratch_base_address=scratch_base_address,
+                output_base_address=output_base_address,
+                broadcast_amount=broadcast_amount,
+                packed_group_layout=True,
+                attn_scale_fp_address=1,
+                inf_fp_address=2,
+                causal_mask=causal_mask,
+            )
+        )
+
+        alloc.free_addr([k_addr, v_addr])
+
+    def init_online_softmax(self, q_idx: int, o_matrix: VRAMMatrixVar, rows: int | None = None):
         """Initialize Online Softmax state: m=-inf, l=0, O_row=0"""
         o_info = super().get_tensor_info(o_matrix.name)
         seq_len, head_dim = o_info.shape
@@ -149,13 +229,15 @@ class ProgramAttentionMixin:
             o_matrix=o_matrix.name,
             seq_len=seq_len,
             head_dim=head_dim,
+            rows=rows,
         )
 
-    def online_softmax_block(self, s_block: VRAMMatrixVar, scale: float):
+    def online_softmax_block(self, s_block: VRAMMatrixVar, scale: float, rows: int | None = None):
         """Perform Online Softmax on S block"""
         super().online_softmax_block(
             s_block_matrix=s_block.name,
             scale=scale,
+            rows=rows,
         )
 
     def compute_pv(
@@ -165,6 +247,7 @@ class ProgramAttentionMixin:
         k_idx: int,
         pv_matrix: VRAMMatrixVar,
         head_dim: int,
+        rows: int | None = None,
     ):
         """Compute PV = P @ V[k_idx] where P is stored in s_block."""
         if not isinstance(s_block, VRAMMatrixVar):
@@ -181,9 +264,10 @@ class ProgramAttentionMixin:
             k_idx=k_idx,
             pv_matrix=pv_matrix.name,
             head_dim=head_dim,
+            rows=rows,
         )
 
-    def scale_o_row(self, o_matrix: VRAMMatrixVar, q_idx: int):
+    def scale_o_row(self, o_matrix: VRAMMatrixVar, q_idx: int, rows: int | None = None):
         """Scale current row block of O by m_res"""
         o_info = super().get_tensor_info(o_matrix.name)
         seq_len, head_dim = o_info.shape
@@ -193,9 +277,10 @@ class ProgramAttentionMixin:
             q_idx=q_idx,
             seq_len=seq_len,
             head_dim=head_dim,
+            rows=rows,
         )
 
-    def final_scale_o(self, q_idx: int, o_matrix: VRAMMatrixVar):
+    def final_scale_o(self, q_idx: int, o_matrix: VRAMMatrixVar, rows: int | None = None):
         """Final scaling: O[q_idx] = O[q_idx] / l"""
         o_info = super().get_tensor_info(o_matrix.name)
         seq_len, head_dim = o_info.shape
@@ -205,6 +290,7 @@ class ProgramAttentionMixin:
             o_matrix=o_matrix.name,
             seq_len=seq_len,
             head_dim=head_dim,
+            rows=rows,
         )
 
 

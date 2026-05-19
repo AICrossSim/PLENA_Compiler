@@ -60,6 +60,7 @@ class MemoryStateMixin:
         if hbm_layout is not None:
             rows, cols = hbm_layout.full_shape
             info.shape = hbm_layout.full_shape
+            info.physical_shape = hbm_layout.physical_shape or hbm_layout.full_shape
             info.size = rows * cols
             info.hbm_addr = hbm_layout.hbm_base_addr
             info.hbm_size = hbm_layout.hbm_size
@@ -68,6 +69,7 @@ class MemoryStateMixin:
         if vram_layout is not None:
             rows, cols = vram_layout.full_shape
             info.shape = vram_layout.full_shape
+            info.physical_shape = vram_layout.physical_shape or vram_layout.full_shape
             info.size = rows * cols
             info.vram_addr = vram_layout.vram_base_addr
             info.kind = "VRAMMatrix" if hbm_layout is None else "Batch"
@@ -108,6 +110,7 @@ class MemoryStateMixin:
         name: str,
         shape: tuple[int, int],
         hbm_addr: int,
+        physical_shape: tuple[int, int] | None = None,
         dtype: str = "fp16",
         kind: str = "HBMObject",
         real_data_ratio: float = 1.125,
@@ -117,6 +120,7 @@ class MemoryStateMixin:
         self.register_matrix(
             name=name,
             shape=shape,
+            physical_shape=physical_shape,
             hbm_base_addr=hbm_addr,
             real_data_ratio=real_data_ratio,
             strict=strict,
@@ -137,12 +141,13 @@ class MemoryStateMixin:
         name: str,
         shape: tuple[int, int],
         vram_addr: int | None = None,
+        physical_shape: tuple[int, int] | None = None,
         dtype: str = "fp16",
         kind: str = "VRAMObject",
         allocate_if_none: bool = True,
         strict: bool = True,
     ) -> MemoryObjectInfo:
-        rows, cols = shape
+        rows, cols = physical_shape or shape
         size = rows * cols
         if vram_addr is None:
             if not allocate_if_none:
@@ -152,6 +157,7 @@ class MemoryStateMixin:
         self.register_vram_matrix(
             name=name,
             shape=shape,
+            physical_shape=physical_shape,
             vram_base_addr=vram_addr,
             strict=strict,
         )
@@ -199,23 +205,30 @@ class MemoryStateMixin:
         name: str,
         shape: tuple[int, int],
         hbm_base_addr: int,
+        physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
         strict: bool = True,
     ) -> MatrixBlockLayout:
         """Register an HBM matrix and derive its mlen block layout."""
         rows, cols = shape
+        physical_rows, physical_cols = physical_shape or shape
 
         if strict:
-            if rows % self.mlen != 0:
-                raise ValueError(f"Matrix rows ({rows}) must be multiple of mlen ({self.mlen})")
-            if cols % self.mlen != 0:
-                raise ValueError(f"Matrix cols ({cols}) must be multiple of mlen ({self.mlen})")
+            if physical_rows % self.mlen != 0:
+                raise ValueError(f"Matrix physical rows ({physical_rows}) must be multiple of mlen ({self.mlen})")
+            if physical_cols % self.mlen != 0:
+                raise ValueError(f"Matrix physical cols ({physical_cols}) must be multiple of mlen ({self.mlen})")
 
-        size = rows * cols
+        size = physical_rows * physical_cols
         hbm_size = int(size * real_data_ratio)
 
         layout = MatrixBlockLayout(
-            name=name, full_shape=shape, block_size=self.mlen, hbm_base_addr=hbm_base_addr, hbm_size=hbm_size
+            name=name,
+            full_shape=shape,
+            physical_shape=(physical_rows, physical_cols),
+            block_size=self.mlen,
+            hbm_base_addr=hbm_base_addr,
+            hbm_size=hbm_size,
         )
 
         self.hbm_matrices[name] = layout
@@ -230,6 +243,7 @@ class MemoryStateMixin:
         name: str,
         shape: tuple[int, int],
         vram_base_addr: int,
+        physical_shape: tuple[int, int] | None = None,
         strict: bool = True,
     ) -> VRAMMatrixBlockLayout:
         """
@@ -244,14 +258,25 @@ class MemoryStateMixin:
             VRAMMatrixBlockLayout object
         """
         batch, hidden = shape
+        physical_batch, physical_hidden = physical_shape or shape
 
         if strict:
-            if batch % self.mlen != 0:
-                raise ValueError(f"VRAM matrix batch ({batch}) must be multiple of mlen ({self.mlen})")
-            if hidden % self.mlen != 0:
-                raise ValueError(f"VRAM matrix hidden ({hidden}) must be multiple of mlen ({self.mlen})")
+            if physical_batch % self.mlen != 0:
+                raise ValueError(
+                    f"VRAM matrix physical batch ({physical_batch}) must be multiple of mlen ({self.mlen})"
+                )
+            if physical_hidden % self.mlen != 0:
+                raise ValueError(
+                    f"VRAM matrix physical hidden ({physical_hidden}) must be multiple of mlen ({self.mlen})"
+                )
 
-        layout = VRAMMatrixBlockLayout(name=name, full_shape=shape, vram_base_addr=vram_base_addr, block_size=self.mlen)
+        layout = VRAMMatrixBlockLayout(
+            name=name,
+            full_shape=shape,
+            physical_shape=(physical_batch, physical_hidden),
+            vram_base_addr=vram_base_addr,
+            block_size=self.mlen,
+        )
 
         self.vram_matrices[name] = layout
         return layout

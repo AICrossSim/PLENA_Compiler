@@ -9,6 +9,8 @@ Algorithm per output row m:
 Requires: f0=0.0 (hw const), fp_preload[fp_one_reg]=1.0.
 """
 
+from __future__ import annotations
+
 from ._imm import load_large_int as _load_large_int_list
 
 PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows

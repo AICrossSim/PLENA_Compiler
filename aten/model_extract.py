@@ -49,7 +49,11 @@ class LayerWeights:
             (f"W_q_{layer_idx}", self.w_q),
             (f"W_o_{layer_idx}", self.w_o),
         ]
-        for kv_h, (w_k, w_v) in enumerate(zip(self.w_k_heads, self.w_v_heads, strict=True)):
+        if len(self.w_k_heads) != len(self.w_v_heads):
+            raise ValueError(
+                f"w_k_heads/w_v_heads length mismatch: {len(self.w_k_heads)} != {len(self.w_v_heads)}"
+            )
+        for kv_h, (w_k, w_v) in enumerate(zip(self.w_k_heads, self.w_v_heads)):
             entries.extend(
                 [
                     (f"W_k_{layer_idx}_h{kv_h}", w_k),

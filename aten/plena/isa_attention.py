@@ -14,6 +14,7 @@ class IsaAttentionMixin:
         s_address: int,
         m_start_address: int,
         scale: float = 1.0,
+        rows: int | None = None,
     ) -> str:
         """
         Online Softmax Computation.
@@ -69,7 +70,8 @@ class IsaAttentionMixin:
         if scale != 1.0:
             lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
 
-        lines.append(f"C_LOOP_START gp{gp_loop}, {mlen}")
+        loop_rows = mlen if rows is None else rows
+        lines.append(f"C_LOOP_START gp{gp_loop}, {loop_rows}")
         lines.append(f"S_LD_FP f{fp_m_old}, gp{gp_m_addr}, 0")
         lines.append(f"S_ADD_FP f{fp_m_res}, f{fp_m_old}, f0")
 
@@ -186,6 +188,7 @@ class IsaAttentionMixin:
         v_hbm_offset_reg: int,
         v_hbm_offset: int,
         pv_address: int,
+        rows: int | None = None,
     ) -> str:
         """
         Compute PV = P @ V via M_MM.
@@ -224,6 +227,7 @@ class IsaAttentionMixin:
 
         num_v_col_blocks = head_dim // mlen
         tiles_per_mlen = mlen // blen
+        p_row_groups = tiles_per_mlen if rows is None else max(1, min(tiles_per_mlen, (rows + blen - 1) // blen))
 
         lines = []
         lines.append("; === PV Multiply (P @ V) using M_MM ===")
@@ -256,7 +260,7 @@ class IsaAttentionMixin:
             lines.append(f"C_LOOP_START gp{gp_v_loop}, {tiles_per_mlen}")
             lines.append(f"S_ADDI_INT gp{gp_p}, gp0, {p_address}")
             lines.append(f"S_ADDI_INT gp{gp_pv}, gp{gp_pv_col_base}, 0")
-            lines.append(f"C_LOOP_START gp{gp_p_loop}, {tiles_per_mlen}")
+            lines.append(f"C_LOOP_START gp{gp_p_loop}, {p_row_groups}")
             lines.append(f"M_MM 0, gp{gp_v}, gp{gp_p}")
             lines.append(f"M_MM_WO gp{gp_pv}, gp{gp_stride}, 0")
             lines.append(f"S_ADDI_INT gp{gp_p}, gp{gp_p}, {blen * mlen}")
@@ -331,6 +335,7 @@ class IsaAttentionMixin:
         m_res_address: int,
         o_address: int,
         row_offset: int = 0,
+        rows: int | None = None,
     ) -> str:
         """Scale each row of O by m_res: O[row] *= m_res[row]."""
         assert head_dim % mlen == 0, f"head_dim ({head_dim}) must be multiple of mlen ({mlen})"
@@ -353,6 +358,7 @@ class IsaAttentionMixin:
         fp_m_res = 1
 
         num_col_blocks = head_dim // mlen
+        loop_rows = mlen if rows is None else rows
 
         lines = []
         lines.append("; === Scale O by m_res ===")
@@ -363,7 +369,7 @@ class IsaAttentionMixin:
             o_addr = o_address + row_offset * mlen
             lines.append(f"S_ADDI_INT gp{gp_m_res}, gp0, {m_res_address}")
             lines.append(f"S_ADDI_INT gp{gp_o}, gp0, {o_addr}")
-            lines.append(f"C_LOOP_START gp{gp_row_loop}, {mlen}")
+            lines.append(f"C_LOOP_START gp{gp_row_loop}, {loop_rows}")
             lines.append(f"S_LD_FP f{fp_m_res}, gp{gp_m_res}, 0")
             lines.append(f"V_MUL_VF gp{gp_o}, gp{gp_o}, f{fp_m_res}, 0")
             lines.append(f"S_ADDI_INT gp{gp_m_res}, gp{gp_m_res}, 1")
@@ -374,7 +380,7 @@ class IsaAttentionMixin:
             o_addr = o_address + row_offset * mlen
             lines.append(f"S_ADDI_INT gp{gp_m_res}, gp0, {m_res_address}")
             lines.append(f"S_ADDI_INT gp{gp_o_row_base}, gp0, {o_addr}")
-            lines.append(f"C_LOOP_START gp{gp_row_loop}, {mlen}")
+            lines.append(f"C_LOOP_START gp{gp_row_loop}, {loop_rows}")
             lines.append(f"S_LD_FP f{fp_m_res}, gp{gp_m_res}, 0")
             lines.append(f"S_ADDI_INT gp{gp_o}, gp{gp_o_row_base}, 0")
             lines.append(f"C_LOOP_START gp{gp_col_loop}, {num_col_blocks}")
@@ -469,6 +475,7 @@ class IsaAttentionMixin:
         l_address: int,
         o_address: int,
         row_offset: int = 0,
+        rows: int | None = None,
     ) -> str:
         """
         Final scaling: O[row] /= l[row].
@@ -496,6 +503,7 @@ class IsaAttentionMixin:
         fp_l = 1
 
         num_col_blocks = head_dim // mlen
+        loop_rows = mlen if rows is None else rows
 
         lines = []
         lines.append("; === Final Scaling O = O / l ===")
@@ -507,7 +515,7 @@ class IsaAttentionMixin:
             o_addr = o_address + row_offset * mlen
             lines.append(f"S_ADDI_INT gp{gp_l}, gp0, {l_address}")
             lines.append(f"S_ADDI_INT gp{gp_o}, gp0, {o_addr}")
-            lines.append(f"C_LOOP_START gp{gp_row_loop}, {mlen}")
+            lines.append(f"C_LOOP_START gp{gp_row_loop}, {loop_rows}")
             lines.append(f"S_LD_FP f{fp_l}, gp{gp_l}, 0")
             lines.append(f"S_RECI_FP f{fp_l}, f{fp_l}, 0")
             lines.append(f"V_MUL_VF gp{gp_o}, gp{gp_o}, f{fp_l}, 0")
@@ -519,7 +527,7 @@ class IsaAttentionMixin:
             o_addr = o_address + row_offset * mlen
             lines.append(f"S_ADDI_INT gp{gp_l}, gp0, {l_address}")
             lines.append(f"S_ADDI_INT gp{gp_o_row_base}, gp0, {o_addr}")
-            lines.append(f"C_LOOP_START gp{gp_row_loop}, {mlen}")
+            lines.append(f"C_LOOP_START gp{gp_row_loop}, {loop_rows}")
             lines.append(f"S_LD_FP f{fp_l}, gp{gp_l}, 0")
             lines.append(f"S_RECI_FP f{fp_l}, f{fp_l}, 0")
             lines.append(f"S_ADDI_INT gp{gp_o}, gp{gp_o_row_base}, 0")
@@ -659,6 +667,7 @@ class IsaAttentionMixin:
         o_matrix: str,
         seq_len: int,
         head_dim: int,
+        rows: int | None = None,
     ) -> str:
         """
         Initialize Online Softmax state for Q block q_idx:
@@ -670,6 +679,7 @@ class IsaAttentionMixin:
 
         o_info = self[o_matrix]
         o_vram_addr = o_info.vram_addr
+        physical_seq_len = o_info.physical_shape[0]
         row_offset = q_idx * self.mlen
 
         isa_code = f"; === Init Online Softmax for Q block {q_idx} ===\n"
@@ -678,9 +688,9 @@ class IsaAttentionMixin:
         isa_code += self._reset_fpsram_asm(l_addr, self.mlen, 0)  # slot 0 = 0.0
         isa_code += self._reset_vram_asm(
             start_address=o_vram_addr,
-            rows=self.mlen,
+            rows=self.mlen if rows is None else rows,
             cols=head_dim,
-            total_rows=seq_len,
+            total_rows=physical_seq_len,
             mlen=self.mlen,
             row_offset=row_offset,
         )
@@ -691,6 +701,7 @@ class IsaAttentionMixin:
         self,
         s_block_matrix: str,
         scale: float,
+        rows: int | None = None,
     ) -> str:
         """
         Run Online Softmax on one S block.
@@ -707,7 +718,11 @@ class IsaAttentionMixin:
 
         isa_code = f"; === Online Softmax Block {s_block_matrix} ===\n"
         isa_code += self._online_softmax_asm(
-            mlen=self.mlen, s_address=s_address, m_start_address=m_start_address, scale=scale
+            mlen=self.mlen,
+            s_address=s_address,
+            m_start_address=m_start_address,
+            scale=scale,
+            rows=rows,
         )
 
         return self._emit(isa_code)
@@ -719,6 +734,7 @@ class IsaAttentionMixin:
         k_idx: int,
         pv_matrix: str,
         head_dim: int,
+        rows: int | None = None,
     ) -> str:
         """
         Compute PV = P @ V[k_idx].
@@ -733,7 +749,8 @@ class IsaAttentionMixin:
         pv_address = pv_info.vram_addr
 
         v_layout = self.get_hbm_layout(v_sub_matrix)
-        v_hbm_offset = k_idx * self.mlen * head_dim
+        physical_head_dim = (v_layout.physical_shape or v_layout.full_shape)[1]
+        v_hbm_offset = k_idx * self.mlen * physical_head_dim
 
         isa_code = f"; === Compute PV = P @ V[k_idx={k_idx}] ===\n"
 
@@ -755,6 +772,7 @@ class IsaAttentionMixin:
             v_hbm_offset_reg=v_hbm_reg,
             v_hbm_offset=v_hbm_offset,
             pv_address=pv_address,
+            rows=rows,
         )
 
         self.register_allocator.free_gp(gp_regs)
@@ -768,10 +786,12 @@ class IsaAttentionMixin:
         q_idx: int,
         seq_len: int,
         head_dim: int,
+        rows: int | None = None,
     ) -> str:
         """Scale the current row block of O by m_res: O[q_idx] *= m_res."""
         o_info = self[o_matrix]
         o_address = o_info.vram_addr
+        physical_seq_len = o_info.physical_shape[0]
 
         fp_sram_start = self._ONLINE_SOFTMAX_FPSRAM_BASE
         m_res_addr = fp_sram_start + self.mlen
@@ -782,10 +802,11 @@ class IsaAttentionMixin:
         isa_code += self._scale_o_asm(
             mlen=self.mlen,
             head_dim=head_dim,
-            seq_len=seq_len,
+            seq_len=physical_seq_len,
             m_res_address=m_res_addr,
             o_address=o_address,
             row_offset=row_offset,
+            rows=rows,
         )
 
         return self._emit(isa_code)
@@ -796,10 +817,12 @@ class IsaAttentionMixin:
         o_matrix: str,
         seq_len: int,
         head_dim: int,
+        rows: int | None = None,
     ) -> str:
         """Final scaling: O[q_idx] /= l."""
         o_info = self[o_matrix]
         o_address = o_info.vram_addr
+        physical_seq_len = o_info.physical_shape[0]
 
         fp_sram_start = self._ONLINE_SOFTMAX_FPSRAM_BASE
         l_addr = fp_sram_start + 2 * self.mlen
@@ -810,10 +833,11 @@ class IsaAttentionMixin:
         isa_code += self._final_scaling_asm(
             mlen=self.mlen,
             head_dim=head_dim,
-            seq_len=seq_len,
+            seq_len=physical_seq_len,
             l_address=l_addr,
             o_address=o_address,
             row_offset=row_offset,
+            rows=rows,
         )
 
         return self._emit(isa_code)

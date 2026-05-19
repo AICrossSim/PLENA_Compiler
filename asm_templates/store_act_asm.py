@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 
 from ._imm import load_large_int_str as _load_large_int

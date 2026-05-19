@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Online softmax assembly code generation for Flash Attention."""
 
 IMM2_BOUND = 2**18 - 1
@@ -19,6 +21,7 @@ def online_softmax_code(
     m_start_address: int,
     qk_scale_address: int = 5,
     causal_mask: bool = True,
+    rows: int | None = None,
 ) -> str:
     """
     Args:
@@ -63,8 +66,9 @@ def online_softmax_code(
         # Load qk_scale from FP SRAM (preloaded at FP SRAM address 5)
         generated_code += f"S_LD_FP f{qk_scale_register}, gp0, {qk_scale_address} \n"
 
-        # Hardware loop over mlen rows
-        generated_code += f"C_LOOP_START gp{loop_register}, {mlen} \n"
+        # Hardware loop over the valid query rows in this tile.
+        loop_rows = mlen if rows is None else rows
+        generated_code += f"C_LOOP_START gp{loop_register}, {loop_rows} \n"
 
         # Scale S row by qk_scale: S = S * qk_scale
         generated_code += f"V_MUL_VF gp{s_address_register}, gp{s_address_register}, f{qk_scale_register}, 0 \n"

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Protocol, Union
 
 
 class Renderable(Protocol):
@@ -37,7 +37,7 @@ def addr(index: int) -> Register:
     return Register("a", index)
 
 
-AsmArg = str | int | Register
+AsmArg = Union[str, int, Register]
 
 
 def render_arg(arg: AsmArg) -> str:
@@ -68,7 +68,7 @@ class Comment:
         return f"; {text}"
 
 
-AsmItem = str | Instr | Comment
+AsmItem = Union[str, Instr, Comment]
 IMM2_BOUND = 1 << 18
 
 
@@ -98,7 +98,7 @@ class IsaBuilder:
         return "\n".join(render_item(item) for item in legalize_large_immediates(self.items)) + "\n"
 
 
-AsmInput = str | Renderable
+AsmInput = Union[str, Renderable]
 
 
 def render_item(item: AsmItem) -> str:

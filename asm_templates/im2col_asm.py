@@ -31,6 +31,8 @@ is in 0..OW-1 and may not be 64-aligned.  This template requires that
 should route to ``im2col_asm_no_shift`` when this cannot be guaranteed.
 """
 
+from __future__ import annotations
+
 from ._imm import load_large_int as _load_large_int_list
 
 PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows

@@ -141,7 +141,8 @@ class SubMatrixInfo:
     parent_name: str  # Parent matrix name
     row_idx: int  # Sub-block row index
     col_idx: int  # Sub-block column index
-    shape: tuple[int, int]  # Sub-block shape (typically 64x64)
+    shape: tuple[int, int]  # Physical sub-block shape (typically mlen x mlen)
+    valid_shape: tuple[int, int] | None = None  # Logical rows/cols carried by this physical tile
 
     # Pre-calculated addresses (computed during compiler phase, used directly at runtime)
     hbm_offset: int = 0  # Offset in HBM (in elements)
@@ -158,8 +159,9 @@ class MatrixBlockLayout:
     """
 
     name: str
-    full_shape: tuple[int, int]  # Full matrix shape (rows, cols)
+    full_shape: tuple[int, int]  # Logical matrix shape (rows, cols)
     block_size: int = MLEN  # Sub-block size (default 64)
+    physical_shape: tuple[int, int] | None = None  # Backing storage shape, if padded
 
     num_row_blocks: int = 0
     num_col_blocks: int = 0
@@ -174,20 +176,29 @@ class MatrixBlockLayout:
     def __post_init__(self):
         """Initialize block information"""
         rows, cols = self.full_shape
-        self.num_row_blocks = math.ceil(rows / self.block_size)
-        self.num_col_blocks = math.ceil(cols / self.block_size)
+        physical_rows, physical_cols = self.physical_shape or self.full_shape
+        if physical_rows < rows or physical_cols < cols:
+            raise ValueError(
+                f"Physical shape {self.physical_shape} cannot be smaller than logical shape {self.full_shape}"
+            )
+        self.physical_shape = (physical_rows, physical_cols)
+        self.num_row_blocks = math.ceil(physical_rows / self.block_size)
+        self.num_col_blocks = math.ceil(physical_cols / self.block_size)
 
         # Create information for all sub-blocks (pre-calculate addresses)
         for r in range(self.num_row_blocks):
             for c in range(self.num_col_blocks):
                 # HBM offset (row-major): sub-block (r,c) starts at r*block_size*cols + c*block_size
-                hbm_offset = r * self.block_size * cols + c * self.block_size
+                hbm_offset = r * self.block_size * physical_cols + c * self.block_size
+                valid_rows = max(0, min(self.block_size, rows - r * self.block_size))
+                valid_cols = max(0, min(self.block_size, cols - c * self.block_size))
 
                 sub_info = SubMatrixInfo(
                     parent_name=self.name,
                     row_idx=r,
                     col_idx=c,
                     shape=(self.block_size, self.block_size),
+                    valid_shape=(valid_rows, valid_cols),
                     hbm_offset=hbm_offset,
                     mram_addr=None,
                 )
@@ -220,7 +231,8 @@ class VRAMSubMatrixInfo:
     parent_name: str  # Parent matrix name
     row_idx: int  # Sub-block row index (batch dimension)
     col_idx: int  # Sub-block column index (hidden dimension)
-    shape: tuple[int, int]  # Sub-block shape (typically mlen x mlen)
+    shape: tuple[int, int]  # Physical sub-block shape (typically mlen x mlen)
+    valid_shape: tuple[int, int] | None = None  # Logical rows/cols carried by this physical tile
 
     # Pre-calculated VRAM address
     vram_addr: int = 0
@@ -240,9 +252,10 @@ class VRAMMatrixBlockLayout:
     """
 
     name: str
-    full_shape: tuple[int, int]  # Full matrix shape (batch, hidden_size)
+    full_shape: tuple[int, int]  # Logical matrix shape (batch, hidden_size)
     vram_base_addr: int  # VRAM base address
     block_size: int = MLEN  # Sub-block size (default 64)
+    physical_shape: tuple[int, int] | None = None  # Backing storage shape, if padded
 
     num_row_blocks: int = 0  # Number of blocks in batch dimension
     num_col_blocks: int = 0  # Number of blocks in hidden dimension
@@ -253,23 +266,32 @@ class VRAMMatrixBlockLayout:
     def __post_init__(self):
         """Initialize block information"""
         batch, hidden = self.full_shape
-        self.num_row_blocks = math.ceil(batch / self.block_size)
-        self.num_col_blocks = math.ceil(hidden / self.block_size)
+        physical_batch, physical_hidden = self.physical_shape or self.full_shape
+        if physical_batch < batch or physical_hidden < hidden:
+            raise ValueError(
+                f"Physical shape {self.physical_shape} cannot be smaller than logical shape {self.full_shape}"
+            )
+        self.physical_shape = (physical_batch, physical_hidden)
+        self.num_row_blocks = math.ceil(physical_batch / self.block_size)
+        self.num_col_blocks = math.ceil(physical_hidden / self.block_size)
 
         # VRAM column-block major address calculation:
-        # col block c base = vram_base + c * batch * mlen
+        # col block c base = vram_base + c * physical_batch * mlen
         # row sub-block r offset within column block = r * mlen * mlen
         for r in range(self.num_row_blocks):
             for c in range(self.num_col_blocks):
-                col_block_base = self.vram_base_addr + c * batch * self.block_size
+                col_block_base = self.vram_base_addr + c * physical_batch * self.block_size
                 row_offset = r * self.block_size * self.block_size
                 vram_addr = col_block_base + row_offset
+                valid_rows = max(0, min(self.block_size, batch - r * self.block_size))
+                valid_cols = max(0, min(self.block_size, hidden - c * self.block_size))
 
                 sub_info = VRAMSubMatrixInfo(
                     parent_name=self.name,
                     row_idx=r,
                     col_idx=c,
                     shape=(self.block_size, self.block_size),
+                    valid_shape=(valid_rows, valid_cols),
                     vram_addr=vram_addr,
                 )
                 self.sub_blocks[(r, c)] = sub_info
@@ -302,6 +324,7 @@ class MemoryObjectInfo:
     kind: str
     dtype: str = "fp16"
     shape: tuple[int, int] = (0, 0)
+    physical_shape: tuple[int, int] = (0, 0)
     size: int = 0
     hbm_addr: int = -1
     hbm_size: int = 0

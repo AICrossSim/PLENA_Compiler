@@ -17,6 +17,7 @@ class ProgramTensorMixin:
         shape: tuple[int, int],
         hbm_addr: int | None = None,
         prestaged_vram_addr: int | None = None,
+        physical_shape: tuple[int, int] | None = None,
     ) -> InputVar:
         """
         Declare an input tensor (in HBM).
@@ -34,19 +35,28 @@ class ProgramTensorMixin:
         Returns:
             InputVar proxy object
         """
-        h, w = shape
+        h, w = physical_shape or shape
         size = h * w
         hbm_size = int(size * self.real_data_ratio)
 
         if hbm_addr is None:
             hbm_addr = self._allocate_hbm(hbm_size)
 
-        var = InputVar(self, name, shape, hbm_addr, hbm_size, prestaged_vram_addr=prestaged_vram_addr)
+        var = InputVar(
+            self,
+            name,
+            shape,
+            hbm_addr,
+            hbm_size,
+            prestaged_vram_addr=prestaged_vram_addr,
+            physical_shape=physical_shape,
+        )
         self._inputs[name] = var
         super().add_hbm_object(
             name=name,
             hbm_addr=hbm_addr,
             shape=shape,
+            physical_shape=physical_shape,
             real_data_ratio=self.real_data_ratio,
         )
         return var
@@ -83,14 +93,15 @@ class ProgramTensorMixin:
 
         if input_var.prestaged_vram_addr is not None:
             # Prestaged path: tensor is already in VRAM — register without ISA.
-            h, w = input_var.shape
+            h, w = input_var.physical_shape
             vram_addr = input_var.prestaged_vram_addr
             # Tell the VRAM allocator that this region is occupied so subsequent
             # allocations don't collide with it.
             self.vram_allocator._vmm.mark_used(vram_addr, h * w, name=internal_name)
             super().add_vram_object(
                 name=internal_name,
-                shape=(h, w),
+                shape=input_var.shape,
+                physical_shape=input_var.physical_shape,
                 vram_addr=vram_addr,
                 dtype="fp16",
                 kind="Batch",
@@ -103,7 +114,13 @@ class ProgramTensorMixin:
                 hbm_object_name=input_var.name, vram_object_name=internal_name, vlen=self.mlen, preload_len=4
             )
 
-        var = VRAMMatrixVar(self, internal_name, input_var.shape, display_name=display_name)
+        var = VRAMMatrixVar(
+            self,
+            internal_name,
+            input_var.shape,
+            display_name=display_name,
+            physical_shape=input_var.physical_shape,
+        )
         self._tensors[internal_name] = var
         return var
 
@@ -125,12 +142,12 @@ class ProgramTensorMixin:
         internal_name = self._scoped_name(display_name)
 
         if hbm_addr is None:
-            h, w = tensor_var.shape
+            h, w = tensor_var.physical_shape
             size = h * w
             hbm_size = int(size * self.real_data_ratio)
             hbm_addr = self._allocate_hbm(hbm_size)
         else:
-            h, w = tensor_var.shape
+            h, w = tensor_var.physical_shape
             hbm_size = int(h * w * self.real_data_ratio)
 
         super().store_to_hbm(
@@ -140,7 +157,15 @@ class ProgramTensorMixin:
             vlen=self.mlen,
         )
 
-        var = InputVar(self, internal_name, tensor_var.shape, hbm_addr, hbm_size, display_name=display_name)
+        var = InputVar(
+            self,
+            internal_name,
+            tensor_var.shape,
+            hbm_addr,
+            hbm_size,
+            display_name=display_name,
+            physical_shape=tensor_var.physical_shape,
+        )
         self._inputs[internal_name] = var
         return var
 
@@ -148,7 +173,14 @@ class ProgramTensorMixin:
     # VRAM Matrix Allocation
     # ========================================================================
 
-    def alloc(self, name: str, rows: int, cols: int, strict: bool = True) -> VRAMMatrixVar:
+    def alloc(
+        self,
+        name: str,
+        rows: int,
+        cols: int,
+        strict: bool = True,
+        physical_shape: tuple[int, int] | None = None,
+    ) -> VRAMMatrixVar:
         """
         Allocate a VRAM matrix.
 
@@ -166,13 +198,36 @@ class ProgramTensorMixin:
         """
         display_name = name
         internal_name = self._scoped_name(name)
-        super().allocate_vram_matrix(name=internal_name, rows=rows, cols=cols, strict=strict)
+        if physical_shape is None and not strict:
+            physical_rows = ((rows + self.blen - 1) // self.blen) * self.blen
+            physical_cols = ((cols + self.mlen - 1) // self.mlen) * self.mlen
+            physical_shape = (max(self.blen, physical_rows), max(self.mlen, physical_cols))
+        super().allocate_vram_matrix(
+            name=internal_name,
+            rows=rows,
+            cols=cols,
+            strict=strict,
+            physical_shape=physical_shape,
+        )
 
-        var = VRAMMatrixVar(self, internal_name, (rows, cols), display_name=display_name)
+        var = VRAMMatrixVar(
+            self,
+            internal_name,
+            (rows, cols),
+            display_name=display_name,
+            physical_shape=physical_shape,
+        )
         self._tensors[internal_name] = var
         return var
 
-    def alloc_at(self, name: str, rows: int, cols: int, vram_addr: int) -> VRAMMatrixVar:
+    def alloc_at(
+        self,
+        name: str,
+        rows: int,
+        cols: int,
+        vram_addr: int,
+        physical_shape: tuple[int, int] | None = None,
+    ) -> VRAMMatrixVar:
         """Allocate a VRAM matrix view at a specific address.
 
         Used to create views into existing VRAM matrices (e.g., per-head
@@ -194,12 +249,20 @@ class ProgramTensorMixin:
         self.add_vram_object(
             name=internal_name,
             shape=(rows, cols),
+            physical_shape=physical_shape,
             vram_addr=vram_addr,
             allocate_if_none=False,
+            strict=False,
         )
         isa_code = f"; VRAM View {name}: ({rows}, {cols}) at VRAM[{vram_addr}]\n"
         self.emit(isa_code)
-        var = VRAMMatrixVar(self, internal_name, (rows, cols), display_name=display_name)
+        var = VRAMMatrixVar(
+            self,
+            internal_name,
+            (rows, cols),
+            display_name=display_name,
+            physical_shape=physical_shape,
+        )
         self._tensors[internal_name] = var
         return var
 

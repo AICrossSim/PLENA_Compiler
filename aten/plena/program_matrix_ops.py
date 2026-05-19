@@ -122,22 +122,43 @@ class ProgramMatrixOpsMixin:
             target_col_idx=target_col_idx,
         )
 
-    def linear_projection(self, input_var: VRAMMatrixVar, weight_var: InputVar, name: str = "linear_out"):
+    def linear_projection(
+        self,
+        input_var: VRAMMatrixVar,
+        weight_var: InputVar,
+        name: str = "linear_out",
+        physical_shape: tuple[int, int] | None = None,
+    ):
         """Emit tiled PLENA linear projection, including K-split accumulation."""
         mlen = self.mlen
 
         rows, k_total = input_var.shape
         _, out_features = weight_var.shape
-        num_row_blocks = math.ceil(rows / mlen)
-        if out_features % mlen != 0:
-            raise ValueError(f"out_features ({out_features}) must be a multiple of mlen ({mlen})")
-        num_col_blocks = out_features // mlen
-        num_k_tiles = math.ceil(k_total / mlen)
+        if physical_shape is None:
+            physical_rows = max(input_var.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
+            physical_out_features = weight_var.physical_shape[1]
+        else:
+            physical_rows, physical_out_features = physical_shape
+            if physical_rows < rows or physical_out_features < out_features:
+                raise ValueError(
+                    f"physical_shape {physical_shape} cannot be smaller than "
+                    f"logical output {(rows, out_features)}"
+                )
+        physical_k = max(input_var.physical_shape[1], weight_var.physical_shape[0])
+        num_row_blocks = math.ceil(physical_rows / mlen)
+        num_col_blocks = math.ceil(physical_out_features / mlen)
+        num_k_tiles = math.ceil(physical_k / mlen)
         max_k_tiles = self.mram_tile_capacity
 
         # When rows is not a multiple of mlen the hardware still operates on
         # full tiles; only the first `rows` rows contain valid output.
-        output = self.alloc(name, rows, out_features, strict=rows % mlen == 0)
+        output = self.alloc(
+            name,
+            rows,
+            out_features,
+            strict=False,
+            physical_shape=(physical_rows, physical_out_features),
+        )
 
         def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split):
             self.vram_sub_projection_to(
@@ -185,9 +206,14 @@ class ProgramMatrixOpsMixin:
         self.free_tensor(temp)
         return output
 
-    def linear(self, input_var: VRAMMatrixVar, weight_var: InputVar):
+    def linear(
+        self,
+        input_var: VRAMMatrixVar,
+        weight_var: InputVar,
+        physical_shape: tuple[int, int] | None = None,
+    ):
         """Default linear op compatibility surface."""
-        return self.linear_projection(input_var, weight_var)
+        return self.linear_projection(input_var, weight_var, physical_shape=physical_shape)
 
     # ========================================================================
     # RoPE (1D Positional Encoding)

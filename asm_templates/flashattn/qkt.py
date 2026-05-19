@@ -71,12 +71,10 @@ def qkt_multiply(
         # q_head_index is absolute and used only for Q VRAM read addressing above.
         if stage == "prefill":
             generated_code += f"M_BTMM 0, gp{q_base_register}, gp0 \n"
-            assert s_base_address + s_head_offset * mlen * mlen < IMM2_BOUND, "S base address is too large"
             generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen * mlen} \n"
             generated_code += f"M_BMM_WO gp{s_base_register}, 0 \n"
         else:
             generated_code += f"M_BTMV 0, gp{q_base_register}, gp0 \n"
-            assert s_base_address + s_head_offset * mlen < IMM2_BOUND, "S base address is too large"
             generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen} \n"
             generated_code += f"M_BMV_WO gp{s_base_register}, 0 \n"
     else:

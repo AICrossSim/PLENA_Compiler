@@ -73,13 +73,15 @@ class IsaCompiler(
         Order (matters): allocate VRAM → register in symbol table → emit ISA.
         """
         hbm_layout = self.get_hbm_layout(hbm_object_name)
-        h, w = hbm_layout.full_shape
+        logical_h, logical_w = hbm_layout.full_shape
+        h, w = hbm_layout.physical_shape or hbm_layout.full_shape
         hbm_addr = hbm_layout.hbm_base_addr
         size = h * w
         vram_base = self.vram_allocator.allocate(size, name=vram_object_name)
         self.add_vram_object(
             name=vram_object_name,
-            shape=(h, w),
+            shape=(logical_h, logical_w),
+            physical_shape=(h, w),
             vram_addr=vram_base,
             dtype="fp16",
             kind="Batch",
@@ -155,8 +157,8 @@ class IsaCompiler(
             else:
                 raise ValueError(f"Tensor '{tensor_name}' has no HBM address. Please specify hbm_addr.")
 
-        batch_size = tensor_info.shape[0]
-        hidden_size = tensor_info.shape[1]
+        batch_size = tensor_info.physical_shape[0] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[0]
+        hidden_size = tensor_info.physical_shape[1] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[1]
 
         isa_code = f"; Store {tensor_name} from VRAM to HBM\n"
         isa_code += f"; VRAM[{tensor_info.vram_addr}] -> HBM[{hbm_addr}], shape=({batch_size}, {hidden_size})\n"
@@ -203,7 +205,8 @@ class IsaCompiler(
             self.add_hbm_object(
                 name=hbm_object_name,
                 hbm_addr=hbm_addr,
-                shape=(batch_size, hidden_size),
+                shape=tensor_info.shape,
+                physical_shape=(batch_size, hidden_size),
             )
 
         return self._emit(isa_code)
@@ -356,6 +359,7 @@ class IsaCompiler(
         name: str,
         hbm_addr: int,
         shape: tuple[int, int],
+        physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
     ):
         """Register an HBM object and build its HBM layout.
@@ -368,6 +372,7 @@ class IsaCompiler(
             self,
             name=name,
             shape=shape,
+            physical_shape=physical_shape,
             hbm_addr=hbm_addr,
             real_data_ratio=real_data_ratio,
         )
