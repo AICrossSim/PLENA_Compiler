@@ -108,6 +108,7 @@ def projection_asm(
     matrix_sram_size: int = 1024,
     scratch_base_address: int = 0,
     vlen: int = 64,
+    scale_offset_value: int | None = None,
 ) -> str:
     """
     Generates optimized assembly code for matrix multiplication (linear layer).
@@ -140,6 +141,9 @@ def projection_asm(
             Only used when K-split is active.  Must not overlap with
             result_base_address or activation_base_address.
         vlen: Vector register width in elements (used for V_ADD_VV accumulation).
+        scale_offset_value: If provided, use this value for C_SET_SCALE_REG instead
+            of computing it from in_features * out_features. Required for unified
+            HBM memory where element section does not start at byte 0.
 
     Returns:
         Generated assembly code string
@@ -169,8 +173,9 @@ def projection_asm(
     lines.append(f"; Linear: (batch, {in_features}) @ ({in_features}, {out_features}) -> (batch, {out_features})")
 
     # Setup scale and stride registers (use act_reg as temp)
-    # Scale = total weight matrix size, Stride = output dimension
-    lines.extend(_load_large_int(act_reg, in_features * out_features))
+    # Scale = scale section byte offset accounting for unified HBM layout
+    _scale_val = scale_offset_value if scale_offset_value is not None else in_features * out_features
+    lines.extend(_load_large_int(act_reg, _scale_val))
     lines.append(f"C_SET_SCALE_REG gp{act_reg}")
     lines.extend(_load_large_int(act_reg, out_features))
     lines.append(f"C_SET_STRIDE_REG gp{act_reg}")
