@@ -138,6 +138,70 @@ def test_alloc_at_correct_address():
     print("  PASS test_alloc_at_correct_address")
 
 
+def test_mram_allocator_scales_with_runtime_mlen():
+    """MRAMAllocator capacity/alignment must use runtime mlen, not module MLEN=64."""
+    from compiler.aten.plena.memory import MRAMAllocator
+
+    alloc = MRAMAllocator(mlen=256, tile_capacity=4)
+    tile_elems = 256 * 256
+
+    assert alloc.alignment == tile_elems
+    assert alloc.total_size == 4 * tile_elems
+    assert alloc.tile_elems == tile_elems
+    assert alloc.tile_capacity == 4
+
+    addrs = [alloc.allocate(f"tile_{i}", tile_elems) for i in range(4)]
+    assert addrs == [0, tile_elems, 2 * tile_elems, 3 * tile_elems]
+
+    try:
+        alloc.allocate("overflow", tile_elems)
+    except MemoryError:
+        pass
+    else:
+        raise AssertionError("MRAMAllocator accepted a fifth tile despite tile_capacity=4")
+
+    print("  PASS test_mram_allocator_scales_with_runtime_mlen")
+
+
+def test_compiler_threads_runtime_memory_geometry():
+    """PlenaCompiler must pass runtime mlen/capacity into VRAM and MRAM allocators."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=256, blen=64, mram_tile_capacity=3)
+    tile_elems = 256 * 256
+
+    assert prog.mram_tile_capacity == 3
+    assert prog.mram_tile_elems == tile_elems
+    assert prog.mram_capacity_elems == 3 * tile_elems
+    assert prog.mram_allocator.alignment == tile_elems
+    assert prog.mram_allocator.total_size == 3 * tile_elems
+    assert prog.vram_allocator.alignment == 256
+
+    print("  PASS test_compiler_threads_runtime_memory_geometry")
+
+
+def test_linear_projection_uses_runtime_mram_tile_capacity():
+    """K-split should follow prog.mram_tile_capacity instead of a module constant."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=128, blen=4, mram_tile_capacity=2)
+    x_input = prog.input("X", shape=(128, 384), prestaged_vram_addr=0)
+    x = prog.load_batch(x_input, name="X")
+    w = prog.input("W", shape=(384, 128))
+
+    prog.linear_projection(x, w, name="Y")
+    code = prog.compile()
+
+    # K=384 at mlen=128 is 3 K-tiles. With runtime capacity 2 this must split
+    # into two projection chunks and accumulate the second partial sum.
+    assert prog.mram_allocator.total_size == 2 * 128 * 128
+    assert "V_ADD_VV" in code
+    assert "linear_out_temp" not in code
+    assert "Y_temp" in code
+
+    print("  PASS test_linear_projection_uses_runtime_mram_tile_capacity")
+
+
 def test_fix_large_immediates_roundtrip():
     """_fix_large_immediates must preserve exact address values."""
     from compiler.aten.plena_frontend import _fix_large_immediates
@@ -287,6 +351,9 @@ if __name__ == "__main__":
         test_vram_fill_zero_all_column_blocks,
         test_vram_add_all_column_blocks,
         test_alloc_at_correct_address,
+        test_mram_allocator_scales_with_runtime_mlen,
+        test_compiler_threads_runtime_memory_geometry,
+        test_linear_projection_uses_runtime_mram_tile_capacity,
         test_fix_large_immediates_roundtrip,
         test_fix_large_immediates_preserves_relative_adds,
         test_rotate_half_matrix_identity,

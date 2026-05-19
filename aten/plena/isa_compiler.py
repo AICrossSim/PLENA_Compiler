@@ -36,9 +36,21 @@ class IsaCompiler(
 
     _ONLINE_SOFTMAX_FPSRAM_BASE = 10
 
-    def __init__(self, mlen: int = 64, blen: int = 4, real_data_ratio: float = 1.125, unroll_loops: bool = False):
+    def __init__(
+        self,
+        mlen: int = 64,
+        blen: int = 4,
+        real_data_ratio: float = 1.125,
+        unroll_loops: bool = False,
+        mram_tile_capacity: int = 4,
+    ):
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
-        super().__init__(mlen=mlen, blen=blen, unroll_loops=unroll_loops)
+        super().__init__(
+            mlen=mlen,
+            blen=blen,
+            unroll_loops=unroll_loops,
+            mram_tile_capacity=mram_tile_capacity,
+        )
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
         self.generated_code = ""
