@@ -84,7 +84,11 @@ from ..ir import (
 )
 
 
-_DEFAULT_LANE = 4   # MLEN / btmm_hlen for the current target
+# MLEN / HLEN for the active target — read from plena_settings.toml
+# (the single source of truth shared with the simulator).
+from ....plena_settings import load_sizes as _load_sizes
+
+_DEFAULT_LANE = _load_sizes().hardware_lane_count
 
 
 class SplitError(RuntimeError):

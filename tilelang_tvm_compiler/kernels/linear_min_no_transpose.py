@@ -26,6 +26,8 @@ host-broadcast (M, N) tile) is identical to ``linear_min``.
 
 import tilelang.language as T
 
+from ..plena_settings import load_sizes as _load_sizes
+
 
 def make_linear_min_no_transpose(
     *,
@@ -34,7 +36,9 @@ def make_linear_min_no_transpose(
     k_blocks: int = 1,
     with_bias: bool = False,
 ):
-    MLEN = 64
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
     if m_blocks < 1 or n_blocks < 1 or k_blocks < 1:
         raise ValueError(
             f"m_blocks/n_blocks/k_blocks must be >= 1; "

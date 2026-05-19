@@ -622,6 +622,108 @@ def _fmt_scalar(x) -> str:
     return str(x)
 
 
+def _count_ops(ops: List[Op]) -> int:
+    """Total op count including nested ``for`` bodies — matches the
+    flat index space ``_format_ops`` walks."""
+    n = 0
+    for op in ops:
+        n += 1
+        if op.kind == "for":
+            n += _count_ops(op.body or [])
+    return n
+
+
+def format_lowir(mod: HLIRModule, lowir_log: List[tuple]) -> str:
+    """Render the low-level "last variable-form" report.
+
+    This is the layer between HLIR and ISA: each HLIR op, after the
+    isa_pass has lowered its buffer refs into physical address
+    expressions but BEFORE those expressions are bound to ``gp``
+    registers. ``lowir_log`` is the recording the ``ExprMaterializer``
+    captures at that exact chokepoint — a list of
+    ``(top_level_op_idx, expr_str)`` where ``expr_str`` still contains
+    the live ``tir.Var`` loop indices (``head_phase``, ``row``, ...).
+
+    Because the recording is taken from real codegen (not a re-derived
+    copy), this report can never drift from what the ISA actually
+    emits. The op indices line up with ``<kernel>.hlir.txt``.
+
+    Use it to verify, e.g., that ``row_mul_fp`` on a packed-head
+    buffer produces ``mask = 1 << head_phase`` (the loop var survives)
+    and not ``mask = 1 << 2`` (the var got constant-folded away).
+    """
+    # Group recorded expressions by depth-first op index — the SAME
+    # [NN] space _format_ops (and isa_pass's _lowir_idx counter) walks,
+    # so every op, nested or not, owns its own bucket.
+    by_op: Dict[int, List[str]] = {}
+    for op_idx, expr_str in lowir_log:
+        by_op.setdefault(op_idx, []).append(expr_str)
+
+    lines = [
+        f"LowIR report  --  kernel: {mod.name!r}",
+        "",
+        "Per-op physical address expressions, captured at the "
+        "var->gp boundary.",
+        "Each expr below is what the ISA materializes into a gp "
+        "register next;",
+        "live tir.Var loop indices (head_phase, row, ...) are still "
+        "symbolic here.",
+        "Op indices match <kernel>.hlir.txt.",
+        "",
+        "=" * 64,
+        "",
+    ]
+
+    def _collapse(exprs: List[str]) -> List[tuple]:
+        """Run-length collapse consecutive identical exprs (a loop body
+        re-emits the same symbolic form every unrolled iteration)."""
+        out: List[tuple] = []
+        prev, run = None, 0
+        for e in exprs:
+            if e == prev:
+                run += 1
+            else:
+                if prev is not None:
+                    out.append((prev, run))
+                prev, run = e, 1
+        if prev is not None:
+            out.append((prev, run))
+        return out
+
+    def _emit(ops: List[Op], indent: int, idx: List[int]) -> None:
+        for op in ops:
+            cur = idx[0]
+            idx[0] += 1
+            ind = " " * indent
+            if op.kind == "for":
+                lv = op.annotations.get("loop_var")
+                ext = op.annotations.get("extent")
+                init = op.annotations.get("init", 0)
+                lines.append(
+                    f"{ind}[{cur:2d}]  for "
+                    f"{getattr(lv, 'name', lv)} in [{init}, {ext}):"
+                )
+                _emit(op.body or [], indent + 4, idx)
+                continue
+            bs = ", ".join(_fmt_buf_arg(a) for a in op.buffer_args) \
+                if op.buffer_args else "-"
+            ss = ", ".join(_fmt_scalar(a) for a in op.scalar_args) \
+                if op.scalar_args else "-"
+            lines.append(
+                f"{ind}[{cur:2d}]  {op.kind}  bufs=({bs})  scalars=({ss})"
+            )
+            exprs = by_op.get(cur, [])
+            if not exprs:
+                lines.append(f"{ind}      (no materialized address exprs)")
+            else:
+                for e, n in _collapse(exprs):
+                    suffix = f"   (x{n})" if n > 1 else ""
+                    lines.append(f"{ind}      -> {e}{suffix}")
+
+    _emit(mod.ops, indent=2, idx=[0])
+    return "\n".join(lines) + "\n"
+
+
 # Sanity helper used by passes to assert progress.
 def assert_addresses_resolved(mod: HLIRModule) -> None:
     missing = [b.name for b in mod.buffers.values() if b.address is None]
@@ -636,5 +738,5 @@ __all__ = [
     "VramRegion", "MramRegion",
     "BufferElement", "Op", "HLIRModule",
     "make_for_op",
-    "assert_addresses_resolved", "format_hlir",
+    "assert_addresses_resolved", "format_hlir", "format_lowir",
 ]

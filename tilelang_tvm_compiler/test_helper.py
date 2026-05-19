@@ -261,6 +261,184 @@ def _validate_io(io: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Canonical output layout — the SINGLE source of truth for how a kernel's
+# logical (B, S, H, D) output maps to its physical VRAM staging layout,
+# and therefore how golden must be flattened and how the comparator must
+# reorder the staged VRAM dump before diffing.
+#
+# Why this exists: golden-flatten order, --stage-output VRAM layout, and
+# check_mem's reorder were each hand-coded per kernel, each carrying its
+# own (often wrong) layout assumption. Every disagreement showed up as a
+# "compare fails" mystery. Route ALL THREE through this one function so
+# they cannot drift.
+#
+# The layout facts (must match the compiler's TileLayout / --stage-output
+# and check_mem.reorder_stride_mode):
+#
+#   * One mlen-wide VRAM tile packs LANE_COUNT = mlen // hlen heads
+#     side by side (each head occupies hlen columns).
+#   * A logical output with H heads therefore spans
+#     H_GROUPS = ceil(H / LANE_COUNT) head-groups.
+#   * --stage-output loads O_hbm back into VRAM head-group-major:
+#     head-group 0 for ALL S rows first, then head-group 1, ...
+#     i.e. physical order  [h_group][s][lane][d].
+#   * golden_flat is batch-major  [s][h][d]  (one row's H heads
+#     contiguous). These two are the same data in different
+#     permutations.
+#   * check_mem.reorder_stride_mode converts head-group-major chunks
+#     back to batch-major exactly when chunks_per_batch > 1 (i.e. when
+#     H_GROUPS > 1). For H_GROUPS == 1 there is no interleaving and the
+#     reorder must stay off.
+# ---------------------------------------------------------------------------
+
+# Every kernel output, whatever its logical rank, ultimately stages
+# into VRAM as a 2D grid:  num_batches logical rows, each
+# elements_per_batch wide. A row wider than MLEN occupies
+# CHUNKS_PER_BATCH = ceil(elements_per_batch / mlen) mlen-wide physical
+# chunks, and --stage-output writes those chunk-group-major (chunk 0 of
+# every row first, then chunk 1 of every row, ...). golden_flat is
+# batch-major (each row's full width contiguous). When CHUNKS_PER_BATCH
+# > 1 the two orders differ and the comparator must reorder; that is
+# precisely what check_mem.reorder_stride_mode does, so use_stride_mode
+# is just CHUNKS_PER_BATCH > 1.
+#
+# BSHD (B,S,H,D) outputs are the common special case: rows = B*S,
+# cols = H*D, and chunk groups coincide with head-groups
+# (LANE_COUNT = mlen//hlen heads per mlen tile). conv NCHW outputs and
+# plain (M,N) matmul outputs are the same 2D grid with a different
+# logical-shape story — :func:`resolve_output_layout` accepts any of
+# them and they all funnel through the identical 2D math here.
+
+@dataclass(frozen=True)
+class OutputLayout:
+    """Resolved 2D staging layout for one kernel output.
+
+    ``num_batches`` logical rows, ``elements_per_batch`` values each,
+    physically chunked into ``mlen``-wide pieces."""
+    num_batches: int
+    elements_per_batch: int
+    mlen: int
+
+    @property
+    def chunks_per_batch(self) -> int:
+        """mlen-wide physical chunks one logical row spans."""
+        return (self.elements_per_batch + self.mlen - 1) // self.mlen
+
+    @property
+    def use_stride_mode(self) -> bool:
+        """True iff the staged VRAM is chunk-group-major and must be
+        reordered back to batch-major before diffing against golden."""
+        return self.chunks_per_batch > 1
+
+    def comparison_params(self) -> dict:
+        """The geometry block check_mem / view_mem need. Merge this into
+        whatever kernel-specific keys (check_hbm, start_row_idx, ...)
+        the SPEC still wants to set."""
+        return {
+            "num_rows": self.num_batches * self.chunks_per_batch,
+            "num_batches": self.num_batches,
+            "elements_per_batch": self.elements_per_batch,
+            "row_dim": self.mlen,
+            "use_stride_mode": self.use_stride_mode,
+        }
+
+    def flatten_golden(self, out):
+        """Flatten a golden tensor of any rank into the canonical 2D
+        ``golden_flat``: ``(num_batches, elements_per_batch)``,
+        batch-major. The comparator reorders the VRAM side to match
+        this — never the reverse. Raises if the tensor's element count
+        doesn't match ``num_batches * elements_per_batch``."""
+        want = self.num_batches * self.elements_per_batch
+        got = 1
+        for dim in out.shape:
+            got *= int(dim)
+        if got != want:
+            raise ValueError(
+                f"flatten_golden: golden has {got} elements but layout "
+                f"expects num_batches*elements_per_batch = "
+                f"{self.num_batches}*{self.elements_per_batch} = {want} "
+                f"(golden shape {tuple(out.shape)})"
+            )
+        return out.reshape(self.num_batches, self.elements_per_batch)
+
+
+def resolve_output_layout(
+    *,
+    mlen: int,
+    # --- form 1: BSHD output ---
+    b: Optional[int] = None,
+    s: Optional[int] = None,
+    h: Optional[int] = None,
+    d: Optional[int] = None,
+    hlen: Optional[int] = None,
+    # --- form 2: explicit 2D output ---
+    num_batches: Optional[int] = None,
+    elements_per_batch: Optional[int] = None,
+) -> OutputLayout:
+    """Build the canonical :class:`OutputLayout`.
+
+    Two calling forms — pick the one matching the kernel's output:
+
+      * BSHD:  ``resolve_output_layout(b=, s=, h=, d=, mlen=, hlen=)``
+        rows = b*s, cols = h*d. ``hlen`` is checked against ``mlen``
+        for the lane-packing invariant (``h`` must be a multiple of
+        ``mlen//hlen``) so a mis-shaped head count fails loudly here.
+
+      * explicit 2D: ``resolve_output_layout(num_batches=,
+        elements_per_batch=, mlen=)`` — for matmul ``(M,N)``, conv
+        ``(C_OUT*H, W)`` and anything else that isn't naturally BSHD.
+
+    Whichever form, the result drives BOTH ``flatten_golden`` and
+    ``comparison_params`` so the golden order and the comparator's
+    reorder agree by construction.
+    """
+    if mlen <= 0:
+        raise ValueError(f"resolve_output_layout: mlen must be > 0; got {mlen}")
+
+    bshd_given = any(v is not None for v in (b, s, h, d, hlen))
+    twod_given = any(v is not None for v in (num_batches, elements_per_batch))
+    if bshd_given and twod_given:
+        raise ValueError(
+            "resolve_output_layout: pass EITHER the BSHD form "
+            "(b/s/h/d/hlen) OR the explicit 2D form "
+            "(num_batches/elements_per_batch), not both"
+        )
+    if twod_given:
+        if num_batches is None or elements_per_batch is None:
+            raise ValueError(
+                "resolve_output_layout 2D form needs both num_batches "
+                "and elements_per_batch"
+            )
+        return OutputLayout(
+            num_batches=int(num_batches),
+            elements_per_batch=int(elements_per_batch),
+            mlen=int(mlen),
+        )
+
+    # BSHD form.
+    if any(v is None for v in (b, s, h, d, hlen)):
+        raise ValueError(
+            "resolve_output_layout BSHD form needs all of b/s/h/d/hlen"
+        )
+    if hlen <= 0 or mlen % hlen != 0:
+        raise ValueError(
+            f"resolve_output_layout: need mlen % hlen == 0; "
+            f"got mlen={mlen}, hlen={hlen}"
+        )
+    lane_count = mlen // hlen
+    if h % lane_count != 0:
+        raise ValueError(
+            f"resolve_output_layout: H ({h}) must be a multiple of "
+            f"LANE_COUNT ({lane_count} = mlen//hlen)"
+        )
+    return OutputLayout(
+        num_batches=int(b) * int(s),
+        elements_per_batch=int(h) * int(d),
+        mlen=int(mlen),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -310,6 +488,23 @@ def run(spec: TvmTestbenchSpec) -> int:
                 f"{patched.count(chr(10))} lines)"
             )
         isa_text = patched
+
+    # Large-immediate normalisation, on the FULL assembled text.
+    # ``isa_pass`` runs this on the kernel body, but the pre-kernel
+    # stub (``build_pre_kernel_stub``) and any ``patch_isa`` hook are
+    # assembled outside that path — their ``S_ADDI_INT`` immediates
+    # never got normalised. With MLEN-512 addresses those overflow the
+    # 18-bit immediate slot. Re-run the pass over the concatenation so
+    # every section is covered.
+    from .isa_pass import _normalize_large_addi_immediates
+    _before = isa_text.count(chr(10))
+    isa_text = _normalize_large_addi_immediates(isa_text)
+    _after = isa_text.count(chr(10))
+    if _after != _before:
+        print(
+            f"      NB  large-imm normalise expanded ASM "
+            f"({_before} -> {_after} lines)"
+        )
     print(
         f"      OK  ({kernel_isa.count(chr(10))} kernel lines"
         + (f" + {stub_isa.count(chr(10))} stub lines" if stub_isa else "")
@@ -406,6 +601,8 @@ def run(spec: TvmTestbenchSpec) -> int:
 __all__ = [
     "TvmTestbenchSpec",
     "run",
+    "OutputLayout",
+    "resolve_output_layout",
     "REPO_ROOT",
     "TESTBENCH_DIR",
     "DEFAULT_LD_LIBRARY_PATH",

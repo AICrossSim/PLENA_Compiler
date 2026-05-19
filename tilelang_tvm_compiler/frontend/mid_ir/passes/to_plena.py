@@ -2706,12 +2706,47 @@ def run(func: MidFunc,
     if pad_inserts or cluster_modes_for_refs:
         _rewrite_refs_to_4d(ops, pad_inserts, cluster_modes_for_refs)
 
+    # Tag every cluster-axis (per-lane) ``for`` so the loop_interchange
+    # pass can recognise it by structure, not by name string. A cluster
+    # ``for``'s loop_var is the phase axis var registered in
+    # ``_LANE_AXIS_INFO`` (value tuple = (phase, number, count)); both
+    # go through ``_get_var``'s name cache so identity == name match.
+    _tag_cluster_for_ops(ops)
+
     return _hlir.HLIRModule(
         name=func.name,
         buffers=buf_name_to_hlir,
         ops=ops,
         param_names=[b.name for b in func.params],
     )
+
+
+def _tag_cluster_for_ops(ops: "List[_hlir.Op]") -> None:
+    """Stamp ``annotations["is_cluster_axis"] = True`` on every ``for``
+    op whose loop variable is a cluster-phase axis. Recurses into nested
+    ``for`` bodies. In place.
+
+    The set of phase-axis vars is read from ``_LANE_AXIS_INFO`` — its
+    values are ``(phase_var, number_var, count)`` and the phase var's
+    ``.name`` is exactly what a per-lane ``for`` carries as ``loop_var``
+    (both minted via ``_get_var``)."""
+    phase_names = {phase.name for (phase, _num, _cnt) in _LANE_AXIS_INFO.values()}
+    if not phase_names:
+        return
+
+    def _walk(op_list):
+        for op in op_list:
+            if op.kind == "for":
+                lv = op.annotations.get("loop_var")
+                lv_name = getattr(lv, "name", lv)
+                if lv_name in phase_names:
+                    op.annotations["is_cluster_axis"] = True
+                if op.body is not None:
+                    _walk(op.body)
+            elif op.body is not None:
+                _walk(op.body)
+
+    _walk(ops)
 
 
 def _pad_tuple_at(values, inserts: Tuple[int, ...], fill):

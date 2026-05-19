@@ -49,18 +49,26 @@ import math
 
 import tilelang.language as T
 
+from ..plena_settings import load_sizes as _load_sizes
+
 from ..address_alloc import FPRAM_USER_BASE
 from ..frontend.gemm_macros import KIND
 
 
 def make_flash_decode_min(
     *,
-    rows: int = 64,
-    hlen: int = 16,
+    rows: int | None = None,
+    hlen: int | None = None,
     head_count: int | None = None,
     num_kv_blocks: int = 2,
 ):
-    MLEN = 64
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
+    if hlen is None:
+        hlen = _hw.hlen
+    if rows is None:
+        rows = MLEN
     if rows != MLEN:
         raise ValueError(
             f"flash_decode_min requires rows == MLEN ({MLEN}), got {rows}"

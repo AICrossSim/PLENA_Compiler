@@ -37,16 +37,22 @@ Like ``rmsnorm_min``:
 
 import tilelang.language as T
 
+from ..plena_settings import load_sizes as _load_sizes
+
 
 def make_layernorm_min(
     *,
-    rows: int = 64,
+    rows: int | None = None,
     hidden_size: int = 128,
     num_s_blocks: int = 2,
     batch: int = 1,
     eps: float = 1e-6,
 ):
-    MLEN = 64
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
+    if rows is None:
+        rows = MLEN
     if rows != MLEN:
         raise ValueError(
             f"layernorm_min requires rows == MLEN ({MLEN}), got {rows}"

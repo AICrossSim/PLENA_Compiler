@@ -18,10 +18,11 @@ holds.
 from .ir import MidFunc
 
 
-# MLEN: hardware vector width. Default for the current PLENA target.
-# When per-target configuration is added, this should come from the
-# target descriptor instead of being hard-coded.
-MLEN = 64
+# MLEN: hardware vector width — read from plena_settings.toml's active
+# mode, the single source of truth shared with the simulator.
+from ...plena_settings import mlen as _mlen
+
+MLEN = _mlen()
 
 
 def _last_dim(buf) -> int:

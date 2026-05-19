@@ -12,48 +12,58 @@ If you discover something the next agent will trip on, append it here.
 
 ## 1. Pipeline at a glance
 
+> **Architecture note.** The old graph-IR frontend
+> (`graph_ir.Graph`, `lift_from_raw_primfunc`, `split_lane_groups`,
+> `materialize_to_primfunc`, `PlenaCodegen`) **has been deleted**.
+> `frontend/pipeline.py` is now a stub that raises if called. The only
+> active lowering chain is the **mid_ir pipeline**. Don't trust any
+> doc/comment that still mentions `graph_ir`.
+
+The real driver is **`tilelang_tvm_compiler/pipeline.py : compile_kernel`**:
+
 ```
   @T.prim_func (tilelang DSL)
-     │  Frontend (frontend/pipeline.py: compile_func)
-     │   1. stmt prep (inline_let_stmts, lower_compound_fp_stores)
-     │   2. lift_from_raw_primfunc → graph_ir.Graph
-     │   3. graph passes (annotate_grid / annotate_sync /
-     │      split_lane_groups / lift_lane_groups / fuse_elementwise /
-     │      scope_inference)
-     │   4. materialize_to_primfunc(expand_lane_buffers=True)
-     │      runs allocate_group_memory.analyze + expand_buffers.expand
-     │      + lower_fp_row_patterns + curtain-bundle partition
-     │   5. _rewrite_buffer_scopes (shared.dyn → vram, etc.)
+     │  0. stmt prep
+     │     inline_let_stmts → lower_compound_fp_stores → hoist_float_constants
      ▼
-  TIR PrimFunc with plena.* externs only
-     │  Backend (compile_kernel, pipeline.py)
-     │   PlenaCodegen.lower_to_hlir (codegen.py)
+  raw tir.PrimFunc (FP literals hoisted to global.fpram 1-slot buffers)
+     │  1. mid_ir pipeline  (frontend/mid_ir/passes/, 9 passes)
+     │     infer_lane_axis  — pick the lane axis (see §11)
+     │     fold             — raw TIR → mid_ir.MidFunc dataclass tree
+     │     mark             — tag each op with its lane-fusion role
+     │     split            — lane blockIdx → (number, phase); grow
+     │                        non-global buffers by a cluster outer dim
+     │     distribute_cluster — push CLUSTER axes inside unroll/pipeline loops
+     │     async_wrap       — wrap can-async ops in Async regions
+     │     view             — assign view_perm to every BufferRef;
+     │                        substitute lane var on HBM refs
+     │     fuse             — collapse each Async region → one MultiLaneOp
+     │     burn_view        — bake view_perm into physical shape + indices
+     │     to_plena         — MidFunc → HLIRModule  (exits mid_ir domain)
      ▼
   HLIRModule                 ← buffers + Op stream, no addresses
-     │  AddressAllocationPass (address_alloc.py)
+     │  1.5  dead_buffer_elim — drop buffers no HLIR op references
+     │  2.   AddressAllocationPass (address_alloc.py)
      ▼
   HLIRModule + addresses     ← per-buffer base address resolved
-     │  IsaEmitterPass.run (isa_pass.py)
+     │  3.   IsaEmitterPass.run (isa_pass.py)  — RegisterAllocator + shim
      ▼
   ISA text  (`*_generated_asm_code.asm`)
 ```
 
-- **Frontend is graph-IR-centric.** All semantic analysis, sync /
-  layout / scope inference, pattern fusion, and lane buffer expansion
-  happen on `graph_ir.Graph` (a typed dataclass tree), not on TIR
-  trees. Passes are pure `Graph → Graph` functions. The only stmt
-  walkers left are pre-graph (`inline_let_stmts`,
-  `lower_compound_fp_stores`) and post-graph (`_rewrite_buffer_scopes`).
-  See [`PIPELINE_ARCHITECTURE.md`](../PIPELINE_ARCHITECTURE.md) for the
-  full walkthrough.
-- The compiler is invoked as a subprocess (`python -m tilelang_tvm_compiler
-  compile ...`) from a Python 3.11 venv (`.venv-tvm`) because TVM is only
-  installed there. The main project venv (`.venv`, 3.12) is for testbench
-  inputs/golden via PyTorch.
-- `--dump-hlir <path>` writes the HLIR after `PlenaCodegen.lower_to_hlir`
-  — useful for debugging op ordering and scalar-expression rendering.
-  **Only written if compile_kernel returns successfully**; on a pass-3
-  failure the HLIR file may be stale from a previous run.
+- **The mid_ir is a typed dataclass tree** (`mid_ir/ir.py : MidFunc`),
+  not TIR. Passes 1–8 are `MidFunc → MidFunc`; `to_plena` (pass 9) is the
+  single bridge out to `HLIRModule`. The only TIR-level walkers left are
+  the pass-0 stmt-prep steps and `infer_lane_axis` (which still inspects
+  raw TIR — see §11).
+- `compile_kernel(prim_func, *, target, name, midir_dump_dir=...,
+  addr_config_override=...)` is the entry point. `midir_dump_dir` makes
+  `to_plena` write `<name>.midir.txt` **and** `compile_kernel` write
+  `post_to_plena.hlir.txt` right after `to_plena` — both survive a later
+  pass failure, so they are the go-to debugging artefacts.
+- `addr_config_override` lets a multi-kernel driver pin FPRAM/HBM bases
+  per kernel — used by `tvm_single_stream_block_test` to stitch the
+  MMDiT chain into one continuous ASM run.
 
 ---
 
@@ -108,6 +118,29 @@ of "narrow vs wide". The runtime compiler enforces this in
 `_logical_2d` helper flattens shapes to (rows, cols) — for BHSD `(1, 4,
 64, 64)` you get `(4*64, 64*64/64) = (256, 64)`. Picking head h's tile
 out of a BHSD VRAM buffer means addressing at `base + h * MLEN * MLEN`.
+
+### Where quantization actually happens (verified in the sim)
+
+Common misconception: that the sim quantizes everywhere. It does not.
+
+- **`QuantTensor::quantize` is a TODO no-op** — it does not quantize.
+  Any VRAM tile written via `QuantTensor::quantize(t, ty)` keeps its
+  fp32 values; the `ty` is just a label.
+- The real MX-E4M3 quantization happens in **`into_bytes`** (the
+  VRAM→HBM serialise path, `H_STORE_V`). HBM stores MX-E4M3.
+- The HBM→VRAM path (`H_PREFETCH_V` / `transfer_mx_from_hbm`) *decodes*
+  MX back to fp32; it does not add a second rounding.
+- Net effect: an intermediate tensor that a kernel writes to an HBM
+  scratch and the next kernel reads back is **MX-quantized exactly once**
+  (at the store).
+- On-chip matmul / vector ops run in **fp32** in the sim (`to_kind(Float)`).
+- The Rust `into_bytes` MX quantizer is line-for-line equivalent to the
+  Python `_mx_fp_quantize_hardware` (same `floor(log2(max)+1e-9)`, same
+  bias, same block grouping over the last dim). So a golden modelled with
+  `_mx_fp_quantize_hardware` matches the sim's HBM bytes — *provided* the
+  golden quantizes the tensor in its real staged 4D shape (block grouping
+  is over the last dim; quantizing a reshaped 2D view changes the block
+  boundaries).
 
 ---
 
@@ -247,93 +280,125 @@ a single iteration. The check is per-loop on the loop stack
 
 ## 6. FP buffer layout convention (FlashAttention kernel)
 
-FP buffers in `flash_attention_min.py` are all `(lane_count, rows)` shape.
-The address allocator places them sequentially starting at `FPRAM_USER_BASE
-= 32`. Declaration order **matters** — the testbench preload depends on it:
+FP buffers in `flash_attention_min.py` are declared as 1D per-lane
+fragments `(rows,)` and the compiler expands each to `(lane_count, rows)`
+inside the lane group. The address allocator places them sequentially
+starting at `FPRAM_USER_BASE = 32`, each slot `lane_count * rows` wide
+(= `4 * 64 = 256` for the typical config).
+
+Current FP buffers (per the actual HLIR, in declaration order):
 
 ```
-M_old   addr = 32 + 0 * 256 = 32
-M_curr  addr = 32 + 1 * 256 = 288
-M_res   addr = 32 + 2 * 256 = 544
-L_old   addr = 32 + 3 * 256 = 800
-L_new   addr = 32 + 4 * 256 = 1056
-P_sum   addr = 32 + 5 * 256 = 1312
-Scale   addr = 32 + 6 * 256 = 1568
-L_inv   addr = 32 + 7 * 256 = 1824
-M_init  addr = 32 + 8 * 256 = 2080
-L_init  addr = 32 + 9 * 256 = 2336
+M_OLD   addr = 32 + 0 * 256 = 32
+M_CURR  addr = 32 + 1 * 256 = 288
+M_RES   addr = 32 + 2 * 256 = 544
+L_OLD   addr = 32 + 3 * 256 = 800
+L_NEW   addr = 32 + 4 * 256 = 1056
+P_SUM   addr = 32 + 5 * 256 = 1312
+L_INV   addr = 32 + 6 * 256 = 1568
 ```
 
-Per-lane addressing within an FP buffer: element `[lane, row]` is at offset
-`base + lane * rows + row`. For `active_lane=2, rows=64`, that's
-`base + 128 + row`. **The active_lane segment must be preloaded by the
-testbench** for buffers the kernel reads before writing
-(`Scale`, `M_init`, `L_init`).
+Per-lane addressing within an FP buffer: element `[lane, row]` is at
+offset `base + lane * rows + row`.
+
+**Scale / M_init / L_init are no longer declared FP buffers.** The
+kernel embeds the literals directly as `T.float16(...)`
+(`scale_val = 1/sqrt(d_k)`, `-1.0e4` for the M init, `0` for L). The
+`hoist_float_constants` pre-pass synthesises a 1-slot `global.fpram`
+buffer per unique value (e.g. `__const_f16_0p25`,
+`__const_f16_neg10000`), and `test_helper` auto-preloads them from the
+`--dump-buffer-addrs` JSON. So the kernel no longer needs the testbench
+to preload an `active_lane` segment of any user FP buffer — every FP
+buffer is written before it is read (M_OLD/L_OLD reset from the hoisted
+consts at the top of each q_block).
 
 ---
 
 ## 7. FlashAttention kernel structure (current state)
 
 `flash_attention_min.py` produces this op nest (HLIR view, with
-`active_lane=2, num_q_blocks=2, num_kv_blocks=2`):
+`head_count=8, num_q_blocks=2, num_kv_blocks=2`). All heads are run —
+the per-`by_phase` loops below cover the full `lane_count` (= MLEN/HLEN):
 
 ```
-for q_block in [0, 2):              ; outer Q loop, T.unroll
-    dma Q[q_block] -> Q_v
-    zero_v O_v
-    for row in [0, 64):              ; reset active_lane FP state
-        fp_copy_at M_init -> M_old
-        fp_copy_at L_init -> L_old
-    for kv_block in [0, 2):          ; KV loop, T.unroll
-        dma K[kv_block] -> K_m
-        dma V[kv_block] -> V_m
-        btmm Q_v @ K_m -> S_v        ; per-head Q @ K^T
-        for row in [0, 64):           ; online softmax body, active_lane only
-            row_mul_fp_at S_v *= Scale          ; 1/sqrt(d_k)
-            fp_copy_at M_old -> M_curr
-            row_reduce_max_at S_v -> M_curr     ; m = max(m_old, row_max)
-            fp_sub_at M_old - M_curr -> M_res   ; m_old - m_curr
-            fp_exp_at M_res -> M_res            ; exp(m_old - m_curr)
-            row_sub_fp_at S_v -= M_curr
-            row_exp_at S_v = exp(S_v)           ; P_block (un-normalised)
-            row_reduce_sum_at S_v -> P_sum
-            fp_mul_at L_new = L_old * M_res
-            fp_add_at L_new += P_sum
-            row_mul_fp_at O_v *= M_res          ; rescale prev O (BSHD, masked)
-            fp_copy_at M_curr -> M_old
-            fp_copy_at L_new -> L_old
-        for h in [0, 4):              ; per-head P @ V via mm_slot
-            mm_slot S_v[h] @ V_m[..h..] -> PV_v[..h..]
-        v_add O_v += PV_v
-    for row in [0, 64):              ; finalize: O /= L_new
-        fp_reci_at L_new -> L_inv
-        row_mul_fp_at O_v *= L_inv          ; BSHD, masked
-    dma O_v -> O_hbm[q_block]
+for q_block in [0, 2):                    ; outer Q loop
+    dma Q[q_block] -> Q_sh
+    for row in [0, 64):                    ; zero running output
+        v_zero O_loc[row]
+    for row in [0, 64):                    ; reset FP state (ALL lanes)
+        for by_phase in [0, 4):
+            fp_copy_at __const_f16_neg10000 -> M_OLD
+        for by_phase in [0, 4):
+            fp_zero_at L_OLD
+    for kv_block in [0, 2):                ; KV loop
+        dma K[kv_block] -> K_sh
+        dma V[kv_block] -> V_sh
+        btmm Q_sh @ K_sh -> S_loc          ; per-head Q @ K^T
+        for row in [0, 64):
+            for by_phase in [0, 4):
+                row_mul_fp S_loc *= __const_f16_0p25   ; 1/sqrt(d_k)
+            for by_phase in [0, 4):
+                fp_copy_at M_OLD -> M_CURR
+        for row in [0, 64):
+            for by_phase in [0, 4):
+                row_reduce_max_at S_loc -> M_CURR
+        for row in [0, 64):
+            for by_phase in [0, 4):
+                fp_sub_at M_OLD - M_CURR -> M_RES
+            for by_phase in [0, 4):
+                fp_exp_at M_RES -> M_RES
+            for by_phase in [0, 4):
+                row_sub_fp S_loc -= M_CURR
+            for by_phase in [0, 4):
+                row_exp S_loc = exp(S_loc)
+            for by_phase in [0, 4):
+                fp_zero_at P_SUM
+        for row in [0, 64):
+            for by_phase in [0, 4):
+                row_reduce_sum_at S_loc -> P_SUM
+        for row in [0, 64):
+            for by_phase in [0, 4):
+                fp_mul_at L_NEW = L_OLD * M_RES
+            for by_phase in [0, 4):
+                fp_add_at L_NEW += P_SUM
+            for by_phase in [0, 4):
+                row_mul_fp O_loc *= M_RES
+            for by_phase in [0, 4):
+                fp_copy_at M_CURR -> M_OLD
+            for by_phase in [0, 4):
+                fp_copy_at L_NEW -> L_OLD
+        for by_phase in [0, 4):            ; per-head P @ V
+            matmul S_loc[by_phase] @ V_sh[..by_phase..] -> PV_loc[..by_phase..]
+        for row in [0, 64):
+            v_add O_loc += PV_loc
+    for row in [0, 64):                    ; finalize: O /= L_new
+        for by_phase in [0, 4):
+            fp_reci_at L_NEW -> L_INV
+        for by_phase in [0, 4):
+            row_mul_fp O_loc *= L_INV
+    dma O_loc -> O_hbm[q_block]
 ```
 
-### Two layouts collide here
+- **Softmax is run on every head** — each `for by_phase in [0, 4)` walks
+  the full lane group. (An earlier version ran only a single
+  `active_lane`; that is no longer the case.)
+- **P @ V uses `plena.matmul`** (`M_MM` / `M_MM_WO`), one issuance per
+  head — *not* `mm_slot`.
+- `M_OLD` / `L_OLD` are **re-initialised inside the q_block loop** from
+  the hoisted consts `__const_f16_neg10000` / a zero store, so a
+  multi-q-block run resets cleanly per tile.
 
-- `S_v` is **BHSD** (BTMM #1's natural output). Each VRAM row is one head's
-  full mlen-wide score row. → `row_*_at` ops use `mask=0` and scalar
-  `active_lane * rows + row` for both VRAM row & FP offset.
-- `O_v` is **BSHD**. Heads occupy column slots within a row.
-  → `row_mul_fp_at` for the rescale uses `mask = 1 << active_lane`,
-  scalars `(row, active_lane, mask)`.
+### Layouts
 
-`PV_v` mirrors `O_v` (BSHD) so `v_add` and the BSHD layout match. `mm_slot`
-writes head h's hlen columns at `dst_col_offset = h * hlen`.
+- `S_loc` is **BHSD** (BTMM #1's natural output): each VRAM row is one
+  head's full mlen-wide score row.
+- `O_loc` / `PV_loc` are **BSHD**: heads occupy column slots within a
+  row. `matmul` writes head h's hlen columns at the matching slot.
 
 ### What's intentionally NOT done yet
 
-- **Multi-head softmax**: only `active_lane` is run through softmax. The
-  other 3 lanes' `S_v` rows stay as raw `Q @ K^T`, BTMM #2 (mm_slot) still
-  runs per-head and writes `score @ V` for them. The testbench's golden
-  mirrors this exactly (active_lane: full softmax(QK^T/√d) @ V; others:
-  raw `score @ V`). To make it real multi-head, the easiest path is a
-  software `for active_lane in T.unroll(lane_count)` around the softmax
-  body (4× cost for correctness on all heads).
-- **Causal mask** — needs a preloaded VRAM `mask` buffer + `v_add` before
-  softmax. Mirror `attention.py`'s approach.
+- **Causal mask** — needs a preloaded VRAM `mask` buffer + `v_add`
+  before softmax. Mirror `attention.py`'s approach.
 - **Batch > 1**.
 
 ---
@@ -361,13 +426,55 @@ similar `tvm_*_test.py` files at the testbench root.)
 
 ### Golden gotchas
 
-- The kernel currently runs softmax on `active_lane` only. So the golden
-  for that head is `softmax(scaled_score) @ V`, but for **non-active heads
-  the golden must be `score @ V` (no softmax)** to match what the kernel
-  actually produces. Don't lazily run softmax on all heads in the golden.
+- The kernel runs softmax on **all heads** now, so the golden is plain
+  per-head `softmax(scaled_score) @ V` for every head. (An earlier
+  version ran a single `active_lane` and the golden had to mirror that
+  with `score @ V` for non-active heads — that is no longer needed.)
 - `torch.softmax(x, dim=-1)` is mathematically equivalent to the kernel's
-  online `max → sub → exp → sum → divide` chain. We previously wrote it
-  out manually for debugging; either works.
+  online `max → sub → exp → sum → divide` chain. Either works for the
+  golden; the online form is only needed if you want to model the f16
+  truncation of each FPRAM scalar step.
+
+### Golden comparison — the biggest time sink (read this)
+
+The golden *comparison* path has bitten us harder than any kernel bug.
+Two distinct bugs, both in how the golden reaches `check_mem.py`:
+
+1. **`golden_result.txt` was written with `%.2f`** (2 decimal places).
+   `check_mem.parse_golden_output` then parsed that text back as the
+   golden — so a true golden of `-0.0083` became `-0.01`, and small
+   values showed a fake ~0.8 relative error. Fix: `create_sim_env.py`
+   now also writes a lossless `golden_output.pt`; `parse_golden_output`
+   prefers the `.pt` and only falls back to the text.
+
+2. **`check_mem.py` down-cast the golden to `bfloat16`** before
+   comparing ("for fair comparison with hardware"). bf16 has 7 mantissa
+   bits — rounding the golden first inflates `|err|/|golden|` for small
+   values. Fix: keep the golden `.float()`; only the *simulated* side
+   stays bf16 (that IS the VRAM storage).
+
+If a comparison shows a wall of fake error on small magnitudes, suspect
+the comparison path before the kernel. Verify `golden_output.pt` exists
+in `build/` and that `parse_golden_output` is reading it.
+
+### Diagnosing a chained-kernel (SSB / MMDiT) failure
+
+When a multi-kernel chain's match rate collapses but each kernel passes
+its own standalone test, the bug is almost always a **kernel-to-kernel
+hand-off**, not a kernel. The proven isolation technique:
+
+- Give the suspect kernel's input an **independent HBM tensor** (its own
+  address, role `"input"`, preloaded) instead of aliasing the upstream
+  kernel's output `"scratch"` buffer. The upstream kernel still runs but
+  can no longer overwrite the isolated input.
+- Feed that independent input either a clean random tensor *or* the
+  upstream kernel's own golden output.
+- If the kernel now passes → the bug is the upstream→this hand-off (the
+  sim writing the shared HBM wrong, or a layout mismatch). If it still
+  fails → the kernel itself, in the chain environment, is wrong.
+- **Pitfall**: do NOT just preload the shared `scratch` buffer — the
+  upstream kernel will overwrite it at runtime. The input must be a
+  *separate* address the upstream kernel never writes.
 
 ---
 
@@ -387,10 +494,13 @@ any of these, the test will fail in confusing ways:
   loop would multiply that into one hw-loop iter and hit the 10 000 cap.
   Use `T.unroll`. Same applies to q_block.
 
-- **Don't preload `M_old` directly in a multi-q-block kernel**. After the
-  first q_block runs, `M_old` is overwritten by `fp_copy(M_curr → M_old)`
-  at the end of every row. The next q_block must reset from a separate
-  `M_init` constant buffer. Same for L.
+- **`M_OLD` / `L_OLD` must be reset *inside* the q_block loop**. After
+  the first q_block runs, `M_OLD` is overwritten by `fp_copy(M_curr →
+  M_old)` at the end of every row, so the next q_block would start from
+  stale state. The current kernel handles this correctly: it re-inits
+  `M_OLD` / `L_OLD` from the hoisted consts (`__const_f16_neg10000` /
+  zero) at the top of each q_block. Do not move that reset outside the
+  loop or back to a one-time preload.
 
 - **Don't use `from __future__ import annotations`** in kernel files. (See
   §4.)
@@ -439,3 +549,93 @@ the terminal:
 grep -nE '^; for |^C_LOOP_(START|END)|^M_BTMM|^M_BMM_WO|^M_MM\b|^V_ADD_VV' \
   transactional_emulator/testbench/build/<asm_file>.asm
 ```
+
+---
+
+## 11. Lane fusion — the core mechanism
+
+Multi-lane fusion is the heart of the frontend: `MLEN / HLEN` hardware
+lanes are packed into one VRAM row, and one multi-lane HW op fires once
+for all lanes instead of looping. Getting the **lane axis** right is
+what makes this work.
+
+### Lane axis is picked by IR-node analysis, NOT string matching
+
+`infer_lane_axis.py` decides which `blockIdx.*` grid var is the lane
+axis. The judgment is done on the **TIR AST**, not on text:
+
+```python
+# infer_lane_axis._collect_bare_index_var_names
+def visit(node):
+    if isinstance(node, tir.BufferLoad):
+        for idx in node.indices:
+            if isinstance(idx, tir.Var):      # ← the actual test
+                found.add(idx.name)
+stmt_functor.post_order_visit(func.body, visit)
+```
+
+The rule: a grid var is a **lane candidate** iff it appears as a
+**bare index slot** — `BufferLoad.indices[i]` is *exactly* a `tir.Var`
+node — somewhere in the body, AND its extent is divisible by LANE.
+
+- `Q_hbm[0, q_block*rows, by, 0]` — the `by` slot is a naked `tir.Var`
+  node → `by` is a lane candidate.
+- `q_block * rows` — that's a `tir.Mul` node; `q_block` is *inside* it,
+  not bare → `q_block` is an outer control loop, **not** a lane axis.
+
+A plain string search for `"by"` could never tell those apart — both
+texts contain `by`/`q_block`. Only inspecting the IR node *type* at the
+index position (`isinstance(idx, tir.Var)`) distinguishes a per-lane
+index from an arithmetic offset. This is the precise sense in which
+lane fusion is **value/ref-based, not string-based**.
+
+Resolution: 0 candidates → no lane axis (cluster pipeline skipped);
+1 → picked; 2+ → `InferLaneAxisError`, author must set
+`T.func_attr({"plena.lane_axis": "<name>"})`. A manual attr always wins.
+
+### How the lane axis flows through the rest of the pipeline
+
+- **split** turns the lane blockIdx into `(number, phase)` and grows
+  every non-global buffer by a cluster outer dim, so per-lane data has
+  somewhere to live.
+- **mark** tags each op with its lane-fusion role; **async_wrap** groups
+  can-async ops; **fuse** collapses each Async region into a single
+  `MultiLaneOp` — that is the actual "fire once for all lanes" step.
+- **view** assigns a `view_perm` to every `BufferRef` and substitutes
+  the lane var on HBM refs; **burn_view** bakes that permutation into
+  the physical shape + index tuples.
+
+### Bare-Var detection vs. lane-var substitution — two different things
+
+`infer_lane_axis`'s **bare-`tir.Var`** test only *picks which axis is
+the lane*. It is deliberately strict: `by + 8` (a `tir.Add`) is NOT a
+lane candidate, only a naked `by` is. This keeps the axis choice
+unambiguous.
+
+Once the axis is chosen, **`view._subst_lane_var` is recursive** and
+handles the lane var wherever it sits inside an index expression — not
+just bare:
+
+```python
+def _subst_lane_var(idx, ctx):
+    if isinstance(idx, VarRef) and idx == ctx.original_var:
+        return phase + number * cluster_count        # the substitution
+    if isinstance(idx, dict):                        # compound node (add/mul/…)
+        return {"op": idx["op"],
+                "args": [_subst_lane_var(a, ctx) for a in idx["args"]]}
+    return idx
+```
+
+So an HBM index like `O_hbm[..., by + o_head_offset, ...]` works: the
+recursion descends into the `add`, finds the `VarRef(by)` inside, and
+rewrites just that leaf — the `+ o_head_offset` is preserved. This is
+what `flash_attention_min.py` relies on to write its output into a
+head-slice of a wider tensor.
+
+Summary: **lane-axis selection** = strict bare-Var only; **lane-var
+substitution** = recursive, accepts the lane var combined with offsets
+(`by + c`, `by * c`, …).
+
+So "multi-lane fuse" is not one pass — it's the chain
+`infer_lane_axis → split → mark → async_wrap → fuse → view → burn_view`,
+all operating on typed mid_ir nodes.

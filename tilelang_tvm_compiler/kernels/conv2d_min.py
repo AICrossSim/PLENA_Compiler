@@ -60,6 +60,8 @@ Layout contract for ``B_cache`` (testbench-side preload):
 
 import tilelang.language as T
 
+from ..plena_settings import load_sizes as _load_sizes
+
 
 def make_conv2d_min(
     *,
@@ -70,8 +72,10 @@ def make_conv2d_min(
     c_in: int = 1,
     c_out: int = 1,
 ):
-    MLEN = 64
-    HLEN = 16
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
+    HLEN = _hw.hlen
 
     if kh * kw != HLEN:
         raise ValueError(

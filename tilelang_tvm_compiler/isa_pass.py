@@ -126,6 +126,12 @@ class IsaEmitterPass:
         # consults this table to resolve Var references in scalar args.
         self.symbol_table: Dict[tir.Var, int] = {}
         self.materializer = ExprMaterializer(shim, self.symbol_table)
+        # Global op counter for the lowir report. Advanced once per op
+        # (including nested ``for`` bodies) so the recorded op index
+        # matches the depth-first ``[NN]`` numbering ``format_hlir``'s
+        # ``_format_ops`` produces — the lowir report and hlir.txt then
+        # line up entry-for-entry.
+        self._lowir_idx: int = -1
         self._dispatch: Dict[str, Callable[[_hlir.HLIRModule, _hlir.Op], None]] = {
             "dma_h2v": self._emit_dma_h2v,
             "dma_h2m": self._emit_dma_h2m,
@@ -195,7 +201,8 @@ class IsaEmitterPass:
         )
 
         ra = self.shim.compiler.register_allocator
-        for i, op in enumerate(mod.ops):
+        self._lowir_idx = -1
+        for op in mod.ops:
             handler = self._dispatch.get(op.kind)
             if handler is None:
                 raise IsaEmissionError(
@@ -203,10 +210,19 @@ class IsaEmitterPass:
                     f"Either add it to isa_pass dispatch table, or guard "
                     f"the op out of HLIR earlier."
                 )
+            # Advance the depth-first op counter and tag the materializer
+            # so every address expr this op lowers is recorded under the
+            # same [NN] index format_hlir prints. _emit_for advances the
+            # counter again for each nested body op.
+            self._lowir_idx += 1
+            i = self._lowir_idx
             ra.push_site(f"op[{i}] {op.kind}")
+            self.materializer.set_lowir_op_idx(i)
+            self.materializer.begin_op()
             try:
                 handler(mod, op)
             finally:
+                self.materializer.end_op()
                 ra.pop_site()
         self.shim.compiler.generated_code = _normalize_large_addi_immediates(
             self.shim.compiler.generated_code
@@ -2135,13 +2151,43 @@ class IsaEmitterPass:
         # operand orientation.
         transpose_b = b_N_axis < b_K_axis
 
-        # The legacy dst_row_stride was the product of every physical
-        # dim of dst strictly after the M axis (= "elements between
-        # consecutive rows of C"). With a 4D BSHD c_region we can
-        # derive it from the region's extents directly.
-        dst_row_stride = 1
-        for ax in range(c_M_axis + 1, len(c_reg.extents)):
-            dst_row_stride *= int(c_reg.extents[ax])
+        # dst_row_stride = elements between consecutive rows of C in
+        # its physical VRAM layout (emit_matmul_general walks C as a
+        # row-major (M, N) block stepping by this much per row).
+        #
+        # The right value depends on where C's cluster axis sits:
+        #
+        #   * packed-head dst (cluster_dim on the H axis, lane_count>1,
+        #     e.g. PV_loc 1x1024x8x128): one physical mlen row holds
+        #     LANE_COUNT heads side by side. The M (row) axis is S =
+        #     axis 1, and consecutive S rows are S_INNER_STRIDE
+        #     (= LANE_COUNT*D_INNER) apart. Deriving the stride from
+        #     c_reg.extents (the logical region, H-extent 1) yields
+        #     only N and makes every row-(r+1) write land in row-r's
+        #     head-1 slot.
+        #
+        #   * cluster axis NOT on H (e.g. S_loc 8x1024x1x1024 has the
+        #     cluster on B/axis 0, lane_count==1), or no tile_layout:
+        #     the per-row spacing is just the extents product after the
+        #     M axis — the legacy path is correct there.
+        #
+        # So only switch to the physical s_inner stride when the dst is
+        # genuinely packed-head AND M is the S axis the s_inner stride
+        # describes.
+        dst_cluster_dim = getattr(dst, "cluster_dim", None)
+        tl_info = self._tile_layout_strides(dst)
+        packed_head_dst = (
+            tl_info is not None
+            and dst_cluster_dim == 2          # cluster on the H axis
+            and int(tl_info["lane_count"]) > 1
+            and c_M_axis == 1                 # M is the S axis
+        )
+        if packed_head_dst:
+            dst_row_stride = int(tl_info["s_inner_stride"])
+        else:
+            dst_row_stride = 1
+            for ax in range(c_M_axis + 1, len(c_reg.extents)):
+                dst_row_stride *= int(c_reg.extents[ax])
         if dst_row_stride <= 0:
             dst_row_stride = None
 
@@ -2170,15 +2216,22 @@ class IsaEmitterPass:
                         return 0, prev_reg
                 m = self.materializer.materialize(raw)
                 self.shim.compiler.generated_code += m.isa
-                materialised_handles.append(m)
                 cached.append((raw, m.register))
-                # Pin so the emit_matmul_general body below can't pick
-                # this register as a spill candidate while the inner
-                # ``allocate_gp(7)`` runs. Unpinned, auto-spill would
-                # save the offset value to IntRAM and then hand the
-                # physical register out to ``gp_act_orow`` / etc,
-                # silently corrupting the offset.
-                self.shim.compiler.register_allocator.pin_gp(m.register)
+                # Pin so emit_matmul_general's ``allocate_gp(7)`` can't
+                # pick this register as a spill candidate and silently
+                # corrupt the offset.
+                #
+                # ONLY for caller-owned registers. A register that the
+                # materializer handed out with ``owns_register=False``
+                # belongs to the per-op idx cache: it is already pinned
+                # by that cache and will be unpinned/freed by
+                # ``end_op``. Pinning / unpinning / releasing it here
+                # would race that ownership (double-free, premature
+                # unpin). So we record it for cleanup ONLY when we own
+                # it, and leave cache-owned registers untouched.
+                if m.owns_register:
+                    materialised_handles.append(m)
+                    self.shim.compiler.register_allocator.pin_gp(m.register)
                 return 0, m.register
             raise IsaEmissionError(
                 f"plena.matmul {name} must be int or PrimExpr; got {raw!r}"
@@ -2219,7 +2272,10 @@ class IsaEmitterPass:
                 task_id=op.annotations.get("intrinsic", "matmul"),
                 scratch_regs=scratch_regs,
                 transpose_b=transpose_b,
-                unroll_loops=False,
+                # Fully unroll — emit static M_MM/M_MM_WO instead of
+                # nested C_LOOP, eliminating the gp loop-counter and
+                # per-iter address-advance overhead.
+                unroll_loops=True,
             )
         finally:
             for m in materialised_handles:
@@ -3131,20 +3187,29 @@ class IsaEmitterPass:
         # emit_matmul). Costs one S_ADDI_INT per iter to re-init gp_idx;
         # the hardware loop overhead disappears entirely.
         if loop_kind in ("unroll", "unrolled"):
-            gp_idx = ra.allocate_gp(1)[0]
+            # Unrolled: the loop variable takes a known constant value in
+            # each iteration, so bind it to a tir.IntImm rather than a
+            # GP. The materializer constant-folds every use — no GP is
+            # pinned, no per-iter ``S_ADDI_INT`` is emitted. This is what
+            # keeps a deep unrolled nest from exhausting the GP file.
             self.shim.compiler.generated_code += (
                 f"; unroll for {loop_var.name} in "
-                f"[{init_imm}, {init_imm + extent_imm}) -- idx gp{gp_idx}\n"
+                f"[{init_imm}, {init_imm + extent_imm}) -- idx is a literal\n"
             )
-            self.symbol_table[loop_var] = gp_idx
-            ra.pin_gp(gp_idx)
+            # All N unrolled iterations share the SAME body [NN] indices
+            # (format_hlir prints the body once). Snapshot the counter
+            # before the first iter and rewind to it at the start of
+            # every iter; let the last iter leave it at the body end so
+            # sibling ops after the for keep numbering correctly.
+            body_start_idx = self._lowir_idx
             try:
                 for i in range(extent_imm):
                     iter_val = init_imm + i
+                    self.symbol_table[loop_var] = tir.IntImm("int32", iter_val)
                     self.shim.compiler.generated_code += (
                         f"; ... unroll iter {i} -> {loop_var.name}={iter_val}\n"
-                        f"S_ADDI_INT gp{gp_idx}, gp0, {iter_val}\n"
                     )
+                    self._lowir_idx = body_start_idx
                     for j, sub_op in enumerate(op.body or []):
                         handler = self._dispatch.get(sub_op.kind)
                         if handler is None:
@@ -3152,31 +3217,41 @@ class IsaEmitterPass:
                                 f"no ISA dispatcher for nested op kind "
                                 f"{sub_op.kind!r} inside unrolled for-loop"
                             )
+                        self._lowir_idx += 1
+                        self.materializer.set_lowir_op_idx(self._lowir_idx)
                         ra.push_site(f"unroll[{i}].body[{j}] {sub_op.kind}")
+                        self.materializer.begin_op()
                         try:
                             handler(mod, sub_op)
                         finally:
+                            self.materializer.end_op()
                             ra.pop_site()
             finally:
-                ra.unpin_gp(gp_idx)
-                del self.symbol_table[loop_var]
-            ra.free_gp([gp_idx])
+                self.symbol_table.pop(loop_var, None)
             return
 
-        # gp_loop is the PLENA hw counter — C_LOOP_END decrements it, so
-        # it MUST stay in a GP and MUST be pinned for the whole body.
-        gp_loop = ra.allocate_gp(1)[0]
+        # gp_loop is the PLENA hw counter — C_LOOP_END decrements it.
+        # The loop-register allocation pass picked the GP by HLIR
+        # liveness and stamped it on the op; that GP is in the emit
+        # allocator's ``gp_reserved`` set, so it is physically disjoint
+        # from any temporary. We pin it here only as a defensive marker.
+        gp_loop = op.annotations.get("loop_gp")
+        if gp_loop is None:
+            raise IsaEmissionError(
+                f"serial for-op {loop_var.name!r} has no 'loop_gp' "
+                f"annotation; loop_register_alloc must run before isa_pass"
+            )
         ra.pin_gp(gp_loop)
 
         # idx lives in IntRAM, not a GP. Deep nests (flash_attention with
-        # an inner matmul, conv2d's 6-level grid) used to exhaust the GP
-        # file when every loop pinned two GPs. Storing the idx in IntRAM
-        # turns it into 1 GP per loop -- the materializer re-loads the
-        # idx on every use via S_LD_INT.
+        # an inner matmul, conv2d's 6-level grid) would exhaust the GP
+        # file if every loop pinned two GPs. Storing the idx in IntRAM
+        # keeps it to 1 GP per loop — the materializer re-loads the idx
+        # on every use via S_LD_INT. (Re-load cost to be optimised later
+        # with a per-op materialisation cache.)
         idx_addr = ra.claim_idx_slot()
-        # Init: 0 -> intram[idx_addr]. gp0 is constant zero, so we can
-        # store it directly without using a scratch GP.
         if init_imm == 0:
+            # gp0 is constant zero — store it straight to the idx slot.
             self.shim.compiler.generated_code += (
                 f"; for {loop_var.name} in [{init_imm}, {init_imm + extent_imm}) "
                 f"-- hw counter gp{gp_loop}, idx ram[{idx_addr}]\n"
@@ -3184,8 +3259,6 @@ class IsaEmitterPass:
                 f"C_LOOP_START gp{gp_loop}, {extent_imm}\n"
             )
         else:
-            # Non-zero init: borrow one GP to compute the value, store,
-            # free immediately. Allocator is free to spill if needed.
             init_gp = ra.allocate_gp(1)[0]
             self.shim.compiler.generated_code += (
                 f"; for {loop_var.name} in [{init_imm}, {init_imm + extent_imm}) "
@@ -3205,30 +3278,39 @@ class IsaEmitterPass:
                         f"no ISA dispatcher for nested op kind {sub_op.kind!r} "
                         f"inside for-loop"
                     )
+                # Depth-first: each body op gets the next [NN] index,
+                # right after the enclosing for. Nested fors recurse and
+                # advance the counter further, matching _format_ops.
+                self._lowir_idx += 1
+                self.materializer.set_lowir_op_idx(self._lowir_idx)
                 ra.push_site(f"for[{loop_var.name}].body[{j}] {sub_op.kind}")
+                self.materializer.begin_op()
                 try:
                     handler(mod, sub_op)
                 finally:
+                    self.materializer.end_op()
                     ra.pop_site()
+
+            # idx += 1: load -> addi -> store. Borrow one GP for the
+            # round-trip. Inside the try so a body failure still hits the
+            # finally's GP / idx-slot release.
+            inc_gp = ra.allocate_gp(1)[0]
+            self.shim.compiler.generated_code += (
+                f"; idx {loop_var.name} += 1 (ram[{idx_addr}])\n"
+                f"S_LD_INT gp{inc_gp}, gp0, {idx_addr}\n"
+                f"S_ADDI_INT gp{inc_gp}, gp{inc_gp}, 1\n"
+                f"S_ST_INT gp{inc_gp}, gp0, {idx_addr}\n"
+                f"C_LOOP_END gp{gp_loop}\n"
+            )
+            ra.free_gp([inc_gp])
         finally:
-            del self.symbol_table[loop_var]
-
-        # idx += 1: load -> addi -> store. Borrow one GP for the round-
-        # trip (auto-spill may briefly displace some other live GP, but
-        # gp_loop is pinned so it cannot be the victim).
-        inc_gp = ra.allocate_gp(1)[0]
-        self.shim.compiler.generated_code += (
-            f"; idx {loop_var.name} += 1 (ram[{idx_addr}])\n"
-            f"S_LD_INT gp{inc_gp}, gp0, {idx_addr}\n"
-            f"S_ADDI_INT gp{inc_gp}, gp{inc_gp}, 1\n"
-            f"S_ST_INT gp{inc_gp}, gp0, {idx_addr}\n"
-            f"C_LOOP_END gp{gp_loop}\n"
-        )
-        ra.free_gp([inc_gp])
-
-        ra.unpin_gp(gp_loop)
-        ra.free_gp([gp_loop])
-        ra.release_idx_slot(idx_addr)
+            # Release loop-owned state on EVERY exit path — including a
+            # body exception. ``gp_loop`` is a reserved GP (assigned by
+            # loop_register_alloc, never taken from the free pool), so we
+            # only unpin it — NOT free_gp, which would corrupt the pool.
+            self.symbol_table.pop(loop_var, None)
+            ra.unpin_gp(gp_loop)
+            ra.release_idx_slot(idx_addr)
 
 
 def _check_scope(buf: _hlir.Buffer, expected: str, op_kind: str, role: str) -> None:

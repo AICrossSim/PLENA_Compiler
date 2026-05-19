@@ -54,6 +54,8 @@ Bias (optional):
 
 import tilelang.language as T
 
+from ..plena_settings import load_sizes as _load_sizes
+
 
 def make_linear_min(
     *,
@@ -75,7 +77,9 @@ def make_linear_min(
     ``bx*MLEN + c_col_offset``. ``c_col_offset`` must be a multiple of
     MLEN so the 64-wide tile lands on an aligned column block.
     """
-    MLEN = 64
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
     if m_blocks < 1 or n_blocks < 1 or k_blocks < 1:
         raise ValueError(
             f"m_blocks/n_blocks/k_blocks must be >= 1; "

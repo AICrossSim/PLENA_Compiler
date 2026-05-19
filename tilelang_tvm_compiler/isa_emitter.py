@@ -107,19 +107,23 @@ class ISAEmitter:
         generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len} \n"
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register} \n"
         a_offset_register = set_stride_register
-        generated_code += f"C_LOOP_START gp{outer_loop_register}, {load_amount_per_hidden} \n"
-        generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_actual_register}, 0 \n"
-        if batch > preload_len:
-            generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / preload_len)} \n"
-        generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, a{activation_offset_reg}, 1, 0 \n"
-        generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len} \n"
-        if batch > preload_len:
-            generated_code += (
-                f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {stride_len * preload_len} \n"
-            )
-            generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
-        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
-        generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
+        # Compile-time unrolled twin C_LOOP. ``result`` and ``a_offset``
+        # were running registers advanced by S_ADDI_INT each iter; we
+        # now bake every (outer, inner) address in as a literal. No
+        # C_LOOP, no per-iter advance.
+        inner_count = math.ceil(batch / preload_len) if batch > preload_len else 1
+        for outer in range(load_amount_per_hidden):
+            for inner in range(inner_count):
+                result_addr = act_vram_offset + (
+                    outer * inner_count + inner) * vlen * preload_len
+                a_off = outer * vlen + (
+                    inner * stride_len * preload_len if batch > preload_len else 0)
+                generated_code += f"S_ADDI_INT gp{result_register}, gp0, {result_addr} \n"
+                generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_actual_register}, {a_off} \n"
+                generated_code += (
+                    f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, "
+                    f"a{activation_offset_reg}, 1, 0 \n"
+                )
         return generated_code
 
     def _emit_store_tile_isa(
@@ -173,17 +177,21 @@ class ISAEmitter:
         generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len}\n"
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register}\n"
         hbm_base_reg = set_stride_register
-        generated_code += f"C_LOOP_START gp{outer_loop_register}, {store_amount_per_hidden}\n"
-        generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_offset_reg}, 0\n"
-        if batch > store_amount:
-            generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / store_amount)}\n"
-        generated_code += f"H_STORE_V gp{vram_reg}, gp{hbm_base_reg}, a{hbm_addr_reg}, 1, 0\n"
-        generated_code += f"S_ADDI_INT gp{vram_reg}, gp{vram_reg}, {vlen * store_amount}\n"
-        if batch > store_amount:
-            generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_base_reg}, {stride_len * store_amount}\n"
-            generated_code += f"C_LOOP_END gp{inner_loop_register}\n"
-        generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {vlen}\n"
-        generated_code += f"C_LOOP_END gp{outer_loop_register}\n"
+        # Compile-time unrolled twin C_LOOP. ``vram_reg`` ran across
+        # both loops; ``hbm_base`` was reset to ``hbm_offset + outer*vlen``
+        # each outer iter and advanced inner. Bake all addresses in as
+        # literals — no C_LOOP, no per-iter advance.
+        inner_count = math.ceil(batch / store_amount) if batch > store_amount else 1
+        for outer in range(store_amount_per_hidden):
+            for inner in range(inner_count):
+                vram_off = (outer * inner_count + inner) * vlen * store_amount
+                hbm_off = outer * vlen + (
+                    inner * stride_len * store_amount if batch > store_amount else 0)
+                generated_code += f"S_ADDI_INT gp{vram_reg}, gp0, {act_vram_offset + vram_off}\n"
+                generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_offset_reg}, {hbm_off}\n"
+                generated_code += (
+                    f"H_STORE_V gp{vram_reg}, gp{hbm_base_reg}, a{hbm_addr_reg}, 1, 0\n"
+                )
         return generated_code
 
     def emit_hbm_tile_to_mram(
@@ -268,7 +276,11 @@ class ISAEmitter:
         isa += reset_reg_asm(alive_registers=gp_preload)
         isa += self._emit_preload_tile_isa(
             vlen=self.program.mlen,
-            preload_len=self.program.blen,
+            # Rows per H_PREFETCH_V instruction = the emulator's
+            # PREFETCH_V_AMOUNT. Using blen here emitted AMOUNT/blen×
+            # too many prefetches with wrong strides (data landed in
+            # the wrong VRAM rows -> downstream all-zero).
+            preload_len=self.program.v_prefetch_amount,
             batch=self.program.mlen,
             hidden_size=self.program.mlen,
             act_vram_offset=vram_addr,
@@ -320,7 +332,9 @@ class ISAEmitter:
             stride_size=self.program.mlen if hbm_stride is None else int(hbm_stride),
             scale_size=self.program.tile_elems if hbm_scale_size is None else int(hbm_scale_size),
             hbm_start_offset=int(hbm_start_offset),
-            store_amount=self.program.blen,
+            # Rows per H_STORE_V instruction = the emulator's
+            # STORE_V_AMOUNT (see preload_len note above).
+            store_amount=self.program.v_writeback_amount,
             hbm_start_offset_reg=hbm_start_offset_reg,
         )
         self.program.compiler.generated_code += isa
@@ -338,17 +352,17 @@ class ISAEmitter:
         loop_count = self.program.mlen if num_rows is None else int(num_rows)
         if loop_count < 1:
             raise ValueError(f"num_rows must be >= 1, got {loop_count}")
-        gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
-        gp, gp_loop = gp_regs
-        lines = [f"; zero tile vram[{vram_addr}] rows={loop_count}"]
-        lines.append(f"S_ADDI_INT gp{gp}, gp0, {vram_addr}")
-        if loop_count == 1:
+        gp_regs = self.program.compiler.register_allocator.allocate_gp(1)
+        (gp,) = gp_regs
+        # Compile-time unrolled: emit one V_MUL_VF per row with the row
+        # address baked in as a literal. No C_LOOP, no per-iter
+        # S_ADDI_INT address advance — kills the gp loop-maintenance
+        # overhead the hardware loop incurs.
+        lines = [f"; zero tile vram[{vram_addr}] rows={loop_count} (unrolled)"]
+        for i in range(loop_count):
+            row_addr = vram_addr + i * self.program.mlen
+            lines.append(f"S_ADDI_INT gp{gp}, gp0, {row_addr}")
             lines.append(f"V_MUL_VF gp{gp}, gp{gp}, f0, 0")
-        else:
-            lines.append(f"C_LOOP_START gp{gp_loop}, {loop_count}")
-            lines.append(f"V_MUL_VF gp{gp}, gp{gp}, f0, 0")
-            lines.append(f"S_ADDI_INT gp{gp}, gp{gp}, {self.program.mlen}")
-            lines.append(f"C_LOOP_END gp{gp_loop}")
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
@@ -367,16 +381,16 @@ class ISAEmitter:
             raise ValueError(
                 f"emit_map_v_fp_tile currently requires row_width == mlen == {self.program.mlen}, got {row_width}"
             )
-        gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
-        gp_dst, gp_src, gp_loop = gp_regs
-        lines = [f"; map fp tile task {task_id} fpram[{fpram_addr}] -> vram[{vram_addr}]"]
-        lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {vram_addr}")
-        lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {fpram_addr}")
-        lines.append(f"C_LOOP_START gp{gp_loop}, {row_count}")
-        lines.append(f"S_MAP_V_FP gp{gp_dst}, gp{gp_src}, 0")
-        lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {row_width}")
-        lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {row_width}")
-        lines.append(f"C_LOOP_END gp{gp_loop}")
+        gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
+        gp_dst, gp_src = gp_regs
+        # Compile-time unrolled: row addresses baked in as literals, one
+        # S_MAP_V_FP per row, no C_LOOP / per-iter address advance.
+        lines = [f"; map fp tile task {task_id} fpram[{fpram_addr}] -> "
+                 f"vram[{vram_addr}] (unrolled, {row_count} rows)"]
+        for i in range(row_count):
+            lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {vram_addr + i * row_width}")
+            lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {fpram_addr + i * row_width}")
+            lines.append(f"S_MAP_V_FP gp{gp_dst}, gp{gp_src}, 0")
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
@@ -395,16 +409,16 @@ class ISAEmitter:
             raise ValueError(
                 f"emit_map_fp_v_tile currently requires row_width == mlen == {self.program.mlen}, got {row_width}"
             )
-        gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
-        gp_dst, gp_src, gp_loop = gp_regs
-        lines = [f"; map fp tile task {task_id} vram[{vram_addr}] -> fpram[{fpram_addr}]"]
-        lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {fpram_addr}")
-        lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {vram_addr}")
-        lines.append(f"C_LOOP_START gp{gp_loop}, {row_count}")
-        lines.append(f"S_MAP_FP_V gp{gp_dst}, gp{gp_src}, 0")
-        lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {row_width}")
-        lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {row_width}")
-        lines.append(f"C_LOOP_END gp{gp_loop}")
+        gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
+        gp_dst, gp_src = gp_regs
+        # Compile-time unrolled: row addresses baked in as literals, one
+        # S_MAP_FP_V per row, no C_LOOP / per-iter address advance.
+        lines = [f"; map fp tile task {task_id} vram[{vram_addr}] -> "
+                 f"fpram[{fpram_addr}] (unrolled, {row_count} rows)"]
+        for i in range(row_count):
+            lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {fpram_addr + i * row_width}")
+            lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {vram_addr + i * row_width}")
+            lines.append(f"S_MAP_FP_V gp{gp_dst}, gp{gp_src}, 0")
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
@@ -592,13 +606,15 @@ class ISAEmitter:
                     rhs_start, _, rhs_step = rhs_prog
                     act_addr = lhs_start + orow * self.program.blen * self.program.mlen
                     mat_addr = rhs_start + oc * self.program.blen
-                    lines.append(f"S_ADDI_INT gp{gp_act}, gp0, {act_addr}")
-                    lines.append(f"S_ADDI_INT gp{gp_mat}, gp0, {mat_addr}")
-                    lines.append(f"C_LOOP_START gp{gp_loop}, {pair_count}")
-                    lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
-                    lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {lhs_step}")
-                    lines.append(f"S_ADDI_INT gp{gp_mat}, gp{gp_mat}, {rhs_step}")
-                    lines.append(f"C_LOOP_END gp{gp_loop}")
+                    # Compile-time unrolled: one M_MM per (act,mat) pair
+                    # with both addresses baked in as literals. No
+                    # C_LOOP, no per-iter S_ADDI_INT advance.
+                    for p in range(pair_count):
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_act}, gp0, {act_addr + p * lhs_step}")
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_mat}, gp0, {mat_addr + p * rhs_step}")
+                        lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
                 else:
                     for lhs_addr, rhs_addr in zip(lhs_vram_addrs, rhs_mram_addrs):
                         act_addr = lhs_addr + orow * self.program.blen * self.program.mlen
@@ -659,30 +675,29 @@ class ISAEmitter:
         # pass gp_act_row_base / gp_mat_col_base directly. gp_act_row_base
         # is advanced inside the orow loop (output_row_stride per iter)
         # and re-loaded with lhs_vram_addr at the top of each oc iter.
+        # Compile-time unrolled twin C_LOOP over (oc, orow). Original:
+        #   oc loop: mat_col_base += blen, result_col_base += blen
+        #     orow loop: act_row_base += output_row_stride,
+        #                result += output_row_stride
+        # Every address is now a literal — no C_LOOP, no per-iter advance.
         lines = [
-            f"; matmul (single-tile, hw-loop) task {task_id} "
+            f"; matmul (single-tile, unrolled) task {task_id} "
             f"lhs=vram[{lhs_vram_addr}] rhs=mram[{rhs_mram_addr}] "
             f"dst=vram[{dst_vram_addr}]  "
-            f"regs: act_row_base=gp{gp_act_row_base} "
-            f"mat_col_base=gp{gp_mat_col_base} "
-            f"result_col_base=gp{gp_result_col_base} "
-            f"result=gp{gp_result} "
-            f"hw_loops=gp{gp_loop_outer}/gp{gp_loop_middle}",
-            f"S_ADDI_INT gp{gp_mat_col_base}, gp0, {rhs_mram_addr}",
-            f"S_ADDI_INT gp{gp_result_col_base}, gp0, {dst_vram_addr}",
-            f"C_LOOP_START gp{gp_loop_outer}, {tiles_per_mlen}",
-            f"S_ADDI_INT gp{gp_act_row_base}, gp0, {lhs_vram_addr}",
-            f"S_ADDI_INT gp{gp_result}, gp{gp_result_col_base}, 0",
-            f"C_LOOP_START gp{gp_loop_middle}, {tiles_per_mlen}",
-            f"M_MM 0, gp{gp_mat_col_base}, gp{gp_act_row_base}",
-            f"M_MM_WO gp{gp_result}, gp0, 0",
-            f"S_ADDI_INT gp{gp_act_row_base}, gp{gp_act_row_base}, {output_row_stride}",
-            f"S_ADDI_INT gp{gp_result}, gp{gp_result}, {output_row_stride}",
-            f"C_LOOP_END gp{gp_loop_middle}",
-            f"S_ADDI_INT gp{gp_mat_col_base}, gp{gp_mat_col_base}, {blen}",
-            f"S_ADDI_INT gp{gp_result_col_base}, gp{gp_result_col_base}, {blen}",
-            f"C_LOOP_END gp{gp_loop_outer}",
+            f"regs: act=gp{gp_act_row_base} mat=gp{gp_mat_col_base} "
+            f"result=gp{gp_result}",
         ]
+        for oc in range(tiles_per_mlen):
+            mat_col = rhs_mram_addr + oc * blen
+            result_col = dst_vram_addr + oc * blen
+            for orow in range(tiles_per_mlen):
+                act_row = lhs_vram_addr + orow * output_row_stride
+                result = result_col + orow * output_row_stride
+                lines.append(f"S_ADDI_INT gp{gp_mat_col_base}, gp0, {mat_col}")
+                lines.append(f"S_ADDI_INT gp{gp_act_row_base}, gp0, {act_row}")
+                lines.append(f"S_ADDI_INT gp{gp_result}, gp0, {result}")
+                lines.append(f"M_MM 0, gp{gp_mat_col_base}, gp{gp_act_row_base}")
+                lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
         ra.free_gp(gp_regs)
 
@@ -741,12 +756,20 @@ class ISAEmitter:
             else:
                 out_addr = dst_vram_addr + dst_col_offset + oc * self.program.blen
                 lines.append(f"S_ADDI_INT gp{gp_out}, gp0, {out_addr}")
-            lines.append(f"C_LOOP_START gp{gp_loop}, {tiles_per_mlen}")
-            lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
-            lines.append(f"M_MM_WO gp{gp_out}, gp0, 0")
-            lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {self.program.blen * self.program.mlen}")
-            lines.append(f"S_ADDI_INT gp{gp_out}, gp{gp_out}, {self.program.blen * self.program.mlen}")
-            lines.append(f"C_LOOP_END gp{gp_loop}")
+            # Compile-time unrolled inner C_LOOP. gp_act / gp_out were
+            # set above (possibly off a register base); for the first
+            # iter reuse them as-is, for the rest re-derive off the same
+            # base + literal offset. gp_act may sit on lhs_vram_addr_reg,
+            # so advance relative to its current value with S_ADDI_INT.
+            row_stride = self.program.blen * self.program.mlen
+            for t in range(tiles_per_mlen):
+                if t > 0:
+                    lines.append(
+                        f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {row_stride}")
+                    lines.append(
+                        f"S_ADDI_INT gp{gp_out}, gp{gp_out}, {row_stride}")
+                lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
+                lines.append(f"M_MM_WO gp{gp_out}, gp0, 0")
 
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
@@ -798,19 +821,22 @@ class ISAEmitter:
         ]
         lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, 1")
 
+        act_row_stride = self.program.blen * self.program.mlen
         for oc in range(tiles_per_slot):
             act_addr = lhs_vram_addr
             mat_addr = rhs_mram_addr + rhs_col_offset + oc * self.program.blen
             out_addr = dst_vram_addr + dst_col_offset + oc * self.program.blen
-            lines.append(f"S_ADDI_INT gp{gp_act}, gp0, {act_addr}")
             lines.append(f"S_ADDI_INT gp{gp_mat}, gp0, {mat_addr}")
-            lines.append(f"S_ADDI_INT gp{gp_out}, gp0, {out_addr}")
-            lines.append(f"C_LOOP_START gp{gp_loop}, {tiles_per_mlen}")
-            lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
-            lines.append(f"M_MM_WO gp{gp_out}, gp0, 0")
-            lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {self.program.blen * self.program.mlen}")
-            lines.append(f"S_ADDI_INT gp{gp_out}, gp{gp_out}, {output_row_stride}")
-            lines.append(f"C_LOOP_END gp{gp_loop}")
+            # Compile-time unrolled inner C_LOOP — act/out addresses baked
+            # in as literals (act steps by blen*mlen, out by the dst row
+            # stride). No C_LOOP, no per-iter advance.
+            for t in range(tiles_per_mlen):
+                lines.append(
+                    f"S_ADDI_INT gp{gp_act}, gp0, {act_addr + t * act_row_stride}")
+                lines.append(
+                    f"S_ADDI_INT gp{gp_out}, gp0, {out_addr + t * output_row_stride}")
+                lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
+                lines.append(f"M_MM_WO gp{gp_out}, gp0, 0")
 
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
         ra.free_gp(gp_regs)
@@ -1147,20 +1173,20 @@ class ISAEmitter:
         loop_count = self.program.mlen if num_rows is None else int(num_rows)
         if loop_count < 1:
             raise ValueError(f"num_rows must be >= 1, got {loop_count}")
-        gp_regs = self.program.compiler.register_allocator.allocate_gp(4)
-        gp_dst, gp_lhs, gp_rhs, gp_loop = gp_regs
+        gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
+        gp_dst, gp_lhs, gp_rhs = gp_regs
+        # Compile-time unrolled: one V_*_VV per row, all three operand
+        # row addresses baked in as literals. No C_LOOP, no per-iter
+        # S_ADDI_INT advance.
         lines = [
-            f"; tile binary task {task_id} op={op} rows={loop_count}",
+            f"; tile binary task {task_id} op={op} rows={loop_count} (unrolled)",
         ]
-        lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_vram_addr}")
-        lines.append(f"S_ADDI_INT gp{gp_lhs}, gp0, {lhs_vram_addr}")
-        lines.append(f"S_ADDI_INT gp{gp_rhs}, gp0, {rhs_vram_addr}")
-        lines.append(f"C_LOOP_START gp{gp_loop}, {loop_count}")
-        lines.append(f"{op_to_insn[op]} gp{gp_dst}, gp{gp_lhs}, gp{gp_rhs}, 0")
-        lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.program.mlen}")
-        lines.append(f"S_ADDI_INT gp{gp_lhs}, gp{gp_lhs}, {self.program.mlen}")
-        lines.append(f"S_ADDI_INT gp{gp_rhs}, gp{gp_rhs}, {self.program.mlen}")
-        lines.append(f"C_LOOP_END gp{gp_loop}")
+        mlen = self.program.mlen
+        for i in range(loop_count):
+            lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_vram_addr + i * mlen}")
+            lines.append(f"S_ADDI_INT gp{gp_lhs}, gp0, {lhs_vram_addr + i * mlen}")
+            lines.append(f"S_ADDI_INT gp{gp_rhs}, gp0, {rhs_vram_addr + i * mlen}")
+            lines.append(f"{op_to_insn[op]} gp{gp_dst}, gp{gp_lhs}, gp{gp_rhs}, 0")
         self.program.compiler.register_allocator.free_gp(gp_regs)
         self.program.compiler.generated_code += "\n".join(lines) + "\n"
 
@@ -1197,99 +1223,54 @@ class ISAEmitter:
         if src2_addrs is not None and len(src2_addrs) != len(dst_addrs):
             raise ValueError("emit_fp_kernel expects matched src2/dst lengths")
         if op in unary_copy:
-            gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
-            gp_src, gp_dst, gp_loop = gp_regs
-            lines = [f"; fp kernel task {task_id} op={op}"]
-            src_prog = self.program._arith_progression([int(addr) for addr in src1_addrs])
-            dst_prog = self.program._arith_progression([int(addr) for addr in dst_addrs])
-            if src_prog is not None and dst_prog is not None:
-                src_start, count, src_step = src_prog
-                dst_start, _, dst_step = dst_prog
-                lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {src_start}")
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_start}")
-                lines.append(f"C_LOOP_START gp{gp_loop}, {count}")
+            gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
+            gp_src, gp_dst = gp_regs
+            # Compile-time unrolled — one S_LD_FP/S_ST_FP pair per slot
+            # with literal addresses. No C_LOOP / arith-progression
+            # address-advance loop.
+            lines = [f"; fp kernel task {task_id} op={op} (unrolled)"]
+            for src_addr, dst_addr in zip(src1_addrs, dst_addrs):
+                lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {int(src_addr)}")
+                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {int(dst_addr)}")
                 lines.append(f"S_LD_FP f1, gp{gp_src}, 0")
                 lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
-                lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {src_step}")
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {dst_step}")
-                lines.append(f"C_LOOP_END gp{gp_loop}")
-            else:
-                for src_addr, dst_addr in zip(src1_addrs, dst_addrs):
-                    lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {int(src_addr)}")
-                    lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {int(dst_addr)}")
-                    lines.append(f"S_LD_FP f1, gp{gp_src}, 0")
-                    lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
             self.program.compiler.register_allocator.free_gp(gp_regs)
             self.program.compiler.generated_code += "\n".join(lines) + "\n"
             return
         if op in unary_math:
-            gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
-            gp_src, gp_dst, gp_loop = gp_regs
-            lines = [f"; fp kernel task {task_id} op={op}"]
-            src_prog = self.program._arith_progression([int(addr) for addr in src1_addrs])
-            dst_prog = self.program._arith_progression([int(addr) for addr in dst_addrs])
-            if src_prog is not None and dst_prog is not None:
-                src_start, count, src_step = src_prog
-                dst_start, _, dst_step = dst_prog
-                lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {src_start}")
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_start}")
-                lines.append(f"C_LOOP_START gp{gp_loop}, {count}")
+            gp_regs = self.program.compiler.register_allocator.allocate_gp(2)
+            gp_src, gp_dst = gp_regs
+            # Compile-time unrolled — one load / math / store per slot,
+            # literal addresses, no C_LOOP.
+            lines = [f"; fp kernel task {task_id} op={op} (unrolled)"]
+            for src_addr, dst_addr in zip(src1_addrs, dst_addrs):
+                lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {int(src_addr)}")
+                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {int(dst_addr)}")
                 lines.append(f"S_LD_FP f1, gp{gp_src}, 0")
                 if op in {"exp", "reci"}:
                     lines.append(f"{unary_math[op]} f1, f1, 0")
                 else:
                     lines.append(f"{unary_math[op]} f1, f1")
                 lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
-                lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {src_step}")
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {dst_step}")
-                lines.append(f"C_LOOP_END gp{gp_loop}")
-            else:
-                for src_addr, dst_addr in zip(src1_addrs, dst_addrs):
-                    lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {int(src_addr)}")
-                    lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {int(dst_addr)}")
-                    lines.append(f"S_LD_FP f1, gp{gp_src}, 0")
-                    if op in {"exp", "reci"}:
-                        lines.append(f"{unary_math[op]} f1, f1, 0")
-                    else:
-                        lines.append(f"{unary_math[op]} f1, f1")
-                    lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
             self.program.compiler.register_allocator.free_gp(gp_regs)
             self.program.compiler.generated_code += "\n".join(lines) + "\n"
             return
         if op in binary_math:
             if src2_addrs is None:
                 raise ValueError(f"emit_fp_kernel op={op!r} requires src2_addrs")
-            gp_regs = self.program.compiler.register_allocator.allocate_gp(4)
-            gp_a, gp_b, gp_dst, gp_loop = gp_regs
-            lines = [f"; fp kernel task {task_id} op={op}"]
-            src1_prog = self.program._arith_progression([int(addr) for addr in src1_addrs])
-            src2_prog = self.program._arith_progression([int(addr) for addr in src2_addrs])
-            dst_prog = self.program._arith_progression([int(addr) for addr in dst_addrs])
-            if src1_prog is not None and src2_prog is not None and dst_prog is not None:
-                src1_start, count, src1_step = src1_prog
-                src2_start, _, src2_step = src2_prog
-                dst_start, _, dst_step = dst_prog
-                lines.append(f"S_ADDI_INT gp{gp_a}, gp0, {src1_start}")
-                lines.append(f"S_ADDI_INT gp{gp_b}, gp0, {src2_start}")
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_start}")
-                lines.append(f"C_LOOP_START gp{gp_loop}, {count}")
+            gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
+            gp_a, gp_b, gp_dst = gp_regs
+            # Compile-time unrolled — one load/load/math/store per slot,
+            # literal addresses, no C_LOOP.
+            lines = [f"; fp kernel task {task_id} op={op} (unrolled)"]
+            for src1_addr, src2_addr, dst_addr in zip(src1_addrs, src2_addrs, dst_addrs):
+                lines.append(f"S_ADDI_INT gp{gp_a}, gp0, {int(src1_addr)}")
+                lines.append(f"S_ADDI_INT gp{gp_b}, gp0, {int(src2_addr)}")
+                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {int(dst_addr)}")
                 lines.append(f"S_LD_FP f1, gp{gp_a}, 0")
                 lines.append(f"S_LD_FP f2, gp{gp_b}, 0")
                 lines.append(f"{binary_math[op]} f1, f1, f2")
                 lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
-                lines.append(f"S_ADDI_INT gp{gp_a}, gp{gp_a}, {src1_step}")
-                lines.append(f"S_ADDI_INT gp{gp_b}, gp{gp_b}, {src2_step}")
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {dst_step}")
-                lines.append(f"C_LOOP_END gp{gp_loop}")
-            else:
-                for src1_addr, src2_addr, dst_addr in zip(src1_addrs, src2_addrs, dst_addrs):
-                    lines.append(f"S_ADDI_INT gp{gp_a}, gp0, {int(src1_addr)}")
-                    lines.append(f"S_ADDI_INT gp{gp_b}, gp0, {int(src2_addr)}")
-                    lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {int(dst_addr)}")
-                    lines.append(f"S_LD_FP f1, gp{gp_a}, 0")
-                    lines.append(f"S_LD_FP f2, gp{gp_b}, 0")
-                    lines.append(f"{binary_math[op]} f1, f1, f2")
-                    lines.append(f"S_ST_FP f1, gp{gp_dst}, 0")
             self.program.compiler.register_allocator.free_gp(gp_regs)
             self.program.compiler.generated_code += "\n".join(lines) + "\n"
             return

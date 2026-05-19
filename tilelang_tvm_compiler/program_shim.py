@@ -40,6 +40,12 @@ class ProgramShim:
     blen: int
     btmm_lane_count: int
     btmm_hlen: int
+    # Rows transferred per H_PREFETCH_V / H_STORE_V instruction — the
+    # emulator's PREFETCH_V_AMOUNT / STORE_V_AMOUNT. The DMA emit must
+    # use these (not blen) as the per-instruction VLEN-row count, or it
+    # emits AMOUNT/blen times too many instructions with wrong strides.
+    v_prefetch_amount: int = 1
+    v_writeback_amount: int = 1
     compiler: CompilerShim = field(default_factory=CompilerShim)
 
     @property
@@ -73,6 +79,8 @@ def make_shim(
     blen: int,
     btmm_lane_count: int,
     btmm_hlen: int,
+    v_prefetch_amount: int = 1,
+    v_writeback_amount: int = 1,
     register_allocator: Optional[RegisterAllocator] = None,
 ) -> ProgramShim:
     compiler = CompilerShim(register_allocator=register_allocator or RegisterAllocator())
@@ -84,6 +92,8 @@ def make_shim(
         blen=blen,
         btmm_lane_count=btmm_lane_count,
         btmm_hlen=btmm_hlen,
+        v_prefetch_amount=v_prefetch_amount,
+        v_writeback_amount=v_writeback_amount,
         compiler=compiler,
     )
 

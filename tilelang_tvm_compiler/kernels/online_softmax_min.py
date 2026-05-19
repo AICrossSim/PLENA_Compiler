@@ -16,6 +16,7 @@ import tvm
 from tvm.script import tir as T
 
 from ..address_alloc import FPRAM_USER_BASE
+from ..plena_settings import load_sizes as _load_sizes
 
 
 _SLOTS = ("M_OLD", "M_CURR", "M_RES", "L_OLD", "L_NEW", "P_SUM")
@@ -27,12 +28,18 @@ def _slot_bases(fp_state_elems: int) -> dict[str, int]:
 
 def make_online_softmax_hbm(
     *,
-    rows: int = 64,
-    hlen: int = 16,
+    rows: int | None = None,
+    hlen: int | None = None,
     lane_count: int = 4,
     active_lane: int = 0,
 ):
-    MLEN = 64
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
+    if hlen is None:
+        hlen = _hw.hlen
+    if rows is None:
+        rows = MLEN
     if rows != MLEN:
         raise ValueError(f"online_softmax_hbm currently requires rows == MLEN ({MLEN}), got {rows}")
     if hlen <= 0 or hlen > MLEN or MLEN % hlen != 0:
@@ -150,7 +157,8 @@ def make_online_softmax_hbm(
 
 
 def build_hbm_module(
-    *, rows: int = 64, hlen: int = 16, lane_count: int = 4, active_lane: int = 0,
+    *, rows: int | None = None, hlen: int | None = None,
+    lane_count: int = 4, active_lane: int = 0,
 ) -> tvm.IRModule:
     func, _ = make_online_softmax_hbm(
         rows=rows, hlen=hlen, lane_count=lane_count, active_lane=active_lane,

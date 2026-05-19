@@ -21,11 +21,13 @@ import math
 
 import tilelang.language as T
 
+from ..plena_settings import load_sizes as _load_sizes
+
 
 def make_gelu_min(
     *,
-    rows: int = 64,
-    hlen: int = 16,
+    rows: int | None = None,
+    hlen: int | None = None,
     head_count: int = 8,
     num_s_blocks: int = 2,
     batch: int = 1,
@@ -39,7 +41,13 @@ def make_gelu_min(
     uses this to drop GELU(mlp) into the right half of
     ``concat([attn, mlp])``.
     """
-    MLEN = 64
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
+    if hlen is None:
+        hlen = _hw.hlen
+    if rows is None:
+        rows = MLEN
     if rows != MLEN:
         raise ValueError(f"gelu_min requires rows == MLEN ({MLEN}), got {rows}")
     if MLEN % hlen != 0:

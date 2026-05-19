@@ -30,7 +30,7 @@ Design notes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from tvm import tir
 
@@ -87,12 +87,68 @@ class ExprMaterializer:
     def __init__(self, shim: ProgramShim, symbol_table: Dict[tir.Var, int]) -> None:
         self.shim = shim
         self.symbol_table = symbol_table
+        # Per-op IntRAM-idx load cache. An IntRAM-backed loop var
+        # (binding ``("ram", addr)``) would otherwise emit a fresh
+        # ``S_LD_INT`` on every single use inside one op's lowering.
+        # While an op is being lowered we cache ``ram_addr -> gp`` so the
+        # idx is loaded once and the register reused. The cache is a
+        # STACK of scopes (op lowering nests: a ``for`` op's handler
+        # dispatches child-op handlers); ``begin_op`` pushes a scope,
+        # ``end_op`` pops it and frees the GPs that scope loaded.
+        self._idx_cache_stack: List[Dict[int, int]] = []
+        # Optional lowir recorder. When non-None, every top-level
+        # ``materialize`` call appends the pre-register symbolic
+        # expression here, tagged with the current op index. This is
+        # the "last variable-form" snapshot the lowir report dumps —
+        # the exact expressions the ISA actually consumes, captured at
+        # the single var->gp chokepoint so the report can never drift
+        # from real codegen. None (default) = zero overhead.
+        self._lowir_log: Optional[List[tuple]] = None
+        self._lowir_op_idx: int = -1
+
+    # ------------------------------------------------------------------
+    # lowir recording — see _lowir_log
+    # ------------------------------------------------------------------
+    def enable_lowir_log(self) -> None:
+        """Start recording materialized expressions for the lowir report."""
+        self._lowir_log = []
+
+    def lowir_log(self) -> List[tuple]:
+        """Recorded ``(op_idx, expr_str)`` entries; empty if disabled."""
+        return self._lowir_log or []
+
+    def set_lowir_op_idx(self, idx: int) -> None:
+        """Tag subsequent recordings with this HLIR op index."""
+        self._lowir_op_idx = idx
+
+    # ------------------------------------------------------------------
+    # per-op lifetime — see _idx_cache_stack
+    # ------------------------------------------------------------------
+    def begin_op(self) -> None:
+        """Open a fresh idx-load cache scope for one op's lowering."""
+        self._idx_cache_stack.append({})
+
+    def end_op(self) -> None:
+        """Close the current scope: unpin + free every idx GP it loaded."""
+        if not self._idx_cache_stack:
+            return
+        scope = self._idx_cache_stack.pop()
+        ra = self.shim.compiler.register_allocator
+        for gp in scope.values():
+            ra.unpin_gp(gp)
+            ra.free_gp([gp])
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
     def materialize(self, expr) -> MaterializedExpr:
         """Top-level entry. Always returns a MaterializedExpr."""
+        if self._lowir_log is not None:
+            # Record the symbolic expression BEFORE register lowering —
+            # tir.Var loop indices (head_phase, row, ...) survive in the
+            # string, which is exactly the "last variable-form" the
+            # lowir report wants. str() of a tir node is side-effect free.
+            self._lowir_log.append((self._lowir_op_idx, str(expr)))
         return self._materialize(expr)
 
     # ------------------------------------------------------------------
@@ -248,6 +304,12 @@ class ExprMaterializer:
                 f"(known: {[x.name for x in self.symbol_table]!r})"
             )
         binding = self.symbol_table[v]
+        # Unrolled loop var: bound to a constant. Materialise the literal
+        # into a register (the materializer constant-folds any enclosing
+        # arithmetic before this point, so reaching here means the bare
+        # var itself is needed as a value).
+        if isinstance(binding, tir.IntImm):
+            return self._materialize_int(int(binding.value))
         if isinstance(binding, int):
             return MaterializedExpr(
                 register=binding, isa="", owns_register=False, _materializer=self
@@ -255,6 +317,18 @@ class ExprMaterializer:
         if isinstance(binding, tuple) and len(binding) == 2 and binding[0] == "ram":
             ram_addr = int(binding[1])
             ra = self.shim.compiler.register_allocator
+            # Per-op cache: if this op's lowering already loaded this
+            # IntRAM idx, reuse the register — skip the redundant
+            # S_LD_INT. The cached GP is owned by the op scope (freed by
+            # ``end_op``), so it is handed out as ``owns_register=False``
+            # — the caller's ``release()`` must NOT free it, or a later
+            # use in the same op would read a dead register.
+            scope = self._idx_cache_stack[-1] if self._idx_cache_stack else None
+            if scope is not None and ram_addr in scope:
+                return MaterializedExpr(
+                    register=scope[ram_addr], isa="",
+                    owns_register=False, _materializer=self,
+                )
             reg = ra.allocate_gp(1)[0]
             # IMPORTANT: write the load ISA directly to ``generated_code``
             # rather than the lazy ``isa`` field. Auto-spill (triggered by
@@ -266,6 +340,17 @@ class ExprMaterializer:
                 f"; load ram-backed idx {v.name} <- intram[{ram_addr}]\n"
                 f"S_LD_INT gp{reg}, gp0, {ram_addr}\n"
             )
+            if scope is not None:
+                # Cache + pin for the rest of this op's lowering so a
+                # later auto-spill can't evict the value out from under
+                # a subsequent reuse. ``end_op`` unpins + frees it.
+                ra.pin_gp(reg)
+                scope[ram_addr] = reg
+                return MaterializedExpr(
+                    register=reg, isa="", owns_register=False,
+                    _materializer=self,
+                )
+            # No active op scope (defensive): fall back to caller-owned.
             return MaterializedExpr(
                 register=reg, isa="", owns_register=True, _materializer=self
             )

@@ -132,11 +132,17 @@ def _emit_output_staging(
     tile_elems = mlen * mlen
     full_tensor_size = rows * cols
 
+    from .plena_settings import (
+        v_prefetch_amount as _v_prefetch_amount,
+        v_writeback_amount as _v_writeback_amount,
+    )
     shim = make_shim(
         mlen=target.mlen,
         blen=target.blen,
         btmm_lane_count=target.btmm_lane_count,
         btmm_hlen=target.btmm_hlen,
+        v_prefetch_amount=_v_prefetch_amount(),
+        v_writeback_amount=_v_writeback_amount(),
         register_allocator=RegisterAllocator(),
     )
     emitter = ISAEmitter(shim)
@@ -279,6 +285,15 @@ def _cmd_compile(args: argparse.Namespace) -> int:
 
     if args.dump_hlir:
         Path(args.dump_hlir).write_text(format_hlir(compiled.hlir))
+        # Companion lowir report: per-op physical address expressions
+        # in their "last variable-form" (pre-gp). Op indices line up
+        # with the .hlir.txt just written.
+        from tilelang_tvm_compiler.hlir import format_lowir
+        Path(args.dump_hlir).with_name(
+            f"{args.asm_name}.lowir.txt"
+        ).write_text(
+            format_lowir(compiled.hlir, compiled.lowir_log or [])
+        )
 
     # GP allocator trace: side-by-side TSV that any reader can align with
     # the ASM dump via the ``asm_line`` column. Column order is fixed so
@@ -360,10 +375,15 @@ def main(argv: list[str] | None = None) -> int:
     p_compile.add_argument("--asm-name", default="kernel")
     p_compile.add_argument("--output", default=None,
                            help="If given, write ISA to this path; else stdout.")
-    p_compile.add_argument("--mlen", type=int, default=64)
-    p_compile.add_argument("--blen", type=int, default=4)
-    p_compile.add_argument("--btmm-lane-count", type=int, default=4)
-    p_compile.add_argument("--btmm-hlen", type=int, default=16)
+    # Hardware sizes default to plena_settings.toml's active mode;
+    # an explicit flag still overrides for a one-off non-default run.
+    from .plena_settings import load_sizes as _load_sizes
+    _hw = _load_sizes()
+    p_compile.add_argument("--mlen", type=int, default=_hw.mlen)
+    p_compile.add_argument("--blen", type=int, default=_hw.blen)
+    p_compile.add_argument("--btmm-lane-count", type=int,
+                           default=_hw.hardware_lane_count)
+    p_compile.add_argument("--btmm-hlen", type=int, default=_hw.hlen)
     p_compile.add_argument(
         "--stage-output",
         default=None,

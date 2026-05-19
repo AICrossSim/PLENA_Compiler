@@ -26,10 +26,12 @@ verifiable.
 
 import tilelang.language as T
 
+from ..plena_settings import load_sizes as _load_sizes
+
 
 def make_concat_min(
     *,
-    rows: int = 64,
+    rows: int | None = None,
     a_dim: int = 128,
     b_dim: int = 128,
     num_s_blocks: int = 2,
@@ -47,7 +49,11 @@ def make_concat_min(
     walks MLEN-wide blocks). Inputs are the head-packed [B,S,1,dim]
     view; a BSHD producer output aliases this byte-for-byte.
     """
-    MLEN = 64
+    # Hardware sizes default to plena_settings.toml's active mode.
+    _hw = _load_sizes()
+    MLEN = _hw.mlen
+    if rows is None:
+        rows = MLEN
     if rows != MLEN:
         raise ValueError(f"concat_min requires rows == MLEN ({MLEN}), got {rows}")
     if a_dim % MLEN != 0:

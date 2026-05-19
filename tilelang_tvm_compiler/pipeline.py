@@ -17,7 +17,7 @@ fixed per chip variant.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +26,10 @@ from tvm import tir
 
 from .address_alloc import AddressAllocationPass, AddressAllocConfig
 from . import dead_buffer_elim as _dead_buffer_elim
+from . import fuse_adjacent_loops as _fuse_adjacent_loops
+from . import loop_interchange as _loop_interchange
+from . import loop_register_alloc as _loop_register_alloc
+from . import plena_settings as _plena_settings
 # Direct submodule imports to avoid the legacy frontend package's
 # __init__ (which imports compile_func → frontend/pipeline.py →
 # ..pipeline.PlenaTarget, a circular import once we land here).
@@ -50,12 +54,20 @@ from .register_alloc import RegisterAllocator
 
 @dataclass
 class PlenaTarget:
-    """Hardware-shape constants. Equivalent to TileTensorProgram() ctor."""
+    """Hardware-shape constants. Equivalent to TileTensorProgram() ctor.
 
-    mlen: int = 64
-    blen: int = 4
-    btmm_lane_count: int = 4   # group_heads
-    btmm_hlen: int = 16        # head dim per BTMM lane
+    Defaults are read from ``plena_settings.toml`` (the active mode's
+    MLEN / HLEN / BLEN) so the compiler and the simulator never drift.
+    Pass explicit values to override for a non-default target / test.
+    """
+
+    mlen: int = field(default_factory=_plena_settings.mlen)
+    blen: int = field(default_factory=_plena_settings.blen)
+    # group_heads — how many narrow heads pack into one MLEN vector.
+    btmm_lane_count: int = field(
+        default_factory=lambda: _plena_settings.load_sizes().hardware_lane_count
+    )
+    btmm_hlen: int = field(default_factory=_plena_settings.hlen)
 
 
 @dataclass
@@ -68,6 +80,12 @@ class CompiledKernel:
     # ``asm_line``/``site``/``event``/``free``/``in_use``/``pinned``
     # plus event-specific fields (regs, slot, addr, n, ...).
     gp_trace: list = None
+    # lowir recording: ``(op_idx, expr_str)`` pairs captured at the
+    # var->gp materialization chokepoint during ISA emit. Feeds the
+    # ``<kernel>.lowir.txt`` report — the symbolic "last variable-form"
+    # of every address expression the ISA actually consumes. Empty list
+    # if not recorded.
+    lowir_log: list = None
 
     def __repr__(self) -> str:
         return (
@@ -125,6 +143,23 @@ def compile_kernel(
         from .hlir import format_hlir as _fmt
         (midir_dump_dir / "post_to_plena.hlir.txt").write_text(_fmt(mod))
 
+    # ---------- 1.25. loop interchange + fusion to a fixed point ----------
+    # to_plena lowers each per-lane op into its own for-loop. Two
+    # structural passes alternate until the IR stops changing:
+    #   * loop_interchange — lifts a cluster ``for`` out of an enclosing
+    #     loop so it becomes a sibling of other cluster loops;
+    #   * fuse_adjacent_loops — merges adjacent same-shape loops.
+    # Alternating both to a fixed point lets interchange expose a fusion
+    # opportunity, fusion expose a further interchange, and so on.
+    # Structural-only — runs before address allocation. The iteration
+    # cap is a safety net; convergence is monotone (each step strictly
+    # reduces loop count or nesting) so it terminates well before it.
+    for _ in range(64):
+        mod, _ic_changed = _loop_interchange.run(mod)
+        mod, _fu_changed = _fuse_adjacent_loops.run(mod)
+        if not (_ic_changed or _fu_changed):
+            break
+
     # ---------- 1.5. drop unreachable buffers ----------
     # Buffers declared in the kernel but not referenced by any HLIR op
     # (e.g. softmax-state fragments in a stub kernel that bypasses
@@ -145,21 +180,37 @@ def compile_kernel(
     addr_pass = AddressAllocationPass(addr_cfg)
     addr_pass.run(mod)
 
+    # ---------- 2.5. loop-register allocation ----------
+    # Assign each serial ``for`` loop's C_LOOP counter (gp_loop) a GP by
+    # HLIR liveness, stamping it on the op. The returned set is reserved
+    # away from the emit-stage allocator so per-op temporaries can never
+    # collide with a loop counter. See doc/LOOP_REGISTER_ALLOC.md.
+    loop_reserved_gp = _loop_register_alloc.run(mod)
+
     # ---------- 3. ISA emit ----------
-    allocator = RegisterAllocator()
+    allocator = RegisterAllocator(
+        gp_reserved=(0, *sorted(loop_reserved_gp)),
+    )
     shim = make_shim(
         mlen=target.mlen,
         blen=target.blen,
         btmm_lane_count=target.btmm_lane_count,
         btmm_hlen=target.btmm_hlen,
+        v_prefetch_amount=_plena_settings.v_prefetch_amount(),
+        v_writeback_amount=_plena_settings.v_writeback_amount(),
         register_allocator=allocator,
     )
     isa_pass = IsaEmitterPass(shim)
+    # Record symbolic address expressions for the lowir report. Enabled
+    # before run() so the recorder captures the real emit pass — no
+    # second codegen pass, no drift from the actual ISA.
+    isa_pass.materializer.enable_lowir_log()
     isa_text = isa_pass.run(mod)
 
     return CompiledKernel(
         name=name, hlir=mod, isa_text=isa_text,
         gp_trace=allocator.trace_rows(),
+        lowir_log=list(isa_pass.materializer.lowir_log()),
     )
 
 
