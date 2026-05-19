@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -17,15 +18,19 @@ from compiler.aten.model_extract import (
     find_model_root,
 )
 import compiler.aten.ops as ops
+from asm_templates._imm import add_large_int as _add_large_int_lines
+from asm_templates._imm import load_large_int as _load_large_int_lines
 from compiler.aten.ops.registry import Backend, OpRegistry
 from compiler.aten.plena import PlenaCompiler
 from compiler.aten.reference import (
     ReferencePrecision,
+    ScheduledReferenceConfig,
     _ksplit_matmul,
     _make_rotate_half_matrix,
     make_rope_inputs,
     quantize_to_mxfp,
     run_decoder_reference,
+    run_native_decoder_scheduled_reference,
 )
 
 __all__ = [
@@ -41,29 +46,31 @@ _IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
 
 
 def _fix_large_immediates(isa_code: str) -> str:
-    """Post-process ISA: replace S_ADDI_INT gp{r}, gp0, {large} with S_LUI_INT + S_ADDI_INT.
+    """Post-process ISA so every S_ADDI_INT immediate fits in the 18-bit field.
 
-    PlenaCompiler emits raw S_ADDI_INT for VRAM/HBM addresses. At large
-    model dimensions these can exceed the 18-bit immediate limit. This pass
-    splits them into S_LUI_INT (upper 22 bits, shifted <<12) + S_ADDI_INT
-    (lower 12 bits), matching asm_templates._imm.load_large_int.
+    Absolute loads from gp0 use asm_templates._imm.load_large_int. Relative
+    adds use asm_templates._imm.add_large_int without a temp register, which
+    lowers to bounded S_ADDI_INT chunks and is safe as a compiler-wide pass.
     """
-    pattern = re.compile(r"^(\s*)S_ADDI_INT gp(\d+), gp0, (\d+)(.*)")
+    pattern = re.compile(r'^(\s*)S_ADDI_INT gp(\d+), gp(\d+), (\d+)(.*)')
     out = []
-    for line in isa_code.split("\n"):
+    for line in isa_code.split('\n'):
         m = pattern.match(line)
         if m:
-            indent, rd, imm_str, rest = m.groups()
+            indent, rd_str, rs_str, imm_str, rest = m.groups()
+            rd = int(rd_str)
+            rs = int(rs_str)
             imm = int(imm_str)
             if imm >= _IMM2_BOUND:
-                upper = imm >> 12
-                lower = imm & 0xFFF
-                out.append(f"{indent}S_LUI_INT gp{rd}, {upper}{rest}")
-                if lower:
-                    out.append(f"{indent}S_ADDI_INT gp{rd}, gp{rd}, {lower}{rest}")
+                replacement = (
+                    _load_large_int_lines(rd, imm)
+                    if rs == 0
+                    else _add_large_int_lines(rd, rs, imm, temp_reg=None)
+                )
+                out.extend(f"{indent}{replacement_line}{rest}" for replacement_line in replacement)
                 continue
         out.append(line)
-    return "\n".join(out)
+    return '\n'.join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +104,72 @@ class AttentionHeadPacking:
     total_q_dim: int
 
 
+@dataclass
+class StageCheckpointRecorder:
+    """Optional debug recorder for preserving VRAM stage boundaries.
+
+    The normal compiler reuses a small set of VRAM buffers. That is good for
+    execution, but bad for post-run validation because the final VRAM dump no
+    longer contains most intermediate values. When enabled, this recorder emits
+    explicit VRAM copies after selected stages and records their addresses.
+    """
+
+    enabled: bool = False
+    checkpoints: list[dict[str, Any]] | None = None
+
+    def __post_init__(self):
+        if self.checkpoints is None:
+            self.checkpoints = []
+
+    def record(
+        self,
+        prog,
+        *,
+        layer_idx: int | None,
+        stage: str,
+        tensor,
+        active_shape: tuple[int, int],
+        semantic: str,
+    ):
+        if not self.enabled:
+            return None
+
+        layer_part = "global" if layer_idx is None else f"l{layer_idx}"
+        safe_stage = re.sub(r"[^0-9A-Za-z_]+", "_", stage).strip("_")
+        name = f"checkpoint_{layer_part}_{safe_stage}"
+        checkpoint = prog.alloc(
+            name,
+            tensor.shape[0],
+            tensor.shape[1],
+            strict=False,
+            physical_shape=tensor.physical_shape,
+        )
+        prog.vram_fill_zero(checkpoint)
+        prog.vram_add(checkpoint, tensor)
+        addr = prog.get_vram_addr(checkpoint.name)
+        self.checkpoints.append(
+            {
+                "name": checkpoint.name,
+                "source": tensor.name,
+                "layer_idx": layer_idx,
+                "stage": stage,
+                "semantic": semantic,
+                "vram_addr": addr,
+                "active_shape": [int(active_shape[0]), int(active_shape[1])],
+                "logical_shape": [int(tensor.shape[0]), int(tensor.shape[1])],
+                "physical_shape": [int(tensor.physical_shape[0]), int(tensor.physical_shape[1])],
+            }
+        )
+        return checkpoint
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "kind": "native_decoder_vram_stage_checkpoints",
+            "checkpoints": list(self.checkpoints or []),
+        }
+
+
 def _ceil_to_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
@@ -111,6 +184,76 @@ def _pad_2d(tensor: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     out = torch.zeros((rows, cols), dtype=tensor.dtype, device=tensor.device)
     out[:src_rows, :src_cols] = tensor
     return out.contiguous()
+
+
+def _pad_batched_sequence_storage(
+    tensor: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    rows_per_batch: int,
+    cols: int,
+) -> torch.Tensor:
+    """Pad (B, S, C) data into independent per-batch row slabs."""
+    if tensor.dim() == 2:
+        if batch_size != 1:
+            raise ValueError(f"2D tensor storage is only valid for batch_size=1, got {batch_size}")
+        tensor = tensor.unsqueeze(0)
+    if tensor.dim() != 3:
+        raise ValueError(f"Expected 2D or 3D sequence tensor, got shape {tuple(tensor.shape)}")
+    if tensor.shape[0] != batch_size or tensor.shape[1] != seq_len:
+        raise ValueError(
+            f"Expected tensor shape ({batch_size}, {seq_len}, C), got {tuple(tensor.shape)}"
+        )
+    if rows_per_batch < seq_len:
+        raise ValueError(f"rows_per_batch={rows_per_batch} cannot cover seq_len={seq_len}")
+    if tensor.shape[2] > cols:
+        raise ValueError(f"Cannot pad tensor with {tensor.shape[2]} cols to {cols}")
+
+    out = torch.zeros((batch_size * rows_per_batch, cols), dtype=tensor.dtype, device=tensor.device)
+    for batch_idx in range(batch_size):
+        start = batch_idx * rows_per_batch
+        out[start:start + seq_len, : tensor.shape[2]] = tensor[batch_idx]
+    return out.contiguous()
+
+
+def _repeat_sequence_storage(
+    tensor: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    rows_per_batch: int,
+) -> torch.Tensor:
+    """Repeat a per-position table into per-batch row slabs."""
+    if tensor.dim() != 2:
+        raise ValueError(f"Expected 2D sequence table, got shape {tuple(tensor.shape)}")
+    if tensor.shape[0] < seq_len:
+        raise ValueError(f"Table rows {tensor.shape[0]} cannot cover seq_len={seq_len}")
+    out = torch.zeros(
+        (batch_size * rows_per_batch, tensor.shape[1]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    for batch_idx in range(batch_size):
+        start = batch_idx * rows_per_batch
+        out[start:start + seq_len] = tensor[:seq_len]
+    return out.contiguous()
+
+
+def _compact_active_sequence_rows(
+    tensor: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    rows_per_batch: int,
+    cols: int,
+) -> torch.Tensor:
+    """Gather active sequence rows from per-batch slabs into compact B*S rows."""
+    rows = []
+    for batch_idx in range(batch_size):
+        start = batch_idx * rows_per_batch
+        rows.append(tensor[start:start + seq_len, :cols])
+    return torch.cat(rows, dim=0).contiguous()
 
 
 def _pad_q_weight_grouped(weight: torch.Tensor, num_heads: int, head_dim: int, padded_hidden: int, padded_head_dim: int):
@@ -229,11 +372,12 @@ def _pad_decoder_weights_for_tiles(
         w_q = _pad_q_weight_grouped(weights.w_q, num_heads, head_dim, padded_hidden, padded_head_dim)
         w_o = _pad_o_weight_grouped(weights.w_o, num_heads, head_dim, padded_head_dim, padded_hidden)
 
+    kv_head_dim = head_packing.head_slot_dim if head_packing is not None and head_packing.enabled else padded_head_dim
     return LayerWeights(
         w_q=w_q,
         w_o=w_o,
-        w_k_heads=[_pad_2d(w, padded_hidden, padded_head_dim) for w in weights.w_k_heads],
-        w_v_heads=[_pad_2d(w, padded_hidden, padded_head_dim) for w in weights.w_v_heads],
+        w_k_heads=[_pad_2d(w, padded_hidden, kv_head_dim) for w in weights.w_k_heads],
+        w_v_heads=[_pad_2d(w, padded_hidden, kv_head_dim) for w in weights.w_v_heads],
         w_gate=_pad_2d(weights.w_gate, padded_hidden, padded_inter),
         w_up=_pad_2d(weights.w_up, padded_hidden, padded_inter),
         w_down=_pad_2d(weights.w_down, padded_inter, padded_hidden),
@@ -320,6 +464,27 @@ def _copy_into_vram_view(prog, source, name, rows, cols, vram_addr):
     return target
 
 
+def _reserve_vram_until(prog, min_next_addr: int, name: str):
+    """Bump the VRAM allocator above an absolute-address template workspace."""
+    current = prog.vram_allocator.next_free
+    if current >= min_next_addr:
+        return None
+    pad_elems = min_next_addr - current
+    pad_rows = (pad_elems + prog.mlen - 1) // prog.mlen
+    return prog.alloc(
+        name,
+        pad_rows,
+        prog.mlen,
+        strict=False,
+        physical_shape=(pad_rows, prog.mlen),
+    )
+
+
+def _ffn_absolute_workspace_end(physical_rows: int, hidden_size: int, inter_dim: int) -> int:
+    """Upper bound for the legacy FFN template's absolute low-VRAM workspace."""
+    return physical_rows * (hidden_size + 2 * inter_dim + max(hidden_size, inter_dim))
+
+
 def _free_named_tensors(prog, names):
     for name in names:
         tensor = prog._tensors.get(name)
@@ -336,9 +501,13 @@ def _emit_kv_stores(
     layer_idx,
     num_kv_heads,
     physical_rows: int | None = None,
+    checkpoint_recorder: StageCheckpointRecorder | None = None,
+    active_seq_len: int | None = None,
+    active_head_dim: int | None = None,
 ):
     rope_matrix, cos_var, sin_var = rope_inputs
     kv_stored = []
+    active_seq_len = active_seq_len or current.shape[0]
     for kv_h in range(num_kv_heads):
         kv_physical_shape = None
         if physical_rows is not None:
@@ -360,6 +529,24 @@ def _emit_kv_stores(
             f"V_{layer_idx}_h{kv_h}",
             physical_shape=v_physical_shape,
         )
+        checkpoint_cols = active_head_dim or K_h.shape[1]
+        if checkpoint_recorder is not None:
+            checkpoint_recorder.record(
+                prog,
+                layer_idx=layer_idx,
+                stage=f"k_proj_h{kv_h}",
+                tensor=K_h,
+                active_shape=(active_seq_len, checkpoint_cols),
+                semantic=f"K projection for KV head {kv_h} before RoPE",
+            )
+            checkpoint_recorder.record(
+                prog,
+                layer_idx=layer_idx,
+                stage=f"v_proj_h{kv_h}",
+                tensor=V_h,
+                active_shape=(active_seq_len, checkpoint_cols),
+                semantic=f"V projection for KV head {kv_h}",
+            )
 
         _apply_rope_projection(
             prog,
@@ -369,6 +556,15 @@ def _emit_kv_stores(
             sin_var,
             f"K_rot_{layer_idx}_h{kv_h}",
         )
+        if checkpoint_recorder is not None:
+            checkpoint_recorder.record(
+                prog,
+                layer_idx=layer_idx,
+                stage=f"k_rope_h{kv_h}",
+                tensor=K_h,
+                active_shape=(active_seq_len, checkpoint_cols),
+                semantic=f"K projection for KV head {kv_h} after RoPE",
+            )
 
         K_stored = prog.store(K_h, name=f"K_stored_{layer_idx}_h{kv_h}")
         V_stored = prog.store(V_h, name=f"V_stored_{layer_idx}_h{kv_h}")
@@ -394,10 +590,46 @@ def _emit_packed_attention_block(
     num_kv_heads,
     ratio,
     head_packing: AttentionHeadPacking,
+    checkpoint_recorder: StageCheckpointRecorder | None = None,
+    active_seq_len: int | None = None,
+    active_hidden: int | None = None,
+    batch_size: int = 1,
+    rows_per_batch: int | None = None,
+    active_seq_len_per_batch: int | None = None,
 ):
-    _save_residual_and_norm(prog, current, scratch)
+    active_seq_len = active_seq_len or seq_len
+    active_hidden = active_hidden or current.shape[1]
+    active_seq_len_per_batch = active_seq_len_per_batch or seq_len
+    rows_per_batch = rows_per_batch or max(prog.mlen, seq_len)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if rows_per_batch < active_seq_len_per_batch:
+        raise ValueError(
+            f"rows_per_batch={rows_per_batch} cannot cover active_seq_len={active_seq_len_per_batch}"
+        )
+    total_physical_rows = batch_size * rows_per_batch if batch_size > 1 else max(prog.mlen, seq_len)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="attn_input",
+            tensor=current,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="decoder layer input before attention RMS norm",
+        )
 
-    q_physical_shape = (max(prog.mlen, seq_len), head_packing.total_q_dim)
+    _save_residual_and_norm(prog, current, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="attn_norm",
+            tensor=current,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="attention RMS-normalized input",
+        )
+
+    q_physical_shape = (total_physical_rows, head_packing.total_q_dim)
     Q = _linear_projection(
         prog,
         current,
@@ -406,14 +638,24 @@ def _emit_packed_attention_block(
         physical_shape=q_physical_shape,
     )
     q_full_addr = prog.get_vram_addr(Q.name)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="q_full",
+            tensor=Q,
+            active_shape=(active_seq_len, head_packing.total_q_dim),
+            semantic="packed Q projection before RoPE",
+        )
 
     O_full = prog.alloc(
         f"O_full_{layer_idx}",
-        seq_len,
+        current.shape[0],
         head_packing.total_q_dim,
         strict=False,
-        physical_shape=(max(prog.mlen, seq_len), head_packing.total_q_dim),
+        physical_shape=(total_physical_rows, head_packing.total_q_dim),
     )
+    prog.vram_fill_zero(O_full)
     o_full_addr = prog.get_vram_addr(O_full.name)
 
     kv_stored = _emit_kv_stores(
@@ -423,7 +665,10 @@ def _emit_packed_attention_block(
         rope_inputs,
         layer_idx,
         num_kv_heads,
-        physical_rows=max(prog.mlen, seq_len),
+        physical_rows=total_physical_rows,
+        checkpoint_recorder=checkpoint_recorder,
+        active_seq_len=active_seq_len,
+        active_head_dim=head_packing.head_slot_dim,
     )
 
     scratch_rows = prog.mlen * (head_packing.broadcast_amount + ratio)
@@ -438,41 +683,127 @@ def _emit_packed_attention_block(
     rope_matrix, cos_var, sin_var = rope_inputs
     q_group_stride = Q.physical_shape[0] * prog.mlen
     o_group_stride = O_full.physical_shape[0] * prog.mlen
-    for kv_h in range(num_kv_heads):
-        q_group_addr = q_full_addr + kv_h * q_group_stride
-        Q_group = prog.alloc_at(
-            f"Q_group{kv_h}_{layer_idx}",
-            seq_len,
-            prog.mlen,
-            q_group_addr,
-            physical_shape=(Q.physical_shape[0], prog.mlen),
-        )
-        _apply_rope_projection(
-            prog,
-            Q_group,
-            rope_matrix,
-            cos_var,
-            sin_var,
-            f"Q_rot_{layer_idx}_g{kv_h}",
-        )
+    q_groups = []
+    if batch_size == 1:
+        for kv_h in range(num_kv_heads):
+            q_group_addr = q_full_addr + kv_h * q_group_stride
+            Q_group = prog.alloc_at(
+                f"Q_group{kv_h}_{layer_idx}",
+                seq_len,
+                prog.mlen,
+                q_group_addr,
+                physical_shape=(Q.physical_shape[0], prog.mlen),
+            )
+            _apply_rope_projection(
+                prog,
+                Q_group,
+                rope_matrix,
+                cos_var,
+                sin_var,
+                f"Q_rot_{layer_idx}_g{kv_h}",
+            )
+            q_groups.append(Q_group)
 
-        K_stored, V_stored = kv_stored[kv_h]
-        prog.flash_attention_packed_group(
-            Q_group,
-            K_stored,
-            V_stored,
+    roll_kv_groups = os.environ.get("PLENA_ROLL_KV_GROUPS", "1") != "0"
+    if batch_size == 1 and roll_kv_groups and num_kv_heads > 1:
+        prog.flash_attention_packed_groups_looped(
+            Q,
+            kv_stored,
             group_heads=ratio,
             head_slot_dim=head_packing.head_slot_dim,
-            output_base_address=o_full_addr + kv_h * o_group_stride,
+            output_base_address=o_full_addr,
             scratch_base_address=attn_scratch_addr,
             broadcast_amount=head_packing.broadcast_amount,
             scale=scale,
-            causal_mask=True,
+            causal_mask=causal_mask,
         )
+    elif batch_size == 1:
+        for kv_h, Q_group in enumerate(q_groups):
+            K_stored, V_stored = kv_stored[kv_h]
+            prog.flash_attention_packed_group(
+                Q_group,
+                K_stored,
+                V_stored,
+                group_heads=ratio,
+                head_slot_dim=head_packing.head_slot_dim,
+                output_base_address=o_full_addr + kv_h * o_group_stride,
+                scratch_base_address=attn_scratch_addr,
+                broadcast_amount=head_packing.broadcast_amount,
+                scale=scale,
+                causal_mask=causal_mask,
+                valid_cols=active_seq_len_per_batch,
+            )
+    else:
+        row_block_stride = rows_per_batch // prog.mlen
+        if rows_per_batch % prog.mlen != 0:
+            raise ValueError(f"rows_per_batch={rows_per_batch} must be a multiple of MLEN={prog.mlen}")
+        batch_vram_stride = rows_per_batch * prog.mlen
+        for batch_idx in range(batch_size):
+            batch_row_offset = batch_idx * batch_vram_stride
+            for kv_h in range(num_kv_heads):
+                q_group_addr = q_full_addr + kv_h * q_group_stride + batch_row_offset
+                Q_group = prog.alloc_at(
+                    f"Q_group{kv_h}_b{batch_idx}_{layer_idx}",
+                    active_seq_len_per_batch,
+                    prog.mlen,
+                    q_group_addr,
+                    physical_shape=(rows_per_batch, prog.mlen),
+                )
+                _apply_rope_projection(
+                    prog,
+                    Q_group,
+                    rope_matrix,
+                    cos_var,
+                    sin_var,
+                    f"Q_rot_{layer_idx}_g{kv_h}_b{batch_idx}",
+                )
+                K_stored, V_stored = kv_stored[kv_h]
+                prog.flash_attention_packed_group(
+                    Q_group,
+                    K_stored,
+                    V_stored,
+                    group_heads=ratio,
+                    head_slot_dim=head_packing.head_slot_dim,
+                    output_base_address=o_full_addr + kv_h * o_group_stride + batch_row_offset,
+                    scratch_base_address=attn_scratch_addr,
+                    broadcast_amount=head_packing.broadcast_amount,
+                    scale=scale,
+                    causal_mask=causal_mask,
+                    k_idx=batch_idx * row_block_stride,
+                    valid_cols=active_seq_len_per_batch,
+                )
 
     prog.free_tensor(attn_scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="o_full",
+            tensor=O_full,
+            active_shape=(active_seq_len, head_packing.total_q_dim),
+            semantic="packed attention output before output projection",
+        )
     O_proj = _linear_projection(prog, O_full, layer_inputs.w_o, f"O_proj_{layer_idx}")
-    return _add_residual(prog, O_proj, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="o_proj",
+            tensor=O_proj,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="attention output projection before residual add",
+        )
+    out = _add_residual(prog, O_proj, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="attn_residual",
+            tensor=out,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="attention block output after residual add",
+        )
+    return out
 
 
 def _emit_attention_block(
@@ -490,11 +821,44 @@ def _emit_attention_block(
     num_heads,
     num_kv_heads,
     ratio,
+    checkpoint_recorder: StageCheckpointRecorder | None = None,
+    active_seq_len: int | None = None,
+    active_hidden: int | None = None,
 ):
+    active_seq_len = active_seq_len or seq_len
+    active_hidden = active_hidden or current.shape[1]
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="attn_input",
+            tensor=current,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="decoder layer input before attention RMS norm",
+        )
+
     _save_residual_and_norm(prog, current, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="attn_norm",
+            tensor=current,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="attention RMS-normalized input",
+        )
 
     Q = _linear_projection(prog, current, layer_inputs.w_q, f"Q_{layer_idx}")
     q_full_addr = prog.get_vram_addr(Q.name)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="q_full",
+            tensor=Q,
+            active_shape=(active_seq_len, total_q_dim),
+            semantic="Q projection before per-head RoPE",
+        )
 
     O_full = prog.alloc(f"O_full_{layer_idx}", seq_len, total_q_dim, strict=False)
     o_full_addr = prog.get_vram_addr(O_full.name)
@@ -506,6 +870,9 @@ def _emit_attention_block(
         rope_inputs,
         layer_idx,
         num_kv_heads,
+        checkpoint_recorder=checkpoint_recorder,
+        active_seq_len=active_seq_len,
+        active_head_dim=head_dim,
     )
 
     rope_matrix, cos_var, sin_var = rope_inputs
@@ -544,22 +911,104 @@ def _emit_attention_block(
         )
         _free_named_tensors(prog, ("O", "S", "PV"))
 
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="o_full",
+            tensor=O_full,
+            active_shape=(active_seq_len, total_q_dim),
+            semantic="attention output before output projection",
+        )
     O_proj = _linear_projection(prog, O_full, layer_inputs.w_o, f"O_proj_{layer_idx}")
-    return _add_residual(prog, O_proj, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="o_proj",
+            tensor=O_proj,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="attention output projection before residual add",
+        )
+    out = _add_residual(prog, O_proj, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="attn_residual",
+            tensor=out,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="attention block output after residual add",
+        )
+    return out
 
 
-def _emit_ffn_block(prog, current, layer_inputs, scratch):
+def _emit_ffn_block(
+    prog,
+    current,
+    layer_inputs,
+    scratch,
+    layer_idx: int | None = None,
+    checkpoint_recorder: StageCheckpointRecorder | None = None,
+    active_seq_len: int | None = None,
+    active_hidden: int | None = None,
+):
+    active_seq_len = active_seq_len or current.shape[0]
+    active_hidden = active_hidden or current.shape[1]
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="ffn_input",
+            tensor=current,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="FFN block input before RMS norm",
+        )
     _save_residual_and_norm(prog, current, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="ffn_norm",
+            tensor=current,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="FFN RMS-normalized input",
+        )
     ops.ffn(prog, current, layer_inputs.w_gate, layer_inputs.w_up, layer_inputs.w_down)
-    return _add_residual(prog, current, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="ffn_out",
+            tensor=current,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="FFN projection output before residual add",
+        )
+    out = _add_residual(prog, current, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="ffn_residual",
+            tensor=out,
+            active_shape=(active_seq_len, active_hidden),
+            semantic="FFN block output after residual add",
+        )
+    return out
 
 
-def _register_layer_inputs(prog, layer_idx: int, weights: LayerWeights) -> LayerInputVars:
+def _register_layer_inputs(
+    prog,
+    layer_idx: int,
+    weights: LayerWeights,
+    physical_shapes: dict[str, tuple[int, int]] | None = None,
+) -> LayerInputVars:
     named_vars = {}
     w_k_heads = []
     w_v_heads = []
+    physical_shapes = physical_shapes or {}
     for tensor_name, tensor in weights.tensor_entries(layer_idx):
-        var = prog.input(tensor_name, shape=tuple(tensor.shape))
+        var = prog.input(tensor_name, shape=tuple(tensor.shape), physical_shape=physical_shapes.get(tensor_name))
         if tensor_name.startswith(f"W_k_{layer_idx}_h"):
             w_k_heads.append(var)
         elif tensor_name.startswith(f"W_v_{layer_idx}_h"):
@@ -578,12 +1027,50 @@ def _register_layer_inputs(prog, layer_idx: int, weights: LayerWeights) -> Layer
     )
 
 
+def _weight_physical_shapes_for_layer(
+    layer_idx: int,
+    weights: LayerWeights,
+    *,
+    head_packing: AttentionHeadPacking | None,
+    padded_head_dim: int,
+) -> dict[str, tuple[int, int]]:
+    if head_packing is None or not head_packing.enabled:
+        return {}
+
+    physical_shapes = {}
+    for kv_h, (w_k, w_v) in enumerate(zip(weights.w_k_heads, weights.w_v_heads)):
+        physical_shapes[f"W_k_{layer_idx}_h{kv_h}"] = (w_k.shape[0], padded_head_dim)
+        physical_shapes[f"W_v_{layer_idx}_h{kv_h}"] = (w_v.shape[0], padded_head_dim)
+    return physical_shapes
+
+
+def _tensor_layout_metadata(prog, input_tensors: dict[str, torch.Tensor]) -> dict[str, dict[str, list[int] | int]]:
+    layouts = {}
+    for name, tensor in input_tensors.items():
+        hbm_layout = prog.hbm_matrices.get(name)
+        if hbm_layout is None:
+            continue
+        source_shape = tuple(int(dim) for dim in tensor.shape)
+        storage_shape = tuple(int(dim) for dim in (hbm_layout.physical_shape or hbm_layout.full_shape))
+        if len(source_shape) < 2 or len(storage_shape) < 2:
+            continue
+        layouts[name] = {
+            "source_shape": list(source_shape),
+            "storage_shape": list(storage_shape),
+            "logical_shape": list(hbm_layout.full_shape),
+            "source_row_elements": source_shape[-1],
+            "storage_row_elements": storage_shape[-1],
+        }
+    return layouts
+
+
 # ---------------------------------------------------------------------------
 # Main compilation function
 # ---------------------------------------------------------------------------
 def compile_native_hf_decoder(
     model,
     seq_len: int = 64,
+    batch_size: int = 1,
     hidden_size: int | None = None,
     inter_dim: int | None = None,
     num_layers: int | None = None,
@@ -596,13 +1083,17 @@ def compile_native_hf_decoder(
     mram_tile_capacity: int = 4,
     seed: int = 42,
     golden_precision: str = "hardware",
+    reference_backend: str = "scheduled",
+    stage_checkpoints: bool = False,
     verbose: bool = False,
 ) -> dict:
     """Compile a HuggingFace decoder model at native dimensions to PLENA ISA metadata."""
-
     def _verbose(message: str = ""):
         if verbose:
             print(message)
+
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
 
     model_cfg = extract_model_config(model)
     if hidden_size is not None and hidden_size != model_cfg.hidden_size:
@@ -625,7 +1116,19 @@ def compile_native_hf_decoder(
     # Rows only need enough physical lanes for the matrix writeback group
     # (BLEN), not a full MLEN block. Columns/K dimensions still use MLEN
     # until the vector, norm, RoPE, and FFN templates learn true tail masks.
-    padded_seq_len = _ceil_to_multiple(seq_len, blen)
+    #
+    # Keep an opt-in compatibility path for reproducing older tile-scaling
+    # reports that padded sequence rows to MLEN.
+    seq_padding_multiple = mlen if os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1" else blen
+    padded_seq_len = _ceil_to_multiple(seq_len, seq_padding_multiple)
+    rows_per_batch = (
+        padded_seq_len
+        if batch_size == 1
+        else _ceil_to_multiple(max(mlen, padded_seq_len), mlen)
+    )
+    compile_seq_rows = batch_size * rows_per_batch
+    active_rows = batch_size * seq_len
+    checkpoint_rows = compile_seq_rows if batch_size > 1 else seq_len
     padded_hidden = _ceil_to_multiple(hidden, mlen)
     padded_inter = _ceil_to_multiple(inter, mlen)
     padded_head_dim = _ceil_to_multiple(head_dim, mlen)
@@ -658,6 +1161,8 @@ def compile_native_hf_decoder(
     padded_total_q_dim = head_packing.total_q_dim if head_packing is not None else num_heads * padded_head_dim
     padding_enabled = (
         padded_seq_len != seq_len
+        or rows_per_batch != seq_len
+        or batch_size != 1
         or padded_hidden != hidden
         or padded_inter != inter
         or padded_head_dim != head_dim
@@ -668,7 +1173,8 @@ def compile_native_hf_decoder(
     layers = root.layers
     n_layers = num_layers if num_layers is not None else len(layers)
     assert layer_idx_start + n_layers <= len(layers), (
-        f"Requested layers [{layer_idx_start}, {layer_idx_start + n_layers}) but model only has {len(layers)} layers"
+        f"Requested layers [{layer_idx_start}, {layer_idx_start + n_layers}) "
+        f"but model only has {len(layers)} layers"
     )
 
     scale = 1.0 / math.sqrt(head_dim)
@@ -681,13 +1187,13 @@ def compile_native_hf_decoder(
         f"head_dim={head_dim}"
     )
     print(
-        f"  compile: seq_len={seq_len}, mlen={mlen}, blen={blen}, "
+        f"  compile: batch_size={batch_size}, seq_len={seq_len}, mlen={mlen}, blen={blen}, "
         f"mram_tile_capacity={mram_tile_capacity}, total_q_dim={total_q_dim}"
     )
     if padding_enabled:
         print(
             "  tile padding: "
-            f"seq_len={seq_len}->{padded_seq_len}, "
+            f"seq_len={seq_len}->{padded_seq_len}, rows_per_batch={rows_per_batch}, "
             f"hidden={hidden}->{padded_hidden}, "
             f"inter={inter}->{padded_inter}, "
             f"head_dim={head_dim}->{padded_head_dim}, "
@@ -732,23 +1238,41 @@ def compile_native_hf_decoder(
     torch.manual_seed(seed)
 
     if embed is not None:
-        input_ids = torch.randint(0, model_cfg.vocab_size or 32000, (seq_len,))
+        input_shape = (seq_len,) if batch_size == 1 else (batch_size, seq_len)
+        input_ids = torch.randint(0, model_cfg.vocab_size or 32000, input_shape)
         with torch.no_grad():
             token_embeds = embed(input_ids).float()
-        if token_embeds.dim() == 3:
+        if batch_size == 1 and token_embeds.dim() == 3:
             token_embeds = token_embeds.squeeze(0)
+        if batch_size > 1 and token_embeds.dim() == 2:
+            token_embeds = token_embeds.unsqueeze(0)
         # Slice to the model hidden width.
-        token_embeds = token_embeds[:, :hidden]
-        _verbose(f"\nEmbedding lookup: input_ids shape={input_ids.shape}, token_embeds={token_embeds.shape}")
+        token_embeds = token_embeds[..., :hidden]
+        _verbose(
+            f"\nEmbedding lookup: input_ids shape={input_ids.shape}, "
+            f"token_embeds={token_embeds.shape}"
+        )
     else:
-        token_embeds = torch.randn(seq_len, hidden)
+        token_embeds = torch.randn(seq_len, hidden) if batch_size == 1 else torch.randn(batch_size, seq_len, hidden)
         print(f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}")
 
     # Llama-style models use RoPE (not learned position embeddings).
     # Set pos_weight to zeros so embedding_add is a no-op for position.
-    pos_weight = torch.zeros(seq_len, hidden)
-    compile_token_embeds = _pad_2d(token_embeds, padded_seq_len, padded_hidden)
-    compile_pos_weight = _pad_2d(pos_weight, padded_seq_len, padded_hidden)
+    pos_weight = torch.zeros_like(token_embeds)
+    compile_token_embeds = _pad_batched_sequence_storage(
+        token_embeds,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        rows_per_batch=rows_per_batch,
+        cols=padded_hidden,
+    )
+    compile_pos_weight = _pad_batched_sequence_storage(
+        pos_weight,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        rows_per_batch=rows_per_batch,
+        cols=padded_hidden,
+    )
 
     _verbose(f"pos_weight: zeros {pos_weight.shape} (RoPE model; learned position add is a no-op)")
     for i in range(n_layers):
@@ -761,7 +1285,7 @@ def compile_native_hf_decoder(
 
     R_matrix, cos_table, sin_table = make_rope_inputs(seq_len, model_cfg)
     if head_packing is not None:
-        compile_R_matrix, compile_cos_table, compile_sin_table = _pad_rope_inputs_for_head_slots(
+        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = _pad_rope_inputs_for_head_slots(
             R_matrix,
             cos_table,
             sin_table,
@@ -772,7 +1296,7 @@ def compile_native_hf_decoder(
         )
         rope_width = head_packing.group_width
     else:
-        compile_R_matrix, compile_cos_table, compile_sin_table = _pad_rope_inputs_for_tiles(
+        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = _pad_rope_inputs_for_tiles(
             R_matrix,
             cos_table,
             sin_table,
@@ -780,28 +1304,66 @@ def compile_native_hf_decoder(
             padded_head_dim=padded_head_dim,
         )
         rope_width = padded_head_dim
+    compile_cos_table = _repeat_sequence_storage(
+        per_sequence_cos_table,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        rows_per_batch=rows_per_batch,
+    )
+    compile_sin_table = _repeat_sequence_storage(
+        per_sequence_sin_table,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        rows_per_batch=rows_per_batch,
+    )
 
     golden_policy = ReferencePrecision.from_mode(golden_precision)
-    print(f"\nComputing CPU golden reference ({golden_policy.label})")
-    golden_out = run_decoder_reference(
-        token_embeds,
-        pos_weight,
-        all_weights,
-        model_cfg,
-        R_matrix,
-        cos_table,
-        sin_table,
-        mlen=mlen,
-        max_k_tiles=mram_tile_capacity,
-        precision=golden_policy,
-        trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
-    )
-    print(f"  golden_out: {golden_out.shape}")
-    _verbose(f"  golden_out[0,:4]: {golden_out[0, :4].tolist()}")
-
-    print(f"\nComputing HF reference (float32, {n_layers} layer{'s' if n_layers != 1 else ''}, no quantization)")
-    with torch.no_grad():
-        hf_ground_truth = run_decoder_reference(
+    reference_backend = reference_backend.lower()
+    print(f"\nComputing CPU golden reference ({golden_policy.label}, backend={reference_backend})")
+    if reference_backend == "scheduled":
+        scheduled_cfg = ScheduledReferenceConfig(
+            seq_len=seq_len,
+            padded_seq_len=padded_seq_len,
+            batch_size=batch_size,
+            rows_per_batch=rows_per_batch,
+            hidden_size=hidden,
+            padded_hidden_size=padded_hidden,
+            inter_dim=inter,
+            padded_inter_dim=padded_inter,
+            head_dim=head_dim,
+            padded_head_dim=padded_head_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            mlen=mlen,
+            blen=blen,
+            max_k_tiles=mram_tile_capacity,
+            attention_head_packing=head_packing is not None,
+            head_slot_dim=head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
+            broadcast_amount=head_packing.broadcast_amount if head_packing is not None else None,
+            total_q_dim=padded_total_q_dim,
+        )
+        padded_golden_output = run_native_decoder_scheduled_reference(
+            compile_token_embeds,
+            compile_pos_weight,
+            compile_weights,
+            scheduled_cfg,
+            compile_R_matrix,
+            compile_cos_table,
+            compile_sin_table,
+            precision=golden_policy,
+            trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
+        )
+        golden_out = _compact_active_sequence_rows(
+            padded_golden_output,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            rows_per_batch=rows_per_batch,
+            cols=hidden,
+        )
+    elif reference_backend == "legacy":
+        if batch_size != 1:
+            raise NotImplementedError("legacy reference_backend does not support batch_size > 1")
+        golden_out = run_decoder_reference(
             token_embeds,
             pos_weight,
             all_weights,
@@ -811,9 +1373,50 @@ def compile_native_hf_decoder(
             sin_table,
             mlen=mlen,
             max_k_tiles=mram_tile_capacity,
-            precision=ReferencePrecision.from_mode("hf_fp32"),
-            trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
+            precision=golden_policy,
+            trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
         )
+        padded_golden_output = _pad_2d(golden_out, padded_seq_len, padded_hidden)
+    else:
+        raise ValueError("reference_backend must be 'scheduled' or 'legacy'")
+    print(f"  golden_out: {golden_out.shape}")
+    _verbose(f"  golden_out[0,:4]: {golden_out[0, :4].tolist()}")
+
+    print(f"\nComputing HF reference (float32, {n_layers} layer{'s' if n_layers != 1 else ''}, no quantization)")
+    with torch.no_grad():
+        if batch_size == 1:
+            hf_ground_truth = run_decoder_reference(
+                token_embeds,
+                pos_weight,
+                all_weights,
+                model_cfg,
+                R_matrix,
+                cos_table,
+                sin_table,
+                mlen=mlen,
+                max_k_tiles=mram_tile_capacity,
+                precision=ReferencePrecision.from_mode("hf_fp32"),
+                trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
+            )
+        else:
+            padded_hf_output = run_native_decoder_scheduled_reference(
+                compile_token_embeds,
+                compile_pos_weight,
+                compile_weights,
+                scheduled_cfg,
+                compile_R_matrix,
+                compile_cos_table,
+                compile_sin_table,
+                precision=ReferencePrecision.from_mode("hf_fp32"),
+                trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
+            )
+            hf_ground_truth = _compact_active_sequence_rows(
+                padded_hf_output,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                rows_per_batch=rows_per_batch,
+                cols=hidden,
+            )
 
     print(f"  hf_ground_truth: {hf_ground_truth.shape}")
     _verbose(f"  hf_ground_truth[0,:4]: {hf_ground_truth[0, :4].tolist()}")
@@ -829,50 +1432,77 @@ def compile_native_hf_decoder(
         real_data_ratio=REAL_DATA_RATIO,
         mram_tile_capacity=mram_tile_capacity,
     )
+    if hlen is not None:
+        prog.hlen = hlen
+    if broadcast_amount is not None:
+        prog.broadcast_amount = broadcast_amount
+    checkpoints = StageCheckpointRecorder(enabled=stage_checkpoints)
 
     # Shared inputs
-    x_input = prog.input("X", shape=(padded_seq_len, padded_hidden))
-    pos_input = prog.input("POS", shape=(padded_seq_len, padded_hidden))
+    sequence_physical_shape = (compile_seq_rows, padded_hidden)
+    rope_table_physical_shape = (compile_seq_rows, rope_width)
+    x_input = prog.input("X", shape=(compile_seq_rows, padded_hidden), physical_shape=sequence_physical_shape)
+    pos_input = prog.input("POS", shape=(compile_seq_rows, padded_hidden), physical_shape=sequence_physical_shape)
 
     r_input = prog.input("R_rope", shape=(rope_width, rope_width))
-    cos_input = prog.input("COS", shape=(padded_seq_len, rope_width))
-    sin_input = prog.input("SIN", shape=(padded_seq_len, rope_width))
+    cos_input = prog.input("COS", shape=(compile_seq_rows, rope_width), physical_shape=rope_table_physical_shape)
+    sin_input = prog.input("SIN", shape=(compile_seq_rows, rope_width), physical_shape=rope_table_physical_shape)
     COS = prog.load_batch(cos_input, name="COS")
     SIN = prog.load_batch(sin_input, name="SIN")
 
+    # The legacy FFN template uses absolute low-VRAM regions for up/gate/scratch
+    # intermediates. Reserve that region before allocating reusable tensors
+    # (causal mask, X/POS, debug checkpoints) so FFN cannot clobber them.
+    ffn_physical_rows = max(compile_seq_rows, blen, mlen)
+    ffn_workspace_end = _ffn_absolute_workspace_end(ffn_physical_rows, padded_hidden, padded_inter)
+    _reserve_vram_until(prog, ffn_workspace_end, "_ffn_absolute_workspace_padding")
+
     # Causal mask: (mlen, mlen) with 0 on/below diagonal, -inf above
     causal_mask_data = torch.zeros(mlen, mlen)
-    causal_mask_data.masked_fill_(torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float("-inf"))
+    causal_mask_data.masked_fill_(
+        torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
+    )
     causal_mask_input = prog.input("causal_mask", shape=(mlen, mlen))
     CAUSAL_MASK = prog.load_batch(causal_mask_input, name="CAUSAL_MASK")
 
     # Per-layer weight inputs (order determines HBM layout)
     layer_inputs = []
     for i in range(n_layers):
-        layer_inputs.append(_register_layer_inputs(prog, i, compile_weights[i]))
+        layer_inputs.append(
+            _register_layer_inputs(
+                prog,
+                i,
+                compile_weights[i],
+                physical_shapes=_weight_physical_shapes_for_layer(
+                    i,
+                    compile_weights[i],
+                    head_packing=head_packing,
+                    padded_head_dim=padded_head_dim,
+                ),
+            )
+        )
 
     # Load activations to VRAM
     X_batch = prog.load_batch(x_input, name="X")
     POS_batch = prog.load_batch(pos_input, name="POS")
     ops.embedding_add(prog, X_batch, POS_batch)  # X += POS in-place
-
-    # VRAM layout hazard: ffn_asm writes gate/up intermediates at absolute
-    # address batch*hidden spanning up to batch*hidden + 2*inter*batch.
-    # The residual scratch buffer must be placed ABOVE this region.
-    _ffn_intermediate_end = padded_seq_len * padded_hidden + 2 * padded_inter * padded_seq_len
-    _current_bump = 2 * padded_seq_len * padded_hidden  # X + POS already allocated
-    _current_bump += 2 * padded_seq_len * rope_width  # COS + SIN loaded to VRAM
-    _current_bump += mlen * mlen  # CAUSAL_MASK loaded to VRAM
-    if _current_bump < _ffn_intermediate_end:
-        _pad_elems = _ffn_intermediate_end - _current_bump
-        # Allocate enough mlen-wide rows to cover the padding
-        _pad_rows = (_pad_elems + mlen - 1) // mlen
-        # Round up to mlen for VRAM alignment
-        _pad_rows = ((_pad_rows + mlen - 1) // mlen) * mlen
-        prog.alloc("_vram_padding", _pad_rows, mlen, strict=False)
+    checkpoints.record(
+        prog,
+        layer_idx=None,
+        stage="embedding_add",
+        tensor=X_batch,
+        active_shape=(checkpoint_rows, hidden),
+        semantic="token embedding plus position tensor",
+    )
 
     # Allocate scratch buffer for residual save/restore (reused across layers)
-    scratch = prog.alloc("residual_scratch", padded_seq_len, padded_hidden, strict=False)
+    scratch = prog.alloc(
+        "residual_scratch",
+        compile_seq_rows,
+        padded_hidden,
+        strict=False,
+        physical_shape=sequence_physical_shape,
+    )
 
     # Chain layers
     current = X_batch
@@ -898,8 +1528,16 @@ def compile_native_hf_decoder(
                 num_kv_heads,
                 ratio,
                 head_packing,
+                checkpoints,
+                checkpoint_rows,
+                hidden,
+                batch_size=batch_size,
+                rows_per_batch=rows_per_batch,
+                active_seq_len_per_batch=seq_len,
             )
         else:
+            if batch_size != 1:
+                raise NotImplementedError("native non-packed MHA decoder lowering does not yet support batch_size > 1")
             current_after_attn = _emit_attention_block(
                 prog,
                 current,
@@ -915,13 +1553,33 @@ def compile_native_hf_decoder(
                 num_heads,
                 num_kv_heads,
                 ratio,
+                checkpoints,
+                checkpoint_rows,
+                hidden,
             )
 
-        current = _emit_ffn_block(prog, current_after_attn, li, scratch)
+        current = _emit_ffn_block(
+            prog,
+            current_after_attn,
+            li,
+            scratch,
+            layer_idx=i,
+            checkpoint_recorder=checkpoints,
+            active_seq_len=checkpoint_rows,
+            active_hidden=hidden,
+        )
         prog.emit_comment(f"=== LAYER {i}/{n_layers} COMPLETE ===")
 
     # Final norm
     ops.rms_norm(prog, current, eps_offset=3, reci_hid_offset=4)
+    checkpoints.record(
+        prog,
+        layer_idx=n_layers - 1,
+        stage="final_norm",
+        tensor=current,
+        active_shape=(checkpoint_rows, hidden),
+        semantic="decoder final RMS norm output",
+    )
 
     isa_code = prog.compile()
     isa_code = _fix_large_immediates(isa_code)
@@ -943,6 +1601,7 @@ def compile_native_hf_decoder(
         for name, tensor in compile_weights[i].tensor_entries(i):
             input_tensors[name] = tensor
             data_order.append(name)
+    tensor_layouts = _tensor_layout_metadata(prog, input_tensors)
 
     # FPRAM layout (same as single-layer decoder):
     #   slot 0 = 0.0        (reserved)
@@ -958,13 +1617,15 @@ def compile_native_hf_decoder(
     o_vram_addr = prog.get_vram_addr(current.name)
 
     out_features = padded_hidden
+    comparison_rows = compile_seq_rows if batch_size > 1 else seq_len
 
     comparison_params = {
         "start_row_idx": o_vram_addr // mlen,
-        "num_rows": (seq_len * out_features) // mlen,
-        "num_batches": seq_len,
+        "num_rows": (comparison_rows * out_features) // mlen,
+        "num_batches": comparison_rows,
         "elements_per_batch": out_features,
         "row_dim": mlen,
+        "physical_rows": current.physical_shape[0],
         "use_stride_mode": out_features > mlen,
     }
 
@@ -975,38 +1636,83 @@ def compile_native_hf_decoder(
         "padded_hidden_size": padded_hidden,
         "padded_inter_dim": padded_inter,
         "num_layers": n_layers,
+        "batch_size": batch_size,
         "seq_len": seq_len,
         "padded_seq_len": padded_seq_len,
+        "rows_per_batch": rows_per_batch,
+        "compile_seq_rows": compile_seq_rows,
+        "active_rows": active_rows,
         "head_dim": head_dim,
         "padded_head_dim": padded_head_dim,
         "attention_head_packing": head_packing is not None,
         "attention_head_slot_dim": head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
+        "attention_kv_storage_head_dim": padded_head_dim,
         "attention_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "mlen": mlen,
         "blen": blen,
+        "mram_tile_capacity": mram_tile_capacity,
+        "stage_checkpoints_enabled": stage_checkpoints,
+        "stage_checkpoint_count": len(checkpoints.checkpoints or []),
+        "reference_backend": reference_backend,
+        "golden_precision": golden_precision,
         "padding_enabled": padding_enabled,
         "isa_lines": len(lines),
     }
+    stage_checkpoint_metadata = checkpoints.metadata()
+    stage_checkpoint_metadata["compile_info"] = {
+        key: info[key]
+        for key in (
+            "model_type",
+            "hidden_size",
+            "inter_dim",
+            "padded_hidden_size",
+            "padded_inter_dim",
+            "num_layers",
+            "batch_size",
+            "seq_len",
+            "padded_seq_len",
+            "rows_per_batch",
+            "compile_seq_rows",
+            "active_rows",
+            "head_dim",
+            "padded_head_dim",
+            "attention_head_packing",
+            "attention_head_slot_dim",
+            "attention_kv_storage_head_dim",
+            "attention_broadcast_amount",
+            "num_heads",
+            "num_kv_heads",
+            "mlen",
+            "blen",
+            "mram_tile_capacity",
+        )
+    }
 
-    print(
-        f"\nCompilation complete: {info['isa_lines']} ISA lines, "
-        f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}"
-    )
+    print(f"\nCompilation complete: {info['isa_lines']} ISA lines, "
+          f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
     return {
         "isa": isa_code,
         "golden_output": golden_out,
-        "padded_golden_output": _pad_2d(golden_out, padded_seq_len, padded_hidden),
+        "padded_golden_output": padded_golden_output,
         "hf_ground_truth": hf_ground_truth,
         "input_tensors": input_tensors,
+        "tensor_layouts": tensor_layouts,
         "data_order": data_order,
         "fp_preload": fp_preload,
         "comparison_params": comparison_params,
         "info": info,
+        "stage_checkpoints": stage_checkpoint_metadata,
+        "sim_golden_result": {
+            "original_output": padded_golden_output,
+            "tensor_layouts": tensor_layouts,
+            "data_order": data_order,
+            "compile_info": info,
+            "stage_checkpoints": stage_checkpoint_metadata,
+        },
         "golden_precision": golden_precision,
+        "reference_backend": reference_backend,
     }
-
-
 # Backwards-compatible alias for older callers.
 compile_hf_model = compile_native_hf_decoder

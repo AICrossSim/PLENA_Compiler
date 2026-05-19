@@ -247,9 +247,11 @@ def flash_attn_asm(
                     # ``scheduler["memory_layout"]["fp_sram"]["attn_scale"]``
                     # so this template no longer hardcodes the QK-scale slot.
                     #
-                    # For batched path: S tiles are at s_base + head * br * bc.
+                    # For batched path M_BMM_WO writes each broadcast result
+                    # as a full physical MLEN x MLEN tile, even when the
+                    # logical br/bc for a short sequence is smaller.
                     # For per-head path: S tile is always at s_base (offset 0).
-                    s_softmax_addr = s_base_address + (inner_q_head_index * br * bc if use_batched else 0)
+                    s_softmax_addr = s_base_address + (inner_q_head_index * mlen * mlen if use_batched else 0)
                     generated_code += online_softmax_code(
                         mlen=mlen,
                         stage=stage,

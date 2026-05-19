@@ -36,6 +36,7 @@ class ProgramMatrixOpsMixin:
             name=input_var.name,
             hbm_addr=input_var.hbm_addr,
             shape=(h, w),
+            physical_shape=input_var.physical_shape,
             real_data_ratio=self.real_data_ratio,
         )
         self._registered_hbm_sub_matrices[input_var.name] = True
@@ -47,6 +48,7 @@ class ProgramMatrixOpsMixin:
         super().ensure_vram_matrix_layout(
             name=matrix_var.name,
             shape=matrix_var.shape,
+            physical_shape=matrix_var.physical_shape,
         )
         self._registered_vram_sub_matrices[matrix_var.name] = True
 

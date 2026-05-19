@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Output computation assembly code generation for Flash Attention."""
 
+from .._imm import load_large_int_str as _load_large_int
+
 IMM2_BOUND = 2**18 - 1
 
 
@@ -42,13 +44,13 @@ def computing_o_code(
     # break diag(MLEN) * (MLEN * Head_dim) into diag(MLEN) * [(MLEN * MLEN) ... (MLEN * MLEN)]
 
     # load o_old base address
-    generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp0, {o_old_base_address} \n"
+    generated_code += _load_large_int(o_old_vector_address_register, o_old_base_address)
 
     # reload m_res base address
-    generated_code += f"S_ADDI_INT gp{m_res_vector_address_register}, gp0, {m_res_base_address} \n"
+    generated_code += _load_large_int(m_res_vector_address_register, m_res_base_address)
 
     # load pv base address
-    generated_code += f"S_ADDI_INT gp{pv_vector_address_register}, gp0, {pv_base_address} \n"
+    generated_code += _load_large_int(pv_vector_address_register, pv_base_address)
 
     if stage == "prefill":
         # loop over different row of m_res using hardware loop
@@ -112,9 +114,9 @@ def computing_row_wise_scaling_code(
 
     generated_code = "; Row-wise Scaling Code (1/l normalization) \n"
     # load l_old base address
-    generated_code += f"S_ADDI_INT gp{l_old_vector_address_register}, gp0, {l_old_base_address} \n"
+    generated_code += _load_large_int(l_old_vector_address_register, l_old_base_address)
     # load o_old base address
-    generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp0, {o_old_base_address} \n"
+    generated_code += _load_large_int(o_old_vector_address_register, o_old_base_address)
 
     if stage == "prefill":
         # loop over different row of Br using hardware loop

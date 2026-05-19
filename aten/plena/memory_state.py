@@ -42,7 +42,10 @@ class MemoryStateMixin:
         self.vram_matrices: dict[str, VRAMMatrixBlockLayout] = {}
         self.fpram_matrices: dict[str, FPRAMObjectLayout] = {}
         # Memory Allocators
-        self.vram_allocator = VRAMAllocator(alignment=mlen)
+        # Matrix ops consume VRAM in MLEN x MLEN tiles. Row-only alignment is
+        # enough for vector reads/writes, but a matrix result can become the
+        # next layer's M_MM input, so keep VRAM allocations tile-aligned.
+        self.vram_allocator = VRAMAllocator(alignment=mlen * mlen)
         self.mram_allocator = MRAMAllocator(mlen=mlen, tile_capacity=mram_tile_capacity)
         self.fpram_allocator = FPRAMAllocator()
 

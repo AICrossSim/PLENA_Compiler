@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from compiler.asm_templates._imm import load_large_int
 from compiler.asm_templates import preload_addr_reg_asm
 from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl
 from compiler.aten.isa_builder import IsaBuilder, addr as areg, gp
@@ -41,7 +42,7 @@ class IsaMatrixMixin:
         return [1, 2, 3] if gp_regs is None else gp_regs
 
     def _emit_hbm_prefetch_setup(self, asm: IsaBuilder, layout, gp_scale: int, gp_stride: int) -> None:
-        rows, cols = layout.full_shape
+        rows, cols = layout.physical_shape or layout.full_shape
         asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), rows * cols)
         asm.instr("C_SET_SCALE_REG", gp(gp_scale))
         asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), cols)
@@ -663,8 +664,8 @@ class IsaMatrixMixin:
                     dst_block_addr = dst_addr + col_block * dst_physical_rows * self.mlen + dst_actual_row * self.mlen
                     src_block_addr = src_addr + col_block * src_physical_rows * self.mlen + src_actual_row * self.mlen
 
-                    lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_block_addr}")
-                    lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {src_block_addr}")
+                    lines.extend(load_large_int(gp_dst, dst_block_addr))
+                    lines.extend(load_large_int(gp_src, src_block_addr))
                     lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_src}, 0")
             self.register_allocator.free_gp(gp_regs)
 

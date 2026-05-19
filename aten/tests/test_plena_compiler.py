@@ -48,14 +48,16 @@ def test_isa_builder_legalizes_large_absolute_immediates():
     print("  PASS test_isa_builder_legalizes_large_absolute_immediates")
 
 
-def test_isa_builder_preserves_relative_large_immediates():
-    """Typed ISA builder should not split relative S_ADDI_INT instructions."""
+def test_isa_builder_legalizes_relative_large_immediates():
+    """Typed ISA builder should split relative S_ADDI_INT instructions safely."""
     from compiler.aten.isa_builder import IsaBuilder, gp
 
     rendered = IsaBuilder().instr("S_ADDI_INT", gp(5), gp(3), 300000).render()
-    assert "S_ADDI_INT gp5, gp3, 300000" in rendered
+    assert "S_ADDI_INT gp5, gp3, 262143" in rendered
+    assert "S_ADDI_INT gp5, gp5, 37857" in rendered
+    assert "S_ADDI_INT gp5, gp3, 300000" not in rendered
     assert "S_LUI_INT" not in rendered
-    print("  PASS test_isa_builder_preserves_relative_large_immediates")
+    print("  PASS test_isa_builder_legalizes_relative_large_immediates")
 
 
 def test_fpvar_helper_uses_canonical_emit_path():
@@ -95,7 +97,9 @@ def test_vram_fill_zero_all_column_blocks():
     code = prog.get_code()
 
     # 384/64 = 6 column blocks, each needs a V_MUL_VF zeroing loop
-    assert code.count("V_MUL_VF") >= 6, f"Expected >= 6 V_MUL_VF (one per column block), got {code.count('V_MUL_VF')}"
+    assert code.count("V_MUL_VF") >= 6, (
+        f"Expected >= 6 V_MUL_VF (one per column block), got {code.count('V_MUL_VF')}"
+    )
     print("  PASS test_vram_fill_zero_all_column_blocks")
 
 
@@ -110,8 +114,40 @@ def test_vram_add_all_column_blocks():
     code = prog.get_code()
 
     # 6 column blocks = 6 V_ADD_VV loops
-    assert code.count("V_ADD_VV") >= 6, f"Expected >= 6 V_ADD_VV (one per column block), got {code.count('V_ADD_VV')}"
+    assert code.count("V_ADD_VV") >= 6, (
+        f"Expected >= 6 V_ADD_VV (one per column block), got {code.count('V_ADD_VV')}"
+    )
     print("  PASS test_vram_add_all_column_blocks")
+
+
+def test_stage_checkpoint_recorder_emits_stable_vram_copy_metadata():
+    """Debug checkpoints should preserve source tensors at new VRAM addresses."""
+    from compiler.aten.plena import PlenaCompiler
+    from compiler.aten.plena_frontend import StageCheckpointRecorder
+
+    prog = PlenaCompiler(mlen=8, blen=2)
+    x = prog.alloc("X", 8, 8)
+    recorder = StageCheckpointRecorder(enabled=True)
+    checkpoint = recorder.record(
+        prog,
+        layer_idx=0,
+        stage="attn_norm",
+        tensor=x,
+        active_shape=(8, 8),
+        semantic="unit test checkpoint",
+    )
+    metadata = recorder.metadata()
+
+    assert checkpoint is not None
+    assert len(metadata["checkpoints"]) == 1
+    entry = metadata["checkpoints"][0]
+    assert entry["stage"] == "attn_norm"
+    assert entry["layer_idx"] == 0
+    assert entry["source"] == x.name
+    assert entry["vram_addr"] == prog.get_vram_addr(checkpoint.name)
+    assert entry["physical_shape"] == [8, 8]
+    assert "VRAM Matrix Add" in prog.get_code()
+    print("  PASS test_stage_checkpoint_recorder_emits_stable_vram_copy_metadata")
 
 
 def test_alloc_at_correct_address():
@@ -128,7 +164,9 @@ def test_alloc_at_correct_address():
     view = prog.alloc_at("X_cb2_view", 64, 64, view_addr)
 
     actual_addr = prog.get_vram_addr(view.name)
-    assert actual_addr == view_addr, f"alloc_at address mismatch: expected {view_addr}, got {actual_addr}"
+    assert actual_addr == view_addr, (
+        f"alloc_at address mismatch: expected {view_addr}, got {actual_addr}"
+    )
     print("  PASS test_alloc_at_correct_address")
 
 
@@ -248,12 +286,16 @@ def test_fix_large_immediates_roundtrip():
 
         if val < (1 << 18):
             # Should remain as S_ADDI_INT
-            assert f"S_ADDI_INT gp5, gp0, {val}" in fixed, f"Small value {val} was incorrectly converted"
+            assert f"S_ADDI_INT gp5, gp0, {val}" in fixed, (
+                f"Small value {val} was incorrectly converted"
+            )
         else:
             # Should be S_LUI_INT + optional S_ADDI_INT
             upper = val >> 12
             lower = val & 0xFFF
-            assert f"S_LUI_INT gp5, {upper}" in fixed, f"Large value {val}: missing S_LUI_INT gp5, {upper}"
+            assert f"S_LUI_INT gp5, {upper}" in fixed, (
+                f"Large value {val}: missing S_LUI_INT gp5, {upper}"
+            )
             # Verify roundtrip: upper << 12 + lower == val
             reconstructed = (upper << 12) + lower
             assert reconstructed == val, (
@@ -263,21 +305,27 @@ def test_fix_large_immediates_roundtrip():
     print("  PASS test_fix_large_immediates_roundtrip")
 
 
-def test_fix_large_immediates_preserves_relative_adds():
-    """_fix_large_immediates must NOT convert relative S_ADDI_INT (non-gp0 source)."""
+def test_fix_large_immediates_legalizes_relative_adds():
+    """_fix_large_immediates must legalize relative S_ADDI_INT without a scratch register."""
     from compiler.aten.plena_frontend import _fix_large_immediates
 
-    # Relative add: gp5 = gp3 + 300000 — should NOT be converted
+    # Relative add: gp5 = gp3 + 300000. With no liveness information available
+    # in the post-pass, this lowers to bounded ADDI chunks instead of using a
+    # scratch register that could clobber live state.
     asm = "S_ADDI_INT gp5, gp3, 300000\n"
     fixed = _fix_large_immediates(asm)
-    assert "S_ADDI_INT gp5, gp3, 300000" in fixed, "Relative S_ADDI_INT was incorrectly converted"
+    assert "S_ADDI_INT gp5, gp3, 262143" in fixed
+    assert "S_ADDI_INT gp5, gp5, 37857" in fixed
+    assert "S_ADDI_INT gp5, gp3, 300000" not in fixed
 
     # Absolute load: gp5 = gp0 + 300000 — SHOULD be converted
     asm2 = "S_ADDI_INT gp5, gp0, 300000\n"
     fixed2 = _fix_large_immediates(asm2)
-    assert "S_LUI_INT" in fixed2, "Absolute S_ADDI_INT with large value was not converted"
+    assert "S_LUI_INT" in fixed2, (
+        "Absolute S_ADDI_INT with large value was not converted"
+    )
 
-    print("  PASS test_fix_large_immediates_preserves_relative_adds")
+    print("  PASS test_fix_large_immediates_legalizes_relative_adds")
 
 
 def test_rotate_half_matrix_identity():
@@ -287,7 +335,9 @@ def test_rotate_half_matrix_identity():
     R = _make_rotate_half_matrix(64)
     RR = R @ R
     expected = -torch.eye(64)
-    assert torch.allclose(RR, expected, atol=1e-6), f"R @ R should be -I, got max diff {(RR - expected).abs().max()}"
+    assert torch.allclose(RR, expected, atol=1e-6), (
+        f"R @ R should be -I, got max diff {(RR - expected).abs().max()}"
+    )
     print("  PASS test_rotate_half_matrix_identity")
 
 
@@ -386,12 +436,225 @@ def test_kv_grouped_head_packing_preserves_slots():
     print("  PASS test_kv_grouped_head_packing_preserves_slots")
 
 
+def test_packed_kv_weights_keep_compact_logical_width_with_physical_storage():
+    """Packed K/V weights should be logical HLEN while reserving MLEN HBM storage."""
+    from compiler.aten.model_extract import LayerWeights, ModelConfig
+    from compiler.aten.plena import PlenaCompiler
+    from compiler.aten.plena_frontend import (
+        AttentionHeadPacking,
+        _pad_decoder_weights_for_tiles,
+        _tensor_layout_metadata,
+        _weight_physical_shapes_for_layer,
+    )
+
+    model_cfg = ModelConfig(
+        hidden_size=2,
+        inter_dim=4,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=2,
+        eps=1e-5,
+        rope_theta=10000.0,
+        vocab_size=None,
+        model_type="unit",
+    )
+    weights = LayerWeights(
+        w_q=torch.ones(2, 4),
+        w_o=torch.ones(4, 2),
+        w_k_heads=[torch.ones(2, 2)],
+        w_v_heads=[torch.ones(2, 2)],
+        w_gate=torch.ones(2, 4),
+        w_up=torch.ones(2, 4),
+        w_down=torch.ones(4, 2),
+        eps=1e-5,
+    )
+    head_packing = AttentionHeadPacking(
+        enabled=True,
+        hlen=4,
+        broadcast_amount=2,
+        head_slot_dim=4,
+        group_width=8,
+        total_q_dim=8,
+    )
+    padded = _pad_decoder_weights_for_tiles(
+        weights,
+        model_cfg,
+        padded_hidden=8,
+        padded_inter=8,
+        padded_head_dim=8,
+        head_packing=head_packing,
+    )
+
+    assert padded.w_k_heads[0].shape == (8, 4)
+    assert padded.w_v_heads[0].shape == (8, 4)
+
+    prog = PlenaCompiler(mlen=8, blen=2)
+    physical_shapes = _weight_physical_shapes_for_layer(
+        0,
+        padded,
+        head_packing=head_packing,
+        padded_head_dim=8,
+    )
+    prog.input("W_k_0_h0", shape=tuple(padded.w_k_heads[0].shape), physical_shape=physical_shapes["W_k_0_h0"])
+    layouts = _tensor_layout_metadata(prog, {"W_k_0_h0": padded.w_k_heads[0]})
+
+    assert layouts["W_k_0_h0"]["source_shape"] == [8, 4]
+    assert layouts["W_k_0_h0"]["storage_shape"] == [8, 8]
+    assert layouts["W_k_0_h0"]["source_row_elements"] == 4
+    assert layouts["W_k_0_h0"]["storage_row_elements"] == 8
+
+    print("  PASS test_packed_kv_weights_keep_compact_logical_width_with_physical_storage")
+
+
+def test_packed_gqa_kv_group_loop_reduces_static_code():
+    """Packed GQA can emit one attention-core body under a KV-head loop."""
+    from compiler.aten.plena import PlenaCompiler
+
+    def instruction_lines(asm: str) -> int:
+        prefixes = ("S_", "C_", "H_", "V_", "M_")
+        return sum(1 for line in asm.splitlines() if line.strip().startswith(prefixes))
+
+    def emit(looped: bool) -> str:
+        prog = PlenaCompiler(mlen=256, blen=64)
+        prog.hlen = 64
+        prog.broadcast_amount = 4
+        q = prog.alloc("Q", 64, 512, strict=False, physical_shape=(256, 512))
+        o = prog.alloc("O", 64, 512, strict=False, physical_shape=(256, 512))
+        scratch = prog.alloc("S_scratch", 256 * (4 + 3), 256, strict=True)
+        mask = prog.alloc("mask", 256, 256, strict=True)
+        kv_pairs = []
+        for kv_h in range(2):
+            k = prog.input(f"K{kv_h}", shape=(64, 64), physical_shape=(256, 256))
+            v = prog.input(f"V{kv_h}", shape=(64, 64), physical_shape=(256, 256))
+            kv_pairs.append((k, v))
+
+        q_base = prog.get_vram_addr(q.name)
+        o_base = prog.get_vram_addr(o.name)
+        scratch_base = prog.get_vram_addr(scratch.name)
+        if looped:
+            prog.flash_attention_packed_groups_looped(
+                q,
+                kv_pairs,
+                group_heads=3,
+                head_slot_dim=64,
+                output_base_address=o_base,
+                scratch_base_address=scratch_base,
+                broadcast_amount=4,
+                causal_mask=mask,
+            )
+        else:
+            for kv_h, (k, v) in enumerate(kv_pairs):
+                q_group = prog.alloc_at(
+                    f"Q_group{kv_h}",
+                    64,
+                    256,
+                    q_base + kv_h * 256 * 256,
+                    physical_shape=(256, 256),
+                )
+                prog.flash_attention_packed_group(
+                    q_group,
+                    k,
+                    v,
+                    group_heads=3,
+                    head_slot_dim=64,
+                    output_base_address=o_base + kv_h * 256 * 256,
+                    scratch_base_address=scratch_base,
+                    broadcast_amount=4,
+                    causal_mask=mask,
+                )
+        return prog.compile()
+
+    baseline = emit(looped=False)
+    looped = emit(looped=True)
+
+    assert baseline.count("Packed GQA QK^T") == 2
+    assert looped.count("Packed GQA attention core loop over KV groups") == 1
+    assert looped.count("Packed GQA QK^T") == 1
+    assert instruction_lines(looped) < instruction_lines(baseline)
+
+    print("  PASS test_packed_gqa_kv_group_loop_reduces_static_code")
+
+
+def test_packed_gqa_fused_accepts_batch_slabs():
+    """Packed GQA should isolate true B>1 slabs instead of attending across B*S rows."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=64, blen=4)
+    prog.hlen = 16
+    prog.broadcast_amount = 4
+
+    q_input = prog.input("Q", shape=(128, 64), physical_shape=(128, 64), prestaged_vram_addr=0)
+    k_input = prog.input("K", shape=(128, 16), physical_shape=(128, 64))
+    v_input = prog.input("V", shape=(128, 16), physical_shape=(128, 64))
+    q = prog.load_batch(q_input, name="Q")
+
+    o = prog.flash_attention(
+        q,
+        k_input,
+        v_input,
+        scale=1.0 / 4.0,
+        hq=4,
+        hkv=1,
+        h_qkv=16,
+        batch_size=2,
+        seq_len=64,
+        kv_seq_len=64,
+    )
+    asm = prog.compile()
+
+    assert o.shape == (128, 64)
+    assert o.physical_shape == (128, 64)
+    assert "VRAM View _gqa_Q_b0" in asm
+    assert "VRAM View _gqa_Q_b1" in asm
+    assert "Load SubMatrix K[0][0]" in asm
+    assert "Load SubMatrix K[1][0]" in asm
+    assert "Compute PV = P @ V[k_idx=0]" in asm
+    assert "Compute PV = P @ V[k_idx=1]" in asm
+
+    print("  PASS test_packed_gqa_fused_accepts_batch_slabs")
+
+
+def test_mha_accepts_batch_slabs():
+    """MHA should isolate true B>1 slabs instead of flattening into one sequence."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=64, blen=4)
+    q_input = prog.input("Q", shape=(128, 64), physical_shape=(128, 64), prestaged_vram_addr=0)
+    k_input = prog.input("K", shape=(128, 64), physical_shape=(128, 64))
+    v_input = prog.input("V", shape=(128, 64), physical_shape=(128, 64))
+    q = prog.load_batch(q_input, name="Q")
+
+    o = prog.flash_attention(
+        q,
+        k_input,
+        v_input,
+        scale=1.0 / 8.0,
+        batch_size=2,
+        seq_len=64,
+        kv_seq_len=64,
+    )
+    asm = prog.compile()
+
+    assert o.shape == (128, 64)
+    assert o.physical_shape == (128, 64)
+    assert "VRAM View _mha_Q_b0" in asm
+    assert "VRAM View _mha_Q_b1" in asm
+    assert "Load SubMatrix Row K[0][:]" in asm
+    assert "Load SubMatrix Row K[1][:]" in asm
+    assert "Compute PV = P @ V[k_idx=0]" in asm
+    assert "Compute PV = P @ V[k_idx=1]" in asm
+
+    print("  PASS test_mha_accepts_batch_slabs")
+
+
 def test_compile_native_hf_decoder_golden_vs_hf():
     """Golden (MXFP8+BF16) should closely match HF float32 at native dims."""
     from compiler.aten.plena_frontend import compile_native_hf_decoder
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained("AICrossSim/clm-60m", torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(
+        "AICrossSim/clm-60m", torch_dtype=torch.float32
+    )
     model.eval()
 
     r = compile_native_hf_decoder(model, seq_len=64, num_layers=1)
@@ -400,7 +663,9 @@ def test_compile_native_hf_decoder_golden_vs_hf():
 
     diff = (golden - hf).abs()
     pct = (diff <= 0.2 + 0.2 * hf.abs()).float().mean() * 100
-    cos = torch.nn.functional.cosine_similarity(golden.flatten().unsqueeze(0), hf.flatten().unsqueeze(0))
+    cos = torch.nn.functional.cosine_similarity(
+        golden.flatten().unsqueeze(0), hf.flatten().unsqueeze(0)
+    )
 
     assert pct >= 95.0, f"Golden vs HF allclose {pct:.1f}% < 95%"
     assert cos.item() >= 0.99, f"Golden vs HF cosine {cos.item():.4f} < 0.99"
@@ -415,7 +680,9 @@ def test_native_compile_assembles():
     from compiler.aten.plena_frontend import compile_native_hf_decoder
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained("AICrossSim/clm-60m", torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(
+        "AICrossSim/clm-60m", torch_dtype=torch.float32
+    )
     model.eval()
 
     r = compile_native_hf_decoder(model, seq_len=64, num_layers=1)
@@ -457,11 +724,12 @@ if __name__ == "__main__":
     tests = [
         test_isa_builder_renders_typed_instruction,
         test_isa_builder_legalizes_large_absolute_immediates,
-        test_isa_builder_preserves_relative_large_immediates,
+        test_isa_builder_legalizes_relative_large_immediates,
         test_fpvar_helper_uses_canonical_emit_path,
         test_hbm_load_helper_uses_typed_legalization,
         test_vram_fill_zero_all_column_blocks,
         test_vram_add_all_column_blocks,
+        test_stage_checkpoint_recorder_emits_stable_vram_copy_metadata,
         test_alloc_at_correct_address,
         test_mram_allocator_scales_with_runtime_mlen,
         test_compiler_threads_runtime_memory_geometry,
@@ -469,10 +737,14 @@ if __name__ == "__main__":
         test_vram_layout_tracks_logical_and_physical_shape,
         test_partial_row_linear_uses_one_blen_row_group,
         test_fix_large_immediates_roundtrip,
-        test_fix_large_immediates_preserves_relative_adds,
+        test_fix_large_immediates_legalizes_relative_adds,
         test_rotate_half_matrix_identity,
         test_grouped_attention_weight_padding_preserves_head_slots,
         test_kv_grouped_head_packing_preserves_slots,
+        test_packed_kv_weights_keep_compact_logical_width_with_physical_storage,
+        test_packed_gqa_kv_group_loop_reduces_static_code,
+        test_packed_gqa_fused_accepts_batch_slabs,
+        test_mha_accepts_batch_slabs,
         test_compile_native_hf_decoder_golden_vs_hf,
         test_native_compile_assembles,
     ]

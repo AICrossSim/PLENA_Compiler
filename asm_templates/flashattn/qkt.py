@@ -70,11 +70,11 @@ def qkt_multiply(
         # s_head_offset is the relative head offset (0..ratio-1) for S writeback.
         # q_head_index is absolute and used only for Q VRAM read addressing above.
         if stage == "prefill":
-            generated_code += f"M_BTMM 0, gp{q_base_register}, gp0 \n"
+            generated_code += f"M_BTMM 0, gp0, gp{q_base_register} \n"
             generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen * mlen} \n"
             generated_code += f"M_BMM_WO gp{s_base_register}, 0 \n"
         else:
-            generated_code += f"M_BTMV 0, gp{q_base_register}, gp0 \n"
+            generated_code += f"M_BTMV 0, gp0, gp{q_base_register} \n"
             generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen} \n"
             generated_code += f"M_BMV_WO gp{s_base_register}, 0 \n"
     else:

@@ -45,63 +45,30 @@ def softmax_plena(prog, input_var, scale: float = 1.0):
     """
     mlen = prog.mlen
 
-    # Allocate output matrix in VRAM (S holds the softmax result)
+    # Allocate output matrix in VRAM (S holds the softmax result).
     S = prog.alloc("S", mlen, mlen)
 
-    # Reserve fp_preload region (addresses 0-2): 0=0.0, 1=scale, 2=-inf
-    # This ensures FPRAM variable allocation starts after these reserved slots
-    prog.fpram_allocator.next_free = 3
-
-    # Allocate FPRAM variables
-    scale_fp = prog.fp_var("scale_fp", size=1)  # scale factor
-    m_old = prog.fp_var("m_old", size=mlen)  # per-row running max
-    m_res = prog.fp_var("m_res", size=mlen)  # per-row decay factor
-    l_old = prog.fp_var("l_old", size=mlen)  # per-row accumulated sum
-    row_max_tmp = prog.fp_var("row_max_tmp", size=1)  # temp: current row max
-    m_old_saved = prog.fp_var("m_old_saved", size=1)  # temp: saved m_old
-    sum_p_tmp = prog.fp_var("sum_p_tmp", size=1)  # temp: current row sum
-    inv_l = prog.fp_var("inv_l", size=mlen)  # 1/l for normalization
-
-    # Step 0: Initialize S = input, load constants from fp_preload
+    # Step 0: Initialize S = input.  The allocated VRAM starts zeroed in the
+    # simulator, matching the previous implementation's S += input behavior.
     prog.vram_add(S, input_var)
-    prog.fpvar_fill_from_fpram(scale_fp, src_fpram_addr=1)  # load scale
-    prog.fpvar_fill_from_fpram(m_old, src_fpram_addr=2)  # load -inf
-    prog.fpvar_fill_from_fpram(l_old, src_fpram_addr=0)  # load 0.0
 
-    # Row-by-row online softmax
-    for row in range(mlen):
-        # 1. Save old max for this row
-        prog.fpvar_copy_asm(m_old.address + row, m_old_saved.address, 1)
-
-        # 2. Scale: S[row] *= scale
-        prog.tile_row_mul_fp_broadcast(S, scale_fp.address, row)
-
-        # 3. Find row maximum
-        prog.tile_row_max(row_max_tmp.address, S, row)
-
-        # 4. Update running max: m_old[row] = max(m_old[row], row_max)
-        prog.fpvar_max_asm(m_old.address + row, row_max_tmp.address, m_old.address + row, 1)
-
-        # 5. Decay factor: m_res[row] = exp(m_old_saved - m_curr)
-        prog.fpvar_sub_asm(m_old_saved.address, m_old.address + row, m_old_saved.address, 1)
-        prog.fpvar_exp_asm(m_old_saved.address, m_res.address + row, 1)
-
-        # 6. Subtract max: S[row] -= m_curr
-        prog.tile_row_sub_fp(S, m_old.address + row, row)
-
-        # 7. Exponentiate: P[row] = exp(S[row])
-        prog.tile_row_exp(S, row)
-
-        # 8. Sum probabilities
-        prog.tile_row_sum(sum_p_tmp.address, S, row)
-
-        # 9. Update accumulated sum: l_old[row] = l_old[row]*m_res[row] + sum_p
-        prog.fpvar_mul_asm(l_old.address + row, m_res.address + row, l_old.address + row, 1)
-        prog.fpvar_add_asm(l_old.address + row, sum_p_tmp.address, l_old.address + row, 1)
-
-    # Final normalization: P[row] /= l_old[row]
-    prog.fpvar_reci(l_old, inv_l)
-    for row in range(mlen):
-        prog.tile_row_mul_fp(S, inv_l.address + row, row)
+    # Reuse the flash-attention online-softmax state layout instead of
+    # allocating separate FPVars for m_old/m_res/l_old/inv_l.  At MLEN=256 the
+    # old FPVar-heavy lowering needed 1028 slots plus reserved constants and
+    # overflowed the 1024-slot FPRAM.  The shared layout uses exactly 3*MLEN
+    # slots at _ONLINE_SOFTMAX_FPSRAM_BASE and scalar FP registers for temps.
+    fp_sram_start = prog._ONLINE_SOFTMAX_FPSRAM_BASE
+    prog.emit(prog._reset_fpsram_asm(fp_sram_start, mlen, 2))  # m_old = -inf
+    prog.emit(prog._reset_fpsram_asm(fp_sram_start + 2 * mlen, mlen, 0))  # l_old = 0
+    prog.emit(
+        prog._online_softmax_asm(
+            mlen=mlen,
+            s_address=prog.get_vram_addr(S.name),
+            m_start_address=fp_sram_start,
+            scale=scale,
+            rows=mlen,
+        )
+    )
+    prog.final_scale_o(0, S, rows=mlen)
 
     return S

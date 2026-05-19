@@ -87,7 +87,7 @@
     uses_mram: true
   doc: "FFN with SiLU gate: w_down @ (silu(w_gate @ x) * (w_up @ x))"
 
-- func: "flash_attention(Tensor Q, Tensor K, Tensor V, float scale, int hq=1, int hkv=1, int h_qkv=0) -> Tensor"
+- func: "flash_attention(Tensor Q, Tensor K, Tensor V, float scale, int hq=1, int hkv=1, int h_qkv=0, int batch_size=1, int seq_len=0, int kv_seq_len=0) -> Tensor"
   category: composite
   in_place: false
   dispatch:

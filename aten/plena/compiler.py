@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from compiler.aten.plena.isa_compiler import IsaCompiler
 from compiler.aten.plena.program_attention import ProgramAttentionMixin
@@ -10,6 +11,40 @@ from compiler.aten.plena.program_fp_tile_ops import ProgramFPTileOpsMixin
 from compiler.aten.plena.program_matrix_ops import ProgramMatrixOpsMixin
 from compiler.aten.plena.program_tensors import ProgramTensorMixin
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar
+from compiler.utils.load_config import load_toml_config
+
+
+def _find_plena_settings_toml() -> Path | None:
+    env_path = os.environ.get("PLENA_SETTINGS_TOML")
+    if env_path:
+        return Path(env_path)
+
+    candidates = [Path.cwd(), *Path(__file__).resolve().parents]
+    for base in candidates:
+        path = base / "plena_settings.toml"
+        if path.exists():
+            return path
+    return None
+
+
+def _behavior_config_value(key: str, default: int) -> int:
+    settings_path = _find_plena_settings_toml()
+    if settings_path is None or not settings_path.exists():
+        return default
+
+    try:
+        config = load_toml_config(settings_path, "CONFIG", mode="BEHAVIOR")
+    except Exception:
+        return default
+
+    value = config.get(key, {})
+    if isinstance(value, dict):
+        value = value.get("value", default)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 # ============================================================================
@@ -38,6 +73,8 @@ class PlenaCompiler(
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
         mram_tile_capacity: int = 4,
+        hbm_v_prefetch_amount: int | None = None,
+        hbm_v_writeback_amount: int | None = None,
     ):
         """
         Args:
@@ -45,6 +82,12 @@ class PlenaCompiler(
             blen: Vector tile size (default 4)
             real_data_ratio: HBM storage ratio (MXFP8 format = 1.125)
             mram_tile_capacity: Number of mlen x mlen tiles that fit in MRAM.
+            hbm_v_prefetch_amount: H_PREFETCH_V transfer count. Defaults to
+                          BEHAVIOR.CONFIG.HBM_V_Prefetch_Amount in
+                          PLENA_SETTINGS_TOML / plena_settings.toml.
+            hbm_v_writeback_amount: H_STORE_V transfer count. Defaults to
+                          BEHAVIOR.CONFIG.HBM_V_Writeback_Amount in
+                          PLENA_SETTINGS_TOML / plena_settings.toml.
             unroll_loops: If True, unroll sub-projection and attention helper loops
                           at ASM-gen time to eliminate C_LOOP_START/END overhead.
                           Overridden by the ATEN_UNROLL env var ("1"=True, "0"=False).
@@ -61,6 +104,18 @@ class PlenaCompiler(
             unroll_loops=unroll_loops,
             mram_tile_capacity=mram_tile_capacity,
         )
+        if hbm_v_prefetch_amount is None:
+            hbm_v_prefetch_amount = _behavior_config_value("HBM_V_Prefetch_Amount", 4)
+        if hbm_v_writeback_amount is None:
+            hbm_v_writeback_amount = _behavior_config_value("HBM_V_Writeback_Amount", 4)
+        if hbm_v_prefetch_amount <= 0:
+            raise ValueError(f"hbm_v_prefetch_amount must be > 0, got {hbm_v_prefetch_amount}")
+        if hbm_v_writeback_amount <= 0:
+            raise ValueError(f"hbm_v_writeback_amount must be > 0, got {hbm_v_writeback_amount}")
+        self.hbm_v_prefetch_amount = hbm_v_prefetch_amount
+        self.hbm_v_writeback_amount = hbm_v_writeback_amount
+        self.hlen = _behavior_config_value("HLEN", mlen)
+        self.broadcast_amount = _behavior_config_value("BROADCAST_AMOUNT", max(1, mlen // max(1, self.hlen)))
 
         # HBM address auto-allocation
         self._next_hbm_addr: int = 0

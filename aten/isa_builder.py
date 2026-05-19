@@ -10,6 +10,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Protocol, Union
 
+from asm_templates._imm import add_large_int as _add_large_int_lines
+from asm_templates._imm import load_large_int as _load_large_int_lines
+
 
 class Renderable(Protocol):
     def render(self) -> str:
@@ -118,22 +121,30 @@ def is_gp_zero(arg: AsmArg) -> bool:
 
 
 def legalize_large_immediates(items: Iterable[AsmItem]) -> list[AsmItem]:
-    """Split typed absolute S_ADDI_INT loads that exceed the immediate field.
+    """Split typed S_ADDI_INT instructions that exceed the immediate field.
 
-    This is the typed equivalent of plena_frontend._fix_large_immediates.
-    Raw string items are intentionally left alone until those call sites move
-    onto typed instructions.
+    This is the typed equivalent of plena_frontend._fix_large_immediates. Raw
+    string items are intentionally left alone until those call sites move onto
+    typed instructions.
     """
     legalized: list[AsmItem] = []
     for item in items:
         if isinstance(item, Instr) and item.opcode == "S_ADDI_INT" and len(item.args) == 3:
             rd, rs, imm = item.args
-            if isinstance(rd, Register) and is_gp_zero(rs) and isinstance(imm, int) and imm >= IMM2_BOUND:
-                upper = imm >> 12
-                lower = imm & 0xFFF
-                legalized.append(Instr("S_LUI_INT", (rd, upper)))
-                if lower:
-                    legalized.append(Instr("S_ADDI_INT", (rd, rd, lower)))
+            if (
+                isinstance(rd, Register)
+                and isinstance(rs, Register)
+                and rd.prefix == "gp"
+                and rs.prefix == "gp"
+                and isinstance(imm, int)
+                and imm >= IMM2_BOUND
+            ):
+                replacement = (
+                    _load_large_int_lines(rd.index, imm)
+                    if is_gp_zero(rs)
+                    else _add_large_int_lines(rd.index, rs.index, imm, temp_reg=None)
+                )
+                legalized.extend(replacement)
                 continue
         legalized.append(item)
     return legalized

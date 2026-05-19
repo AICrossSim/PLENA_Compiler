@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """PV multiplication assembly code generation for Flash Attention."""
 
+from .._imm import load_large_int_str as _load_large_int
+
 IMM2_BOUND = 2**18 - 1
 
 
@@ -54,21 +56,21 @@ def computing_pv_code(
     # NOTE: We ALWAYS prefetch V because K prefetch in qkt_multiply uses MSRAM 0,
     # which overwrites any previously prefetched V. Even though all heads share
     # the same V data (same KV head), we must re-prefetch after each K prefetch.
-    generated_code += f"S_ADDI_INT gp{v_base_register}, gp0, {v_head_index * head_dim} \n"
+    generated_code += _load_large_int(v_base_register, v_head_index * head_dim)
     # Use v_msram_base as MSRAM destination (can be 0 since K was already used)
-    generated_code += f"S_ADDI_INT gp{out_base_register}, gp0, {v_msram_base} \n"
+    generated_code += _load_large_int(out_base_register, v_msram_base)
     # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
     generated_code += f"H_PREFETCH_M gp{out_base_register}, gp{v_base_register}, a{v_base_hbm_offset_reg}, 0, 1 \n"
 
     # P address for this head's softmax scores
     p_start_address = p_base_address + q_head_index * mlen * mlen
-    generated_code += f"S_ADDI_INT gp{p_base_register}, gp0, {p_start_address} \n"
+    generated_code += _load_large_int(p_base_register, p_start_address)
 
     # V is prefetched to MSRAM at v_msram_base
-    generated_code += f"S_ADDI_INT gp{v_base_register}, gp0, {v_msram_base} \n"
+    generated_code += _load_large_int(v_base_register, v_msram_base)
 
     # Output starts at output_base + head_offset (for this head's column position)
-    generated_code += f"S_ADDI_INT gp{out_base_register}, gp0, {output_base_address + head_offset * head_dim} \n"
+    generated_code += _load_large_int(out_base_register, output_base_address + head_offset * head_dim)
 
     if stage == "prefill":
         # Loop structure:
@@ -77,7 +79,7 @@ def computing_pv_code(
         outer_loop_count = head_dim // blen  # Number of column blocks
         valid_rows = mlen if rows is None else rows
         inner_loop_count = (valid_rows + blen - 1) // blen  # Number of valid row blocks
-        generated_code += f"S_ADDI_INT gp{out_col_register}, gp0, {output_base_address + head_offset * head_dim} \n"
+        generated_code += _load_large_int(out_col_register, output_base_address + head_offset * head_dim)
         generated_code += f"C_LOOP_START gp{outer_loop_register}, {outer_loop_count} \n"
         generated_code += f"C_LOOP_START gp{inner_loop_register}, {inner_loop_count} \n"
 
@@ -94,7 +96,7 @@ def computing_pv_code(
         generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
 
         # After inner loop: reset P, advance to next column block
-        generated_code += f"S_ADDI_INT gp{p_base_register}, gp0, {p_start_address} \n"
+        generated_code += _load_large_int(p_base_register, p_start_address)
         # Move to next column position (blen elements to the right)
         generated_code += f"S_ADDI_INT gp{out_col_register}, gp{out_col_register}, {blen} \n"
         generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_col_register}, 0 \n"

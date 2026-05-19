@@ -111,7 +111,10 @@ class ProgramTensorMixin:
         else:
             # Normal path: emit HBM → VRAM prefetch ISA.
             super().load_batch(
-                hbm_object_name=input_var.name, vram_object_name=internal_name, vlen=self.mlen, preload_len=4
+                hbm_object_name=input_var.name,
+                vram_object_name=internal_name,
+                vlen=self.mlen,
+                preload_len=self.hbm_v_prefetch_amount,
             )
 
         var = VRAMMatrixVar(
@@ -155,6 +158,7 @@ class ProgramTensorMixin:
             hbm_addr=hbm_addr,
             hbm_object_name=internal_name,
             vlen=self.mlen,
+            store_amount=self.hbm_v_writeback_amount,
         )
 
         var = InputVar(
@@ -385,11 +389,13 @@ class ProgramTensorMixin:
 
     def ffn(self, input_var: VRAMMatrixVar, w_gate: InputVar, w_up: InputVar, w_down: InputVar):
         """Emit the fused FFN kernel and return the in-place activation var."""
-        batch_size, hidden_size = input_var.shape
-        _, inter_dim = w_up.shape
+        batch_size, hidden_size = input_var.physical_shape
+        _, inter_dim = w_up.physical_shape
         mlen = self.mlen
         blen = self.blen
         activation_base_address = self.get_vram_addr(input_var.name)
+        max_k_tiles = max(hidden_size // mlen, inter_dim // mlen)
+        use_loop_instructions = max_k_tiles <= self.mram_tile_capacity
 
         isa_code = preload_addr_reg_asm(
             addr_reg_to_set=[1, 2, 3],
@@ -411,7 +417,8 @@ class ProgramTensorMixin:
             down_weight_hbm_offset_reg=3,
             const_one_fp_address=5,
             activation_base_address=activation_base_address,
-            use_loop_instructions=True,
+            use_loop_instructions=use_loop_instructions,
+            matrix_sram_size=self.mram_capacity_elems,
         )
 
         self.emit(isa_code)
