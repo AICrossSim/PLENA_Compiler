@@ -111,6 +111,7 @@ def run_decoder_reference(
     sin_table: torch.Tensor,
     *,
     mlen: int,
+    max_k_tiles: int = _HW_MAX_K_TILES,
     precision: ReferencePrecision,
     trace: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
@@ -128,9 +129,10 @@ def run_decoder_reference(
             cos_table,
             sin_table,
             mlen,
+            max_k_tiles,
             precision,
         )
-        x = _ffn_block_ref(x, layer, mlen, precision)
+        x = _ffn_block_ref(x, layer, mlen, max_k_tiles, precision)
 
         if trace is not None:
             trace(layer_idx, x)
@@ -146,18 +148,19 @@ def _attention_block_ref(
     cos_table: torch.Tensor,
     sin_table: torch.Tensor,
     mlen: int,
+    max_k_tiles: int,
     precision: ReferencePrecision,
 ) -> torch.Tensor:
     quantize = precision.quantize
     residual = x.clone()
     x_normed = _rms_norm_ref(x, layer.eps, precision)
-    q_full = _round(_linear_ref(x_normed, quantize(layer.w_q), mlen, precision), precision)
+    q_full = _round(_linear_ref(x_normed, quantize(layer.w_q), mlen, max_k_tiles, precision), precision)
 
     k_heads = []
     v_heads = []
     for kv_h in range(config.num_kv_heads):
-        k_h = _linear_ref(x_normed, quantize(layer.w_k_heads[kv_h]), mlen, precision)
-        v_h = _linear_ref(x_normed, quantize(layer.w_v_heads[kv_h]), mlen, precision)
+        k_h = _linear_ref(x_normed, quantize(layer.w_k_heads[kv_h]), mlen, max_k_tiles, precision)
+        v_h = _linear_ref(x_normed, quantize(layer.w_v_heads[kv_h]), mlen, max_k_tiles, precision)
         k_h = _rope_ref(k_h, rope_matrix, cos_table, sin_table, precision)
         k_heads.append(_hbm_round_ref(k_h, precision))
         v_heads.append(_hbm_round_ref(v_h, precision))
@@ -171,7 +174,7 @@ def _attention_block_ref(
         o_heads.append(_flash_attn_ref(q_h, k_heads[kv_h], v_heads[kv_h], scale, causal=True))
 
     attn_out = _round(torch.cat(o_heads, dim=1), precision)
-    o_proj = _round(_linear_ref(attn_out, quantize(layer.w_o), mlen, precision), precision)
+    o_proj = _round(_linear_ref(attn_out, quantize(layer.w_o), mlen, max_k_tiles, precision), precision)
     return _residual_add_ref(o_proj, residual, precision)
 
 
@@ -179,15 +182,16 @@ def _ffn_block_ref(
     x: torch.Tensor,
     layer: LayerWeights,
     mlen: int,
+    max_k_tiles: int,
     precision: ReferencePrecision,
 ) -> torch.Tensor:
     quantize = precision.quantize
     residual = x.clone()
     x_normed = _rms_norm_ref(x, layer.eps, precision)
-    up_out = _linear_ref(x_normed, quantize(layer.w_up), mlen, precision)
-    gate_out = _linear_ref(x_normed, quantize(layer.w_gate), mlen, precision)
+    up_out = _linear_ref(x_normed, quantize(layer.w_up), mlen, max_k_tiles, precision)
+    gate_out = _linear_ref(x_normed, quantize(layer.w_gate), mlen, max_k_tiles, precision)
     silu_gate = precision.to_inter(F.silu(_round(up_out, precision)) * _round(gate_out, precision))
-    x = _linear_ref(precision.from_inter(silu_gate), quantize(layer.w_down), mlen, precision)
+    x = _linear_ref(precision.from_inter(silu_gate), quantize(layer.w_down), mlen, max_k_tiles, precision)
     return _residual_add_ref(_round(x, precision), residual, precision)
 
 
@@ -205,6 +209,7 @@ def _linear_ref(
     x: torch.Tensor,
     weight: torch.Tensor,
     mlen: int,
+    max_k_tiles: int,
     precision: ReferencePrecision,
 ) -> torch.Tensor:
     if not precision.use_ksplit:
@@ -213,7 +218,7 @@ def _linear_ref(
         x,
         weight,
         mlen=mlen,
-        max_k_tiles=_HW_MAX_K_TILES,
+        max_k_tiles=max_k_tiles,
         to_inter=precision.to_inter,
         from_inter=precision.from_inter,
     )

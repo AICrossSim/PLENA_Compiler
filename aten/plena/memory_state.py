@@ -18,18 +18,32 @@ from compiler.aten.plena.memory import (
 class MemoryStateMixin:
     """Sub-matrix layout manager for PLENA HBM, VRAM, MRAM, and FPRAM state."""
 
-    def __init__(self, mlen: int = MLEN, blen: int = BLEN, unroll_loops: bool = False):
+    def __init__(
+        self,
+        mlen: int = MLEN,
+        blen: int = BLEN,
+        unroll_loops: bool = False,
+        mram_tile_capacity: int = 4,
+    ):
+        if mlen <= 0:
+            raise ValueError(f"mlen must be > 0, got {mlen}")
+        if mram_tile_capacity <= 0:
+            raise ValueError(f"mram_tile_capacity must be > 0, got {mram_tile_capacity}")
+
         self.mlen = mlen
         self.blen = blen
         self.unroll_loops = unroll_loops
+        self.mram_tile_capacity = mram_tile_capacity
+        self.mram_tile_elems = mlen * mlen
+        self.mram_capacity_elems = self.mram_tile_capacity * self.mram_tile_elems
 
         # Layout tables
         self.hbm_matrices: dict[str, MatrixBlockLayout] = {}
         self.vram_matrices: dict[str, VRAMMatrixBlockLayout] = {}
         self.fpram_matrices: dict[str, FPRAMObjectLayout] = {}
         # Memory Allocators
-        self.vram_allocator = VRAMAllocator()
-        self.mram_allocator = MRAMAllocator()
+        self.vram_allocator = VRAMAllocator(alignment=mlen)
+        self.mram_allocator = MRAMAllocator(mlen=mlen, tile_capacity=mram_tile_capacity)
         self.fpram_allocator = FPRAMAllocator()
 
     def __contains__(self, name: str) -> bool:

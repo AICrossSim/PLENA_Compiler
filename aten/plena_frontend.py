@@ -270,6 +270,7 @@ def compile_native_hf_decoder(
     layer_idx_start: int = 0,
     mlen: int = 64,
     blen: int = 4,
+    mram_tile_capacity: int = 4,
     seed: int = 42,
     golden_precision: str = "hardware",
     verbose: bool = False,
@@ -301,8 +302,14 @@ def compile_native_hf_decoder(
 
     print("=" * 80)
     print(f"Model Compiler - {model_cfg.model_type} ({n_layers} layer{'s' if n_layers != 1 else ''})")
-    print(f"  decoder: hidden={hidden}, inter={inter}, heads={num_heads}/{num_kv_heads}, head_dim={head_dim}")
-    print(f"  compile: seq_len={seq_len}, mlen={mlen}, blen={blen}, total_q_dim={total_q_dim}")
+    print(
+        f"  decoder: hidden={hidden}, inter={inter}, heads={num_heads}/{num_kv_heads}, "
+        f"head_dim={head_dim}"
+    )
+    print(
+        f"  compile: seq_len={seq_len}, mlen={mlen}, blen={blen}, "
+        f"mram_tile_capacity={mram_tile_capacity}, total_q_dim={total_q_dim}"
+    )
     print("=" * 80)
 
     # ----------------------------------------------------------- weights
@@ -361,6 +368,7 @@ def compile_native_hf_decoder(
         cos_table,
         sin_table,
         mlen=mlen,
+        max_k_tiles=mram_tile_capacity,
         precision=golden_policy,
         trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
     )
@@ -378,6 +386,7 @@ def compile_native_hf_decoder(
             cos_table,
             sin_table,
             mlen=mlen,
+            max_k_tiles=mram_tile_capacity,
             precision=ReferencePrecision.from_mode("hf_fp32"),
             trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
         )
@@ -390,7 +399,12 @@ def compile_native_hf_decoder(
     registry = OpRegistry.load()
     registry.set_backend(Backend.PLENA)
 
-    prog = PlenaCompiler(mlen=mlen, blen=blen, real_data_ratio=REAL_DATA_RATIO)
+    prog = PlenaCompiler(
+        mlen=mlen,
+        blen=blen,
+        real_data_ratio=REAL_DATA_RATIO,
+        mram_tile_capacity=mram_tile_capacity,
+    )
 
     # Shared inputs
     x_input = prog.input("X", shape=(seq_len, hidden))

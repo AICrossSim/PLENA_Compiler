@@ -6,13 +6,13 @@ import math
 
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
-MAX_K_TILES = 4  # MRAM capacity: 4 x mlen^2 elements
 
-
-def _iter_k_chunks(num_k_tiles: int):
+def _iter_k_chunks(num_k_tiles: int, max_k_tiles: int):
+    if max_k_tiles <= 0:
+        raise ValueError(f"max_k_tiles must be > 0, got {max_k_tiles}")
     k_start = 0
     while k_start < num_k_tiles:
-        k_end = min(k_start + MAX_K_TILES, num_k_tiles)
+        k_end = min(k_start + max_k_tiles, num_k_tiles)
         yield k_start, k_end - k_start
         k_start = k_end
 
@@ -133,6 +133,7 @@ class ProgramMatrixOpsMixin:
             raise ValueError(f"out_features ({out_features}) must be a multiple of mlen ({mlen})")
         num_col_blocks = out_features // mlen
         num_k_tiles = math.ceil(k_total / mlen)
+        max_k_tiles = self.mram_tile_capacity
 
         # When rows is not a multiple of mlen the hardware still operates on
         # full tiles; only the first `rows` rows contain valid output.
@@ -150,7 +151,7 @@ class ProgramMatrixOpsMixin:
                 **k_split,
             )
 
-        if num_k_tiles <= MAX_K_TILES:
+        if num_k_tiles <= max_k_tiles:
             for col_idx in range(num_col_blocks):
                 for row_idx in range(num_row_blocks):
                     emit_projection(row_idx, col_idx, output, row_idx, col_idx)
@@ -159,7 +160,7 @@ class ProgramMatrixOpsMixin:
         # Temp buffer for one partial-sum tile. Allocating the full output shape
         # here can overlap with the real output for wide projections.
         temp = self.alloc(f"{name}_temp", mlen, mlen)
-        for k_chunk_idx, (k_block_start, k_block_count) in enumerate(_iter_k_chunks(num_k_tiles)):
+        for k_chunk_idx, (k_block_start, k_block_count) in enumerate(_iter_k_chunks(num_k_tiles, max_k_tiles)):
             k_split = {
                 "k_block_start": k_block_start,
                 "k_block_count": k_block_count,

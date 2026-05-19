@@ -357,12 +357,22 @@ class MRAMAllocator(MemoryAllocatorBase):
     """
     Matrix RAM address allocator.
 
-    Each sub-block is mlen x mlen = 4096 elements; aligned to mlen*mlen.
-    Default total_size=16384 holds 4 sub-blocks (MAX_K_TILES=4).
+    Each sub-block is mlen x mlen elements; aligned to mlen*mlen.
+    By default the allocator holds four matrix tiles.
     """
 
-    def __init__(self, total_size: int = MLEN * MLEN * 4):
-        super().__init__(total_size=total_size, alignment=MLEN * MLEN, mem_name="MRAM")
+    def __init__(self, total_size: int | None = None, *, mlen: int = MLEN, tile_capacity: int = 4):
+        if mlen <= 0:
+            raise ValueError(f"mlen must be > 0, got {mlen}")
+        if tile_capacity <= 0:
+            raise ValueError(f"tile_capacity must be > 0, got {tile_capacity}")
+
+        self.mlen = mlen
+        self.tile_capacity = tile_capacity
+        self.tile_elems = mlen * mlen
+        if total_size is None:
+            total_size = self.tile_elems * tile_capacity
+        super().__init__(total_size=total_size, alignment=self.tile_elems, mem_name="MRAM")
 
     def allocate(self, name: str, size: int) -> int:
         return self._vmm.allocate(name, size)

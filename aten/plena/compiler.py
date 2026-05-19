@@ -31,12 +31,20 @@ class PlenaCompiler(
     program-builder helpers on top. Operations eagerly emit ISA text.
     """
 
-    def __init__(self, mlen: int = 64, blen: int = 4, real_data_ratio: float = 1.125, unroll_loops: bool = False):
+    def __init__(
+        self,
+        mlen: int = 64,
+        blen: int = 4,
+        real_data_ratio: float = 1.125,
+        unroll_loops: bool = False,
+        mram_tile_capacity: int = 4,
+    ):
         """
         Args:
             mlen: Matrix tile size (default 64)
             blen: Vector tile size (default 4)
             real_data_ratio: HBM storage ratio (MXFP8 format = 1.125)
+            mram_tile_capacity: Number of mlen x mlen tiles that fit in MRAM.
             unroll_loops: If True, unroll sub-projection and attention helper loops
                           at ASM-gen time to eliminate C_LOOP_START/END overhead.
                           Overridden by the ATEN_UNROLL env var ("1"=True, "0"=False).
@@ -46,7 +54,13 @@ class PlenaCompiler(
             unroll_loops = True
         elif _env_unroll == "0":
             unroll_loops = False
-        super().__init__(mlen=mlen, blen=blen, real_data_ratio=real_data_ratio, unroll_loops=unroll_loops)
+        super().__init__(
+            mlen=mlen,
+            blen=blen,
+            real_data_ratio=real_data_ratio,
+            unroll_loops=unroll_loops,
+            mram_tile_capacity=mram_tile_capacity,
+        )
 
         # HBM address auto-allocation
         self._next_hbm_addr: int = 0
