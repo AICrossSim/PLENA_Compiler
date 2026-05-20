@@ -396,14 +396,14 @@ class IsaMatrixMixin:
 
         if self.unroll_loops:
             for i in range(self.mlen):
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {target_block.vram_addr + i * self.mlen}")
-                lines.append(f"S_ADDI_INT gp{gp_src1}, gp0, {src1_block.vram_addr + i * self.mlen}")
-                lines.append(f"S_ADDI_INT gp{gp_src2}, gp0, {src2_block.vram_addr + i * self.mlen}")
+                lines.extend(load_large_int(gp_dst, target_block.vram_addr + i * self.mlen))
+                lines.extend(load_large_int(gp_src1, src1_block.vram_addr + i * self.mlen))
+                lines.extend(load_large_int(gp_src2, src2_block.vram_addr + i * self.mlen))
                 lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_src1}, gp{gp_src2}, 0")
         else:
-            lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {target_block.vram_addr}")
-            lines.append(f"S_ADDI_INT gp{gp_src1}, gp0, {src1_block.vram_addr}")
-            lines.append(f"S_ADDI_INT gp{gp_src2}, gp0, {src2_block.vram_addr}")
+            lines.extend(load_large_int(gp_dst, target_block.vram_addr))
+            lines.extend(load_large_int(gp_src1, src1_block.vram_addr))
+            lines.extend(load_large_int(gp_src2, src2_block.vram_addr))
             lines.append(f"C_LOOP_START gp{gp_loop}, {self.mlen}")
             lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_src1}, gp{gp_src2}, 0")
             lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}")
