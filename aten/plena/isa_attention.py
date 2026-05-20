@@ -93,6 +93,9 @@ class IsaAttentionMixin:
         if scale != 1.0:
             lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}")
 
+        # V_RED_MAX accumulates into its destination FP register in the
+        # emulator, so clear the per-row max accumulator before each row.
+        lines.append(f"S_LD_FP f{fp_row_max}, gp0, 2")
         lines.append(f"V_RED_MAX f{fp_row_max}, gp{gp_s}, {mask_en}")
 
         # m_curr = max(row_max, m_old) — online softmax must retain the running max.
@@ -176,6 +179,7 @@ class IsaAttentionMixin:
             if scale != 1.0:
                 lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}")
 
+            lines.append(f"S_LD_FP f{fp_row_max}, gp0, 2")
             lines.append(f"V_RED_MAX f{fp_row_max}, gp{gp_s}, {mask_en}")
 
             # m_curr = max(row_max, m_old) — online softmax must retain the running max.

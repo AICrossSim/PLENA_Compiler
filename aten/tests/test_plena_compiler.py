@@ -5,6 +5,7 @@ Run: PYTHONPATH=.:tools:.. python3 aten/tests/test_plena_compiler.py
 
 import sys
 import os
+import re
 
 # Insert PLENA_Simulator root and tools/ so imports resolve correctly regardless
 # of how the test is invoked (direct python3 or via PYTHONPATH=.:tools:..).
@@ -271,6 +272,46 @@ def test_partial_row_linear_uses_one_blen_row_group():
     assert ", 1" in code
 
     print("  PASS test_partial_row_linear_uses_one_blen_row_group")
+
+
+def test_ffn_workspace_uses_allocator_and_avoids_rope_tables():
+    """FFN temps must be allocator-managed, not hardcoded into low VRAM."""
+    from compiler.aten.plena import PlenaCompiler
+
+    def overlaps(a0, a1, b0, b1):
+        return a0 < b1 and b0 < a1
+
+    prog = PlenaCompiler(mlen=256, blen=64, mram_tile_capacity=16)
+    cos_input = prog.input("COS", shape=(64, 256), physical_shape=(64, 256))
+    sin_input = prog.input("SIN", shape=(64, 256), physical_shape=(64, 256))
+    cos = prog.load_batch(cos_input, name="COS")
+    sin = prog.load_batch(sin_input, name="SIN")
+    x_input = prog.input("X", shape=(64, 768), physical_shape=(64, 768))
+    x = prog.load_batch(x_input, name="X")
+    w_gate = prog.input("W_gate", shape=(768, 1536), physical_shape=(768, 1536))
+    w_up = prog.input("W_up", shape=(768, 1536), physical_shape=(768, 1536))
+    w_down = prog.input("W_down", shape=(1536, 768), physical_shape=(1536, 768))
+
+    cos_range = (prog.get_vram_addr(cos.name), prog.get_vram_addr(cos.name) + 64 * 256)
+    sin_range = (prog.get_vram_addr(sin.name), prog.get_vram_addr(sin.name) + 64 * 256)
+    prog.ffn(x, w_gate, w_up, w_down)
+    code = prog.compile()
+
+    match = re.search(r"Allocate VRAM Matrix _ffn_workspace:.* at VRAM\[(\d+)\]", code)
+    assert match is not None, "FFN workspace allocation comment missing"
+    workspace_base = int(match.group(1))
+    workspace_elems = 64 * (2 * 1536 + 1536)
+    workspace_range = (workspace_base, workspace_base + workspace_elems)
+
+    assert not overlaps(*workspace_range, *cos_range), (
+        f"FFN workspace {workspace_range} overlaps COS {cos_range}"
+    )
+    assert not overlaps(*workspace_range, *sin_range), (
+        f"FFN workspace {workspace_range} overlaps SIN {sin_range}"
+    )
+    assert "_ffn_absolute_workspace_padding" not in code
+
+    print("  PASS test_ffn_workspace_uses_allocator_and_avoids_rope_tables")
 
 
 def test_fix_large_immediates_roundtrip():
@@ -736,6 +777,7 @@ if __name__ == "__main__":
         test_linear_projection_uses_runtime_mram_tile_capacity,
         test_vram_layout_tracks_logical_and_physical_shape,
         test_partial_row_linear_uses_one_blen_row_group,
+        test_ffn_workspace_uses_allocator_and_avoids_rope_tables,
         test_fix_large_immediates_roundtrip,
         test_fix_large_immediates_legalizes_relative_adds,
         test_rotate_half_matrix_identity,

@@ -22,12 +22,18 @@ def ffn_asm(
     use_loop_instructions: bool = False,
     use_fused_up_gate: bool = False,
     matrix_sram_size: int = 1024,
+    workspace_base_address: int = 0,
 ) -> str:
     """
     Generates assembly code for a FFN operation.
 
     Set use_loop_instructions=True to use C_LOOP_START/END for compact code.
     Set use_fused_up_gate=True to fuse upsize and gate projections (requires 12 registers).
+
+    ``workspace_base_address`` is the VRAM base for FFN temporaries. The default
+    preserves the historical direct_emit layout at low VRAM addresses. Compiler
+    lowering should pass an allocator-managed base so FFN temporaries cannot
+    clobber persistent tensors such as RoPE tables.
 
     ``matrix_sram_size`` is the MRAM capacity (element-units-per-tile * tiles). When
     a projection's K dimension exceeds ``matrix_sram_size // mlen`` tiles, the template
@@ -51,6 +57,7 @@ def ffn_asm(
             down_weight_hbm_offset_reg,
             const_one_fp_address,
             activation_base_address,
+            workspace_base_address=workspace_base_address,
         )
     elif use_loop_instructions:
         return _ffn_asm_with_loops(
@@ -67,6 +74,7 @@ def ffn_asm(
             down_weight_hbm_offset_reg,
             const_one_fp_address,
             activation_base_address,
+            workspace_base_address=workspace_base_address,
         )
     else:
         return _ffn_asm_unrolled(
@@ -84,7 +92,21 @@ def ffn_asm(
             const_one_fp_address,
             activation_base_address,
             matrix_sram_size=matrix_sram_size,
+            workspace_base_address=workspace_base_address,
         )
+
+
+def _ffn_workspace_layout(
+    batch: int,
+    seq_len: int,
+    intermediate_size: int,
+    workspace_base_address: int,
+) -> tuple[int, int, int]:
+    rows = batch * seq_len
+    up_result_base = workspace_base_address
+    gate_result_base = up_result_base + rows * intermediate_size
+    scratch_base = gate_result_base + rows * intermediate_size
+    return up_result_base, gate_result_base, scratch_base
 
 
 def _ffn_asm_unrolled(
@@ -102,6 +124,7 @@ def _ffn_asm_unrolled(
     const_one_fp_address: int,
     activation_base_address: int,
     matrix_sram_size: int = 1024,
+    workspace_base_address: int = 0,
 ) -> str:
     """Unrolled FFN: up + gate + SiLU + down projections.
 
@@ -112,10 +135,9 @@ def _ffn_asm_unrolled(
     ``aten/ops/plena/linear_ops.py::linear_plena``.
     """
 
-    # memory assignment
-    # 0 -> activation
-    # b * s * hidden_size -> upsize intermediate results
-    # b * s * (hidden_size + intermediate_size) -> gate projection results
+    up_result_base, gate_result_base, scratch_base = _ffn_workspace_layout(
+        batch, seq_len, intermediate_size, workspace_base_address
+    )
 
     w_actual_register = alive_registers[0]
     w_temp_register = alive_registers[1]
@@ -136,20 +158,17 @@ def _ffn_asm_unrolled(
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
     # Set the address for on-chip sram
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
 
     # K-split config: when K tile count > MRAM tile capacity, we split K and
     # accumulate partial sums. `activation` region (used as input) starts at
-    # `activation_base_address`; the K-split scratch region for up/gate lives
-    # *after* the up+gate output regions at
-    # `batch*seq_len*(hidden_size+2*intermediate_size)` (hidden_size chunk for
-    # activation, intermediate_size each for up and gate results).
+    # `activation_base_address`; the K-split scratch region lives after the
+    # allocator-managed up/gate output regions.
     MAX_K_TILES = max(1, matrix_sram_size // mlen)
 
     # --- FFN Upsize Linear (K = hidden_size) ---
-    hidden_size // mlen
-    up_scratch_base = batch * seq_len * (hidden_size + 2 * intermediate_size)
+    up_num_k_tiles = hidden_size // mlen
     generated_code += _emit_ffn_projection_unrolled(
         mlen=mlen,
         vlen=vlen,
@@ -161,7 +180,7 @@ def _ffn_asm_unrolled(
         weight_stride=intermediate_size,
         weight_hbm_offset_reg=up_weight_hbm_offset_reg,
         result_base_register=up_result_register,
-        result_base_value=batch * seq_len * hidden_size,
+        result_base_value=up_result_base,
         activation_base_address=activation_base_address,
         activation_base_register=None,
         max_k_tiles=MAX_K_TILES,
@@ -170,12 +189,11 @@ def _ffn_asm_unrolled(
         a_actual_register=a_actual_register,
         intermediate_register=intermediate_register,
         w_hbm_offset_register=w_hbm_offset_register,
-        scratch_base_value=up_scratch_base,
+        scratch_base_value=scratch_base,
         section_comment="FFN Upsize Linear Generation",
     )
 
     generated_code += " ; FFN Gate Projection Generation \n"
-    gate_scratch_base = batch * seq_len * (hidden_size + 2 * intermediate_size)
     generated_code += _emit_ffn_projection_unrolled(
         mlen=mlen,
         vlen=vlen,
@@ -187,7 +205,7 @@ def _ffn_asm_unrolled(
         weight_stride=intermediate_size,
         weight_hbm_offset_reg=gate_weight_hbm_offset_reg,
         result_base_register=gate_result_register,
-        result_base_value=batch * seq_len * (hidden_size + intermediate_size),
+        result_base_value=gate_result_base,
         activation_base_address=activation_base_address,
         activation_base_register=None,
         max_k_tiles=MAX_K_TILES,
@@ -196,14 +214,14 @@ def _ffn_asm_unrolled(
         a_actual_register=a_actual_register,
         intermediate_register=intermediate_register,
         w_hbm_offset_register=w_hbm_offset_register,
-        scratch_base_value=gate_scratch_base,
+        scratch_base_value=scratch_base,
         section_comment="FFN Gate Projection (inlined)",
     )
 
     generated_code += "; SILU Generation \n"
     generated_code += f"S_LD_FP f1, gp0, {const_one_fp_address} \n"
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
     generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # SiLU: sigmoid(x) * x * gate, using activation region as scratchpad
@@ -232,10 +250,8 @@ def _ffn_asm_unrolled(
     # Storing the results to the activation base region
     act_result_register = gate_result_register
     # Down projection: K = intermediate_size. Activation input is at
-    # VRAM address batch*seq_len*hidden_size (up_result region, post-SiLU).
-    # Scratch for K-split lives past the gate region so it never collides
-    # with input (up_result) or output (activation_base_address).
-    down_scratch_base = batch * seq_len * (hidden_size + 2 * intermediate_size)
+    # VRAM address up_result_base (post-SiLU). Scratch for K-split lives past
+    # the gate region so it never collides with input or output.
     generated_code += _emit_ffn_projection_unrolled(
         mlen=mlen,
         vlen=vlen,
@@ -250,14 +266,14 @@ def _ffn_asm_unrolled(
         result_base_value=activation_base_address,
         activation_base_address=None,
         activation_base_register=up_result_register,
-        activation_base_register_value=batch * seq_len * hidden_size,
+        activation_base_register_value=up_result_base,
         max_k_tiles=max(1, matrix_sram_size // mlen),
         w_actual_register=w_actual_register,
         w_temp_register=w_temp_register,
         a_actual_register=a_actual_register,
         intermediate_register=intermediate_register,
         w_hbm_offset_register=w_hbm_offset_register,
-        scratch_base_value=down_scratch_base,
+        scratch_base_value=scratch_base,
         section_comment="FFN Downsize Linear (inlined)",
     )
     return generated_code
@@ -309,7 +325,7 @@ def _emit_ffn_projection_unrolled(
     assert k_size % mlen == 0, f"K ({k_size}) must be a multiple of MLEN ({mlen})"
     assert out_size % mlen == 0, f"out_size ({out_size}) must be a multiple of MLEN ({mlen})"
     num_k_tiles = k_size // mlen
-    (batch * seq_len) // blen
+    num_act_cols = (batch * seq_len) // blen
 
     lines: list[str] = [f" ; {section_comment} (k_size={k_size}, out_size={out_size})\n"]
 
@@ -387,11 +403,15 @@ def _emit_ffn_projection_unrolled(
         if not is_first:
             # V_ADD_VV output += scratch  for the entire output region.
             # Use w_actual_register as output pointer, w_temp_register as scratch ptr.
-            lines.append(f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]\n")
+            lines.append(
+                f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]\n"
+            )
             lines.append(_load_large_int(w_actual_register, result_base_value))
             lines.append(_load_large_int(w_temp_register, scratch_base_value))
             for _ in range(per_vlen_adds):
-                lines.append(f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 \n")
+                lines.append(
+                    f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 \n"
+                )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {vlen} \n")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {vlen} \n")
 
@@ -490,11 +510,15 @@ def _emit_ffn_projection_chunk(
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n")
                 lines.append(
-                    _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * weight_stride, w_temp_register)
+                    _addi_large_int(
+                        w_hbm_offset_register, w_hbm_offset_register, mlen * weight_stride, w_temp_register
+                    )
                 )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n")
         else:
-            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n")
+            lines.append(
+                f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n"
+            )
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_base_register}, {(weight_row % (mlen // blen)) * blen} \n"
             )
@@ -522,12 +546,16 @@ def _emit_ffn_projection_chunk(
             for _ in range(k_tile_count):
                 lines.append(f"M_MM 0, gp{w_temp_register}, gp{a_actual_register} \n")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} \n")
-                lines.append(f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n")
+                lines.append(
+                    f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n"
+                )
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 \n")
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} \n")
 
         if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_size // blen - 1:
-            lines.append(f"S_ADDI_INT gp{result_base_register}, gp{result_base_register}, {mlen * batch * seq_len} \n")
+            lines.append(
+                f"S_ADDI_INT gp{result_base_register}, gp{result_base_register}, {mlen * batch * seq_len} \n"
+            )
 
     return "".join(lines)
 
@@ -544,6 +572,7 @@ def ffn_up_silu_asm(
     up_weight_hbm_offset_reg: int,
     const_one_fp_address: int,
     activation_base_address: int,
+    workspace_base_address: int = 0,
 ) -> str:
     """Up projection + SiLU only (no gate/down). Uses C_LOOP instructions."""
     # Register allocation
@@ -570,7 +599,8 @@ def ffn_up_silu_asm(
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
     # Set base address for up result
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
+    up_result_base, _, _ = _ffn_workspace_layout(batch, seq_len, intermediate_size, workspace_base_address)
+    generated_code += _load_large_int(up_result_register, up_result_base)
 
     # Upsize linear (loop)
     generated_code += "; FFN Upsize Linear Generation (Loop)\n"
@@ -667,6 +697,7 @@ def ffn_intermediate_asm(
     up_weight_hbm_offset_reg: int,
     const_one_fp_address: int,
     activation_base_address: int,
+    workspace_base_address: int = 0,
 ) -> str:
     """Up + gate + SiLU (no down projection). Uses C_LOOP instructions."""
     # Register allocation
@@ -684,6 +715,9 @@ def ffn_intermediate_asm(
     loop_inner2_reg = alive_registers[9]
 
     generated_code = "; FFN Intermediate Generation (Up + Gate + SILU only)\n"
+    up_result_base, gate_result_base, _ = _ffn_workspace_layout(
+        batch, seq_len, intermediate_size, workspace_base_address
+    )
 
     # Setup: scale/stride registers
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
@@ -693,8 +727,8 @@ def ffn_intermediate_asm(
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
     # Set base addresses for results
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
 
     # Upsize linear (loop)
     generated_code += "; FFN Upsize Linear Generation (Loop)\n"
@@ -773,8 +807,8 @@ def ffn_intermediate_asm(
     generated_code += "; FFN Gate Projection Generation (Loop)\n"
 
     # Reset base addresses
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
     generated_code += f"S_ADDI_INT gp{w_hbm_offset_register}, gp0, 0\n"
 
     generated_code += f"; Outer loop: {num_mlen_blocks} MLEN blocks\n"
@@ -844,8 +878,8 @@ def ffn_intermediate_asm(
     generated_code += f"S_LD_FP f1, gp0, {const_one_fp_address}\n"
 
     # Reset addresses
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
     generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # Loop over batch * seq_len * (intermediate_size // vlen)
@@ -865,7 +899,7 @@ def ffn_intermediate_asm(
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
-    # Note: Result is stored in up_result_register at base address batch * seq_len * hidden_size
+    # Note: Result is stored in up_result_register at up_result_base
     generated_code += "; Intermediate result (up + gate + SILU) stored at up_result_register location\n"
 
     return generated_code
@@ -885,6 +919,7 @@ def _ffn_asm_with_loops(
     down_weight_hbm_offset_reg: int,
     const_one_fp_address: int,
     activation_base_address: int,
+    workspace_base_address: int = 0,
 ) -> str:
     """Full FFN (up + gate + SiLU + down) using C_LOOP instructions."""
 
@@ -903,6 +938,9 @@ def _ffn_asm_with_loops(
     loop_inner2_reg = alive_registers[9]
 
     generated_code = "; FFN Generation (Loop-Optimized)\n"
+    up_result_base, gate_result_base, _ = _ffn_workspace_layout(
+        batch, seq_len, intermediate_size, workspace_base_address
+    )
 
     # Setup: scale/stride registers
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
@@ -912,8 +950,8 @@ def _ffn_asm_with_loops(
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
     # Set base addresses for results
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
 
     # Upsize linear (loop)
     generated_code += "; FFN Upsize Linear Generation (Loop)\n"
@@ -992,8 +1030,8 @@ def _ffn_asm_with_loops(
     generated_code += "; FFN Gate Projection Generation (Loop)\n"
 
     # Reset base addresses
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
     generated_code += f"S_ADDI_INT gp{w_hbm_offset_register}, gp0, 0\n"
 
     generated_code += f"; Outer loop: {num_mlen_blocks} MLEN blocks\n"
@@ -1063,8 +1101,8 @@ def _ffn_asm_with_loops(
     generated_code += f"S_LD_FP f1, gp0, {const_one_fp_address}\n"
 
     # Reset addresses
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
     generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # Loop over batch * seq_len * (intermediate_size // vlen)
@@ -1097,7 +1135,7 @@ def _ffn_asm_with_loops(
     # Result goes to activation base region
     act_result_register = gate_result_register
     generated_code += _load_large_int(act_result_register, activation_base_address)
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
+    generated_code += _load_large_int(up_result_register, up_result_base)
 
     # Downsize: (b*s, intermediate_size) @ (intermediate_size, hidden_size) -> (b*s, hidden_size)
     num_down_mlen_blocks = hidden_size // mlen
@@ -1127,7 +1165,7 @@ def _ffn_asm_with_loops(
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen}\n"
 
     # Reset activation base; up_result_register recomputed here (used as temp below)
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
+    generated_code += _load_large_int(up_result_register, up_result_base)
     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{up_result_register}, 0\n"
     num_down_act_cols = (batch * seq_len) // blen
     generated_code += f"; Inner loop: {num_down_act_cols} activation columns\n"
@@ -1185,6 +1223,7 @@ def _ffn_asm_fused_up_gate(
     down_weight_hbm_offset_reg: int,
     const_one_fp_address: int,
     activation_base_address: int,
+    workspace_base_address: int = 0,
 ) -> str:
     """Fused FFN: overlaps up/gate prefetch to reduce HBM traffic. Requires 12 registers."""
 
@@ -1206,6 +1245,9 @@ def _ffn_asm_fused_up_gate(
     w_gate_base_register = alive_registers[11]  # Gate weight base in MRAM
 
     generated_code = "; FFN Generation (Fused Up+Gate Optimized)\n"
+    up_result_base, gate_result_base, _ = _ffn_workspace_layout(
+        batch, seq_len, intermediate_size, workspace_base_address
+    )
 
     # Setup: scale/stride registers
     generated_code += _load_large_int(w_actual_register, hidden_size * intermediate_size)
@@ -1215,8 +1257,8 @@ def _ffn_asm_fused_up_gate(
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
 
     # Set base addresses for results
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
 
     # Fused up + gate linear with overlapped prefetch
     generated_code += "; Fused Up+Gate Linear (overlapped prefetch optimization)\n"
@@ -1377,8 +1419,8 @@ def _ffn_asm_fused_up_gate(
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register}\n"
 
     # Initialize SILU pointers
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
-    generated_code += _load_large_int(gate_result_register, batch * seq_len * (hidden_size + intermediate_size))
+    generated_code += _load_large_int(up_result_register, up_result_base)
+    generated_code += _load_large_int(gate_result_register, gate_result_base)
     generated_code += _load_large_int(intermediate_register, activation_base_address)
 
     # Initialize DOWN prefetch pointers (w_actual_register=MRAM offset, a_actual_register=HBM offset)
@@ -1420,7 +1462,7 @@ def _ffn_asm_fused_up_gate(
 
     act_result_register = gate_result_register
     generated_code += _load_large_int(act_result_register, activation_base_address)
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
+    generated_code += _load_large_int(up_result_register, up_result_base)
 
     down_act_col_advance = mlen * blen
 
@@ -1435,7 +1477,7 @@ def _ffn_asm_fused_up_gate(
     # First block computation
     generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen_down}\n"
 
-    generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
+    generated_code += _load_large_int(up_result_register, up_result_base)
     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{up_result_register}, 0\n"
     num_down_act_cols = (batch * seq_len) // blen
 
@@ -1485,7 +1527,7 @@ def _ffn_asm_fused_up_gate(
         generated_code += f"; Middle loop: {tiles_per_mlen_down} tiles per MLEN block\n"
         generated_code += f"C_LOOP_START gp{loop_inner_reg}, {tiles_per_mlen_down}\n"
 
-        generated_code += _load_large_int(up_result_register, batch * seq_len * hidden_size)
+        generated_code += _load_large_int(up_result_register, up_result_base)
         generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{up_result_register}, 0\n"
 
         generated_code += f"C_LOOP_START gp{loop_inner2_reg}, {num_down_act_cols}\n"

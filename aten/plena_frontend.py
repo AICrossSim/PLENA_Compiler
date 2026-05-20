@@ -464,27 +464,6 @@ def _copy_into_vram_view(prog, source, name, rows, cols, vram_addr):
     return target
 
 
-def _reserve_vram_until(prog, min_next_addr: int, name: str):
-    """Bump the VRAM allocator above an absolute-address template workspace."""
-    current = prog.vram_allocator.next_free
-    if current >= min_next_addr:
-        return None
-    pad_elems = min_next_addr - current
-    pad_rows = (pad_elems + prog.mlen - 1) // prog.mlen
-    return prog.alloc(
-        name,
-        pad_rows,
-        prog.mlen,
-        strict=False,
-        physical_shape=(pad_rows, prog.mlen),
-    )
-
-
-def _ffn_absolute_workspace_end(physical_rows: int, hidden_size: int, inter_dim: int) -> int:
-    """Upper bound for the legacy FFN template's absolute low-VRAM workspace."""
-    return physical_rows * (hidden_size + 2 * inter_dim + max(hidden_size, inter_dim))
-
-
 def _free_named_tensors(prog, names):
     for name in names:
         tensor = prog._tensors.get(name)
@@ -772,7 +751,6 @@ def _emit_packed_attention_block(
                     k_idx=batch_idx * row_block_stride,
                     valid_cols=active_seq_len_per_batch,
                 )
-
     prog.free_tensor(attn_scratch)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
@@ -1449,13 +1427,6 @@ def compile_native_hf_decoder(
     sin_input = prog.input("SIN", shape=(compile_seq_rows, rope_width), physical_shape=rope_table_physical_shape)
     COS = prog.load_batch(cos_input, name="COS")
     SIN = prog.load_batch(sin_input, name="SIN")
-
-    # The legacy FFN template uses absolute low-VRAM regions for up/gate/scratch
-    # intermediates. Reserve that region before allocating reusable tensors
-    # (causal mask, X/POS, debug checkpoints) so FFN cannot clobber them.
-    ffn_physical_rows = max(compile_seq_rows, blen, mlen)
-    ffn_workspace_end = _ffn_absolute_workspace_end(ffn_physical_rows, padded_hidden, padded_inter)
-    _reserve_vram_until(prog, ffn_workspace_end, "_ffn_absolute_workspace_padding")
 
     # Causal mask: (mlen, mlen) with 0 on/below diagonal, -inf above
     causal_mask_data = torch.zeros(mlen, mlen)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-
 from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
@@ -589,7 +588,12 @@ class ProgramAttentionMixin:
                 self.vram_add(s_head, causal_mask, num_rows=rows)
             elif causal_mask is True:
                 self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
-            self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=valid_cols or seq_len)
+            # A materialized causal mask already makes inactive/future columns
+            # negligible for the active rows. Passing valid_cols here selects
+            # the vector-mask reduce path, whose semantics differ from a pure
+            # active-lane reduction in the emulator.
+            softmax_valid_cols = None if isinstance(causal_mask, VRAMMatrixVar) else (valid_cols or seq_len)
+            self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
             self.compute_pv(s_head, V, k_idx, pv, head_slot_dim, rows=rows)
             self.scale_o_row(o_head, 0, rows=rows)
             self.vram_add(o_head, pv, num_rows=rows)
@@ -732,7 +736,8 @@ class ProgramAttentionMixin:
                     self.vram_add(s_head, causal_mask, num_rows=rows)
                 elif causal_mask is True:
                     self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
-                self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=seq_len)
+                softmax_valid_cols = None if isinstance(causal_mask, VRAMMatrixVar) else seq_len
+                self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
                 self.emit(
                     self._pv_multiply_asm(
                         mlen=mlen,

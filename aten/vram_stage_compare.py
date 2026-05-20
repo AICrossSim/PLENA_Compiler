@@ -115,9 +115,9 @@ def _linear_hw(A: torch.Tensor, B: torch.Tensor, mlen: int, max_k_tiles: int) ->
 def _rope_hw(x: torch.Tensor, rope: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     rows, cols = x.shape
     rope_slice = rope[:cols, :cols]
-    cos_slice = cos[:rows, :cols]
-    sin_slice = sin[:rows, :cols]
     x_inter = _round_hw(x)
+    cos_slice = _pad_expected_to_actual(cos[:rows, :cols], x_inter)
+    sin_slice = _pad_expected_to_actual(sin[:rows, :cols], x_inter)
     x_rot = _round_hw(torch.matmul(x_inter, _round_hw(rope_slice)))
     x_cos = _round_hw(x_inter * _round_hw(cos_slice))
     x_rot_sin = _round_hw(x_rot * _round_hw(sin_slice))

@@ -396,6 +396,16 @@ class ProgramTensorMixin:
         activation_base_address = self.get_vram_addr(input_var.name)
         max_k_tiles = max(hidden_size // mlen, inter_dim // mlen)
         use_loop_instructions = max_k_tiles <= self.mram_tile_capacity
+        workspace_elems = batch_size * (2 * inter_dim + max(hidden_size, inter_dim))
+        workspace_rows = (workspace_elems + mlen - 1) // mlen
+        workspace = self.alloc(
+            "_ffn_workspace",
+            workspace_rows,
+            mlen,
+            strict=False,
+            physical_shape=(workspace_rows, mlen),
+        )
+        workspace_base_address = self.get_vram_addr(workspace.name)
 
         isa_code = preload_addr_reg_asm(
             addr_reg_to_set=[1, 2, 3],
@@ -419,9 +429,11 @@ class ProgramTensorMixin:
             activation_base_address=activation_base_address,
             use_loop_instructions=use_loop_instructions,
             matrix_sram_size=self.mram_capacity_elems,
+            workspace_base_address=workspace_base_address,
         )
 
         self.emit(isa_code)
+        self.free_tensor(workspace)
         return input_var
 
 

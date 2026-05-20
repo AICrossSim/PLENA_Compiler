@@ -286,6 +286,29 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         asm = ffn_asm(hidden_size=128, intermediate_size=256, use_loop_instructions=True, **args)
         _check_all_addi_immediates(self, asm, "ffn_asm(loop,128,256)")
 
+    def test_workspace_base_offsets_loop_path(self):
+        """Production loop path must place FFN temps at the explicit workspace base."""
+        ffn_asm = self._import_ffn_asm()
+        args = dict(self.BASE_ARGS)
+        args["alive_registers"] = list(range(10))
+        workspace_base = 1_000_000
+        rows = args["batch"] * args["seq_len"]
+        gate_base = workspace_base + rows * 256
+
+        asm = ffn_asm(
+            hidden_size=128,
+            intermediate_size=256,
+            use_loop_instructions=True,
+            workspace_base_address=workspace_base,
+            **args,
+        )
+
+        self.assertIn(f"S_LUI_INT gp3, {workspace_base >> 12}", asm)
+        self.assertIn(f"S_ADDI_INT gp3, gp3, {workspace_base & 0xFFF}", asm)
+        self.assertIn(f"S_LUI_INT gp5, {gate_base >> 12}", asm)
+        self.assertIn(f"S_ADDI_INT gp5, gp5, {gate_base & 0xFFF}", asm)
+        _check_all_addi_immediates(self, asm, "ffn_asm(loop,workspace)")
+
 
 def _check_all_addi_immediates(test_case, asm: str, label: str) -> None:
     """Assert every S_ADDI_INT immediate in asm is < 2^18."""
