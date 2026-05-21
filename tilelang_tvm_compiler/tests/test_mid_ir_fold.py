@@ -24,7 +24,6 @@ from tvm import tir
 
 from tilelang_tvm_compiler.frontend.mid_ir import ir
 from tilelang_tvm_compiler.frontend.mid_ir.passes.fold import (
-    FoldError,
     run as fold_run,
 )
 

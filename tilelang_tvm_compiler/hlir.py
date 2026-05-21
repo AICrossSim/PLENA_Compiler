@@ -29,9 +29,8 @@ That keeps the codegen pass mechanical -- no clever rewrites yet.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-from . import scope as _scope
 
 
 @dataclass(frozen=True)
@@ -186,12 +185,12 @@ def hbm_strides_for_layout(shape, layout: str = DEFAULT_LAYOUT):
 
 def make_tile_layout(
     *, shape=None, layout: str = DEFAULT_LAYOUT, mlen: int, hlen: int,
-    cluster_dim: Optional[int] = None,
+    cluster_dim: int | None = None,
     # Legacy keyword form (b/s/h/d) kept for back-compat with any older
     # caller. New callers should pass ``shape=...`` plus ``layout=...``.
-    b: Optional[int] = None, s: Optional[int] = None,
-    h: Optional[int] = None, d: Optional[int] = None,
-) -> Optional["TileLayout"]:
+    b: int | None = None, s: int | None = None,
+    h: int | None = None, d: int | None = None,
+) -> TileLayout | None:
     """Build a TileLayout for a 4D buffer if (and only if) it needs
     multi-tile storage.
 
@@ -277,21 +276,21 @@ class Buffer:
 
     name: str
     scope: str                       # one of scope.{HBM,VRAM,MRAM,FPRAM}
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     dtype: str
 
     # Filled by AddressAllocationPass. None until then.
-    address: Optional[int] = None     # base address in the buffer's scope
+    address: int | None = None     # base address in the buffer's scope
     hbm_offset: int = 0               # for HBM tiles that are sub-regions
-    hbm_stride: Optional[int] = None  # row stride in HBM (defaults to mlen)
-    hbm_scale_size: Optional[int] = None  # tile elem count (defaults to tile_elems)
+    hbm_stride: int | None = None  # row stride in HBM (defaults to mlen)
+    hbm_scale_size: int | None = None  # tile elem count (defaults to tile_elems)
 
     # Multi-tile physical layout descriptor for VRAM/MRAM buffers whose
     # logical shape overflows one inner tile. None means "single tile,
     # plain row-major" — the existing case all kernels written before
     # this change relied on. See ``TileLayout`` docstring for the
     # logical→physical mapping.
-    tile_layout: Optional[TileLayout] = None
+    tile_layout: TileLayout | None = None
 
     # Author-pinned ``global.vram`` / ``global.mram`` tensor caches. The
     # testbench (or a pre-kernel stub) loads these row-major-contiguous,
@@ -316,7 +315,7 @@ class Buffer:
     # only exists so ``--dump-buffer-addrs`` can emit the value the
     # test harness needs to preload — nothing else in the compiler
     # reads it.
-    constant_value: Optional[float] = None
+    constant_value: float | None = None
 
     # 4D-buffer layout hint, used to resolve which axis is the row /
     # channel / col dim. ``BSHD`` (the default) means axes are already
@@ -333,12 +332,12 @@ class Buffer:
     # cluster-aware (HBM globals, user-declared ``global.*`` caches,
     # pure scalar fpram slots). Downstream addressing reads this
     # directly instead of guessing from shape.
-    cluster_dim: Optional[int] = None
+    cluster_dim: int | None = None
 
     # Pass-attached scratch (e.g. logical_rows, logical_cols, row_blocks,
     # col_blocks for HBM buffers). Free-form so passes can stash hints
     # without growing this dataclass.
-    annotations: Dict[str, Any] = field(default_factory=dict)
+    annotations: dict[str, Any] = field(default_factory=dict)
 
     @property
     def num_elements(self) -> int:
@@ -381,8 +380,8 @@ class BufferSlice:
           for whole buffers).
     """
     parent: str                               # name of parent Buffer
-    starts: Tuple[Any, ...]                   # int | tir.PrimExpr per dim
-    extents: Tuple[int, ...]                  # int per dim
+    starts: tuple[Any, ...]                   # int | tir.PrimExpr per dim
+    extents: tuple[int, ...]                  # int per dim
 
 
 @dataclass
@@ -400,8 +399,8 @@ class VramRegion:
     Each ``extents`` entry is a Python int.
     """
     parent: str
-    starts: Tuple[Any, ...]
-    extents: Tuple[int, ...]
+    starts: tuple[Any, ...]
+    extents: tuple[int, ...]
 
 
 @dataclass
@@ -416,8 +415,8 @@ class MramRegion:
     MRAM; mixing them up would target the wrong HW unit).
     """
     parent: str
-    starts: Tuple[Any, ...]
-    extents: Tuple[int, ...]
+    starts: tuple[Any, ...]
+    extents: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -430,7 +429,7 @@ class BufferElement:
     """
 
     buffer: str
-    indices: Tuple[Any, ...]
+    indices: tuple[Any, ...]
 
 
 @dataclass
@@ -454,11 +453,11 @@ class Op:
     kind: str
     # Each entry is either a buffer name (whole-buffer reference) or a
     # BufferSlice (a sub-region of a parent buffer).
-    buffer_args: List[Any]            # List[str | BufferSlice]
-    scalar_args: List[Any] = field(default_factory=list)  # int | float | str | tir.PrimExpr
-    annotations: Dict[str, Any] = field(default_factory=dict)  # debug/passes
+    buffer_args: list[Any]            # List[str | BufferSlice]
+    scalar_args: list[Any] = field(default_factory=list)  # int | float | str | tir.PrimExpr
+    annotations: dict[str, Any] = field(default_factory=dict)  # debug/passes
     # Only set for structured ops (currently just "for"). Leaves leave it None.
-    body: Optional[List["Op"]] = None
+    body: list[Op] | None = None
     # Per-buffer-arg axes. Parallel to ``buffer_args``: the i-th entry
     # is the per-dim ``(role_name, extent)`` tuple for ``buffer_args[i]``.
     # ``role_name`` is a string identifying the dim's algebra role
@@ -473,7 +472,7 @@ class Op:
     # this leave the slot ``None``. Slot count must equal
     # ``len(buffer_args)``; default empty for back-compat with
     # constructors that haven't migrated.
-    buffer_axes: List[Optional[Tuple[Tuple[str, int], ...]]] = field(
+    buffer_axes: list[tuple[tuple[str, int], ...] | None] = field(
         default_factory=list,
     )
 
@@ -481,7 +480,7 @@ class Op:
 def make_for_op(
     loop_var,
     extent,
-    body: List[Op],
+    body: list[Op],
     init: int = 0,
 ) -> Op:
     """Helper: build a structured For op."""
@@ -499,12 +498,12 @@ class HLIRModule:
     """One PrimFunc lowered to HLIR. Buffers + linear op stream."""
 
     name: str
-    buffers: Dict[str, Buffer]        # name -> Buffer
-    ops: List[Op]
+    buffers: dict[str, Buffer]        # name -> Buffer
+    ops: list[Op]
     # PrimFunc parameter names in their declaration order. Useful so
     # downstream passes know which buffers come in as inputs/outputs vs
     # internally-allocated scratch.
-    param_names: List[str] = field(default_factory=list)
+    param_names: list[str] = field(default_factory=list)
 
     def get_buffer(self, name: str) -> Buffer:
         if name not in self.buffers:
@@ -514,7 +513,7 @@ class HLIRModule:
             )
         return self.buffers[name]
 
-    def buffers_in_scope(self, scope: str) -> List[Buffer]:
+    def buffers_in_scope(self, scope: str) -> list[Buffer]:
         return [b for b in self.buffers.values() if b.scope == scope]
 
     def __repr__(self) -> str:
@@ -525,7 +524,7 @@ class HLIRModule:
 def format_hlir(mod: HLIRModule) -> str:
     """Pretty-print HLIR. Used for `--dump-hlir`."""
     lines = [f"HLIRModule(name={mod.name!r})", ""]
-    lines.append(f"Params (in declaration order):")
+    lines.append("Params (in declaration order):")
     for p in mod.param_names:
         lines.append(f"  - {p}")
     lines.append("")
@@ -553,7 +552,7 @@ def format_hlir(mod: HLIRModule) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _format_ops(ops: List[Op], lines: List[str], indent: int, prefix: List[int]) -> None:
+def _format_ops(ops: list[Op], lines: list[str], indent: int, prefix: list[int]) -> None:
     """Recursive op pretty-printer; handles structured ops (for) with nesting."""
     for op in ops:
         idx = prefix[0]
@@ -632,9 +631,14 @@ def assert_addresses_resolved(mod: HLIRModule) -> None:
 
 
 __all__ = [
-    "Buffer", "BufferSlice",
-    "VramRegion", "MramRegion",
-    "BufferElement", "Op", "HLIRModule",
+    "Buffer",
+    "BufferElement",
+    "BufferSlice",
+    "HLIRModule",
+    "MramRegion",
+    "Op",
+    "VramRegion",
+    "assert_addresses_resolved",
+    "format_hlir",
     "make_for_op",
-    "assert_addresses_resolved", "format_hlir",
 ]

@@ -19,12 +19,12 @@ will touch.
 
 from __future__ import annotations
 
-from typing import Iterable, Set
+from collections.abc import Iterable
 
 from . import hlir as _hlir
 
 
-def _collect_from_primexpr(expr, out: Set[str]) -> None:
+def _collect_from_primexpr(expr, out: set[str]) -> None:
     """Best-effort: walk a PrimExpr tree looking for BufferElement /
     BufferLoad / Var-backed buffer references. We don't import tir here
     so the pass stays usable in pure-HLIR builds; isinstance against the
@@ -55,7 +55,7 @@ def _collect_from_primexpr(expr, out: Set[str]) -> None:
             _collect_from_primexpr(a, out)
 
 
-def _collect_op_refs(op: _hlir.Op, out: Set[str]) -> None:
+def _collect_op_refs(op: _hlir.Op, out: set[str]) -> None:
     for ba in op.buffer_args:
         if isinstance(ba, str):
             out.add(ba)
@@ -69,8 +69,8 @@ def _collect_op_refs(op: _hlir.Op, out: Set[str]) -> None:
             _collect_op_refs(inner, out)
 
 
-def _collect_reachable(ops: Iterable[_hlir.Op]) -> Set[str]:
-    out: Set[str] = set()
+def _collect_reachable(ops: Iterable[_hlir.Op]) -> set[str]:
+    out: set[str] = set()
     for op in ops:
         _collect_op_refs(op, out)
     return out

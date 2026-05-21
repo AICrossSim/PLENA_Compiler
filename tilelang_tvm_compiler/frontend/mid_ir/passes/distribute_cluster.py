@@ -71,12 +71,9 @@ What this pass does NOT touch
 
 from __future__ import annotations
 
-from typing import List
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    BufferDef, BufferRef,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
     MidFunc, Stmt,
@@ -92,7 +89,7 @@ def _is_unroll_for(s: Stmt) -> bool:
 
 
 def _clone_cluster_with_body(template: ParallelAxis,
-                             body: List[Stmt]) -> ParallelAxis:
+                             body: list[Stmt]) -> ParallelAxis:
     """Make a fresh CLUSTER axis with the same axis_name / extent /
     parent_grid_axis_name as ``template`` but a different body."""
     return ParallelAxis(
@@ -113,15 +110,15 @@ def _clone_cluster_with_body(template: ParallelAxis,
 # ---------------------------------------------------------------------------
 
 
-def _distribute_one_cluster(cluster: ParallelAxis) -> List[Stmt]:
+def _distribute_one_cluster(cluster: ParallelAxis) -> list[Stmt]:
     """Take a single CLUSTER axis whose body may contain unroll Fors,
     return a list of stmts equivalent to the original but with each
     unroll For lifted out and the cluster pushed inside.
 
     See module docstring for the rewrite rule.
     """
-    out: List[Stmt] = []
-    pending: List[Stmt] = []   # ops accumulated since last unroll-for boundary
+    out: list[Stmt] = []
+    pending: list[Stmt] = []   # ops accumulated since last unroll-for boundary
 
     def flush_pending() -> None:
         nonlocal pending
@@ -211,11 +208,11 @@ def _walk_stmt(stmt: Stmt) -> Stmt:
     return stmt
 
 
-def _walk_stmts(stmts: List[Stmt]) -> List[Stmt]:
+def _walk_stmts(stmts: list[Stmt]) -> list[Stmt]:
     """Walk a body list. CLUSTER axes that distribute into multiple
     stmts are flattened in here (the only place that handles a 1→N
     rewrite cleanly)."""
-    out: List[Stmt] = []
+    out: list[Stmt] = []
     for s in stmts:
         if (isinstance(s, ParallelAxis)
                 and s.kind == ParallelKind.CLUSTER
@@ -264,4 +261,4 @@ def run(func: MidFunc) -> MidFunc:
     )
 
 
-__all__ = ["run", "DistributeClusterError"]
+__all__ = ["DistributeClusterError", "run"]

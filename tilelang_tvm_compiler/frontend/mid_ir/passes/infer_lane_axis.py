@@ -37,9 +37,7 @@ Runs BEFORE pass_1_fold — it operates on raw TIR.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
 
-import tvm
 from tvm import tir
 
 
@@ -60,11 +58,11 @@ class InferLaneAxisError(RuntimeError):
 
 
 def _collect_block_idx_bindings(func: tir.PrimFunc
-                                ) -> List[Tuple[str, int]]:
+                                ) -> list[tuple[str, int]]:
     """Walk the body, collect ``(var_name, extent)`` for every
     ``thread_extent`` AttrStmt whose IterVar is bound to ``blockIdx.*``
     and has a static integer extent."""
-    out: List[Tuple[str, int]] = []
+    out: list[tuple[str, int]] = []
 
     def visit(stmt) -> None:
         if stmt is None:
@@ -100,7 +98,7 @@ def _collect_block_idx_bindings(func: tir.PrimFunc
     return out
 
 
-def _existing_lane_axis(func: tir.PrimFunc) -> Optional[str]:
+def _existing_lane_axis(func: tir.PrimFunc) -> str | None:
     if func.attrs is None:
         return None
     if _LANE_AXIS_FUNC_ATTR not in func.attrs:
@@ -181,4 +179,4 @@ def run(func: tir.PrimFunc, lane: int = _DEFAULT_LANE) -> tir.PrimFunc:
     )
 
 
-__all__ = ["run", "InferLaneAxisError"]
+__all__ = ["InferLaneAxisError", "run"]

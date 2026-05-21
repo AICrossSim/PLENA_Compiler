@@ -58,10 +58,7 @@ Limitations / explicit gaps for later
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
 
-import tvm
 from tvm import tir
 
 from ..ir import (
@@ -108,10 +105,10 @@ class FoldError(RuntimeError):
 
 class _VarRegistry:
     def __init__(self) -> None:
-        self._by_id: Dict[int, VarRef] = {}
+        self._by_id: dict[int, VarRef] = {}
         # Keep a strong reference to each Var so its id() can't be
         # recycled inside this fold call.
-        self._anchor: List[object] = []
+        self._anchor: list[object] = []
 
     def ref(self, var) -> VarRef:
         existing = self._by_id.get(id(var))
@@ -127,7 +124,7 @@ class _VarRegistry:
 # (vs threaded through every helper) because the recursion already
 # fans out through many small functions; passing it would force a
 # wide signature change for no benefit. Reset at the top of ``run``.
-_active_registry: Optional[_VarRegistry] = None
+_active_registry: _VarRegistry | None = None
 
 
 def _vref(var) -> VarRef:
@@ -196,7 +193,7 @@ def _assert_no_str_in_indices(stmts) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _call_kind(call: tir.Call) -> Optional[str]:
+def _call_kind(call: tir.Call) -> str | None:
     if not isinstance(call, tir.Call):
         return None
     op_name = getattr(call.op, "name", "")
@@ -209,7 +206,7 @@ def _call_kind(call: tir.Call) -> Optional[str]:
     return None
 
 
-def _call_args(call: tir.Call) -> List:
+def _call_args(call: tir.Call) -> list:
     op_name = getattr(call.op, "name", "")
     if op_name == "tir.call_extern" and call.args:
         return list(call.args[1:])
@@ -233,7 +230,7 @@ def _scope_string(buf: tir.Buffer, default: str) -> str:
     return default
 
 
-def _shape_ints(buf: tir.Buffer) -> List[int]:
+def _shape_ints(buf: tir.Buffer) -> list[int]:
     out = []
     for d in buf.shape:
         if isinstance(d, tir.IntImm):
@@ -279,7 +276,7 @@ def _buffer_def(buf: tir.Buffer, default_scope: str = "global") -> BufferDef:
 # ---------------------------------------------------------------------------
 
 
-def _index_expr(expr) -> Union[int, VarRef, dict]:
+def _index_expr(expr) -> int | VarRef | dict:
     """Convert a TIR PrimExpr appearing as an index into a mid_ir
     IndexExpr (int / VarRef / dict). Compound arithmetic becomes a
     ``{"op": "<add/mul/...>", "args": [...]}`` dict; passes that need
@@ -340,7 +337,7 @@ def _is_full_range_ramp_for_dim(idx, dim_extent: int) -> bool:
 
 
 def _region_to_ref(call: tir.Call,
-                   buf_table: Dict[str, BufferDef]) -> BufferRef:
+                   buf_table: dict[str, BufferDef]) -> BufferRef:
     """Convert ``tl.tileop.region(BufferLoad(buf, [starts]), mode, *extents)``
     into a BufferRef.
 
@@ -371,7 +368,7 @@ def _region_to_ref(call: tir.Call,
         if buf_def is None:
             buf_def = _buffer_def(load.buffer, default_scope="shared")
             buf_table[load.buffer.name] = buf_def
-        indices: List = []
+        indices: list = []
         for axis, idx in enumerate(load.indices):
             dim_extent = int(buf_def.shape[axis]) if axis < len(buf_def.shape) else None
             if isinstance(idx, tir.IntImm) and int(idx.value) == 0:
@@ -401,7 +398,7 @@ def _region_to_ref(call: tir.Call,
     if buf_def is None:
         buf_def = _buffer_def(load.buffer, default_scope="shared")
         buf_table[load.buffer.name] = buf_def
-    indices: List = []
+    indices: list = []
     for axis, (s, e) in enumerate(zip(starts, extents)):
         if not isinstance(e, tir.IntImm):
             raise FoldError(
@@ -442,7 +439,7 @@ _BIN_NODE_TO_OP = {
 }
 
 
-def _peel_cast_roundtrip(expr, target_dtype: Optional[str] = None):
+def _peel_cast_roundtrip(expr, target_dtype: str | None = None):
     """Strip TVM-inserted fp16↔fp32 cast roundtrips.
 
     TVM lowers ``fp16 = 1.0 / fp16`` to
@@ -516,7 +513,7 @@ def _peel_cast_roundtrip(expr, target_dtype: Optional[str] = None):
     return expr
 
 
-def _try_bin_op(node) -> Optional[BinOp]:
+def _try_bin_op(node) -> BinOp | None:
     cls = type(node)
     if cls in _BIN_NODE_TO_OP:
         return _BIN_NODE_TO_OP[cls]
@@ -527,7 +524,7 @@ def _try_bin_op(node) -> Optional[BinOp]:
     return None
 
 
-def _try_unary_call(node) -> Optional[UnaryOp]:
+def _try_unary_call(node) -> UnaryOp | None:
     """Recognise T.exp(x), T.sqrt(x). Reciprocal shows up as
     ``1.0 / x`` (a tir.Div), not as a Call — handled separately."""
     if not isinstance(node, tir.Call):
@@ -546,7 +543,7 @@ def _try_unary_call(node) -> Optional[UnaryOp]:
 
 
 def _store_to_ref(store: tir.BufferStore,
-                  buf_table: Dict[str, BufferDef]) -> BufferRef:
+                  buf_table: dict[str, BufferDef]) -> BufferRef:
     name = store.buffer.name
     if name not in buf_table:
         buf_table[name] = _buffer_def(store.buffer, default_scope="shared")
@@ -557,7 +554,7 @@ def _store_to_ref(store: tir.BufferStore,
 
 
 def _load_to_ref(load: tir.BufferLoad,
-                 buf_table: Dict[str, BufferDef]) -> BufferRef:
+                 buf_table: dict[str, BufferDef]) -> BufferRef:
     name = load.buffer.name
     if name not in buf_table:
         buf_table[name] = _buffer_def(load.buffer, default_scope="shared")
@@ -568,7 +565,7 @@ def _load_to_ref(load: tir.BufferLoad,
 
 
 def _try_fold_parallel(for_stmt: tir.For,
-                       buf_table: Dict[str, BufferDef]) -> Optional[Elementwise]:
+                       buf_table: dict[str, BufferDef]) -> Elementwise | None:
     """``for i in T.Parallel(N): dst[..., i] = expr(loads_at_..._i)``
     → Elementwise.
 
@@ -608,10 +605,10 @@ def _index_exprs_equal(a, b) -> bool:
 
 
 def _wrap_src(load: tir.BufferLoad,
-              dst_indices: List,
-              buf_table: Dict[str, BufferDef],
-              dst_buf: Optional[BufferDef] = None,
-              ) -> Optional[Union[BufferRef, Broadcast]]:
+              dst_indices: list,
+              buf_table: dict[str, BufferDef],
+              dst_buf: BufferDef | None = None,
+              ) -> BufferRef | Broadcast | None:
     """Convert a BufferLoad src into either a plain BufferRef (when
     its index tuple matches dst's exactly) or a Broadcast (when it's
     a prefix — fewer trailing dims).
@@ -657,7 +654,7 @@ def _wrap_src(load: tir.BufferLoad,
 
 
 def _to_raw_store(store: tir.BufferStore,
-                  buf_table: Dict[str, BufferDef]) -> RawStore:
+                  buf_table: dict[str, BufferDef]) -> RawStore:
     """Wrap a BufferStore as an opaque RawStore.
 
     The ``dst`` BufferRef is computed from the store's indices via the
@@ -672,8 +669,8 @@ def _to_raw_store(store: tir.BufferStore,
 
 
 def _axes_for_ref(ref: BufferRef,
-                  simd_axis: Optional[int],
-                  simd_size: int) -> List[AxisInfo]:
+                  simd_axis: int | None,
+                  simd_size: int) -> list[AxisInfo]:
     """Build per-axis AxisInfo for a BufferRef given the op's SIMD context.
 
     Each axis carries its **buffer-declared extent** plus a role:
@@ -693,7 +690,7 @@ def _axes_for_ref(ref: BufferRef,
     is prepended later by pass_3_split / pass_4b_view alongside the
     indices change.
     """
-    out: List[AxisInfo] = []
+    out: list[AxisInfo] = []
     rank = len(ref.indices)
     normalised_simd = (
         simd_axis + rank if (simd_axis is not None and simd_axis < 0)
@@ -712,9 +709,9 @@ def _axes_for_ref(ref: BufferRef,
 
 def _axes_for_broadcast_src(
     bc: Broadcast,
-    simd_axis: Optional[int],
+    simd_axis: int | None,
     simd_size: int,
-) -> List[AxisInfo]:
+) -> list[AxisInfo]:
     """Per-axis AxisInfo for the inner ref of a Broadcast.
 
     The dst rank exceeds the src rank by ``len(bc.broadcast_dims)``;
@@ -737,7 +734,7 @@ def _axes_for_broadcast_src(
     # broadcast_dims sit at or before it.
     bd_set = set(bc.broadcast_dims)
     if simd_axis in bd_set:
-        src_simd: Optional[int] = None
+        src_simd: int | None = None
     else:
         # Number of broadcast_dims with smaller index — drop them from
         # the dst index to land on the matching src dim.
@@ -749,10 +746,10 @@ def _axes_for_broadcast_src(
 
 
 def _try_fold_store(store: tir.BufferStore,
-                    parallel_var: Optional[tir.Var],
-                    buf_table: Dict[str, BufferDef],
-                    axis: Optional[int] = None,
-                    size: int = 1) -> Optional[Elementwise]:
+                    parallel_var: tir.Var | None,
+                    buf_table: dict[str, BufferDef],
+                    axis: int | None = None,
+                    size: int = 1) -> Elementwise | None:
     """Recognise the RHS of ``store`` as a mid_ir-expressible
     Elementwise. Returns None on no-match — caller is responsible for
     falling back to ``RawStore`` rather than raising. Never raises.
@@ -851,7 +848,7 @@ def _try_fold_store(store: tir.BufferStore,
     # Binary: A op B (each a BufferLoad — may broadcast independently).
     binop = _try_bin_op(expr)
     if binop is not None:
-        srcs: List[Union[BufferRef, Broadcast]] = []
+        srcs: list[BufferRef | Broadcast] = []
         for arg in (expr.a, expr.b):
             arg = _peel_cast_roundtrip(arg)
             if isinstance(arg, tir.BufferLoad):
@@ -885,7 +882,7 @@ _REDUCE_OPS_BY_NAME = {
 
 
 def _fold_reduce(call: tir.Call,
-                 buf_table: Dict[str, BufferDef]) -> Reduce:
+                 buf_table: dict[str, BufferDef]) -> Reduce:
     """``tl.tileop.reduce(src, dst, op_name, dim, clear)``.
 
     Tilelang's reduce ABI varies — args[0] / args[1] are always
@@ -901,8 +898,8 @@ def _fold_reduce(call: tir.Call,
     src_ref = _region_to_ref(args[0], buf_table)
     dst_ref = _region_to_ref(args[1], buf_table)
 
-    op_name: Optional[str] = None
-    axis: Optional[int] = None
+    op_name: str | None = None
+    axis: int | None = None
     for cand in args[2:]:
         if op_name is None and isinstance(cand, tir.StringImm):
             op_name = str(cand.value).lower()
@@ -927,7 +924,7 @@ def _fold_reduce(call: tir.Call,
     # axis is tagged REDUCE on src, every other axis is BATCH.
     src_rank = len(src_ref.indices)
     normalised_axis = axis + src_rank if axis < 0 else axis
-    src_axes: List[AxisInfo] = []
+    src_axes: list[AxisInfo] = []
     for dim, ext in enumerate(src_ref.buffer.shape):
         full = int(ext)
         if dim == normalised_axis:
@@ -938,7 +935,7 @@ def _fold_reduce(call: tir.Call,
             # we only want SIMD treatment when dim is REDUCE's neighbor on the
             # SIMD axis, which Reduce doesn't have. Force BATCH instead.
             src_axes[-1] = AxisInfo(role=AxisRole.BATCH, extent=full)
-    dst_axes: List[AxisInfo] = []
+    dst_axes: list[AxisInfo] = []
     for dim, ext in enumerate(dst_ref.buffer.shape):
         dst_axes.append(AxisInfo(role=AxisRole.BATCH, extent=int(ext)))
     return Reduce(
@@ -948,7 +945,7 @@ def _fold_reduce(call: tir.Call,
 
 
 def _fold_dma(call: tir.Call,
-              buf_table: Dict[str, BufferDef]) -> Dma:
+              buf_table: dict[str, BufferDef]) -> Dma:
     args = _call_args(call)
     if len(args) < 2:
         raise FoldError(f"tl.tileop.copy: expected 2 args, got {len(args)}")
@@ -960,9 +957,9 @@ def _fold_dma(call: tir.Call,
     # index along it). View pass prepends a CLUSTER axis when the
     # buffer is lane-aware. This matches the per-axis story Elementwise
     # uses for default ``axis=-1, size=last_dim``.
-    def _default_axes(ref: BufferRef) -> List[AxisInfo]:
+    def _default_axes(ref: BufferRef) -> list[AxisInfo]:
         shape = ref.buffer.shape
-        out: List[AxisInfo] = []
+        out: list[AxisInfo] = []
         for i, d in enumerate(shape):
             role = AxisRole.SIMD if i == len(shape) - 1 else AxisRole.BATCH
             out.append(AxisInfo(role=role, extent=int(d)))
@@ -976,7 +973,7 @@ def _fold_dma(call: tir.Call,
 
 def _fold_gemm(call: tir.Call,
                kind: str,
-               buf_table: Dict[str, BufferDef]) -> Gemm:
+               buf_table: dict[str, BufferDef]) -> Gemm:
     args = _call_args(call)
     if len(args) < 3:
         raise FoldError(f"tl.tileop.gemm_py: expected ≥3 args, got {len(args)}")
@@ -1118,8 +1115,8 @@ def _is_serial_for(stmt: tir.For) -> bool:
 
 
 def _walk_stmt(stmt,
-               buf_table: Dict[str, BufferDef],
-               current_kind: Optional[str]) -> List:
+               buf_table: dict[str, BufferDef],
+               current_kind: str | None) -> list:
     """Walk one TIR Stmt, return a list of mid_ir Stmt items.
 
     A single TIR construct may unfold into 0, 1, or more mid_ir items
@@ -1318,10 +1315,10 @@ def run(func: tir.PrimFunc, name: str = "kernel") -> MidFunc:
 
 
 def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
-    buf_table: Dict[str, BufferDef] = {}
+    buf_table: dict[str, BufferDef] = {}
 
     # Seed param buffers (always global by convention).
-    params: List[BufferDef] = []
+    params: list[BufferDef] = []
     for var in func.params:
         buf = func.buffer_map.get(var)
         if buf is None:
@@ -1345,7 +1342,7 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
     allocs = [b for n, b in buf_table.items() if n not in param_names]
 
     # Lane axes from func attr (T.func_attr({"plena.lane_axis": "by"}) or list).
-    lane_axes: List[str] = []
+    lane_axes: list[str] = []
     if func.attrs is not None and _LANE_AXIS_FUNC_ATTR in func.attrs:
         raw = func.attrs[_LANE_AXIS_FUNC_ATTR]
         if isinstance(raw, tir.StringImm):
@@ -1361,7 +1358,7 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
     # Carry select prim_func attrs forward so downstream passes (e.g.
     # to_plena reading ``plena.layout``) can find them. We unwrap TVM
     # ObjectRef strings to plain Python so dict access works uniformly.
-    attrs_out: Dict[str, object] = {}
+    attrs_out: dict[str, object] = {}
     if func.attrs is not None:
         for k in ("plena.layout",):
             if k in func.attrs:
@@ -1392,4 +1389,4 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
     )
 
 
-__all__ = ["run", "FoldError"]
+__all__ = ["FoldError", "run"]

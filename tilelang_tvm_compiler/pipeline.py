@@ -19,7 +19,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import tvm
 from tvm import tir
@@ -83,8 +82,8 @@ def compile_kernel(
     *,
     target: PlenaTarget,
     name: str = "kernel",
-    midir_dump_dir: Optional[Path] = None,
-    addr_config_override: Optional[AddressAllocConfig] = None,
+    midir_dump_dir: Path | None = None,
+    addr_config_override: AddressAllocConfig | None = None,
 ) -> CompiledKernel:
     """Lower a raw TIR PrimFunc through the mid_ir pipeline + downstream
     address-alloc + ISA-emit passes.
@@ -176,4 +175,4 @@ def compile_module(
     return out
 
 
-__all__ = ["PlenaTarget", "CompiledKernel", "compile_kernel", "compile_module"]
+__all__ = ["CompiledKernel", "PlenaTarget", "compile_kernel", "compile_module"]

@@ -49,12 +49,11 @@ What this pass does NOT touch
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 from ..cluster_guard import should_skip_cluster, MLEN
 from ..ir import (
     AxisRole, AxisInfo,
-    BufferDef, BufferRef, Slice, VarRef,
+    BufferDef, BufferRef, VarRef,
     Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
@@ -85,11 +84,11 @@ _NUMBER_VAR_BY_NAME: dict = {}
 #   BSHD: lane swaps with the next dim → perm [1, 0, 2, ...]
 
 
-def _identity_perm(rank: int) -> List[int]:
+def _identity_perm(rank: int) -> list[int]:
     return list(range(rank))
 
 
-def _bshd_perm(rank: int) -> List[int]:
+def _bshd_perm(rank: int) -> list[int]:
     """Swap logical dim 0 (lane) and logical dim 1 (S). Other dims
     untouched. Requires rank >= 2."""
     if rank < 2:
@@ -165,7 +164,7 @@ def _rewrite_global_ref(ref: BufferRef, ctx: _ClusterCtx) -> BufferRef:
     )
 
 
-def _forced_view_kind(buf: BufferDef) -> Optional[str]:
+def _forced_view_kind(buf: BufferDef) -> str | None:
     """Decide a view_kind that the buffer's physical shape demands,
     overriding whatever the op-role table proposes.
 
@@ -226,11 +225,11 @@ def _rewrite_lane_ref(ref: BufferRef, ctx: _ClusterCtx,
 
 
 def _axes_after_lane_rewrite(
-    pre_axes: List[AxisInfo],
+    pre_axes: list[AxisInfo],
     ref: BufferRef,
     ctx: _ClusterCtx,
     view_kind: str,
-) -> List[AxisInfo]:
+) -> list[AxisInfo]:
     """Mirror ``_rewrite_lane_ref`` on the per-axis info table.
 
     ``_rewrite_lane_ref`` only *prepends* the cluster phase to
@@ -246,8 +245,8 @@ def _axes_after_lane_rewrite(
 
 
 def _axes_after_global_rewrite(
-    pre_axes: List[AxisInfo],
-) -> List[AxisInfo]:
+    pre_axes: list[AxisInfo],
+) -> list[AxisInfo]:
     """Global refs are unchanged by view (no phase prepend, no view_perm).
     Just return a shallow copy so downstream mutations don't alias."""
     return list(pre_axes)
@@ -266,9 +265,9 @@ def _rewrite_ref(ref: BufferRef, ctx: _ClusterCtx,
 
 
 def _rewrite_ref_with_axes(
-    ref: BufferRef, pre_axes: List[AxisInfo],
+    ref: BufferRef, pre_axes: list[AxisInfo],
     ctx: _ClusterCtx, view_kind: str,
-) -> Tuple[BufferRef, List[AxisInfo]]:
+) -> tuple[BufferRef, list[AxisInfo]]:
     """Run the same rewrite the ref undergoes on its axes table.
 
     Keeps the two channels (physical buffer view + per-op axis roles)
@@ -304,7 +303,7 @@ def _rewrite_src(src, ctx: _ClusterCtx, view_kind: str):
 
 
 def _rewrite_src_with_axes(
-    src, pre_axes: List[AxisInfo],
+    src, pre_axes: list[AxisInfo],
     ctx: _ClusterCtx, view_kind: str,
 ):
     """Axes-aware src rewrite that mirrors ``_rewrite_src``.
@@ -448,7 +447,7 @@ def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
 # ---------------------------------------------------------------------------
 
 
-def _walk(stmt: Stmt, ctx: Optional[_ClusterCtx], bhsd_buffers: set) -> Stmt:
+def _walk(stmt: Stmt, ctx: _ClusterCtx | None, bhsd_buffers: set) -> Stmt:
     if isinstance(stmt, ParallelAxis):
         if stmt.kind == ParallelKind.CLUSTER:
             if stmt.parent_grid_axis_name is None:
@@ -552,7 +551,7 @@ def _walk(stmt: Stmt, ctx: Optional[_ClusterCtx], bhsd_buffers: set) -> Stmt:
 
 
 def _collect_views(stmt: Stmt,
-                   table: Dict[str, List[Tuple[Optional[List[int]], str]]]
+                   table: dict[str, list[tuple[list[int] | None, str]]]
                    ) -> None:
     """Walk; for every BufferRef record (view_perm, op_label) under the
     buffer's name. Only refs to non-global buffers tracked."""
@@ -598,7 +597,7 @@ def _collect_views(stmt: Stmt,
 
 
 def _check_global_consistency(func: MidFunc) -> None:
-    table: Dict[str, List[Tuple[Optional[List[int]], str]]] = {}
+    table: dict[str, list[tuple[list[int] | None, str]]] = {}
     for s in func.body:
         _collect_views(s, table)
     for buf_name, entries in table.items():
@@ -646,4 +645,4 @@ def run(func: MidFunc) -> MidFunc:
     return new_func
 
 
-__all__ = ["run", "ViewError", "ViewConflictError"]
+__all__ = ["ViewConflictError", "ViewError", "run"]

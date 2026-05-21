@@ -34,7 +34,7 @@ sys.path.insert(0, str(_REPO_ROOT / "tools"))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
-from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
+from transformers import AutoModelForCausalLM  # noqa: E402
 
 
 def _load_model_for_weights(model_id: str, torch_dtype=None):
@@ -75,7 +75,6 @@ from utils.load_config import load_toml_config  # noqa: E402
 # Use existing emulator runner for the Rust invocation.
 sys.path.insert(0, str(_REPO_ROOT / "transactional_emulator" / "testbench"))
 from emulator_runner import run_emulator  # noqa: E402
-from verification.check_mem import read_bin_file_as_array  # noqa: E402
 
 
 

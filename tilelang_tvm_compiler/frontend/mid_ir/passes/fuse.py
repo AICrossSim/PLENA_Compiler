@@ -34,7 +34,6 @@ What stays untouched
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
@@ -88,10 +87,10 @@ class _ClusterAxis:
 # ---------------------------------------------------------------------------
 
 
-def _collect_op_refs(op) -> List[BufferRef]:
+def _collect_op_refs(op) -> list[BufferRef]:
     """Return every BufferRef the op directly references. Used to
     build dim_map."""
-    refs: List[BufferRef] = []
+    refs: list[BufferRef] = []
     if isinstance(op, Dma):
         refs.extend([op.src, op.dst])
     elif isinstance(op, Gemm):
@@ -110,7 +109,7 @@ def _collect_op_refs(op) -> List[BufferRef]:
     return refs
 
 
-def _build_dim_map(op, cluster_axis_names: List[str]) -> Dict[str, List[int]]:
+def _build_dim_map(op, cluster_axis_names: list[str]) -> dict[str, list[int]]:
     """For each non-global buffer the op touches, record the physical
     dims that map to each cluster axis (in cluster_axis_names order).
 
@@ -121,7 +120,7 @@ def _build_dim_map(op, cluster_axis_names: List[str]) -> Dict[str, List[int]]:
     excluded from the map.
     """
     n_axes = len(cluster_axis_names)
-    out: Dict[str, List[int]] = {}
+    out: dict[str, list[int]] = {}
     refs = op.list_refs() if hasattr(op, "list_refs") else _collect_op_refs(op)
     for ref in refs:
         if ref.buffer.scope == "global":
@@ -141,7 +140,7 @@ def _build_dim_map(op, cluster_axis_names: List[str]) -> Dict[str, List[int]]:
 # ---------------------------------------------------------------------------
 
 
-def _walk(stmt: Stmt, cluster_stack: List[_ClusterAxis]) -> Stmt:
+def _walk(stmt: Stmt, cluster_stack: list[_ClusterAxis]) -> Stmt:
     if isinstance(stmt, ParallelAxis):
         if stmt.kind == ParallelKind.CLUSTER:
             if stmt.parent_grid_axis_name is None:
@@ -226,7 +225,7 @@ def _walk(stmt: Stmt, cluster_stack: List[_ClusterAxis]) -> Stmt:
     return stmt
 
 
-def _match_lane_composite(idx, axes: List[_ClusterAxis]):
+def _match_lane_composite(idx, axes: list[_ClusterAxis]):
     """If ``idx`` is exactly a lane index — either the bare original
     lane var, or the ``add(phase, mul(number, count))`` split form
     pass_4b_view produces — return its matching ``_ClusterAxis``.
@@ -259,7 +258,7 @@ def _match_lane_composite(idx, axes: List[_ClusterAxis]):
     return None
 
 
-def _ranged_slice_for_axis(ax: "_ClusterAxis", extra_offset=None):
+def _ranged_slice_for_axis(ax: _ClusterAxis, extra_offset=None):
     """Build ``ranged_slice(mul(number, count) [+ extra_offset], count)``
     for one cluster axis. ``extra_offset`` (a constant head offset, or
     None) is folded into the slice's START so the ranged_slice stays at
@@ -272,7 +271,7 @@ def _ranged_slice_for_axis(ax: "_ClusterAxis", extra_offset=None):
     return {"op": "ranged_slice", "args": [base, ax.count]}
 
 
-def _collapse_lane_axis(idx, axes: List[_ClusterAxis]):
+def _collapse_lane_axis(idx, axes: list[_ClusterAxis]):
     """Fold a per-lane index expression back into a cluster-wide
     ``ranged_slice``.
 
@@ -324,7 +323,7 @@ def _collapse_lane_axis(idx, axes: List[_ClusterAxis]):
     }
 
 
-def _collapse_ref(ref: BufferRef, axes: List[_ClusterAxis]) -> BufferRef:
+def _collapse_ref(ref: BufferRef, axes: list[_ClusterAxis]) -> BufferRef:
     """Apply ``_collapse_lane_axis`` to every index of a user-declared
     global ref (``global`` HBM or ``global.vram`` / ``global.mram`` /
     ``global.fpram`` on-chip caches).
@@ -345,7 +344,7 @@ def _collapse_ref(ref: BufferRef, axes: List[_ClusterAxis]) -> BufferRef:
     )
 
 
-def _collapse_src(src, axes: List[_ClusterAxis]):
+def _collapse_src(src, axes: list[_ClusterAxis]):
     if isinstance(src, Broadcast):
         return Broadcast(
             src=_collapse_ref(src.src, axes),
@@ -354,7 +353,7 @@ def _collapse_src(src, axes: List[_ClusterAxis]):
     return _collapse_ref(src, axes)
 
 
-def _collapse_lane_in_op(op, axes: List[_ClusterAxis]):
+def _collapse_lane_in_op(op, axes: list[_ClusterAxis]):
     """Rebuild ``op`` with HBM refs widened to cluster-wide ranged
     slices. Only HBM refs are touched; on-chip refs are unchanged.
 
@@ -401,7 +400,7 @@ def _collapse_lane_in_op(op, axes: List[_ClusterAxis]):
     return op
 
 
-def _fuse_async(stmt: Async, cluster_stack: List[_ClusterAxis]) -> Stmt:
+def _fuse_async(stmt: Async, cluster_stack: list[_ClusterAxis]) -> Stmt:
     """One Async → one MultiLaneOp. Async body must hold exactly one
     op (the strict one-async-one-op invariant from pass_4).
 
@@ -458,4 +457,4 @@ def run(func: MidFunc) -> MidFunc:
     )
 
 
-__all__ = ["run", "FuseError"]
+__all__ = ["FuseError", "run"]

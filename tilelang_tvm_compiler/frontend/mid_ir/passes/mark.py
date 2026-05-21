@@ -60,7 +60,6 @@ idempotent — calling it twice yields the same markers.
 
 from __future__ import annotations
 
-from typing import List
 
 from ..ir import (
     Dma, Gemm, Elementwise, Reduce, RawStore, For, Async, MultiLaneOp,
@@ -214,7 +213,7 @@ def run(func: MidFunc) -> MidFunc:
     """Set ``.marker`` on every Dma / Gemm[btmm] / Elementwise /
     Reduce in ``func.body``. Returns a new MidFunc; original is not
     mutated."""
-    new_body: List[Stmt] = [_walk(s) for s in func.body]
+    new_body: list[Stmt] = [_walk(s) for s in func.body]
     return MidFunc(
         name=func.name,
         params=list(func.params),
@@ -226,4 +225,4 @@ def run(func: MidFunc) -> MidFunc:
     )
 
 
-__all__ = ["run", "MarkError"]
+__all__ = ["MarkError", "run"]

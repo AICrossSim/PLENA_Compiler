@@ -17,7 +17,7 @@ emitter contract is honoured.
 from __future__ import annotations
 
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import tvm
 from tvm import tir
@@ -25,7 +25,6 @@ from tvm import tir
 from . import hlir as _hlir
 from . import scope as _scope
 from .expr_materializer import ExprMaterializer, MaterializedExpr
-from .frontend.mid_ir.cluster_guard import MLEN as _HW_MLEN
 from .isa_emitter import ISAEmitter
 from .program_shim import ProgramShim
 
@@ -53,7 +52,7 @@ def _normalize_large_addi_immediates(asm_code: str) -> str:
         instruction mask will then truncate it, producing wrong code that
         the user can spot via the warning).
     """
-    lines: List[str] = []
+    lines: list[str] = []
     for raw_line in asm_code.splitlines():
         line = raw_line.rstrip("\n")
         stripped = line.strip()
@@ -124,9 +123,9 @@ class IsaEmitterPass:
         # Symbol table: tir.Var -> currently-bound GP register id. Loop
         # bodies push entries on enter and pop on exit. ExprMaterializer
         # consults this table to resolve Var references in scalar args.
-        self.symbol_table: Dict[tir.Var, int] = {}
+        self.symbol_table: dict[tir.Var, int] = {}
         self.materializer = ExprMaterializer(shim, self.symbol_table)
-        self._dispatch: Dict[str, Callable[[_hlir.HLIRModule, _hlir.Op], None]] = {
+        self._dispatch: dict[str, Callable[[_hlir.HLIRModule, _hlir.Op], None]] = {
             "dma_h2v": self._emit_dma_h2v,
             "dma_h2m": self._emit_dma_h2m,
             "dma_v2h": self._emit_dma_v2h,
@@ -215,11 +214,11 @@ class IsaEmitterPass:
 
     @staticmethod
     def _logical_2d(
-        shape: Tuple[int, ...], layout: str = "BSHD",
-    ) -> Tuple[int, int]:
+        shape: tuple[int, ...], layout: str = "BSHD",
+    ) -> tuple[int, int]:
         return _hlir.logical_2d_extents(shape, layout)
 
-    def _vram_row_shape(self, buf: _hlir.Buffer, op_kind: str, role: str) -> Tuple[int, int]:
+    def _vram_row_shape(self, buf: _hlir.Buffer, op_kind: str, role: str) -> tuple[int, int]:
         _check_scope(buf, _scope.VRAM, op_kind, role)
         rows, cols = self._logical_2d(buf.shape, buf.layout)
         if cols != self.shim.mlen:
@@ -236,8 +235,8 @@ class IsaEmitterPass:
         role: str,
         row_expr,
         head_expr,
-        op_axes: Optional[Tuple[Tuple[str, int], ...]] = None,
-    ) -> Tuple[tir.PrimExpr, tir.PrimExpr | None]:
+        op_axes: tuple[tuple[str, int], ...] | None = None,
+    ) -> tuple[tir.PrimExpr, tir.PrimExpr | None]:
         """Translate logical ``(head=H-idx, row=S-idx)`` coords on a
         VRAM buffer into a physical vram-row index + optional V_MASK.
 
@@ -295,9 +294,9 @@ class IsaEmitterPass:
         # have one). ``batch`` may appear multiple times — pick the one
         # with the largest extent as the rows axis; extent-1 batch
         # entries are pad-to-4D / cluster-expand placeholders.
-        d_axis: Optional[int] = None
-        cluster_dim: Optional[int] = None
-        rows_axis: Optional[int] = None
+        d_axis: int | None = None
+        cluster_dim: int | None = None
+        rows_axis: int | None = None
         rows_extent = -1
         for i, (role_name, _extent) in enumerate(op_axes):
             if role_name == "simd":
@@ -451,7 +450,7 @@ class IsaEmitterPass:
         # the time we emit S_LD_FP/S_MUL_FP, mats[0]/mats[1] both point
         # at a reg holding mats[2]'s value. Pinning blocks that path.
         ra = self.shim.compiler.register_allocator
-        mats: List[MaterializedExpr] = []
+        mats: list[MaterializedExpr] = []
         for a in addr_exprs:
             m = self.materializer.materialize(a)
             self.shim.compiler.generated_code += m.isa
@@ -644,7 +643,7 @@ class IsaEmitterPass:
         # else is "batch". Among batch axes the one with the largest
         # extent acts as "rows"; the rest are pad placeholders that
         # carry a B=1 or H=1 stride term.
-        roles: List[str] = []
+        roles: list[str] = []
         for i in range(rank):
             if i == d_axis:
                 roles.append("d")
@@ -675,7 +674,7 @@ class IsaEmitterPass:
         # Per-axis stride contribution. We iterate physical axes
         # in order so any 7D nuance (s_tile / s_inner split when
         # s_tiles > 1) lives next to its axis's stride choice.
-        terms: List = []
+        terms: list = []
         mask_expr = None
 
         for i, role in enumerate(roles):
@@ -805,7 +804,7 @@ class IsaEmitterPass:
         return expr, mask_expr, info
 
     def _region_origin_offset(self, buf: _hlir.Buffer,
-                              region) -> "tir.PrimExpr | int":
+                              region) -> tir.PrimExpr | int:
         """Translate a Region's ``starts`` into a physical element
         offset against ``buf.address``.
 
@@ -932,7 +931,7 @@ class IsaEmitterPass:
             acc = tir.Add(acc, t)
         return acc
 
-    def _d_tile_info(self, buf: _hlir.Buffer) -> Tuple[int, int]:
+    def _d_tile_info(self, buf: _hlir.Buffer) -> tuple[int, int]:
         """Return ``(n_d_tiles, d_tile_stride_elems)`` for a VRAM buffer.
 
         Thin convenience wrapper over ``_tile_layout_strides`` —
@@ -1200,7 +1199,7 @@ class IsaEmitterPass:
         """Yield (vram_offset_elems, hbm_offset_elems) for each tile of buf."""
         mlen = self.shim.mlen
         ann = hbm_buf.annotations
-        rows = ann.get("logical_rows", mlen)
+        ann.get("logical_rows", mlen)
         cols = ann.get("logical_cols", mlen)
         row_blocks = ann.get("row_blocks", 1)
         col_blocks = ann.get("col_blocks", 1)
@@ -1384,7 +1383,7 @@ class IsaEmitterPass:
             )
         # Permute parent shape and slice extents into canonical (B, S, H, D)
         # order per parent.layout. Downstream math works in BSHD.
-        B, S, H, D = _hlir._select_axes(parent.shape, parent.layout)
+        _B, _S, _H, _D = _hlir._select_axes(parent.shape, parent.layout)
         eb, es, eh, ed = _hlir._select_axes(sl.extents, parent.layout)
         if eb != 1:
             raise IsaEmissionError(
@@ -1648,7 +1647,7 @@ class IsaEmitterPass:
         dst = mod.get_buffer(op.buffer_args[1])
         if not isinstance(sl, _hlir.BufferSlice):
             raise IsaEmissionError(
-                f"dma_h2m_slice: buffer_args[0] must be BufferSlice"
+                "dma_h2m_slice: buffer_args[0] must be BufferSlice"
             )
         parent = mod.get_buffer(sl.parent)
         _check_scope(parent, _scope.HBM, op.kind, "src.parent")
@@ -1692,7 +1691,7 @@ class IsaEmitterPass:
         sl = op.buffer_args[1]
         if not isinstance(sl, _hlir.BufferSlice):
             raise IsaEmissionError(
-                f"dma_v2h_slice: buffer_args[1] must be BufferSlice"
+                "dma_v2h_slice: buffer_args[1] must be BufferSlice"
             )
         parent = mod.get_buffer(sl.parent)
         _check_scope(src, _scope.VRAM, op.kind, "src")
@@ -2071,8 +2070,8 @@ class IsaEmitterPass:
 
         mlen = int(self.shim.mlen)
 
-        def _find_role_axis(roles: Tuple[str, ...], role: str,
-                            operand: str) -> Optional[int]:
+        def _find_role_axis(roles: tuple[str, ...], role: str,
+                            operand: str) -> int | None:
             hits = [i for i, r in enumerate(roles) if r == role]
             if not hits:
                 return None
@@ -2156,8 +2155,8 @@ class IsaEmitterPass:
         # same PrimExpr (e.g. ``rhs = by*hlen``, ``dst = by*hlen``) share
         # one materialised register so we don't run into the 16-GP cap.
         # Materialised registers are released after the emit returns.
-        materialised_handles: List = []
-        cached: List = []  # list of (raw_expr, register) for CSE lookup
+        materialised_handles: list = []
+        cached: list = []  # list of (raw_expr, register) for CSE lookup
 
         def _resolve_offset(raw, name: str):
             if isinstance(raw, tir.IntImm):
@@ -2294,7 +2293,7 @@ class IsaEmitterPass:
                 f"plena.mm_slot col_count must be a compile-time integer; got "
                 f"{type(col_count_raw).__name__}: {col_count_raw!r}"
             ) from exc
-        lhs_rows, lhs_cols = self._logical_2d(lhs.shape)
+        _lhs_rows, _lhs_cols = self._logical_2d(lhs.shape)
         rhs_rows, rhs_cols = self._logical_2d(rhs.shape)
         dst_rows, dst_cols = self._logical_2d(dst.shape)
         # LHS must contain at least one mlen*mlen tile. For static offsets
@@ -3244,4 +3243,4 @@ def _check_scope(buf: _hlir.Buffer, expected: str, op_kind: str, role: str) -> N
         )
 
 
-__all__ = ["IsaEmitterPass", "IsaEmissionError"]
+__all__ = ["IsaEmissionError", "IsaEmitterPass"]

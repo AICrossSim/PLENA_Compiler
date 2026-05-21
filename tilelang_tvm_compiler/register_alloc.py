@@ -34,7 +34,7 @@ IntRAM spill region:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 
 
 class RegisterExhausted(RuntimeError):
@@ -63,8 +63,8 @@ class _SpillRecord:
 class BorrowToken:
     """Opaque handle returned from ``spill_borrow``. Pass back to
     ``spill_return`` to release the borrow and reload spilled GPs."""
-    borrowed: List[int]
-    spilled: List[_SpillRecord] = field(default_factory=list)
+    borrowed: list[int]
+    spilled: list[_SpillRecord] = field(default_factory=list)
 
 
 class RegisterAllocator:
@@ -79,22 +79,22 @@ class RegisterAllocator:
         gp_reserved_set = set(gp_reserved)
         addr_reserved_set = set(addr_reserved)
         self._gp_total = gp_total
-        self._gp_free: List[int] = [i for i in range(gp_total) if i not in gp_reserved_set]
+        self._gp_free: list[int] = [i for i in range(gp_total) if i not in gp_reserved_set]
         # In-use GPs in allocation order (LIFO spill candidates pulled
         # from the end). Always disjoint from ``_gp_free``.
-        self._gp_in_use: List[int] = []
-        self._addr_free: List[int] = [i for i in range(addr_total) if i not in addr_reserved_set]
+        self._gp_in_use: list[int] = []
+        self._addr_free: list[int] = [i for i in range(addr_total) if i not in addr_reserved_set]
         # Spill slot bitmap.
-        self._spill_slots_in_use: List[bool] = [False] * SPILL_SLOTS
+        self._spill_slots_in_use: list[bool] = [False] * SPILL_SLOTS
         # Idx slot bitmap (loop idx values stored in IntRAM instead of
         # GPs so deep nests don't pin the whole GP file).
-        self._idx_slots_in_use: List[bool] = [False] * IDX_SLOTS
+        self._idx_slots_in_use: list[bool] = [False] * IDX_SLOTS
         # Late-bound by the shim/compiler so allocate_gp can auto-spill
         # on demand. Stays None for tests that don't wire it up.
         self.compiler = None
         # Each successful auto-spill records (orig_reg, slot) so the
         # matching ``free_gp`` reload-restores from IntRAM.
-        self._auto_spills_by_borrow: Dict[int, _SpillRecord] = {}
+        self._auto_spills_by_borrow: dict[int, _SpillRecord] = {}
         # Set of GPs that hold long-lived bindings (loop indices etc.)
         # — never picked as spill candidates. The ISA pass populates
         # this via ``pin_gp`` / ``unpin_gp`` whenever it binds /
@@ -106,12 +106,12 @@ class RegisterAllocator:
         # Dumped at end of compile to ``<build_dir>/<asm>.gp_trace.tsv``
         # so the ASM can be cross-referenced line-by-line with the
         # allocation events that produced it.
-        self._trace: List[Dict[str, str]] = []
+        self._trace: list[dict[str, str]] = []
         # Source-site stack pushed by ISA pass / materializer when they
         # want events grouped under a logical operation (e.g. ``op[12]
         # row_reduce_sum_at``, ``materialize Add``). Whatever sits on
         # top here annotates every event until popped.
-        self._site_stack: List[str] = []
+        self._site_stack: list[str] = []
 
     # ------------------------------------------------------------------
     # Event trace
@@ -140,7 +140,7 @@ class RegisterAllocator:
         """Append one row to ``self._trace``. Captures the post-mutation
         state (free pool / in-use list / pinned set) so a reader can
         replay the timeline without reconstructing it from deltas."""
-        row: Dict[str, object] = {
+        row: dict[str, object] = {
             "asm_line": self._asm_line(),
             "site":     self._site(),
             "event":    event,
@@ -153,13 +153,13 @@ class RegisterAllocator:
         row["pinned"] = ",".join(str(r) for r in sorted(self._pinned_gp))
         self._trace.append(row)
 
-    def trace_rows(self) -> List[Dict[str, object]]:
+    def trace_rows(self) -> list[dict[str, object]]:
         return list(self._trace)
 
     # ------------------------------------------------------------------
     # GP register pool
     # ------------------------------------------------------------------
-    def allocate_gp(self, n: int) -> List[int]:
+    def allocate_gp(self, n: int) -> list[int]:
         # Auto-spill is allowed only against UNPINNED in-use regs. Loop
         # hw-counters and idx regs are always pinned by `_emit_for`, so
         # they can never be picked as spill victims -- which was the
@@ -206,7 +206,7 @@ class RegisterAllocator:
                 f"bound on the allocator; call shim.compiler.bind_allocator() "
                 f"or pass `compiler=` to the RegisterAllocator constructor"
             )
-        candidates: List[int] = []
+        candidates: list[int] = []
         for r in reversed(self._gp_in_use):
             if r in self._pinned_gp:
                 continue
@@ -284,8 +284,8 @@ class RegisterAllocator:
         n: int,
         *,
         compiler,
-        protect: Optional[Iterable[int]] = None,
-    ) -> Tuple[List[int], BorrowToken]:
+        protect: Iterable[int] | None = None,
+    ) -> tuple[list[int], BorrowToken]:
         """Borrow ``n`` GP registers, spilling currently-allocated ones
         to IntRAM if necessary. Emits ``S_ST_INT`` lines into
         ``compiler.generated_code`` for every spilled GP. Returns
@@ -301,9 +301,9 @@ class RegisterAllocator:
         protect_set.discard(0)  # gp0 reserved-zero is never spillable anyway
 
         need = n - len(self._gp_free)
-        spilled: List[_SpillRecord] = []
+        spilled: list[_SpillRecord] = []
         if need > 0:
-            candidates: List[int] = []
+            candidates: list[int] = []
             for r in reversed(self._gp_in_use):
                 if r in protect_set:
                     continue
@@ -414,7 +414,7 @@ class RegisterAllocator:
     # ------------------------------------------------------------------
     # Address register pool
     # ------------------------------------------------------------------
-    def allocate_addr(self, n: int) -> List[int]:
+    def allocate_addr(self, n: int) -> list[int]:
         if n > len(self._addr_free):
             raise RegisterExhausted(
                 f"requested {n} addr registers but only {len(self._addr_free)} free"
@@ -435,9 +435,9 @@ class RegisterAllocator:
 
 
 __all__ = [
-    "RegisterAllocator",
-    "RegisterExhausted",
-    "BorrowToken",
     "SPILL_BASE",
     "SPILL_SLOTS",
+    "BorrowToken",
+    "RegisterAllocator",
+    "RegisterExhausted",
 ]

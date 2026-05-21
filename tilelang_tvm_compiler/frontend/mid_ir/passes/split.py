@@ -70,13 +70,12 @@ For(by_number) → For(by_phase) → ...``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 from tvm import tir as _tir
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    BufferDef, BufferRef, Slice, VarRef,
+    BufferDef, BufferRef, VarRef,
     Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
@@ -136,11 +135,11 @@ def _is_lane_aware_buffer(buf: BufferDef) -> bool:
 
 @dataclass
 class _Ctx:
-    cluster_counts: List[int]
-    lane_axes: List[str]
+    cluster_counts: list[int]
+    lane_axes: list[str]
     # name -> grown BufferDef. Only contains entries for buffers that
     # were grown (lane-aware). Other buffers are left alone.
-    grown: Dict[str, BufferDef]
+    grown: dict[str, BufferDef]
 
 
 def _swap_buf(buf: BufferDef, ctx: _Ctx) -> BufferDef:
@@ -344,7 +343,7 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
 
 
 def run(func: MidFunc,
-        cluster_counts: Optional[List[int]] = None) -> MidFunc:
+        cluster_counts: list[int] | None = None) -> MidFunc:
     """Split each declared lane-axis blockIdx into (number, phase) and
     grow every non-global buffer by one outer cluster dim.
 
@@ -377,7 +376,7 @@ def run(func: MidFunc,
     for c in cluster_counts:
         cluster_total *= c
 
-    grown: Dict[str, BufferDef] = {}
+    grown: dict[str, BufferDef] = {}
     for buf in list(func.params) + list(func.allocs):
         if _is_lane_aware_buffer(buf) and buf.name not in grown:
             grown[buf.name] = _grow_buffer(buf, cluster_total)
@@ -413,7 +412,7 @@ def run(func: MidFunc,
         grown=grown,
     )
 
-    new_body: List[Stmt] = [_walk_stmt(s, ctx) for s in func.body]
+    new_body: list[Stmt] = [_walk_stmt(s, ctx) for s in func.body]
     new_params = [_swap_buf(b, ctx) for b in func.params]
     new_allocs = [_swap_buf(b, ctx) for b in func.allocs]
 
@@ -428,4 +427,4 @@ def run(func: MidFunc,
     )
 
 
-__all__ = ["run", "SplitError"]
+__all__ = ["SplitError", "run"]

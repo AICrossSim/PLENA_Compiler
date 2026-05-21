@@ -30,7 +30,6 @@ from asm_templates import (
     projection_asm,
     rms_norm_asm,
 )
-from asm_templates._imm import load_large_int
 
 
 def _load_template(template_name: str) -> str:

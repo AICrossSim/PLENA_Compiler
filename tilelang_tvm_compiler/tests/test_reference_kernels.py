@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import re
 
-import tilelang_tvm_compiler  # bootstrap TVM 0.23
 
 from tilelang_tvm_compiler.frontend import compile_func, compile_to_tir_text
 from tilelang_tvm_compiler.kernels.mm64 import make_mm64

@@ -30,7 +30,6 @@ Design notes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
 
 from tvm import tir
 
@@ -58,8 +57,8 @@ class MaterializedExpr:
     register: int
     isa: str
     owns_register: bool             # caller may free `register` via release()
-    intermediates: List[int] = field(default_factory=list)
-    _materializer: "ExprMaterializer | None" = None
+    intermediates: list[int] = field(default_factory=list)
+    _materializer: ExprMaterializer | None = None
 
     def release(self) -> None:
         """Free `register` (if owned) and any intermediates we held on to."""
@@ -84,7 +83,7 @@ class ExprMaterializer:
     removing entries when entering / leaving a loop body.
     """
 
-    def __init__(self, shim: ProgramShim, symbol_table: Dict[tir.Var, int]) -> None:
+    def __init__(self, shim: ProgramShim, symbol_table: dict[tir.Var, int]) -> None:
         self.shim = shim
         self.symbol_table = symbol_table
 
@@ -476,4 +475,4 @@ def _try_pow2_shift_amount(x) -> int | None:
     return k
 
 
-__all__ = ["ExprMaterializer", "MaterializedExpr", "ExprMaterializeError"]
+__all__ = ["ExprMaterializeError", "ExprMaterializer", "MaterializedExpr"]

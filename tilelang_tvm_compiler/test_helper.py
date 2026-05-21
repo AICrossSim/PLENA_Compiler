@@ -52,7 +52,8 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any
+from collections.abc import Callable, Mapping
 
 
 # ---------------------------------------------------------------------------
@@ -131,14 +132,14 @@ class TvmTestbenchSpec:
     """k=v pairs forwarded as ``--kernel-kwargs k1=v1,k2=v2,...``."""
 
     mlen: int = 64
-    btmm_hlen: Optional[int] = None
-    btmm_lane_count: Optional[int] = None
+    btmm_hlen: int | None = None
+    btmm_lane_count: int | None = None
 
-    stage_output: Optional[str] = None
+    stage_output: str | None = None
     """Buffer name to re-stage from HBM -> VRAM at the end of the
     kernel for view_mem comparison (passed via ``--stage-output``)."""
 
-    artifact_prefix: Optional[str] = None
+    artifact_prefix: str | None = None
     """Prefix for ancillary build artefacts. Defaults to ``asm_name``."""
 
     # ---- venv / subprocess env ----
@@ -147,13 +148,13 @@ class TvmTestbenchSpec:
     the compiler. ``.venv`` (Python 3.12, the new default) or the legacy
     ``.venv-tvm`` (Python 3.11, TVM-wheel-only)."""
 
-    ld_library_path: Optional[str] = DEFAULT_LD_LIBRARY_PATH
+    ld_library_path: str | None = DEFAULT_LD_LIBRARY_PATH
     """Forwarded as the subprocess's ``LD_LIBRARY_PATH``. Pass ``""`` to
     explicitly clear it (the ``.venv-tvm`` convention) or ``None`` to
     inherit from the parent process unchanged."""
 
     # ---- buffer-addrs JSON ----
-    parse_buffer_addrs: Optional[BufferAddrsParser] = None
+    parse_buffer_addrs: BufferAddrsParser | None = None
     """If given, the helper passes ``--dump-buffer-addrs`` to the
     compiler, then calls this function with the parsed JSON. The result
     is forwarded to ``build_pre_kernel_stub`` /
@@ -162,9 +163,9 @@ class TvmTestbenchSpec:
     don't need address introspection don't pay for it."""
 
     # ---- optional kernel hooks ----
-    build_pre_kernel_stub: Optional[PreKernelStubBuilder] = None
-    build_fp_preload: Optional[FpPreloadBuilder] = None
-    patch_isa: Optional[Any] = None
+    build_pre_kernel_stub: PreKernelStubBuilder | None = None
+    build_fp_preload: FpPreloadBuilder | None = None
+    patch_isa: Any | None = None
     """Optional last-mile rewrite hook over the assembled ASM text.
 
     Signature: ``(isa_text: str) -> str``. Called after the compile
@@ -195,7 +196,7 @@ def _compile_via_subprocess(
     spec: TvmTestbenchSpec,
     *,
     hlir_path: Path,
-    addrs_path: Optional[Path],
+    addrs_path: Path | None,
 ) -> str:
     """Subprocess into the TVM venv to compile the kernel.
 
@@ -283,7 +284,7 @@ def run(spec: TvmTestbenchSpec) -> int:
     # ---------- 1. compile ----------
     print(f"[1/4] Compiling TVM {spec.asm_name} kernel ...")
     hlir_path = build_dir / f"{spec.asm_name}.hlir.txt"
-    addrs_path: Optional[Path] = (
+    addrs_path: Path | None = (
         build_dir / f"{spec.asm_name}.buffer_addrs.json"
         if spec.parse_buffer_addrs is not None else None
     )
@@ -365,7 +366,7 @@ def run(spec: TvmTestbenchSpec) -> int:
         print(f"           fp_preload: {tuple(fp_preload.shape)}")
 
     # ---------- 3. create_sim_env (.pt + .asm + fp/int sram bins) ----------
-    print(f"[3/4] create_sim_env -> .pt + .asm + fp/int sram bins ...")
+    print("[3/4] create_sim_env -> .pt + .asm + fp/int sram bins ...")
     create_sim_env(
         input_tensor=input_feed,
         generated_code=isa_text,
@@ -377,7 +378,7 @@ def run(spec: TvmTestbenchSpec) -> int:
     print(f"      OK  -> {build_dir}")
 
     # ---------- 4. create_mem_for_sim (assemble + pack HBM) ----------
-    print(f"[4/4] create_mem_for_sim -> assemble .asm + pack HBM bin ...")
+    print("[4/4] create_mem_for_sim -> assemble .asm + pack HBM bin ...")
     create_mem_for_sim(
         data_size=256,
         mode="behave_sim",
@@ -386,7 +387,7 @@ def run(spec: TvmTestbenchSpec) -> int:
         specified_data_order=input_order,
         build_path=build_dir,
     )
-    print(f"      OK  -> generated_machine_code.mem + hbm_for_behave_sim.bin")
+    print("      OK  -> generated_machine_code.mem + hbm_for_behave_sim.bin")
 
     # ---------- comparison_params + asm snapshot ----------
     comparison_params = spec.build_comparison_params(io, addrs)
@@ -404,9 +405,9 @@ def run(spec: TvmTestbenchSpec) -> int:
 
 
 __all__ = [
-    "TvmTestbenchSpec",
-    "run",
+    "DEFAULT_LD_LIBRARY_PATH",
     "REPO_ROOT",
     "TESTBENCH_DIR",
-    "DEFAULT_LD_LIBRARY_PATH",
+    "TvmTestbenchSpec",
+    "run",
 ]

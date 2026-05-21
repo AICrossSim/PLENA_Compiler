@@ -49,7 +49,6 @@ already-handled cases continue to flow through unchanged.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
 
 import tvm
 from tvm import tir
@@ -91,9 +90,9 @@ class _ConstantTable:
 
     def __init__(self) -> None:
         # (dtype, value) → (buffer, name)
-        self._table: Dict[Tuple[str, float], Tuple[tir.Buffer, str]] = {}
+        self._table: dict[tuple[str, float], tuple[tir.Buffer, str]] = {}
         # Insertion order, so generated ASM is reproducible across runs.
-        self._order: List[Tuple[str, float]] = []
+        self._order: list[tuple[str, float]] = []
 
     def get_or_create(self, dtype: str, value: float) -> tir.Buffer:
         key = (dtype, float(value))
@@ -126,10 +125,10 @@ class _ConstantTable:
         self._order.append(key)
         return buf
 
-    def alloc_buffers(self) -> List[tir.Buffer]:
+    def alloc_buffers(self) -> list[tir.Buffer]:
         return [self._table[k][0] for k in self._order]
 
-    def name_value_map(self) -> Dict[str, float]:
+    def name_value_map(self) -> dict[str, float]:
         return {self._table[k][1]: k[1] for k in self._order}
 
 
@@ -264,7 +263,7 @@ def _make_synth_load(buf, broadcast_index):
 
 
 def _walk(stmt, table: _ConstantTable, root_block_name: str,
-          extra_allocs: List[tir.Buffer]):
+          extra_allocs: list[tir.Buffer]):
     if stmt is None:
         return None
     if isinstance(stmt, tir.SeqStmt):
@@ -402,4 +401,4 @@ def run(func: tir.PrimFunc,
     )
 
 
-__all__ = ["run", "ATTR_KEY", "DEFAULT_ROOT_BLOCK_NAME"]
+__all__ = ["ATTR_KEY", "DEFAULT_ROOT_BLOCK_NAME", "run"]

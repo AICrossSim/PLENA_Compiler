@@ -23,14 +23,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from typing import Dict, Tuple
 
 from . import hlir as _hlir
 from . import scope as _scope
 
 
 def _row_stride_for_layout(
-    shape: Tuple[int, ...], layout: str, *, fallback: int,
+    shape: tuple[int, ...], layout: str, *, fallback: int,
 ) -> int:
     """Element distance between row r and row r+1 *within the same
     channel* of a 4D buffer laid out row-major in HBM under ``layout``.
@@ -46,14 +45,14 @@ def _row_stride_for_layout(
         return fallback
     # The row dim's stride is just the product of every dim that lies
     # AFTER it in the source layout's row-major order.
-    bi, ri, _ci, _di = _hlir.LAYOUT_AXES[layout]
+    _bi, ri, _ci, _di = _hlir.LAYOUT_AXES[layout]
     stride = 1
     for i in range(ri + 1, len(shape)):
         stride *= int(shape[i])
     return stride
 
 
-def _logical_2d(shape: Tuple[int, ...], layout: str = "BSHD") -> Tuple[int, int]:
+def _logical_2d(shape: tuple[int, ...], layout: str = "BSHD") -> tuple[int, int]:
     """Collapse N-D shape -> (rows, cols) using ``layout``.
 
     Thin wrapper around ``hlir.logical_2d_extents``. For BSHD the legacy
@@ -112,8 +111,8 @@ class AddressAllocConfig:
     # the dict fall back to the bump allocator. Pinned addresses do NOT
     # advance the bump cursor — the driver is responsible for not
     # double-booking bytes.
-    hbm_address_overrides: Dict[str, int] = field(default_factory=dict)
-    fpram_address_overrides: Dict[str, int] = field(default_factory=dict)
+    hbm_address_overrides: dict[str, int] = field(default_factory=dict)
+    fpram_address_overrides: dict[str, int] = field(default_factory=dict)
 
     @property
     def tile_elems(self) -> int:
@@ -124,7 +123,7 @@ def _align_up(n: int, mul: int) -> int:
     return ((n + mul - 1) // mul) * mul
 
 
-def _hbm_packed_byte_size(num_elements: int, cfg: "AddressAllocConfig") -> int:
+def _hbm_packed_byte_size(num_elements: int, cfg: AddressAllocConfig) -> int:
     """Bytes a single tensor occupies in hbm_for_behave_sim.bin after
     `map_mx_data_to_hbm_for_behave_sim` packs it.
 
@@ -247,4 +246,4 @@ class AddressAllocationPass:
         return mod
 
 
-__all__ = ["AddressAllocConfig", "AddressAllocationPass", "FPRAM_USER_BASE"]
+__all__ = ["FPRAM_USER_BASE", "AddressAllocConfig", "AddressAllocationPass"]

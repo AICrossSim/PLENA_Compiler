@@ -175,7 +175,7 @@ class TestSoftmaxNaNPropagation:
 
         # Even if this specific seed didn't overflow, demonstrate the mechanism
         # by showing that extreme values DO cause NaN
-        extreme = torch.tensor([100.0, 0.0, -50.0, 10.0])
+        torch.tensor([100.0, 0.0, -50.0, 10.0])
         # In online_softmax: shifted = [0, -100, -150, -90]
         # exp(-150) = 0 in bf16, that's fine — but if the max itself is inf:
         extreme_with_inf = torch.tensor([float("inf"), 0.0, -50.0, 10.0])

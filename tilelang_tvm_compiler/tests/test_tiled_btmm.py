@@ -4,7 +4,6 @@ writeback (per-head non-contiguous in 2D)."""
 import re
 import sys
 
-from tilelang_tvm_compiler import hlir as _hlir
 from tilelang_tvm_compiler.kernels.tiled_btmm import make_tiled_btmm
 from tilelang_tvm_compiler.pipeline import compile_kernel, PlenaTarget
 
@@ -17,7 +16,7 @@ def _compile(seq_q=128, seq_k=128):
 
 def test_kernel_has_nested_for_loops():
     """3-level nesting: q_block -> hg (head_group) -> kv_block."""
-    ck, c = _compile()
+    ck, _c = _compile()
     ops = ck.hlir.ops
     assert len(ops) == 1 and ops[0].kind == "for", "outer must be a for"
     hg_ops = ops[0].body
@@ -29,7 +28,7 @@ def test_kernel_has_nested_for_loops():
     assert kinds == ["dma_h2v_slice", "dma_h2m_slice", "btmm", "dma_v2h_slice"], (
         f"unexpected inner-body kinds: {kinds}"
     )
-    print(f"[ok] nested for: q_block -> hg -> kv_block -> [4 inner ops]")
+    print("[ok] nested for: q_block -> hg -> kv_block -> [4 inner ops]")
 
 
 def test_v2h_slice_emits_per_head_tile_comments():
@@ -120,7 +119,7 @@ def test_kernel_has_btmm_pair():
     asm = ck.isa_text
     assert asm.count("M_BTMM ") == 1
     assert asm.count("M_BMM_WO ") == 1
-    print(f"[ok] M_BTMM + M_BMM_WO emitted exactly once each (inside loop body)")
+    print("[ok] M_BTMM + M_BMM_WO emitted exactly once each (inside loop body)")
 
 
 def main():

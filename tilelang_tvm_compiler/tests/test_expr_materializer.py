@@ -86,7 +86,7 @@ def test_constant_fold_add():
     assert ", 80" in m.isa and "S_ADD_INT" not in m.isa, (
         f"expected folded literal 80, got: {m.isa!r}"
     )
-    print(f"[ok] constant fold: 64+16=80 in single S_ADDI_INT")
+    print("[ok] constant fold: 64+16=80 in single S_ADDI_INT")
 
 
 def test_constant_fold_mul():
@@ -94,7 +94,7 @@ def test_constant_fold_mul():
     expr = tir.Mul(tir.IntImm("int32", 4), tir.IntImm("int32", 64))
     m = mat.materialize(expr)
     assert ", 256" in m.isa and "S_MUL_INT" not in m.isa
-    print(f"[ok] constant fold: 4*64=256 in single S_ADDI_INT")
+    print("[ok] constant fold: 4*64=256 in single S_ADDI_INT")
 
 
 def test_mul_by_one_identity():
@@ -120,7 +120,7 @@ def test_compound_loop_offset():
     expr = kv * tir.IntImm("int32", 64) + tir.IntImm("int32", 16)
     m = mat.materialize(expr)
     print(f"[compound] reg=gp{m.register}")
-    print(f"[compound] isa:")
+    print("[compound] isa:")
     for line in m.isa.strip().split("\n"):
         print(f"           {line}")
     # `kv * 64` strength-reduces to S_SLLI_INT (since 64 is a power of 2),
@@ -129,7 +129,7 @@ def test_compound_loop_offset():
     assert "S_MUL_INT" not in m.isa, "should not need a multiplier here"
     assert "S_ADDI_INT" in m.isa, "expected S_ADDI_INT for (kv<<6) + 16"
     assert "S_ADD_INT" not in m.isa, "non-immediate add should not appear here"
-    print(f"[ok] compound: kv * 64 + 16 lowered correctly (uses SLLI + ADDI fast-path)")
+    print("[ok] compound: kv * 64 + 16 lowered correctly (uses SLLI + ADDI fast-path)")
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,7 @@ def test_compound_release_frees_all():
     )
     m.release()
     assert len(ra._gp_free) == free_before
-    print(f"[ok] compound release: full pool restored after release()")
+    print("[ok] compound release: full pool restored after release()")
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ def test_floordiv_constant_fold():
     expr = tir.FloorDiv(tir.IntImm("int32", 256), tir.IntImm("int32", 64))
     m = mat.materialize(expr)
     assert ", 4" in m.isa, f"expected literal 4, got {m.isa!r}"
-    print(f"[ok] FloorDiv fold: 256 // 64 = 4")
+    print("[ok] FloorDiv fold: 256 // 64 = 4")
 
 
 def test_floormod_constant_fold():
@@ -181,7 +181,7 @@ def test_floormod_constant_fold():
     expr = tir.FloorMod(tir.IntImm("int32", 100), tir.IntImm("int32", 64))
     m = mat.materialize(expr)
     assert ", 36" in m.isa
-    print(f"[ok] FloorMod fold: 100 % 64 = 36")
+    print("[ok] FloorMod fold: 100 % 64 = 36")
 
 
 def test_floordiv_by_one_identity():
@@ -256,7 +256,7 @@ def test_mul_by_pow2_two_literals_still_folds():
     assert "S_SLLI_INT" not in m.isa
     assert "S_MUL_INT" not in m.isa
     assert ", 256" in m.isa
-    print(f"[ok] 4 * 64 still folds to literal 256")
+    print("[ok] 4 * 64 still folds to literal 256")
 
 
 def test_floordiv_by_pow2_uses_srli():
@@ -292,7 +292,7 @@ def test_mul_by_non_pow2_still_uses_mul():
     m = mat.materialize(tir.Mul(v, tir.IntImm("int32", 7)))
     assert "S_MUL_INT" in m.isa
     assert "S_SLLI_INT" not in m.isa
-    print(f"[ok] x * 7 (non-pow2) uses S_MUL_INT")
+    print("[ok] x * 7 (non-pow2) uses S_MUL_INT")
 
 
 def test_shift_by_zero_is_identity():
@@ -303,7 +303,7 @@ def test_shift_by_zero_is_identity():
     m = mat.materialize(tir.Mul(v, tir.IntImm("int32", 1)))
     assert "S_SLLI_INT" not in m.isa
     assert m.register == 5
-    print(f"[ok] x * 1 is identity (not SLLI 0)")
+    print("[ok] x * 1 is identity (not SLLI 0)")
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ class AssemblyToBinary:
         self.instruction_length = config_settings.get("INSTRUCTION_LENGTH", 0)
         self.funct_width = config_settings.get("FUNCT_WIDTH", 0)
         self.funct_dist = self.instruction_length - 2 * self.funct_width
-        
+
     def _convert_to_binary(self, instruction):
         """
         Convert an instruction to its binary representation.

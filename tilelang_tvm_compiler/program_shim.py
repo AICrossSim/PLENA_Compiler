@@ -19,7 +19,6 @@ contract here and add fields lazily as we enable more emitter methods.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .register_alloc import RegisterAllocator
 
@@ -73,7 +72,7 @@ def make_shim(
     blen: int,
     btmm_lane_count: int,
     btmm_hlen: int,
-    register_allocator: Optional[RegisterAllocator] = None,
+    register_allocator: RegisterAllocator | None = None,
 ) -> ProgramShim:
     compiler = CompilerShim(register_allocator=register_allocator or RegisterAllocator())
     # Wire the allocator back to the compiler so auto-spill can emit
@@ -88,4 +87,4 @@ def make_shim(
     )
 
 
-__all__ = ["ProgramShim", "CompilerShim", "make_shim"]
+__all__ = ["CompilerShim", "ProgramShim", "make_shim"]

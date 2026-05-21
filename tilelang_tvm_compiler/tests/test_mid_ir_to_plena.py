@@ -32,7 +32,6 @@ from tilelang_tvm_compiler import hlir as _hlir
 from tilelang_tvm_compiler import scope as _scope
 from tilelang_tvm_compiler.frontend.mid_ir import ir
 from tilelang_tvm_compiler.frontend.mid_ir.passes.to_plena import (
-    ToPlenaError,
     run as to_plena_run,
 )
 

@@ -59,7 +59,7 @@ Dumping is opt-in via ``build_dir`` argument; pass None to skip
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from tvm import tir as _tir
 
@@ -118,7 +118,7 @@ def _for_loop_var(for_stmt: For) -> _tir.Var:
 
 
 def _map_scope(scope: str, rank: int,
-               override: Optional[str] = None) -> str:
+               override: str | None = None) -> str:
     """mid_ir scope string → HLIR scope string.
 
     ``override`` is set by the use-driven inference (e.g. a buffer used
@@ -153,8 +153,8 @@ def _map_scope(scope: str, rank: int,
 
 
 def _pad_to_4d_shape(
-    shape: Tuple[int, ...], heads_at_h: bool = False,
-) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    shape: tuple[int, ...], heads_at_h: bool = False,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Pad a 1D / 2D shape up to canonical 4D for downstream uniformity.
 
     Distinct from cluster expansion: this is a pure rank-normalisation
@@ -195,11 +195,11 @@ def _pad_to_4d_shape(
 
 def _make_hlir_buffer(
     buf: BufferDef,
-    override: Optional[str] = None,
-    lane_count: Optional[int] = None,
-    mode: Optional[str] = None,
+    override: str | None = None,
+    lane_count: int | None = None,
+    mode: str | None = None,
     kernel_layout: str = "BSHD",
-) -> Tuple[_hlir.Buffer, Tuple[int, ...]]:
+) -> tuple[_hlir.Buffer, tuple[int, ...]]:
     """Build an HLIR ``Buffer`` from a mid_ir ``BufferDef``.
 
     Returns ``(buffer, inserted_positions)`` — positions in the OUTPUT
@@ -226,7 +226,7 @@ def _make_hlir_buffer(
     # ``"fragment.fpram"`` vs ``"global.fpram"``).
     physical = _map_scope(buf.scope, len(buf.shape), override)
     is_global = _is_global_scope(buf.scope)
-    inserts: Tuple[int, ...] = ()
+    inserts: tuple[int, ...] = ()
     # Cluster expand only applies to allocatable on-chip buffers. HBM
     # (``"global"``) and author-pinned on-chip globals
     # (``"global.vram"`` / ``"global.mram"`` / ``"global.fpram"``)
@@ -307,7 +307,7 @@ def _is_global_scope(scope: str) -> bool:
     return scope == "global" or scope.startswith("global.")
 
 
-def _infer_lane_modes(func: MidFunc) -> Dict[str, str]:
+def _infer_lane_modes(func: MidFunc) -> dict[str, str]:
     """For every non-global buffer, decide its lane-expansion mode by
     inspecting how mid_ir ops use it. Mirrors
     ``graph_passes.allocate_group_memory`` but works on mid_ir nodes.
@@ -315,7 +315,7 @@ def _infer_lane_modes(func: MidFunc) -> Dict[str, str]:
     Priority (first match wins) — ``ROW_STACK`` takes precedence over
     ``COL_PACK`` if a buffer is used as a BTMM dst somewhere.
     """
-    modes: Dict[str, str] = {}
+    modes: dict[str, str] = {}
 
     def record(name: str, mode: str) -> None:
         prev = modes.get(name)
@@ -400,7 +400,7 @@ def _infer_lane_modes(func: MidFunc) -> Dict[str, str]:
 
 def _expand_buffer_shape_with_cluster(
     buf: BufferDef, lane_count: int, mode: str,
-) -> Tuple[List[int], Optional[int]]:
+) -> tuple[list[int], int | None]:
     """Reshape to canonical 4D BSHD (or 2D for FPRAM) and report which
     axis holds the cluster (lane) dim in the new shape.
 
@@ -451,7 +451,7 @@ def _expand_buffer_shape_with_cluster(
 #
 # This must stay consistent with the new ``cluster_dim`` value
 # returned by :func:`_expand_buffer_shape_with_cluster`.
-_CLUSTER_MODE_NEW_LANE_DIM: Dict[str, Optional[int]] = {
+_CLUSTER_MODE_NEW_LANE_DIM: dict[str, int | None] = {
     _MODE_COL_PACK:  2,    # lane → H
     _MODE_ROW_STACK: 0,    # lane → B
     _MODE_BSHD_LIFT: None, # no lane in scope
@@ -459,13 +459,13 @@ _CLUSTER_MODE_NEW_LANE_DIM: Dict[str, Optional[int]] = {
 
 
 def _rewrite_ref_for_cluster_mode(
-    starts_or_extents: Tuple[Any, ...],
+    starts_or_extents: tuple[Any, ...],
     mode: str,
-    old_cluster_dim: Optional[int],
-    new_shape: Tuple[int, ...],
+    old_cluster_dim: int | None,
+    new_shape: tuple[int, ...],
     *,
     is_extent: bool,
-) -> Tuple[Any, ...]:
+) -> tuple[Any, ...]:
     """Map a rank-3 ref to its rank-4 BSHD equivalent.
 
     Inputs:
@@ -519,7 +519,7 @@ def _rewrite_ref_for_cluster_mode(
         )
     s_src, d_src = non_lane_sources[0], non_lane_sources[1]
 
-    out: List[Any] = [fill] * 4
+    out: list[Any] = [fill] * 4
     # Lane slot: sync-wrap convention (start=0, extent=lane span).
     if is_extent:
         out[new_lane_dim] = int(new_shape[new_lane_dim])
@@ -532,14 +532,14 @@ def _rewrite_ref_for_cluster_mode(
 
 def _expand_buffer_shape(
     buf: BufferDef, lane_count: int, mode: str,
-) -> List[int]:
+) -> list[int]:
     """Back-compat shape-only wrapper. New code should use
     ``_expand_buffer_shape_with_cluster``."""
     shape, _ = _expand_buffer_shape_with_cluster(buf, lane_count, mode)
     return shape
 
 
-def _infer_scope_overrides(func: MidFunc) -> Dict[str, str]:
+def _infer_scope_overrides(func: MidFunc) -> dict[str, str]:
     """Scan body; figure out per-buffer scope overrides driven by op
     usage.
 
@@ -552,7 +552,7 @@ def _infer_scope_overrides(func: MidFunc) -> Dict[str, str]:
     the dst buffer is tagged MRAM, ``dma_h2m`` will be picked
     automatically.
     """
-    overrides: Dict[str, str] = {}
+    overrides: dict[str, str] = {}
 
     def visit_op(op) -> None:
         if isinstance(op, Gemm):
@@ -622,11 +622,11 @@ def _render_idx(idx) -> Any:
     return idx
 
 
-def _ref_extents(ref: BufferRef) -> Tuple[int, ...]:
+def _ref_extents(ref: BufferRef) -> tuple[int, ...]:
     """Extents of the slice this ref describes — full-axis Slices give
     the buffer's full size on that dim; a ranged_slice compound carries
     its own extent; everything else (single scalar index) is 1."""
-    out: List[int] = []
+    out: list[int] = []
     for i, dim in enumerate(ref.buffer.shape):
         idx = ref.indices[i]
         if isinstance(idx, Slice):
@@ -696,17 +696,17 @@ _INT32 = "int32"
 # from a mid_ir For). Index expressions from mid_ir come through
 # VarRef and bypass this cache entirely (``_render_idx_as_primexpr``
 # unwraps the wrapped ``tir.Var`` directly).
-_VAR_CACHE: Dict[str, "_tir.Var"] = {}
+_VAR_CACHE: dict[str, _tir.Var] = {}
 
 # Module-global lane modes table, populated by ``run`` at the start of
 # each compile and read by per-op lowering helpers. Cleared by ``run``.
-_LANE_MODES: Dict[str, str] = {}
+_LANE_MODES: dict[str, str] = {}
 
 # Per-buffer pad-to-4D insert positions. Populated by ``run`` after
 # ``_make_hlir_buffer``. Used by ``_axes_for_ref`` to align mid_ir
 # per-op axes (rank == mid_ir buffer rank) with the post-pad HLIR
 # shape so ``hlir.Op.buffer_axes`` agrees with ``buf.shape``.
-_PAD_INSERTS: Dict[str, Tuple[int, ...]] = {}
+_PAD_INSERTS: dict[str, tuple[int, ...]] = {}
 
 # Per-buffer cluster-expansion records ``(mode, mid_ir_cluster_dim,
 # new_4d_shape)``. The pair to ``_PAD_INSERTS``: any on-chip buffer
@@ -714,8 +714,8 @@ _PAD_INSERTS: Dict[str, Tuple[int, ...]] = {}
 # (col_pack / row_stack / bshd_lift / fp_lane), and that's recorded
 # here so axes-aware helpers can translate mid_ir-side (rank-3) axes
 # tables onto the post-expansion 4D HLIR shape.
-_CLUSTER_MODES: Dict[
-    str, Tuple[str, Optional[int], Tuple[int, ...]],
+_CLUSTER_MODES: dict[
+    str, tuple[str, int | None, tuple[int, ...]],
 ] = {}
 
 # Per-buffer HLIR-side ``buffer_axes`` (post pad-to-4D / cluster-expand).
@@ -723,10 +723,10 @@ _CLUSTER_MODES: Dict[
 # HLIR buffer's shape — one role tag per physical dim. Populated by
 # ``run`` once the per-buffer mode is known; read by every lowering
 # helper that needs to stamp ``buffer_axes`` on its emitted hlir.Op.
-_BUFFER_HLIR_AXES: Dict[str, Tuple[Tuple[str, int], ...]] = {}
+_BUFFER_HLIR_AXES: dict[str, tuple[tuple[str, int], ...]] = {}
 
 
-def _axes_of(buf_name: str) -> Optional[Tuple[Tuple[str, int], ...]]:
+def _axes_of(buf_name: str) -> tuple[tuple[str, int], ...] | None:
     """Look up the per-dim role tuple for ``buf_name`` from the
     ``_BUFFER_HLIR_AXES`` table populated at ``run`` start. Returns
     ``None`` for unknown buffers (e.g. transient names that never
@@ -735,7 +735,7 @@ def _axes_of(buf_name: str) -> Optional[Tuple[Tuple[str, int], ...]]:
     return _BUFFER_HLIR_AXES.get(buf_name)
 
 
-def _hlir_axes_for_buffer(buf: "_hlir.Buffer") -> Tuple[Tuple[str, int], ...]:
+def _hlir_axes_for_buffer(buf: _hlir.Buffer) -> tuple[tuple[str, int], ...]:
     """Synthesise the ``buffer_axes`` tuple for ``buf`` from its
     post-expansion shape + ``cluster_dim``.
 
@@ -757,7 +757,7 @@ def _hlir_axes_for_buffer(buf: "_hlir.Buffer") -> Tuple[Tuple[str, int], ...]:
         return ()
     d_axis = rank - 1
     cdim = buf.cluster_dim
-    out: List[Tuple[str, int]] = []
+    out: list[tuple[str, int]] = []
     for i in range(rank):
         if i == d_axis:
             role = "simd"
@@ -775,7 +775,7 @@ def _hlir_axes_for_buffer(buf: "_hlir.Buffer") -> Tuple[Tuple[str, int], ...]:
 # ``_render_idx_as_primexpr`` consults this to expand a bare lane-var
 # index (e.g. ``by``) into ``by_phase + by_number * lane_count`` so the
 # ISA materializer only sees axes bound by enclosing HLIR for-ops.
-_LANE_AXIS_INFO: "Dict[VarRef, Tuple[VarRef, VarRef, int]]" = {}
+_LANE_AXIS_INFO: dict[VarRef, tuple[VarRef, VarRef, int]] = {}
 
 
 # Hardware vector lane width (MLEN). Set by ``run()`` from the compile
@@ -786,7 +786,7 @@ _LANE_AXIS_INFO: "Dict[VarRef, Tuple[VarRef, VarRef, int]]" = {}
 _HW_MLEN: int = 0
 
 
-def _get_var(name: str) -> "_tir.Var":
+def _get_var(name: str) -> _tir.Var:
     v = _VAR_CACHE.get(name)
     if v is None:
         v = _tir.Var(name, _INT32)
@@ -796,8 +796,8 @@ def _get_var(name: str) -> "_tir.Var":
 
 def _populate_lane_axis_info(
     func: MidFunc,
-    lane_axes: List[str],
-    cluster_counts: List[int],
+    lane_axes: list[str],
+    cluster_counts: list[int],
 ) -> None:
     """Walk ``func.body`` looking for each named lane axis's pair of
     (CLUSTER phase ParallelAxis, sibling number ParallelAxis). Record
@@ -812,7 +812,7 @@ def _populate_lane_axis_info(
     ``number -> phase`` nest.
     """
     # First gather every ParallelAxis in the body, keyed by axis_name.
-    axes_by_name: Dict[str, ParallelAxis] = {}
+    axes_by_name: dict[str, ParallelAxis] = {}
 
     def collect(s) -> None:
         if isinstance(s, ParallelAxis):
@@ -918,7 +918,7 @@ def _render_idx_as_primexpr(idx):
     return idx
 
 
-def _make_buffer_arg(ref: BufferRef) -> Union[str, _hlir.BufferSlice]:
+def _make_buffer_arg(ref: BufferRef) -> str | _hlir.BufferSlice:
     """Build an HLIR buffer_arg from a mid_ir BufferRef. Whole-buffer
     refs become bare buffer-name strings; partial refs become BufferSlice."""
     if _is_whole_buffer_ref(ref):
@@ -1007,9 +1007,9 @@ def _dma_kind_slice_variant(base: str) -> str:
 
 
 def _lower_multi_lane_dma(op: Dma, lane_count: int,
-                          buf_name_to_hlir: Dict[str, _hlir.Buffer],
-                          cluster_axis_name: Optional[str] = None,
-                          cluster_axis_var: "Optional[VarRef]" = None,
+                          buf_name_to_hlir: dict[str, _hlir.Buffer],
+                          cluster_axis_name: str | None = None,
+                          cluster_axis_var: VarRef | None = None,
                           ) -> _hlir.Op:
     src_scope = buf_name_to_hlir[op.src.buffer.name].scope
     dst_scope = buf_name_to_hlir[op.dst.buffer.name].scope
@@ -1048,7 +1048,7 @@ def _lower_multi_lane_dma(op: Dma, lane_count: int,
 
 
 def _ref_flat_offset(ref: BufferRef,
-                     phase_var_zero: "Optional[VarRef]" = None) -> _tir.PrimExpr:
+                     phase_var_zero: VarRef | None = None) -> _tir.PrimExpr:
     """Compute ``ref``'s starting element offset in row-major flat layout.
 
     Iterates buffer.shape backwards accumulating stride; concrete indices
@@ -1091,9 +1091,9 @@ def _ref_flat_offset(ref: BufferRef,
 
 
 def _lower_vram_to_vram_copy(op: Dma,
-                             buf_name_to_hlir: Dict[str, _hlir.Buffer],
-                             cluster_axis_name: Optional[str] = None,
-                             cluster_axis_var: "Optional[VarRef]" = None,
+                             buf_name_to_hlir: dict[str, _hlir.Buffer],
+                             cluster_axis_name: str | None = None,
+                             cluster_axis_var: VarRef | None = None,
                              ) -> _hlir.Op:
     """``T.copy(vram_src, vram_dst)`` → region-schema ``copy_v_to_v``.
 
@@ -1113,8 +1113,8 @@ def _lower_vram_to_vram_copy(op: Dma,
     multi-lane copy).
     """
     def _ref_region(ref: BufferRef) -> _hlir.VramRegion:
-        starts: List[Any] = []
-        extents: List[int] = []
+        starts: list[Any] = []
+        extents: list[int] = []
         for dim, idx in zip(ref.buffer.shape, ref.indices):
             if isinstance(idx, Slice):
                 starts.append(_tir.IntImm(_INT32, 0))
@@ -1138,7 +1138,7 @@ def _lower_vram_to_vram_copy(op: Dma,
 
     src_region = _ref_region(op.src)
     dst_region = _ref_region(op.dst)
-    for_specs: List[Tuple[Any, int]] = []
+    for_specs: list[tuple[Any, int]] = []
     leaf = _hlir.Op(
         kind="copy_v_to_v",
         buffer_args=[src_region, dst_region],
@@ -1147,7 +1147,7 @@ def _lower_vram_to_vram_copy(op: Dma,
     )
     if not for_specs:
         return leaf
-    body: List[_hlir.Op] = [leaf]
+    body: list[_hlir.Op] = [leaf]
     for v, ext in reversed(for_specs):
         body = [_hlir.make_for_op(loop_var=v, extent=int(ext), body=body)]
     return body[0]
@@ -1158,8 +1158,8 @@ def _is_zero_imm(expr) -> bool:
 
 
 def _ref_per_dim_starts(
-    ref: BufferRef, phase_var_zero: "Optional[VarRef]" = None,
-) -> Tuple[Any, ...]:
+    ref: BufferRef, phase_var_zero: VarRef | None = None,
+) -> tuple[Any, ...]:
     """Per-dim start indices for a BufferRef, mirroring ``_ref_extents``.
 
     Slice → 0 (whole axis); ranged_slice → start_expr (rendered);
@@ -1168,7 +1168,7 @@ def _ref_per_dim_starts(
     VarRef equal (by identity) to ``phase_var_zero`` (the
     cluster-phase axis VarRef) is treated as 0 under sync wrap.
     """
-    out: List[Any] = []
+    out: list[Any] = []
     for idx in ref.indices:
         if isinstance(idx, Slice):
             out.append(0)
@@ -1185,9 +1185,9 @@ def _ref_per_dim_starts(
 def _lower_v_fp_transfer(
     op: Dma,
     direction: str,                          # "v_to_fp" or "fp_to_v"
-    buf_name_to_hlir: Dict[str, _hlir.Buffer],
-    cluster_axis_name: Optional[str] = None,
-    cluster_axis_var: "Optional[VarRef]" = None,
+    buf_name_to_hlir: dict[str, _hlir.Buffer],
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
 ) -> _hlir.Op:
     """``T.copy(vram, fpram)`` / ``T.copy(fpram, vram)`` → one HLIR slice
     op carrying the full logical region.
@@ -1232,8 +1232,8 @@ def _lower_v_fp_transfer(
 
 
 def _zero_cluster_axis_in_fp_indices(
-    ref: BufferRef, cluster_axis_name: Optional[str],
-) -> "tuple":
+    ref: BufferRef, cluster_axis_name: str | None,
+) -> tuple:
     """Render ``ref.indices`` to PrimExprs, replacing the cluster-phase
     axis with 0 when the enclosing MultiLaneOp covers all lanes in one
     issue. ``ref.buffer.cluster_dim`` (set by split / propagated by
@@ -1264,7 +1264,7 @@ def _ref_touch_count(ref: BufferRef) -> int:
 
 
 def _lower_multi_lane_btmm(op: Gemm, lane_count: int,
-                           buf_name_to_hlir: Optional[Dict[str, _hlir.Buffer]] = None,
+                           buf_name_to_hlir: dict[str, _hlir.Buffer] | None = None,
                            ) -> _hlir.Op:
     """MultiLaneOp(Gemm) → region-schema btmm / btmv op.
 
@@ -1302,8 +1302,8 @@ def _lower_multi_lane_btmm(op: Gemm, lane_count: int,
     )
 
 
-def _find_role(axes: List[AxisInfo], role: AxisRole
-                ) -> Tuple[Optional[int], Optional[AxisInfo]]:
+def _find_role(axes: list[AxisInfo], role: AxisRole
+                ) -> tuple[int | None, AxisInfo | None]:
     """Return ``(dim_index, AxisInfo)`` of the first entry tagged
     ``role``, or ``(None, None)`` if not found."""
     for i, a in enumerate(axes):
@@ -1312,7 +1312,7 @@ def _find_role(axes: List[AxisInfo], role: AxisRole
     return None, None
 
 
-def _has_cluster_role(axes: Optional[List[AxisInfo]]) -> bool:
+def _has_cluster_role(axes: list[AxisInfo] | None) -> bool:
     """True if any dim in ``axes`` is tagged ``CLUSTER``."""
     if not axes:
         return False
@@ -1320,9 +1320,9 @@ def _has_cluster_role(axes: Optional[List[AxisInfo]]) -> bool:
 
 
 def _axes_to_hlir_tuple(
-    axes: List[AxisInfo],
-    inserts: Tuple[int, ...] = (),
-) -> Tuple[Tuple[str, int], ...]:
+    axes: list[AxisInfo],
+    inserts: tuple[int, ...] = (),
+) -> tuple[tuple[str, int], ...]:
     """Convert mid_ir per-axis ``AxisInfo`` list into the
     ``Tuple[(role_name, extent), ...]`` form ``hlir.Op.buffer_axes``
     expects.
@@ -1333,7 +1333,7 @@ def _axes_to_hlir_tuple(
     follow the same convention as ``_pad_tuple_at`` — ascending
     indices in OUTPUT coords.
     """
-    out: List[Tuple[str, int]] = [
+    out: list[tuple[str, int]] = [
         (a.role.value, int(a.extent)) for a in axes
     ]
     for pos in inserts:
@@ -1341,7 +1341,7 @@ def _axes_to_hlir_tuple(
     return tuple(out)
 
 
-def _split_axes_by_role(axes: List[AxisInfo]):
+def _split_axes_by_role(axes: list[AxisInfo]):
     """Group an op's axes table into ``(batch_extents, inner_extent)``.
 
     ``batch_extents`` are the BATCH-role extents in axis order — each
@@ -1352,7 +1352,7 @@ def _split_axes_by_role(axes: List[AxisInfo]):
     REDUCE / BROADCAST axes are op-specific and not handled here (only
     Elementwise / Dma / Reduce-leaf paths use this helper).
     """
-    batch_extents: List[int] = []
+    batch_extents: list[int] = []
     inner = 1
     for a in axes:
         if a.role == AxisRole.BATCH:
@@ -1369,9 +1369,9 @@ def _split_axes_by_role(axes: List[AxisInfo]):
 
 def _lower_multi_lane_elementwise(
     op: Elementwise, lane_count: int,
-    buf_name_to_hlir: Optional[Dict[str, _hlir.Buffer]] = None,
-    cluster_axis_name: Optional[str] = None,
-    cluster_axis_var: "Optional[VarRef]" = None,
+    buf_name_to_hlir: dict[str, _hlir.Buffer] | None = None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
 ) -> _hlir.Op:
     """Pure elementwise (no Broadcast srcs) → ``v_add`` / ``v_exp`` /
     ``v_zero`` / etc., wrapped in explicit ``for`` loops for each
@@ -1410,12 +1410,12 @@ def _lower_multi_lane_elementwise(
             kind = "v_zero"
     else:
         raise ToPlenaError(f"unsupported elementwise op {op.op!r}")
-    buffer_args: List[Any] = []
+    buffer_args: list[Any] = []
     for s in op.srcs:
         if isinstance(s, Broadcast):
             raise ToPlenaError(
-                f"MultiLaneOp Elementwise with Broadcast src — pass_2_mark "
-                f"should have set can_async=False"
+                "MultiLaneOp Elementwise with Broadcast src — pass_2_mark "
+                "should have set can_async=False"
             )
         buffer_args.append(s.buffer.name)
     buffer_args.append(op.dst.buffer.name)
@@ -1461,9 +1461,9 @@ def _lower_multi_lane_elementwise(
                 f"v_* lowering: dst {op.dst.buffer.name!r} has no 4D "
                 f"hlir axes table; got {dst_hlir_axes!r}"
             )
-        starts: List[Any] = []
-        extents: List[int] = []
-        for_specs: List[Tuple[Any, int]] = []
+        starts: list[Any] = []
+        extents: list[int] = []
+        for_specs: list[tuple[Any, int]] = []
         for slot, (role_name, extent) in enumerate(dst_hlir_axes[:3]):
             if int(extent) == 1:
                 starts.append(_tir.IntImm(_INT32, 0))
@@ -1493,7 +1493,7 @@ def _lower_multi_lane_elementwise(
         )
         if not for_specs:
             return leaf
-        body: List[_hlir.Op] = [leaf]
+        body: list[_hlir.Op] = [leaf]
         for v, ext in reversed(for_specs):
             body = [_hlir.make_for_op(loop_var=v, extent=ext, body=body)]
         return body[0]
@@ -1503,13 +1503,13 @@ def _lower_multi_lane_elementwise(
     batch_extents, inner_extent = _split_axes_by_role(op.dst_axes)
 
     def _build_leaf_flat(row_offset):
-        off = row_offset if row_offset is not None else _tir.IntImm(_INT32, 0)
+        row_offset if row_offset is not None else _tir.IntImm(_INT32, 0)
         raise ToPlenaError(f"unhandled v_* kind {kind!r}")
 
     if not batch_extents:
         return _build_leaf_flat(row_offset=None)
 
-    strides: List[int] = []
+    strides: list[int] = []
     running = inner_extent
     for ext in reversed(batch_extents):
         strides.append(running)
@@ -1520,7 +1520,7 @@ def _lower_multi_lane_elementwise(
     for v, st in zip(row_vars, strides):
         term = _tir.Mul(v, _tir.IntImm(_INT32, st)) if st != 1 else v
         total_offset = term if total_offset is None else _tir.Add(total_offset, term)
-    body: List[_hlir.Op] = [_build_leaf_flat(row_offset=total_offset)]
+    body: list[_hlir.Op] = [_build_leaf_flat(row_offset=total_offset)]
     for v, ext in reversed(list(zip(row_vars, batch_extents))):
         body = [_hlir.make_for_op(loop_var=v, extent=int(ext), body=body)]
     return body[0]
@@ -1533,8 +1533,8 @@ _UNARY_TO_ROW_INTRIN = {
 
 def _lower_per_row_unary(
     op: Elementwise,
-    cluster_axis_name: Optional[str] = None,
-    cluster_axis_var: "Optional[VarRef]" = None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
 ) -> _hlir.Op:
     """Per-row unary VRAM op → single-row ``row_<op>`` leaf.
 
@@ -1585,7 +1585,7 @@ def _lower_per_row_unary(
 
 
 def _lower_multi_lane(mlo: MultiLaneOp,
-                      buf_name_to_hlir: Dict[str, _hlir.Buffer],
+                      buf_name_to_hlir: dict[str, _hlir.Buffer],
                       lane_count: int) -> _hlir.Op:
     """Single MultiLaneOp → single HLIR Op with lane_count scalar.
 
@@ -1616,8 +1616,8 @@ def _lower_multi_lane(mlo: MultiLaneOp,
     )
 
 
-def _lane_loop_var(cluster_axis_name: Optional[str],
-                   cluster_axis_var: "Optional[VarRef]" = None) -> _tir.Var:
+def _lane_loop_var(cluster_axis_name: str | None,
+                   cluster_axis_var: VarRef | None = None) -> _tir.Var:
     """Pick a loop_var for the synthetic ``for lane`` that wraps a
     bare op inside a cluster. Prefer the cluster axis's VarRef (so the
     loop_var identity matches the in-buffer phase var); fall back to
@@ -1661,14 +1661,14 @@ def _per_lane_stride(buf: _hlir.Buffer, mode: str) -> int:
     return stride
 
 
-_GEMM_ROLE_TO_LABEL: Dict[AxisRole, str] = {
+_GEMM_ROLE_TO_LABEL: dict[AxisRole, str] = {
     AxisRole.GEMM_M: "M",
     AxisRole.GEMM_K: "K",
     AxisRole.GEMM_N: "N",
 }
 
 
-def _axes_to_dim_roles(axes: List[AxisInfo]) -> Tuple[str, ...]:
+def _axes_to_dim_roles(axes: list[AxisInfo]) -> tuple[str, ...]:
     """Project a mid_ir per-axis ``AxisInfo`` table onto the gemm
     dim-role labels emitters consume.
 
@@ -1685,7 +1685,7 @@ def _axes_to_dim_roles(axes: List[AxisInfo]) -> Tuple[str, ...]:
 
 
 def _align_dim_roles_to_4d(buf_name: str,
-                           mid_axes: List[AxisInfo]) -> Tuple[str, ...]:
+                           mid_axes: list[AxisInfo]) -> tuple[str, ...]:
     """Align a mid_ir per-axis roles table onto the HLIR buffer's
     post-expansion 4D shape, returning a 4-tuple of dim-role labels
     ("M"/"K"/"N"/"_") suitable for the gemm Region+roles schema.
@@ -1724,7 +1724,7 @@ def _align_dim_roles_to_4d(buf_name: str,
             )
         return tuple(out)
     if buf_name in _CLUSTER_MODES:
-        mode, old_cluster_dim, new_shape = _CLUSTER_MODES[buf_name]
+        mode, old_cluster_dim, _new_shape = _CLUSTER_MODES[buf_name]
         if mode == _MODE_FP_LANE:
             return base
         if len(base) != 3:
@@ -1768,9 +1768,9 @@ def _align_dim_roles_to_4d(buf_name: str,
 
 def _make_onchip_region(
     name: str,
-    buf: "_hlir.Buffer",
-    starts: Tuple[Any, ...],
-    extents: Tuple[int, ...],
+    buf: _hlir.Buffer,
+    starts: tuple[Any, ...],
+    extents: tuple[int, ...],
 ):
     """Build a Vram/MramRegion based on buffer scope."""
     if buf.scope == _scope.MRAM:
@@ -1779,11 +1779,11 @@ def _make_onchip_region(
 
 
 def _gemm_full_region(
-    ref: "BufferRef",
-    buf: "_hlir.Buffer",
+    ref: BufferRef,
+    buf: _hlir.Buffer,
     *,
-    lane_axis_name: Optional[str] = None,
-) -> "Any":
+    lane_axis_name: str | None = None,
+) -> Any:
     """Build a 4D Vram/MramRegion that covers the *whole* buffer.
 
     ``starts`` are all zero (or ``lane_var`` on the cluster axis when
@@ -1803,8 +1803,8 @@ def _gemm_full_region(
     """
     cluster_dim = getattr(buf, "cluster_dim", None)
     shape = [int(d) for d in buf.shape]
-    starts: List[Any] = []
-    extents: List[int] = []
+    starts: list[Any] = []
+    extents: list[int] = []
     for i, dim_extent in enumerate(shape):
         if (cluster_dim is not None
                 and i == cluster_dim
@@ -1821,11 +1821,11 @@ def _gemm_full_region(
 
 def _lower_bare_per_head_gemm(
     op: Gemm,
-    cluster_extent: Optional[int],
-    cluster_axis_name: Optional[str] = None,
-    cluster_axis_var: "Optional[VarRef]" = None,
-    buf_name_to_hlir: Optional[Dict[str, _hlir.Buffer]] = None,
-    lane_modes: Optional[Dict[str, str]] = None,
+    cluster_extent: int | None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
+    buf_name_to_hlir: dict[str, _hlir.Buffer] | None = None,
+    lane_modes: dict[str, str] | None = None,
 ) -> _hlir.Op:
     """Bare (non-async) per-head matmul / mv → region-based HLIR op.
 
@@ -1863,7 +1863,7 @@ def _lower_bare_per_head_gemm(
     # LHS rows == 1 → matrix-vector. Read off ``op.a_axes`` GEMM_M
     # extent (authoritative); fall back to buffer shape only if axes
     # are missing.
-    a_M_extent: Optional[int] = None
+    a_M_extent: int | None = None
     if op.a_axes:
         _, a_m_info = _find_role(op.a_axes, AxisRole.GEMM_M)
         if a_m_info is not None:
@@ -1885,7 +1885,7 @@ def _lower_bare_per_head_gemm(
     b_roles = _align_dim_roles_to_4d(op.b.buffer.name, op.b_axes)
     c_roles = _align_dim_roles_to_4d(op.c.buffer.name, op.c_axes)
 
-    annotations: Dict[str, Any] = {
+    annotations: dict[str, Any] = {
         "source": (
             "per-head Gemm(rows=1) inside cluster" if (use_mv and inside_cluster)
             else "per-head Gemm(rows=1)"            if use_mv
@@ -1902,7 +1902,7 @@ def _lower_bare_per_head_gemm(
     )
 
 
-def _row_axis_index_of_buf(name: str, shape, cluster_dim: Optional[int]) -> int:
+def _row_axis_index_of_buf(name: str, shape, cluster_dim: int | None) -> int:
     """Index of the logical row axis in a buffer's shape.
 
     Skips the innermost axis (column / D / hlen) and the cluster axis
@@ -1944,7 +1944,7 @@ def _row_axis_index(ref: BufferRef) -> int:
 
 
 def _row_axis_index_from_axes(
-    axes: List[AxisInfo],
+    axes: list[AxisInfo],
     *,
     ctx: str,
 ) -> int:
@@ -2004,13 +2004,13 @@ def _logical_rows_from_buf(ref: BufferRef) -> int:
 
 
 def _render_ref_with_role_axes(
-    ref: "BufferRef",
-    axes: List[AxisInfo],
+    ref: BufferRef,
+    axes: list[AxisInfo],
     *,
     row_var,
     lane_var,
     ctx: str,
-) -> Tuple[Any, ...]:
+) -> tuple[Any, ...]:
     """Render a mid_ir ``BufferRef`` as an HLIR index tuple, using its
     per-axis role table to resolve any ``Slice`` ("the op covers this
     whole axis") into the right loop var.
@@ -2036,7 +2036,7 @@ def _render_ref_with_role_axes(
             f"{len(ref.indices)} indices but axes table has {len(axes)} "
             f"entries (indices={list(ref.indices)!r}, axes={axes!r})"
         )
-    out: List[Any] = []
+    out: list[Any] = []
     for axis_idx, (raw_idx, axis) in enumerate(zip(ref.indices, axes)):
         if not isinstance(raw_idx, Slice):
             out.append(_render_idx_as_primexpr(raw_idx))
@@ -2060,7 +2060,7 @@ def _build_row_at_region(
     row_var,
     lane_var,
     ctx: str,
-) -> "_hlir.VramRegion":
+) -> _hlir.VramRegion:
     """Build a ``VramRegion`` for a single-row row_*_at op.
 
     ``row_*_at`` ops touch exactly one logical row (one (b, s, h)
@@ -2085,9 +2085,9 @@ def _build_row_at_region(
         raise ToPlenaError(
             f"{ctx}: buffer {buf_name!r} has no 4D hlir axes; got {axes!r}"
         )
-    starts: List[Any] = []
-    extents: List[int] = []
-    rows_slot: Optional[int] = None
+    starts: list[Any] = []
+    extents: list[int] = []
+    rows_slot: int | None = None
     rows_extent: int = -1
     # First pass: find the rows axis (largest batch).
     for i, (role, extent) in enumerate(axes):
@@ -2116,9 +2116,9 @@ def _build_row_at_region(
 
 
 def _lower_bare_reduce(op: Reduce,
-                       cluster_extent: Optional[int],
-                       cluster_axis_name: Optional[str] = None,
-                       cluster_axis_var: "Optional[VarRef]" = None,
+                       cluster_extent: int | None,
+                       cluster_axis_name: str | None = None,
+                       cluster_axis_var: VarRef | None = None,
                        ) -> _hlir.Op:
     """Bare reduce → single-row ``row_reduce_*_at`` leaf op,
     optionally wrapped in a synthesised ``for row``.
@@ -2187,9 +2187,9 @@ def _lower_bare_reduce(op: Reduce,
 
 def _lower_bare_broadcast_elementwise(
     op: Elementwise,
-    cluster_extent: Optional[int],
-    cluster_axis_name: Optional[str] = None,
-    cluster_axis_var: "Optional[VarRef]" = None,
+    cluster_extent: int | None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
 ) -> _hlir.Op:
     """Bare elementwise with a per-row FPRAM Broadcast src
     → single-row ``row_<op>_fp`` leaf op.
@@ -2292,9 +2292,9 @@ def _fp_buffer_element_from_ref(ref: BufferRef) -> _hlir.BufferElement:
 
 def _lower_bare_fp_scalar_elementwise(
     op: Elementwise,
-    cluster_extent: Optional[int],
-    cluster_axis_name: Optional[str] = None,
-    cluster_axis_var: "Optional[VarRef]" = None,
+    cluster_extent: int | None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
 ) -> _hlir.Op:
     """Bare elementwise on FPRAM rank-1 per-lane state → ``for lane:
     fp_<op>_at(<addr exprs>)``.
@@ -2395,10 +2395,10 @@ def _op_fires_once_across_lanes(op: _hlir.Op) -> bool:
 
 
 def _wrap_per_lane_ops_with_for_lane(
-    body: List[_hlir.Op],
-    lane_var: "_tir.Var",
+    body: list[_hlir.Op],
+    lane_var: _tir.Var,
     lane_extent: int,
-) -> List[_hlir.Op]:
+) -> list[_hlir.Op]:
     """Emit the body of a CLUSTER ParallelAxis. Each per-lane op gets
     its OWN ``for lane in cluster_extent`` wrapper so the lane axis is
     threaded one instruction at a time (matching the kernel's program
@@ -2410,7 +2410,7 @@ def _wrap_per_lane_ops_with_for_lane(
     with the same rule so per-lane ops inside still get their own
     for-lane wrapper.
     """
-    out: List[_hlir.Op] = []
+    out: list[_hlir.Op] = []
     for op in body:
         if op.kind == "for":
             # Recurse: inner body may contain per-lane ops that need
@@ -2434,13 +2434,13 @@ def _wrap_per_lane_ops_with_for_lane(
     return out
 
 
-def _walk_stmts(stmts: List[Stmt],
-                buf_name_to_hlir: Dict[str, _hlir.Buffer],
-                cluster_extent: Optional[int],
-                cluster_axis_name: Optional[str] = None,
-                cluster_axis_var: "Optional[VarRef]" = None,
-                ) -> List[_hlir.Op]:
-    out: List[_hlir.Op] = []
+def _walk_stmts(stmts: list[Stmt],
+                buf_name_to_hlir: dict[str, _hlir.Buffer],
+                cluster_extent: int | None,
+                cluster_axis_name: str | None = None,
+                cluster_axis_var: VarRef | None = None,
+                ) -> list[_hlir.Op]:
+    out: list[_hlir.Op] = []
     for s in stmts:
         out.extend(_walk_stmt(s, buf_name_to_hlir, cluster_extent,
                               cluster_axis_name, cluster_axis_var))
@@ -2448,11 +2448,11 @@ def _walk_stmts(stmts: List[Stmt],
 
 
 def _walk_stmt(stmt: Stmt,
-               buf_name_to_hlir: Dict[str, _hlir.Buffer],
-               cluster_extent: Optional[int],
-               cluster_axis_name: Optional[str] = None,
-               cluster_axis_var: "Optional[VarRef]" = None,
-               ) -> List[_hlir.Op]:
+               buf_name_to_hlir: dict[str, _hlir.Buffer],
+               cluster_extent: int | None,
+               cluster_axis_name: str | None = None,
+               cluster_axis_var: VarRef | None = None,
+               ) -> list[_hlir.Op]:
     if isinstance(stmt, ParallelAxis):
         if stmt.kind == ParallelKind.CLUSTER:
             # CLUSTER: each per-lane op gets its own ``for lane in
@@ -2555,7 +2555,7 @@ def _walk_stmt(stmt: Stmt,
 
 
 def run(func: MidFunc,
-        build_dir: Optional[Path] = None,
+        build_dir: Path | None = None,
         mlen: int = 64) -> _hlir.HLIRModule:
     """Lower a MidFunc to HLIRModule.
 
@@ -2611,7 +2611,7 @@ def run(func: MidFunc,
     # ``_expand_buffer_shape_with_cluster``'s rank check. Skip it.
     cluster_skipped = should_skip_cluster(func)
     if cluster_skipped:
-        lane_modes: Dict[str, str] = {}
+        lane_modes: dict[str, str] = {}
         lane_count = 1
     else:
         lane_modes = _infer_lane_modes(func)
@@ -2640,10 +2640,10 @@ def run(func: MidFunc,
     if func.attrs is not None and "plena.layout" in func.attrs:
         kernel_layout = str(func.attrs["plena.layout"])
 
-    buf_name_to_hlir: Dict[str, _hlir.Buffer] = {}
-    pad_inserts: Dict[str, Tuple[int, ...]] = {}
-    cluster_modes_for_refs: Dict[
-        str, Tuple[str, Optional[int], Tuple[int, ...]],
+    buf_name_to_hlir: dict[str, _hlir.Buffer] = {}
+    pad_inserts: dict[str, tuple[int, ...]] = {}
+    cluster_modes_for_refs: dict[
+        str, tuple[str, int | None, tuple[int, ...]],
     ] = {}
     # Reset module-global mid_ir-axes ↔ hlir-axes alignment tables so a
     # fresh compile doesn't see stale entries from a previous one.
@@ -2714,7 +2714,7 @@ def run(func: MidFunc,
     )
 
 
-def _pad_tuple_at(values, inserts: Tuple[int, ...], fill):
+def _pad_tuple_at(values, inserts: tuple[int, ...], fill):
     """Insert ``fill`` at each position in ``inserts`` (positions in
     OUTPUT coords, ascending). E.g. inserting (0, 2) into ('a', 'b')
     with fill 0 yields (0, 'a', 0, 'b')."""
@@ -2726,8 +2726,8 @@ def _pad_tuple_at(values, inserts: Tuple[int, ...], fill):
 
 def _rewrite_refs_to_4d(
     ops,
-    pad_inserts: Dict[str, Tuple[int, ...]],
-    cluster_modes: Dict[str, Tuple[str, Optional[int], Tuple[int, ...]]],
+    pad_inserts: dict[str, tuple[int, ...]],
+    cluster_modes: dict[str, tuple[str, int | None, tuple[int, ...]]],
 ) -> None:
     """Bring every ``VramRegion`` ref in line with its buffer's post-
     expansion 4D rank, in place.
@@ -2775,4 +2775,4 @@ def _rewrite_refs_to_4d(
             _rewrite_refs_to_4d(op.body, pad_inserts, cluster_modes)
 
 
-__all__ = ["run", "ToPlenaError"]
+__all__ = ["ToPlenaError", "run"]

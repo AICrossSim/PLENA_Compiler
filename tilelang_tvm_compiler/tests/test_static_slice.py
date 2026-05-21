@@ -17,7 +17,6 @@ from tilelang_tvm_compiler.kernels.static_slice_dma import (
     BATCH,
     GROUP_HEADS,
     HLEN,
-    MLEN,
     SEQ_TOTAL,
     SLICE_EXTENT,
     SLICE_START,
@@ -95,7 +94,7 @@ def test_isa_calls_h_prefetch_v():
     ck = compile_kernel(static_slice_dma, target=PlenaTarget(), name="static_slice")
     asm = ck.isa_text
     assert "H_PREFETCH_V" in asm
-    print(f"[ok] H_PREFETCH_V emitted")
+    print("[ok] H_PREFETCH_V emitted")
 
 
 def main() -> int:

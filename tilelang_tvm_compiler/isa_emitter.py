@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 # This file is at .../compiler/tilelang_tvm_compiler/isa_emitter.py.
 # Walking three parents lands at the project root so that
@@ -42,7 +42,7 @@ from compiler.asm_templates import preload_addr_reg_asm, reset_reg_asm
 class ISAEmitter:
     """Emit ISA strings for already-prepared tensor/FP operations."""
 
-    def __init__(self, program: "TileTensorProgram") -> None:
+    def __init__(self, program: TileTensorProgram) -> None:
         self.program = program
 
     def _emit_preload_tile_isa(
@@ -53,16 +53,16 @@ class ISAEmitter:
         batch: int,
         hidden_size: int,
         act_vram_offset: int,
-        alive_registers: List[int],
+        alive_registers: list[int],
         activation_offset_reg: int,
-        stride_size: Optional[int] = None,
-        scale_size: Optional[int] = None,
+        stride_size: int | None = None,
+        scale_size: int | None = None,
         hbm_start_offset: int = 0,
         # PLENA TVM extension: when supplied, the offset is COPIED from
         # `hbm_start_offset_reg` instead of loaded as a literal. Used by
         # the slice-aware DMA dispatcher when the slice has a runtime-
         # computed start (e.g. derived from a loop var).
-        hbm_start_offset_reg: Optional[int] = None,
+        hbm_start_offset_reg: int | None = None,
     ) -> str:
         generated_code = "; Preload Activation Generation \n"
         a_actual_register = alive_registers[0]
@@ -128,15 +128,15 @@ class ISAEmitter:
         vlen: int,
         batch: int,
         hidden_size: int,
-        alive_registers: List[int],
+        alive_registers: list[int],
         act_vram_offset: int,
         hbm_addr_reg: int,
-        stride_size: Optional[int] = None,
-        scale_size: Optional[int] = None,
+        stride_size: int | None = None,
+        scale_size: int | None = None,
         hbm_start_offset: int = 0,
         store_amount: int = 4,
         # PLENA TVM extension (see emit_preload_tile_isa for rationale).
-        hbm_start_offset_reg: Optional[int] = None,
+        hbm_start_offset_reg: int | None = None,
     ) -> str:
         generated_code = "; Store Activation Generation\n"
 
@@ -192,11 +192,11 @@ class ISAEmitter:
         hbm_addr: int,
         mram_addr: int,
         hbm_offset: int = 0,
-        hbm_scale: Optional[int] = None,
-        hbm_stride: Optional[int] = None,
+        hbm_scale: int | None = None,
+        hbm_stride: int | None = None,
         # PLENA TVM extension: when set, the offset is sourced from
         # this GP register (caller owns it). `hbm_offset` is ignored.
-        hbm_offset_reg: Optional[int] = None,
+        hbm_offset_reg: int | None = None,
     ) -> None:
         addr_reg = self.program.compiler.register_allocator.allocate_addr(1)[0]
         gp_addr = self.program.compiler.register_allocator.allocate_gp(2)
@@ -237,13 +237,13 @@ class ISAEmitter:
         *,
         hbm_addr: int,
         vram_addr: int,
-        hbm_stride: Optional[int] = None,
-        hbm_scale_size: Optional[int] = None,
+        hbm_stride: int | None = None,
+        hbm_scale_size: int | None = None,
         hbm_start_offset: int = 0,
         # PLENA TVM extension: when set, the runtime-computed offset
         # comes from this GP register (caller owns it; emitter just
         # reads). `hbm_start_offset` is ignored in that case.
-        hbm_start_offset_reg: Optional[int] = None,
+        hbm_start_offset_reg: int | None = None,
     ) -> None:
         ra = self.program.compiler.register_allocator
         addr_reg = ra.allocate_addr(1)[0]
@@ -289,11 +289,11 @@ class ISAEmitter:
         *,
         vram_addr: int,
         hbm_addr: int,
-        hbm_stride: Optional[int] = None,
-        hbm_scale_size: Optional[int] = None,
+        hbm_stride: int | None = None,
+        hbm_scale_size: int | None = None,
         hbm_start_offset: int = 0,
         # PLENA TVM extension; see emit_load_tile_from_hbm.
-        hbm_start_offset_reg: Optional[int] = None,
+        hbm_start_offset_reg: int | None = None,
     ) -> None:
         ra = self.program.compiler.register_allocator
         addr_reg = ra.allocate_addr(1)[0]
@@ -328,7 +328,7 @@ class ISAEmitter:
         ra.spill_return(token, compiler=self.program.compiler)
         ra.free_addr([addr_reg])
 
-    def emit_zero_vram_tile(self, vram_addr: int, num_rows: Optional[int] = None) -> None:
+    def emit_zero_vram_tile(self, vram_addr: int, num_rows: int | None = None) -> None:
         # `num_rows` is how many MLEN-wide rows to zero. Defaults to MLEN
         # for legacy callers that always zero a full MLEN*MLEN tile.
         # Buffers smaller than that (e.g. a (1, MLEN) accumulator) MUST
@@ -690,13 +690,13 @@ class ISAEmitter:
         self,
         *,
         lhs_vram_addr: int,
-        lhs_vram_addr_reg: Optional[int] = None,
+        lhs_vram_addr_reg: int | None = None,
         rhs_mram_addr: int,
         rhs_col_offset: int = 0,
-        rhs_col_offset_reg: Optional[int] = None,
+        rhs_col_offset_reg: int | None = None,
         dst_vram_addr: int,
         dst_col_offset: int = 0,
-        dst_col_offset_reg: Optional[int] = None,
+        dst_col_offset_reg: int | None = None,
         col_count: int,
         task_id: str = "slot_matmul",
         zero_dst: bool = False,
@@ -760,7 +760,7 @@ class ISAEmitter:
         hlen: int,
         rhs_col_offset: int = 0,
         dst_col_offset: int = 0,
-        dst_row_stride: Optional[int] = None,
+        dst_row_stride: int | None = None,
         task_id: str = "matmul_narrow_hwloop",
         zero_dst: bool = False,
     ) -> None:
@@ -823,21 +823,21 @@ class ISAEmitter:
         N: int,
         lhs_vram_base: int,
         lhs_offset: int = 0,
-        lhs_offset_reg: Optional[int] = None,
-        lhs_m_tile_stride: Optional[int] = None,
-        lhs_k_tile_stride: Optional[int] = None,
+        lhs_offset_reg: int | None = None,
+        lhs_m_tile_stride: int | None = None,
+        lhs_k_tile_stride: int | None = None,
         rhs_mram_base: int,
         rhs_offset: int = 0,
-        rhs_offset_reg: Optional[int] = None,
-        rhs_k_tile_stride: Optional[int] = None,
-        rhs_n_mlen_tile_stride: Optional[int] = None,
+        rhs_offset_reg: int | None = None,
+        rhs_k_tile_stride: int | None = None,
+        rhs_n_mlen_tile_stride: int | None = None,
         dst_vram_base: int,
         dst_offset: int = 0,
-        dst_offset_reg: Optional[int] = None,
-        dst_m_tile_stride: Optional[int] = None,
-        dst_row_stride: Optional[int] = None,
+        dst_offset_reg: int | None = None,
+        dst_m_tile_stride: int | None = None,
+        dst_row_stride: int | None = None,
         task_id: str = "matmul",
-        scratch_regs: Optional[List[int]] = None,
+        scratch_regs: list[int] | None = None,
         transpose_b: bool = False,
         unroll_loops: bool = False,
     ) -> None:
@@ -947,7 +947,7 @@ class ISAEmitter:
         else:
             gp_regs = ra.allocate_gp(7)
             caller_owns_scratch = False
-        (gp_act_orow, gp_out_orow, gp_act, gp_mat, gp_out,
+        (gp_act_orow, gp_out_orow, gp_act, gp_mat, _gp_out,
          gp_loop_orow, gp_loop_k) = gp_regs
 
         lines = [
@@ -987,7 +987,6 @@ class ISAEmitter:
                 # Matmul opcode: M_TMM transposes the (mlen, mlen) MRAM
                 # tile on the fly; its (rs1, rs2) order is also swapped
                 # vs M_MM (rs1 = vram_lhs, rs2 = mram_rhs).
-                mm_opcode = "M_TMM" if transpose_b else "M_MM"
                 for oc in range(tiles_per_n_mlen):
                     dst_col = n_mlen * mlen + oc * blen
                     if lhs_offset_reg is not None:
@@ -1028,7 +1027,7 @@ class ISAEmitter:
                                     f"S_ADDI_INT gp{gp_act}, gp0, {act_static}"
                                 )
                             for k in range(K_tiles):
-                                act_k = act_static + k * int(lhs_k_tile_stride) - (orow * a_orow_step + lhs_static_full - lhs_static_full)
+                                act_static + k * int(lhs_k_tile_stride) - (orow * a_orow_step + lhs_static_full - lhs_static_full)
                                 # Recompute act/mat per k explicitly so
                                 # there is no incremental S_ADDI between
                                 # M_MMs (matches unroll-only style).
@@ -1124,7 +1123,7 @@ class ISAEmitter:
         dst_vram_addr: int,
         op: str = "add",
         task_id: str = "tile_binary",
-        num_rows: Optional[int] = None,
+        num_rows: int | None = None,
     ) -> None:
         """One ``V_*_VV`` per MLEN-wide row, looped ``num_rows`` times.
 
@@ -1185,7 +1184,7 @@ class ISAEmitter:
         *,
         src1_addrs: Sequence[int],
         dst_addrs: Sequence[int],
-        src2_addrs: Optional[Sequence[int]] = None,
+        src2_addrs: Sequence[int] | None = None,
         op: str,
         task_id: str = "fp_kernel",
     ) -> None:
@@ -1299,12 +1298,12 @@ class ISAEmitter:
         self,
         *,
         src_vram_addr: int,
-        dst_vram_addr: Optional[int] = None,
+        dst_vram_addr: int | None = None,
         op: str,
         row_count: int,
-        dst_addrs: Optional[Sequence[int]] = None,
-        rhs_addrs: Optional[Sequence[int]] = None,
-        mask_val: Optional[int] = None,
+        dst_addrs: Sequence[int] | None = None,
+        rhs_addrs: Sequence[int] | None = None,
+        mask_val: int | None = None,
         task_id: str = "row_operations",
     ) -> None:
         if row_count <= 0:
@@ -1316,7 +1315,7 @@ class ISAEmitter:
             raise ValueError(f"Unsupported emit_row_operation op={op!r}")
 
         gp_regs = self.program.compiler.register_allocator.allocate_gp(5)
-        gp_src, gp_fp, gp_dst, gp_loop, gp_mask = gp_regs
+        gp_src, gp_fp, gp_dst, _gp_loop, gp_mask = gp_regs
         lines = [f"; row operation task {task_id} op={op} rows={row_count}"]
         lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {int(src_vram_addr)}")
         dst_vram_addr = int(src_vram_addr if dst_vram_addr is None else dst_vram_addr)
@@ -1377,7 +1376,7 @@ class ISAEmitter:
                         lines.append(f"{binary_ops[op]} gp{gp_dst}, gp{gp_src}, f1, {1 if use_mask else 0}")
 
         if use_mask:
-            lines.append("S_ADDI_INT gp{0}, gp0, 0".format(gp_mask))
+            lines.append(f"S_ADDI_INT gp{gp_mask}, gp0, 0")
             lines.append(f"C_SET_V_MASK_REG gp{gp_mask}")
 
         self.program.compiler.register_allocator.free_gp(gp_regs)

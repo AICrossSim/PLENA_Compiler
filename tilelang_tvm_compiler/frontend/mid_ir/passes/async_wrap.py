@@ -33,13 +33,11 @@ What this pass does NOT touch
 
 from __future__ import annotations
 
-from typing import List
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
     Dma, Gemm, Elementwise, Reduce,
-    For, Async, MultiLaneOp,
-    ParallelAxis, ParallelKind,
+    For, Async, ParallelAxis, ParallelKind,
     MidFunc, Stmt,
 )
 
@@ -124,12 +122,12 @@ def _walk(stmt: Stmt, in_cluster: bool, ids: _IdCounter) -> Stmt:
     return stmt
 
 
-def _wrap_async_runs(stmts: List[Stmt], ids: _IdCounter) -> List[Stmt]:
+def _wrap_async_runs(stmts: list[Stmt], ids: _IdCounter) -> list[Stmt]:
     """For each ``can_async=True`` leaf op in the cluster body, wrap it
     in its own Async region (strict one-async-one-op). can_async=False
     ops stay unwrapped. Already-wrapped Async / MultiLaneOp / nested
     structure stays as-is."""
-    out: List[Stmt] = []
+    out: list[Stmt] = []
     for s in stmts:
         if _is_async_eligible(s):
             out.append(Async(body=[s], scope_id=ids.fresh()))
@@ -170,4 +168,4 @@ def run(func: MidFunc) -> MidFunc:
     )
 
 
-__all__ = ["run", "AsyncWrapError"]
+__all__ = ["AsyncWrapError", "run"]

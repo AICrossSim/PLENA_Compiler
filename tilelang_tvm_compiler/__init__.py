@@ -74,9 +74,9 @@ from . import intrinsics
 
 __all__ = [
     "PlenaCodegen",
-    "compile_module",
     "TvmTestbenchSpec",
+    "compile_module",
+    "intrinsics",
     "run_testbench",
     "scope",
-    "intrinsics",
 ]

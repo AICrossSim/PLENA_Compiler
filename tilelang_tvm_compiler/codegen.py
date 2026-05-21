@@ -12,7 +12,7 @@ imperatively in Python because we are using TVM (no dialect machinery).
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import tvm
 from tvm import tir
@@ -30,7 +30,7 @@ class CodegenError(RuntimeError):
 class _BufferInfo:
     """What we remember per buffer for ISA emission."""
 
-    __slots__ = ("name", "scope", "shape", "dtype")
+    __slots__ = ("dtype", "name", "scope", "shape")
 
     def __init__(self, name: str, scope: str, shape, dtype: str):
         self.name = name
@@ -56,15 +56,15 @@ class PlenaCodegen:
         self.func = func
         self.name = name
         # data-handle Var -> _BufferInfo
-        self._buffers: Dict[tir.Var, _BufferInfo] = {}
+        self._buffers: dict[tir.Var, _BufferInfo] = {}
         # name-keyed lookup for diagnostic messages
-        self._buffers_by_name: Dict[str, _BufferInfo] = {}
-        self._isa_lines: List[str] = []
+        self._buffers_by_name: dict[str, _BufferInfo] = {}
+        self._isa_lines: list[str] = []
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
-    def buffers_by_name(self) -> Dict[str, "_BufferInfo"]:
+    def buffers_by_name(self) -> dict[str, _BufferInfo]:
         """Read-only view of {buffer_name -> info}. Populated after run()."""
         return dict(self._buffers_by_name)
 
@@ -89,8 +89,8 @@ class PlenaCodegen:
         kernel_layout = self._kernel_layout()
 
         # Construct HLIR buffers (preserving param order).
-        hlir_buffers: Dict[str, _hlir.Buffer] = {}
-        param_names: List[str] = []
+        hlir_buffers: dict[str, _hlir.Buffer] = {}
+        param_names: list[str] = []
         for var in self.func.params:
             buf = self.func.buffer_map.get(var, None)
             if buf is None:
@@ -103,7 +103,7 @@ class PlenaCodegen:
                 hlir_buffers[name] = self._buf_info_to_hlir(info, kernel_layout)
 
         # Walk the body and collect Op stream.
-        ops: List[_hlir.Op] = []
+        ops: list[_hlir.Op] = []
         self._collect_ops(self.func.body, ops)
 
         return _hlir.HLIRModule(
@@ -125,7 +125,7 @@ class PlenaCodegen:
 
     @staticmethod
     def _buf_info_to_hlir(
-        info: "_BufferInfo", kernel_layout: str = "BSHD",
+        info: _BufferInfo, kernel_layout: str = "BSHD",
     ) -> _hlir.Buffer:
         return _hlir.Buffer(
             name=info.name,
@@ -135,7 +135,7 @@ class PlenaCodegen:
             layout=kernel_layout,
         )
 
-    def _collect_ops(self, stmt, ops: List[_hlir.Op]) -> None:
+    def _collect_ops(self, stmt, ops: list[_hlir.Op]) -> None:
         if isinstance(stmt, tir.SeqStmt):
             for s in stmt:
                 self._collect_ops(s, ops)
@@ -161,7 +161,7 @@ class PlenaCodegen:
             # it in a structured ForOp. Pass 3 walks `body` while binding
             # `loop_var` to a GP register so PrimExprs that reference it
             # can be materialised by ExprMaterializer.
-            body_ops: List[_hlir.Op] = []
+            body_ops: list[_hlir.Op] = []
             self._collect_ops(stmt.body, body_ops)
             extent = (
                 int(stmt.extent.value) if isinstance(stmt.extent, tir.IntImm)
@@ -201,7 +201,7 @@ class PlenaCodegen:
         val: tir.Call,
         name: str,
         kind: str,
-        ops: List[_hlir.Op],
+        ops: list[_hlir.Op],
     ) -> None:
         """Parse `plena.dma_*_slice` calls.
 
@@ -237,7 +237,7 @@ class PlenaCodegen:
 
         # Each start may be int / IntImm (static) or arbitrary PrimExpr
         # (dynamic). Pass 3 will dispatch on type.
-        starts: List[Any] = []
+        starts: list[Any] = []
         for s in starts_raw:
             if isinstance(s, tir.IntImm):
                 starts.append(int(s.value))
@@ -247,7 +247,7 @@ class PlenaCodegen:
                 raise CodegenError(
                     f"{name}: start must be IntImm or PrimExpr, got {type(s).__name__}"
                 )
-        extents: List[int] = []
+        extents: list[int] = []
         for e in extents_raw:
             if not isinstance(e, tir.IntImm):
                 raise CodegenError(
@@ -269,7 +269,7 @@ class PlenaCodegen:
             sliced = _hlir.BufferSlice(
                 parent=src_info.name, starts=tuple(starts), extents=tuple(extents),
             )
-            buffer_args: List[Any] = [sliced, dst_info.name]
+            buffer_args: list[Any] = [sliced, dst_info.name]
         elif name == "plena.dma_v2h_slice":
             sliced = _hlir.BufferSlice(
                 parent=dst_info.name, starts=tuple(starts), extents=tuple(extents),
@@ -285,7 +285,7 @@ class PlenaCodegen:
             annotations={"intrinsic": name},
         ))
 
-    def _collect_op_from_evaluate(self, ev: tir.Evaluate, ops: List[_hlir.Op]) -> None:
+    def _collect_op_from_evaluate(self, ev: tir.Evaluate, ops: list[_hlir.Op]) -> None:
         val = ev.value
         if not isinstance(val, tir.Call):
             return
@@ -312,9 +312,9 @@ class PlenaCodegen:
         #     kv_block * mlen + offset) -> kept as-is so ExprMaterializer
         #     can lower it at ISA emit time
         raw_args = list(val.args[1:])
-        buffer_args: List[str] = []
-        scalar_args: List[Any] = []
-        scopes: List[Optional[str]] = []
+        buffer_args: list[str] = []
+        scalar_args: list[Any] = []
+        scopes: list[str | None] = []
         for a in raw_args:
             if isinstance(a, tir.Var) and a in self._buffers:
                 info = self._buffers[a]
@@ -335,7 +335,7 @@ class PlenaCodegen:
         # Verify scopes against the registered intrinsic spec. We collapse
         # scopes from buffer/scalar args back into the original positional
         # order so verification matches op signatures.
-        ordered_scopes: List[Optional[str]] = []
+        ordered_scopes: list[str | None] = []
         bi = 0
         si = 0
         for a in raw_args:
@@ -445,7 +445,7 @@ class PlenaCodegen:
         self._isa_lines.append(spec.emit(resolved))
 
     @staticmethod
-    def _call_extern_name(call: tir.Call) -> Optional[str]:
+    def _call_extern_name(call: tir.Call) -> str | None:
         op = call.op
         # tvm.ir.Op for builtins like "tir.call_extern"
         op_name = getattr(op, "name", None)
@@ -458,9 +458,9 @@ class PlenaCodegen:
             return head.value
         return None
 
-    def _resolve_args(self, args) -> tuple[list[str], list[Optional[str]]]:
+    def _resolve_args(self, args) -> tuple[list[str], list[str | None]]:
         resolved: list[str] = []
-        scopes: list[Optional[str]] = []
+        scopes: list[str | None] = []
         for a in args:
             if isinstance(a, tir.Var) and a in self._buffers:
                 info = self._buffers[a]
@@ -501,7 +501,7 @@ class PlenaCodegen:
         return str(a)
 
     def _verify_scopes(
-        self, spec: _intrin.IntrinsicSpec, name: str, scopes: list[Optional[str]]
+        self, spec: _intrin.IntrinsicSpec, name: str, scopes: list[str | None]
     ) -> None:
         expected = list(spec.operand_scopes)
         if len(scopes) != len(expected):
@@ -529,10 +529,10 @@ class PlenaCodegen:
     # header / buffer directives
     # ------------------------------------------------------------------
     def _emit_header(self) -> None:
-        self._isa_lines.append(f"; ============================================")
+        self._isa_lines.append("; ============================================")
         self._isa_lines.append(f"; PLENA pseudo-ISA  --  kernel: {self.name}")
-        self._isa_lines.append(f"; generated by tilelang_tvm_compiler (skeleton)")
-        self._isa_lines.append(f"; ============================================")
+        self._isa_lines.append("; generated by tilelang_tvm_compiler (skeleton)")
+        self._isa_lines.append("; ============================================")
 
     def _emit_buffer_directives(self) -> None:
         if not self._buffers:
@@ -566,12 +566,12 @@ class PlenaCodegen:
             )
 
 
-def compile_module(mod: tvm.IRModule) -> Dict[str, str]:
+def compile_module(mod: tvm.IRModule) -> dict[str, str]:
     """Compile every PrimFunc in `mod` to PLENA pseudo-ISA.
 
     Returns a {global_symbol -> isa_text} mapping.
     """
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for gv, func in mod.functions.items():
         if not isinstance(func, tir.PrimFunc):
             continue

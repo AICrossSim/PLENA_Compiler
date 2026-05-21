@@ -46,17 +46,13 @@ What's left untouched
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    AxisRole, AxisInfo,
-    BufferDef, BufferRef, Slice,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
+    AxisInfo,
+    BufferDef, BufferRef, Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
     For, Async, MultiLaneOp,
-    ParallelAxis, ParallelKind,
-    MidFunc, Stmt,
+    ParallelAxis, MidFunc, Stmt,
 )
 
 
@@ -69,15 +65,15 @@ class BurnViewError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _identity_perm(rank: int) -> List[int]:
+def _identity_perm(rank: int) -> list[int]:
     return list(range(rank))
 
 
-def _is_identity(perm: List[int]) -> bool:
+def _is_identity(perm: list[int]) -> bool:
     return perm == _identity_perm(len(perm))
 
 
-def _collect_views(stmt: Stmt, table: Dict[str, List[Tuple[int, ...]]]) -> None:
+def _collect_views(stmt: Stmt, table: dict[str, list[tuple[int, ...]]]) -> None:
     """Walk; for every BufferRef record its view_perm under buffer name.
     Skips global buffers and refs with view_perm=None."""
 
@@ -124,11 +120,11 @@ def _collect_views(stmt: Stmt, table: Dict[str, List[Tuple[int, ...]]]) -> None:
     # RawStore: opaque, skip.
 
 
-def _agreed_perms(table: Dict[str, List[Tuple[int, ...]]]
-                  ) -> Dict[str, Tuple[int, ...]]:
+def _agreed_perms(table: dict[str, list[tuple[int, ...]]]
+                  ) -> dict[str, tuple[int, ...]]:
     """For each buffer, verify all collected perms agree. Returns
     name → single perm. Raises on mismatch."""
-    out: Dict[str, Tuple[int, ...]] = {}
+    out: dict[str, tuple[int, ...]] = {}
     for name, perms in table.items():
         first = perms[0]
         for p in perms[1:]:
@@ -146,7 +142,7 @@ def _agreed_perms(table: Dict[str, List[Tuple[int, ...]]]
 # ---------------------------------------------------------------------------
 
 
-def _permute_buffer(buf: BufferDef, perm: Tuple[int, ...]) -> BufferDef:
+def _permute_buffer(buf: BufferDef, perm: tuple[int, ...]) -> BufferDef:
     if len(perm) != len(buf.shape):
         raise BurnViewError(
             f"buffer {buf.name!r} rank {len(buf.shape)} doesn't match "
@@ -154,7 +150,7 @@ def _permute_buffer(buf: BufferDef, perm: Tuple[int, ...]) -> BufferDef:
         )
     # Track the cluster axis through the permutation: it lands at the
     # new position whose ``perm[i]`` equals the old cluster_dim.
-    new_cluster: Optional[int] = None
+    new_cluster: int | None = None
     if buf.cluster_dim is not None:
         for new_i, old_i in enumerate(perm):
             if old_i == buf.cluster_dim:
@@ -170,11 +166,11 @@ def _permute_buffer(buf: BufferDef, perm: Tuple[int, ...]) -> BufferDef:
 
 
 def _build_permuted_defs(func: MidFunc,
-                         perms: Dict[str, Tuple[int, ...]]) -> Dict[str, BufferDef]:
+                         perms: dict[str, tuple[int, ...]]) -> dict[str, BufferDef]:
     """Return name → permuted BufferDef for every lane-aware buffer that
     needs a non-identity perm. Identity perms still build a fresh def
     for uniformity (so callers swap to a single canonical def)."""
-    out: Dict[str, BufferDef] = {}
+    out: dict[str, BufferDef] = {}
     for buf in list(func.params) + list(func.allocs):
         if buf.scope == "global" or buf.scope.startswith("global."):
             continue
@@ -191,7 +187,7 @@ def _build_permuted_defs(func: MidFunc,
 
 
 def _rewrite_ref(ref: BufferRef,
-                 new_defs: Dict[str, BufferDef]) -> BufferRef:
+                 new_defs: dict[str, BufferDef]) -> BufferRef:
     if ref.buffer.scope == "global" or ref.buffer.scope.startswith("global."):
         return ref
     new_def = new_defs.get(ref.buffer.name)
@@ -211,7 +207,7 @@ def _rewrite_ref(ref: BufferRef,
     )
 
 
-def _permute_axes(axes: List[AxisInfo], ref: BufferRef) -> List[AxisInfo]:
+def _permute_axes(axes: list[AxisInfo], ref: BufferRef) -> list[AxisInfo]:
     """Apply the same view_perm to the per-axis info that burn_view
     applies to ref.indices. ``ref.view_perm`` is the perm; ``axes``
     is in pre-permute (view-pass) order.
@@ -302,7 +298,7 @@ def _rewrite_op(op, new_defs):
     raise BurnViewError(f"unhandled op type {type(op).__name__}")
 
 
-def _walk(stmt: Stmt, new_defs: Dict[str, BufferDef]) -> Stmt:
+def _walk(stmt: Stmt, new_defs: dict[str, BufferDef]) -> Stmt:
     if isinstance(stmt, ParallelAxis):
         return ParallelAxis(
             axis_name=stmt.axis_name,
@@ -349,7 +345,7 @@ def run(func: MidFunc) -> MidFunc:
         return func
 
     # Phase 1+2: gather views, verify, build new defs.
-    table: Dict[str, List[Tuple[int, ...]]] = {}
+    table: dict[str, list[tuple[int, ...]]] = {}
     for s in func.body:
         _collect_views(s, table)
     perms = _agreed_perms(table)
@@ -375,4 +371,4 @@ def run(func: MidFunc) -> MidFunc:
     )
 
 
-__all__ = ["run", "BurnViewError"]
+__all__ = ["BurnViewError", "run"]

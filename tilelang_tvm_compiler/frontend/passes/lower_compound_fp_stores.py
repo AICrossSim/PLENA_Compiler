@@ -44,7 +44,6 @@ single-op pattern.
 
 from __future__ import annotations
 
-from typing import List, Optional
 
 import tvm
 from tvm import tir
@@ -123,7 +122,7 @@ def _is_one(expr) -> bool:
     return False
 
 
-def _is_reci_pattern(expr) -> Optional[tir.PrimExpr]:
+def _is_reci_pattern(expr) -> tir.PrimExpr | None:
     """Return the denominator of ``1 / x``, else None."""
     if isinstance(expr, tir.Div) and _is_one(expr.a):
         return expr.b
@@ -157,7 +156,7 @@ class _Ctx:
 
     def __init__(self) -> None:
         self.next_id = 0
-        self.new_buffers: List[tir.Buffer] = []
+        self.new_buffers: list[tir.Buffer] = []
 
     def fresh_tmp(self, template: tir.Buffer) -> tir.Buffer:
         name = f"__tmp_fp_{self.next_id}"
@@ -177,7 +176,7 @@ class _Ctx:
         return buf
 
 
-def _to_leaf(expr, dst: tir.Buffer, indices, pre: List[tir.Stmt],
+def _to_leaf(expr, dst: tir.Buffer, indices, pre: list[tir.Stmt],
              ctx: _Ctx) -> tir.PrimExpr:
     """Ensure ``expr`` is a leaf (BufferLoad or constant); if not, evaluate
     it into a fresh fragment and return a BufferLoad of that fragment.
@@ -228,7 +227,7 @@ def _decompose_store(store: tir.BufferStore, ctx: _Ctx) -> tir.Stmt:
         # left to the existing passes.
         return store
 
-    pre: List[tir.Stmt] = []
+    pre: list[tir.Stmt] = []
     target_dtype = str(store.buffer.dtype)
     # Peel fp16↔fp32 cast roundtrips so the dispatch below matches the
     # actual op shape regardless of TVM's widening artifacts.
@@ -315,7 +314,7 @@ def _walk(stmt, ctx: _Ctx):
     return stmt
 
 
-def _inject_alloc_buffers(stmt, new_buffers: List[tir.Buffer]):
+def _inject_alloc_buffers(stmt, new_buffers: list[tir.Buffer]):
     """Append ``new_buffers`` to the alloc_buffers of the *first* tir.Block
     we encounter (the kernel root block under T.Kernel).
 
@@ -382,4 +381,4 @@ def run(func: tir.PrimFunc) -> tir.PrimFunc:
     )
 
 
-__all__ = ["run", "LowerCompoundFpStoresError"]
+__all__ = ["LowerCompoundFpStoresError", "run"]

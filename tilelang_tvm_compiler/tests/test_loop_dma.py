@@ -66,7 +66,7 @@ def test_loop_dma_increments_index_at_loop_tail():
         rf"S_ADDI_INT gp{idx_reg}, gp{idx_reg}, 1\s*\n\s*C_LOOP_END gp{hw_reg}"
     )
     assert inc_then_end.search(asm), (
-        f"expected idx increment immediately before C_LOOP_END"
+        "expected idx increment immediately before C_LOOP_END"
     )
     print(f"[ok] tail increment: gp{idx_reg} += 1 then C_LOOP_END gp{hw_reg}")
 
@@ -76,7 +76,7 @@ def test_loop_dma_body_contains_dma():
     ck = compile_kernel(loop_dma, target=PlenaTarget(), name="loop_dma_kernel")
     asm = ck.isa_text
     assert "H_PREFETCH_V" in asm, "DMA body lost from loop"
-    print(f"[ok] body: H_PREFETCH_V appears inside the loop")
+    print("[ok] body: H_PREFETCH_V appears inside the loop")
 
 
 def test_loop_dma_no_register_conflict():

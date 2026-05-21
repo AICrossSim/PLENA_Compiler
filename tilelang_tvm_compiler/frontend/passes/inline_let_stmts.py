@@ -25,9 +25,7 @@ This pass is a no-op for kernels without LetStmts.
 
 from __future__ import annotations
 
-from typing import Dict
 
-import tvm
 from tvm import tir
 
 
@@ -35,7 +33,7 @@ class InlineLetStmtsError(RuntimeError):
     pass
 
 
-def _subst_expr(expr, mapping: Dict[tir.Var, tir.PrimExpr]):
+def _subst_expr(expr, mapping: dict[tir.Var, tir.PrimExpr]):
     if expr is None:
         return None
     if isinstance(expr, tir.Var):
@@ -80,7 +78,7 @@ def _subst_expr(expr, mapping: Dict[tir.Var, tir.PrimExpr]):
     return expr
 
 
-def _walk(stmt, mapping: Dict[tir.Var, tir.PrimExpr]):
+def _walk(stmt, mapping: dict[tir.Var, tir.PrimExpr]):
     if stmt is None:
         return None
     if isinstance(stmt, tir.SeqStmt):
@@ -164,4 +162,4 @@ def run(func: tir.PrimFunc) -> tir.PrimFunc:
     )
 
 
-__all__ = ["run", "InlineLetStmtsError"]
+__all__ = ["InlineLetStmtsError", "run"]

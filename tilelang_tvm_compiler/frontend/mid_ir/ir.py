@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Union
 
 
 # ---------------------------------------------------------------------------
@@ -138,12 +138,12 @@ class BufferDef:
     lane position from shape values.
     """
     name: str
-    shape: List[int]           # logical extents (int-only; symbolic later)
+    shape: list[int]           # logical extents (int-only; symbolic later)
     dtype: str
     scope: str = "global"
-    cluster_dim: Optional[int] = None
+    cluster_dim: int | None = None
 
-    def with_outer_dim(self, extent: int) -> "BufferDef":
+    def with_outer_dim(self, extent: int) -> BufferDef:
         # Prepending a dim shifts every existing axis by +1, including
         # the cluster_dim marker if set.
         new_cluster = None if self.cluster_dim is None else self.cluster_dim + 1
@@ -177,8 +177,8 @@ class BufferRef:
     (BSHD view of a BHSD-shell buffer).
     """
     buffer: BufferDef
-    indices: List["IndexExpr"]
-    view_perm: Optional[List[int]] = None
+    indices: list[IndexExpr]
+    view_perm: list[int] | None = None
 
 
 @dataclass
@@ -284,16 +284,16 @@ class Elementwise:
     can_async=True in Async regions.
     """
     dst: BufferRef
-    srcs: List[Union[BufferRef, "Broadcast"]]
-    op: Union[BinOp, UnaryOp]
+    srcs: list[BufferRef | Broadcast]
+    op: BinOp | UnaryOp
     # Per-axis roles + extents (authoritative source for lower).
-    dst_axes: List[AxisInfo] = field(default_factory=list)
-    src_axes: List[List[AxisInfo]] = field(default_factory=list)
+    dst_axes: list[AxisInfo] = field(default_factory=list)
+    src_axes: list[list[AxisInfo]] = field(default_factory=list)
     # Legacy fields kept transitionally for code that hasn't migrated
     # to axes; new lowering paths must read dst_axes / src_axes only.
-    axis: Optional[Union[int, List[int]]] = None
+    axis: int | list[int] | None = None
     size: int = 1
-    marker: Optional[Marker] = None
+    marker: Marker | None = None
     can_async: bool = False
 
 
@@ -306,7 +306,7 @@ class Broadcast:
     last-axis position → broadcast_dims = [0, 1].
     """
     src: BufferRef
-    broadcast_dims: List[int]
+    broadcast_dims: list[int]
 
 
 @dataclass
@@ -329,9 +329,9 @@ class Reduce:
     src: BufferRef
     op: ReduceOp
     axis: int
-    dst_axes: List[AxisInfo] = field(default_factory=list)
-    src_axes: List[AxisInfo] = field(default_factory=list)
-    marker: Optional[Marker] = None
+    dst_axes: list[AxisInfo] = field(default_factory=list)
+    src_axes: list[AxisInfo] = field(default_factory=list)
+    marker: Marker | None = None
     can_async: bool = False
 
 
@@ -363,10 +363,10 @@ class Gemm:
     transpose_a: bool = False
     transpose_b: bool = False
     kind: str = "overwrite"
-    a_axes: List[AxisInfo] = field(default_factory=list)
-    b_axes: List[AxisInfo] = field(default_factory=list)
-    c_axes: List[AxisInfo] = field(default_factory=list)
-    marker: Optional[Marker] = None
+    a_axes: list[AxisInfo] = field(default_factory=list)
+    b_axes: list[AxisInfo] = field(default_factory=list)
+    c_axes: list[AxisInfo] = field(default_factory=list)
+    marker: Marker | None = None
     can_async: bool = False
 
 
@@ -390,9 +390,9 @@ class Dma:
     """
     src: BufferRef
     dst: BufferRef
-    src_axes: List[AxisInfo] = field(default_factory=list)
-    dst_axes: List[AxisInfo] = field(default_factory=list)
-    marker: Optional[Marker] = None
+    src_axes: list[AxisInfo] = field(default_factory=list)
+    dst_axes: list[AxisInfo] = field(default_factory=list)
+    marker: Marker | None = None
     can_async: bool = False
 
 
@@ -496,13 +496,13 @@ class ParallelAxis:
     """
     axis_name: str
     extent: int
-    body: List["Stmt"]
+    body: list[Stmt]
     kind: ParallelKind
-    thread_tag: Optional[str] = None
-    parent_grid_axis_name: Optional[str] = None
-    original_axis_name: Optional[str] = None
-    axis_var: Optional[VarRef] = None
-    original_axis_var: Optional[VarRef] = None
+    thread_tag: str | None = None
+    parent_grid_axis_name: str | None = None
+    original_axis_name: str | None = None
+    axis_var: VarRef | None = None
+    original_axis_var: VarRef | None = None
 
 
 @dataclass
@@ -524,9 +524,9 @@ class For:
     """
     loop_var: str
     extent: int
-    body: List["Stmt"]
+    body: list[Stmt]
     kind: str = "serial"                # "serial" | "unroll"
-    loop_var_var: Optional[VarRef] = None
+    loop_var_var: VarRef | None = None
 
 
 @dataclass
@@ -536,7 +536,7 @@ class Async:
     (each Async ends up in its own for, fused into a multi-lane HW op
     by pass_6_fuse).
     """
-    body: List["Stmt"]
+    body: list[Stmt]
     scope_id: int                       # unique per async region
 
 
@@ -570,10 +570,10 @@ class MultiLaneOp:
                                 Pass_7_perm reads this when deciding
                                 where each cluster axis sits physically.
     """
-    inner: "Op"
-    cluster_axis_names: List[str]
-    dim_map: Dict[str, List[int]]
-    cluster_axis_vars: List[VarRef] = field(default_factory=list)
+    inner: Op
+    cluster_axis_names: list[str]
+    dim_map: dict[str, list[int]]
+    cluster_axis_vars: list[VarRef] = field(default_factory=list)
 
 
 # A "statement" is anything that appears in a body list.
@@ -611,12 +611,12 @@ class MidFunc:
     halves of split lane axes.
     """
     name: str
-    params: List[BufferDef]
-    allocs: List[BufferDef]
-    body: List[Stmt]
-    lane_axes: List[str] = field(default_factory=list)
-    cluster_counts: List[int] = field(default_factory=list)
-    attrs: Dict[str, str] = field(default_factory=dict)
+    params: list[BufferDef]
+    allocs: list[BufferDef]
+    body: list[Stmt]
+    lane_axes: list[str] = field(default_factory=list)
+    cluster_counts: list[int] = field(default_factory=list)
+    attrs: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -651,14 +651,14 @@ def _fmt_src(s) -> str:
     return _fmt_ref(s)
 
 
-def _fmt_marker(m: Optional[Marker], can_async: bool = False) -> str:
+def _fmt_marker(m: Marker | None, can_async: bool = False) -> str:
     if m is None:
         return ""
     suffix = " async" if can_async else ""
     return f" #{m.value}{suffix}"
 
 
-def _fmt_axes(axes: List[AxisInfo]) -> str:
+def _fmt_axes(axes: list[AxisInfo]) -> str:
     """Compact ``[role:extent, role:extent, ...]`` dump for a per-op
     axes list. Empty list returns ``[]`` (so a missing-axes case is
     visually obvious)."""
@@ -668,7 +668,7 @@ def _fmt_axes(axes: List[AxisInfo]) -> str:
     return "[" + ", ".join(parts) + "]"
 
 
-def _print_stmt(s: Stmt, indent: int, out: List[str]) -> None:
+def _print_stmt(s: Stmt, indent: int, out: list[str]) -> None:
     pad = "  " * indent
     if isinstance(s, ParallelAxis):
         # Display kind directly as the keyword:
@@ -770,7 +770,7 @@ def _print_stmt(s: Stmt, indent: int, out: List[str]) -> None:
 
 def format_func(fn: MidFunc) -> str:
     """Return a multi-line text dump of ``fn`` for eyeballing."""
-    out: List[str] = []
+    out: list[str] = []
     params = ", ".join(
         f"{p.name}: {p.dtype}{tuple(p.shape)} @{p.scope}" for p in fn.params
     )
@@ -789,13 +789,28 @@ def format_func(fn: MidFunc) -> str:
 
 
 __all__ = [
-    "BinOp", "UnaryOp", "ReduceOp", "Marker",
-    "AxisRole", "AxisInfo",
-    "BufferDef", "BufferRef", "Slice", "VarRef", "IndexExpr",
-    "Elementwise", "Broadcast", "Reduce",
-    "Gemm", "Dma", "RawStore",
-    "ParallelKind", "ParallelAxis",
-    "For", "Async", "MultiLaneOp",
+    "Async",
+    "AxisInfo",
+    "AxisRole",
+    "BinOp",
+    "Broadcast",
+    "BufferDef",
+    "BufferRef",
+    "Dma",
+    "Elementwise",
+    "For",
+    "Gemm",
+    "IndexExpr",
+    "Marker",
     "MidFunc",
+    "MultiLaneOp",
+    "ParallelAxis",
+    "ParallelKind",
+    "RawStore",
+    "Reduce",
+    "ReduceOp",
+    "Slice",
+    "UnaryOp",
+    "VarRef",
     "format_func",
 ]

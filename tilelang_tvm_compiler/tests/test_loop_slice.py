@@ -16,7 +16,6 @@ from tilelang_tvm_compiler import hlir as _hlir
 from tilelang_tvm_compiler.kernels.loop_slice_dma import (
     GROUP_HEADS,
     HLEN,
-    MLEN,
     NUM_BLOCKS,
     SEQ_TOTAL,
     loop_slice_dma,
@@ -36,7 +35,7 @@ def test_hlir_records_for_then_slice():
     assert not isinstance(sl.starts[1], int), (
         f"expected dynamic PrimExpr at starts[1], got {type(sl.starts[1]).__name__}"
     )
-    print(f"[ok] HLIR: for-op containing dma_h2v_slice with dynamic seq start")
+    print("[ok] HLIR: for-op containing dma_h2v_slice with dynamic seq start")
 
 
 def test_isa_emits_outer_loop():
@@ -57,7 +56,7 @@ def test_isa_strength_reduces_dynamic_offset():
     # offset computation. (Strict count omitted because TVM may or may
     # not pre-simplify (i*64)*64 -> i*4096; either way SLLI is used.)
     assert "S_SLLI_INT" in loop_body, "expected S_SLLI_INT for dynamic offset (i * power-of-2)"
-    print(f"[ok] dynamic offset uses S_SLLI_INT (strength-reduced)")
+    print("[ok] dynamic offset uses S_SLLI_INT (strength-reduced)")
 
 
 def test_isa_uses_register_sourced_offset_in_dma():

@@ -205,7 +205,7 @@ def test_smolvlm2_codegen_assembles():
     from assembler import AssemblyToBinary
 
     paths = _get_paths()
-    compiler_root = Path(__file__).resolve().parents[2]
+    Path(__file__).resolve().parents[2]
     asm_tool = AssemblyToBinary(paths["operation"], paths["hw_config"])
 
     for label, build_fn in [

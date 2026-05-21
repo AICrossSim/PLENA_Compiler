@@ -20,7 +20,7 @@ FPRAM operand convention:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Sequence
+from collections.abc import Callable, Sequence
 
 from . import scope as _scope
 
@@ -36,7 +36,7 @@ class IntrinsicSpec:
     emit: Callable[[list[str]], str]
 
 
-_REGISTRY: Dict[str, IntrinsicSpec] = {}
+_REGISTRY: dict[str, IntrinsicSpec] = {}
 
 
 def register(spec: IntrinsicSpec) -> None:

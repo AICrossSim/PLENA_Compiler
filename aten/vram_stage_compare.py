@@ -175,9 +175,9 @@ def compare_stages(vram_path, build_dir, hidden, inter, num_heads, num_kv_heads,
             print(f"  norm+FFN+norm: {allclose_final:.1f}% allclose (atol=0.2)")
             print(f"                 MSE={mse_final:.4e}")
             if allclose_final >= 99.0:
-                print(f"  ==> PASS: emulator's FFN chain matches golden from its own intermediate")
+                print("  ==> PASS: emulator's FFN chain matches golden from its own intermediate")
             else:
-                print(f"  ==> DIVERGENCE in FFN chain")
+                print("  ==> DIVERGENCE in FFN chain")
 
     return results
 

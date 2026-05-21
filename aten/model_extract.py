@@ -132,7 +132,7 @@ def extract_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
     """
     # Detect layer type
     is_llada = hasattr(layer, "q_proj") and not hasattr(layer, "self_attn")
-    
+
     if is_llada:
         return _extract_llada_layer_weights(layer, config)
     else:
@@ -170,7 +170,7 @@ def _extract_llada_layer_weights(layer: Any, config: ModelConfig) -> LayerWeight
     total_kv_dim = config.num_kv_heads * config.head_dim
     w_k_full = _linear_weight(layer.k_proj, hidden, total_kv_dim)
     w_v_full = _linear_weight(layer.v_proj, hidden, total_kv_dim)
-    
+
     # Get epsilon from either attn_norm or ff_norm
     norm = getattr(layer, "attn_norm", getattr(layer, "ff_norm", None))
 

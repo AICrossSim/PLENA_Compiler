@@ -41,4 +41,4 @@ def should_skip_cluster(func: MidFunc) -> bool:
     return False
 
 
-__all__ = ["should_skip_cluster", "MLEN"]
+__all__ = ["MLEN", "should_skip_cluster"]

@@ -20,7 +20,6 @@ import sys
 
 from tilelang_tvm_compiler.frontend.mid_ir import ir
 from tilelang_tvm_compiler.frontend.mid_ir.passes.async_wrap import (
-    AsyncWrapError,
     run as async_run,
 )
 

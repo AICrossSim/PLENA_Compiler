@@ -146,7 +146,7 @@ def _ffn_asm_unrolled(
     MAX_K_TILES = max(1, matrix_sram_size // mlen)
 
     # --- FFN Upsize Linear (K = hidden_size) ---
-    up_num_k_tiles = hidden_size // mlen
+    hidden_size // mlen
     up_scratch_base = batch * seq_len * (hidden_size + 2 * intermediate_size)
     generated_code += _emit_ffn_projection_unrolled(
         mlen=mlen,
@@ -307,7 +307,7 @@ def _emit_ffn_projection_unrolled(
     assert k_size % mlen == 0, f"K ({k_size}) must be a multiple of MLEN ({mlen})"
     assert out_size % mlen == 0, f"out_size ({out_size}) must be a multiple of MLEN ({mlen})"
     num_k_tiles = k_size // mlen
-    num_act_cols = (batch * seq_len) // blen
+    (batch * seq_len) // blen
 
     lines: list[str] = [f" ; {section_comment} (k_size={k_size}, out_size={out_size})\n"]
 
