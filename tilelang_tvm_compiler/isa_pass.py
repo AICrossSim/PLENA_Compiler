@@ -82,10 +82,7 @@ def _normalize_large_addi_immediates(asm_code: str) -> str:
             continue
 
         if imm_value < 0:
-            print(
-                f"[isa_pass] WARN: negative imm in {stripped!r}; "
-                f"normalize pass only handles unsigned overflow."
-            )
+            print(f"[isa_pass] WARN: negative imm in {stripped!r}; normalize pass only handles unsigned overflow.")
             lines.append(line)
             continue
 
@@ -189,9 +186,7 @@ class IsaEmitterPass:
                 f";   {buf.name:<10s} scope={buf.scope:<5s} addr={buf.address}  "
                 f"shape={'x'.join(str(s) for s in buf.shape)}\n"
             )
-        self.shim.compiler.generated_code += (
-            "; ============================================================\n\n"
-        )
+        self.shim.compiler.generated_code += "; ============================================================\n\n"
 
         ra = self.shim.compiler.register_allocator
         for i, op in enumerate(mod.ops):
@@ -207,14 +202,13 @@ class IsaEmitterPass:
                 handler(mod, op)
             finally:
                 ra.pop_site()
-        self.shim.compiler.generated_code = _normalize_large_addi_immediates(
-            self.shim.compiler.generated_code
-        )
+        self.shim.compiler.generated_code = _normalize_large_addi_immediates(self.shim.compiler.generated_code)
         return self.shim.compiler.generated_code
 
     @staticmethod
     def _logical_2d(
-        shape: tuple[int, ...], layout: str = "BSHD",
+        shape: tuple[int, ...],
+        layout: str = "BSHD",
     ) -> tuple[int, int]:
         return _hlir.logical_2d_extents(shape, layout)
 
@@ -269,9 +263,7 @@ class IsaEmitterPass:
         """
         _check_scope(buf, _scope.VRAM, op_kind, role)
         if not buf.shape:
-            raise IsaEmissionError(
-                f"{op_kind} {role} buffer {buf.name!r}: empty shape"
-            )
+            raise IsaEmissionError(f"{op_kind} {role} buffer {buf.name!r}: empty shape")
         mlen = int(self.shim.mlen)
         rank = len(buf.shape)
 
@@ -308,10 +300,7 @@ class IsaEmitterPass:
                     rows_extent = int(_extent)
                     rows_axis = i
         if d_axis is None:
-            raise IsaEmissionError(
-                f"{op_kind} {role} buffer {buf.name!r}: no ``simd`` axis "
-                f"in op_axes {list(op_axes)}"
-            )
+            raise IsaEmissionError(f"{op_kind} {role} buffer {buf.name!r}: no ``simd`` axis in op_axes {list(op_axes)}")
         d_dim = int(buf.shape[d_axis])
 
         if rank >= 3 and rows_axis is not None:
@@ -330,15 +319,11 @@ class IsaEmitterPass:
             if head_stride == 1:
                 terms.append(head_expr)
             elif head_stride > 1:
-                terms.append(
-                    tir.Mul(head_expr, tir.IntImm("int32", head_stride))
-                )
+                terms.append(tir.Mul(head_expr, tir.IntImm("int32", head_stride)))
             if row_stride == 1:
                 terms.append(row_expr)
             else:
-                terms.append(
-                    tir.Mul(row_expr, tir.IntImm("int32", row_stride))
-                )
+                terms.append(tir.Mul(row_expr, tir.IntImm("int32", row_stride)))
             flat_row = terms[0]
             for t in terms[1:]:
                 flat_row = tir.Add(flat_row, t)
@@ -363,12 +348,14 @@ class IsaEmitterPass:
                     f"shift / mask shortcut for the narrow-D path requires it."
                 )
             vram_row_expr = tir.shift_right(
-                flat_row, tir.IntImm("int32", log2_lc),
+                flat_row,
+                tir.IntImm("int32", log2_lc),
             )
             # PLENA has no bitwise-AND; ``flat_row % lane_count`` is
             # ``flat_row - ((flat_row >> k) << k)``.
             quotient_shifted_back = tir.shift_left(
-                vram_row_expr, tir.IntImm("int32", log2_lc),
+                vram_row_expr,
+                tir.IntImm("int32", log2_lc),
             )
             col_in_row = tir.Sub(flat_row, quotient_shifted_back)
             mask_expr = tir.shift_left(tir.IntImm("int32", 1), col_in_row)
@@ -399,17 +386,25 @@ class IsaEmitterPass:
             stride = 1
             for dim, idx in zip(reversed(buf.shape), reversed(arg.indices)):
                 idx_expr = tir.IntImm("int32", int(idx)) if isinstance(idx, int) else idx
-                term = idx_expr if stride == 1 else tir.Mul(
-                    idx_expr, tir.IntImm("int32", int(stride)),
+                term = (
+                    idx_expr
+                    if stride == 1
+                    else tir.Mul(
+                        idx_expr,
+                        tir.IntImm("int32", int(stride)),
+                    )
                 )
-                offset = term if stride == 1 and isinstance(offset, tir.IntImm) and int(offset.value) == 0 else tir.Add(term, offset)
+                offset = (
+                    term
+                    if stride == 1 and isinstance(offset, tir.IntImm) and int(offset.value) == 0
+                    else tir.Add(term, offset)
+                )
                 stride *= int(dim)
             return tir.Add(tir.IntImm("int32", int(buf.address)), offset)
         if isinstance(arg, (int, tir.PrimExpr)):
             return arg
         raise IsaEmissionError(
-            f"{op_kind} {role} expects an FPRAM address or buffer element ref; "
-            f"got {type(arg).__name__}: {arg!r}"
+            f"{op_kind} {role} expects an FPRAM address or buffer element ref; got {type(arg).__name__}: {arg!r}"
         )
 
     def _emit_fp_scalar_op_at(
@@ -427,13 +422,10 @@ class IsaEmitterPass:
         else:
             expected = 3
         if len(op.scalar_args) != expected:
-            raise IsaEmissionError(
-                f"{op.kind} expects {expected} scalar address args, got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"{op.kind} expects {expected} scalar address args, got {len(op.scalar_args)}")
 
         addr_exprs = [
-            self._resolve_fp_scalar_addr_arg(mod, a, op.kind, f"arg{i}")
-            for i, a in enumerate(op.scalar_args)
+            self._resolve_fp_scalar_addr_arg(mod, a, op.kind, f"arg{i}") for i, a in enumerate(op.scalar_args)
         ]
         # Materialize one address expression at a time, commit its ISA to
         # ``generated_code`` immediately, and ``pin_gp`` the result reg so
@@ -526,18 +518,18 @@ class IsaEmitterPass:
         s_tile_stride = int(tl.h_groups) * inner_b
         d_tile_stride = int(tl.s_tiles) * s_tile_stride
         return {
-            "d_tiles":        int(tl.d_tiles),
-            "s_tiles":        int(tl.s_tiles),
-            "h_groups":       int(tl.h_groups),
-            "logical_b":      int(tl.logical_b),
-            "mlen":           int(tl.mlen),
-            "lane_count":     int(tl.lane_count),
-            "d_inner":        int(tl.d_inner),
+            "d_tiles": int(tl.d_tiles),
+            "s_tiles": int(tl.s_tiles),
+            "h_groups": int(tl.h_groups),
+            "logical_b": int(tl.logical_b),
+            "mlen": int(tl.mlen),
+            "lane_count": int(tl.lane_count),
+            "d_inner": int(tl.d_inner),
             "s_inner_stride": inner_lane,
-            "h_grp_stride":   h_grp_stride,
-            "s_tile_stride":  s_tile_stride,
-            "d_tile_stride":  d_tile_stride,
-            "b_stride":       b_stride,
+            "h_grp_stride": h_grp_stride,
+            "s_tile_stride": s_tile_stride,
+            "d_tile_stride": d_tile_stride,
+            "b_stride": b_stride,
         }
 
     def _buffer_tile_grid_iter(self, buf: _hlir.Buffer):
@@ -586,8 +578,7 @@ class IsaEmitterPass:
                         )
                         for s_inner in range(info["mlen"]):
                             phys = tile_base + s_inner * s_inner_stride
-                            yield (d_tile, s_tile, h_grp, b,
-                                   s_inner, phys)
+                            yield (d_tile, s_tile, h_grp, b, s_inner, phys)
 
     def _logical_to_phys_row_offset(
         self,
@@ -684,13 +675,13 @@ class IsaEmitterPass:
                 # outer loop; the per-issue base is always at the
                 # logical row's d-tile=0 chunk. Non-zero d-starts are
                 # not supported here.
-                if not (isinstance(region.starts[i], (int, tir.IntImm))
-                        and (int(region.starts[i])
-                             if isinstance(region.starts[i], int)
-                             else int(region.starts[i].value)) == 0):
+                if not (
+                    isinstance(region.starts[i], (int, tir.IntImm))
+                    and (int(region.starts[i]) if isinstance(region.starts[i], int) else int(region.starts[i].value))
+                    == 0
+                ):
                     raise IsaEmissionError(
-                        f"row_*_at on {buf.name!r}: d-axis start must be "
-                        f"0; got {region.starts[i]!r}"
+                        f"row_*_at on {buf.name!r}: d-axis start must be 0; got {region.starts[i]!r}"
                     )
                 continue
             if role == "lane":
@@ -709,29 +700,26 @@ class IsaEmitterPass:
                 lane_stride = axis_stride[i]
                 if lane_count == 1 and i == 0:
                     lane_stride = 1
-                    for dim in buf.shape[i + 1:]:
+                    for dim in buf.shape[i + 1 :]:
                         lane_stride *= int(dim)
                 if lane_count > 1:
                     h_grp = tir.floordiv(
-                        start, tir.IntImm("int32", lane_count),
+                        start,
+                        tir.IntImm("int32", lane_count),
                     )
                     lane = tir.floormod(
-                        start, tir.IntImm("int32", lane_count),
+                        start,
+                        tir.IntImm("int32", lane_count),
                     )
                     if lane_stride:
-                        terms.append(
-                            tir.Mul(h_grp,
-                                    tir.IntImm("int32", lane_stride))
-                        )
+                        terms.append(tir.Mul(h_grp, tir.IntImm("int32", lane_stride)))
                     mask_expr = tir.shift_left(
-                        tir.IntImm("int32", 1), lane,
+                        tir.IntImm("int32", 1),
+                        lane,
                     )
                 else:
                     if lane_stride:
-                        terms.append(
-                            tir.Mul(start,
-                                    tir.IntImm("int32", lane_stride))
-                        )
+                        terms.append(tir.Mul(start, tir.IntImm("int32", lane_stride)))
                 continue
             # role == "batch": could be the rows axis or a degenerate
             # placeholder. The stride is determined by where this axis
@@ -761,40 +749,23 @@ class IsaEmitterPass:
             #   i == 2 and cluster_dim != 2 → H placeholder (h_grp_stride)
             if i == 0:
                 if info["b_stride"]:
-                    terms.append(
-                        tir.Mul(start, tir.IntImm("int32", info["b_stride"]))
-                    )
+                    terms.append(tir.Mul(start, tir.IntImm("int32", info["b_stride"])))
             elif i == 1:
                 if info["s_tiles"] > 1:
                     s_tile = tir.floordiv(start, tir.IntImm("int32", mlen))
                     s_inner = tir.floormod(start, tir.IntImm("int32", mlen))
-                    terms.append(
-                        tir.Mul(s_tile,
-                                tir.IntImm("int32", info["s_tile_stride"]))
-                    )
-                    terms.append(
-                        tir.Mul(s_inner,
-                                tir.IntImm("int32", info["s_inner_stride"]))
-                    )
+                    terms.append(tir.Mul(s_tile, tir.IntImm("int32", info["s_tile_stride"])))
+                    terms.append(tir.Mul(s_inner, tir.IntImm("int32", info["s_inner_stride"])))
                 else:
                     if info["s_inner_stride"] == 1:
                         terms.append(start)
                     else:
-                        terms.append(
-                            tir.Mul(start,
-                                    tir.IntImm("int32", info["s_inner_stride"]))
-                        )
+                        terms.append(tir.Mul(start, tir.IntImm("int32", info["s_inner_stride"])))
             elif i == 2:
                 if info["h_grp_stride"]:
-                    terms.append(
-                        tir.Mul(start,
-                                tir.IntImm("int32", info["h_grp_stride"]))
-                    )
+                    terms.append(tir.Mul(start, tir.IntImm("int32", info["h_grp_stride"])))
             else:
-                raise IsaEmissionError(
-                    f"row_*_at on {buf.name!r}: unexpected batch axis at "
-                    f"physical index {i}"
-                )
+                raise IsaEmissionError(f"row_*_at on {buf.name!r}: unexpected batch axis at physical index {i}")
 
         if not terms:
             return tir.IntImm("int32", 0), mask_expr, info
@@ -803,8 +774,7 @@ class IsaEmitterPass:
             expr = tir.Add(expr, t)
         return expr, mask_expr, info
 
-    def _region_origin_offset(self, buf: _hlir.Buffer,
-                              region) -> tir.PrimExpr | int:
+    def _region_origin_offset(self, buf: _hlir.Buffer, region) -> tir.PrimExpr | int:
         """Translate a Region's ``starts`` into a physical element
         offset against ``buf.address``.
 
@@ -825,8 +795,7 @@ class IsaEmitterPass:
                 if isinstance(s, tir.IntImm) and int(s.value) == 0:
                     continue
                 raise IsaEmissionError(
-                    f"_region_origin_offset: {region.parent!r} non-zero "
-                    f"start at axis {i} but parent has no tile_layout"
+                    f"_region_origin_offset: {region.parent!r} non-zero start at axis {i} but parent has no tile_layout"
                 )
             return 0
         cluster_dim = getattr(buf, "cluster_dim", None)
@@ -858,8 +827,7 @@ class IsaEmitterPass:
         for i, s in enumerate(region.starts):
             if _is_zero(s):
                 continue
-            if (cluster_dim is not None and i == cluster_dim
-                    and lane_count == 1 and i == 0):
+            if cluster_dim is not None and i == cluster_dim and lane_count == 1 and i == 0:
                 # row_stack lane axis: B carries lane stacking, no
                 # packed-head (lane_count == 1). Each lane occupies
                 # ``shape[1] * shape[2] * shape[3]`` elements
@@ -871,7 +839,7 @@ class IsaEmitterPass:
                 # rows=1 S_loc) b_stride overshoots and lane 1's data
                 # ends up past the buffer.
                 lane_stride = 1
-                for dim in buf.shape[i + 1:]:
+                for dim in buf.shape[i + 1 :]:
                     lane_stride *= int(dim)
                 terms.append(_mul(s, lane_stride))
                 continue
@@ -889,25 +857,17 @@ class IsaEmitterPass:
                     h_grp = s // lane_count
                     lane = s % lane_count
                     if h_grp:
-                        terms.append(
-                            tir.IntImm("int32", h_grp * h_grp_stride)
-                        )
+                        terms.append(tir.IntImm("int32", h_grp * h_grp_stride))
                     if lane:
-                        terms.append(
-                            tir.IntImm("int32", lane * d_inner)
-                        )
+                        terms.append(tir.IntImm("int32", lane * d_inner))
                 elif isinstance(s, tir.IntImm):
                     val = int(s.value)
                     h_grp = val // lane_count
                     lane = val % lane_count
                     if h_grp:
-                        terms.append(
-                            tir.IntImm("int32", h_grp * h_grp_stride)
-                        )
+                        terms.append(tir.IntImm("int32", h_grp * h_grp_stride))
                     if lane:
-                        terms.append(
-                            tir.IntImm("int32", lane * d_inner)
-                        )
+                        terms.append(tir.IntImm("int32", lane * d_inner))
                 else:
                     terms.append(_mul(s, d_inner))
                 continue
@@ -922,8 +882,7 @@ class IsaEmitterPass:
                 stride = 1
             terms.append(_mul(s, stride))
 
-        terms = [t for t in terms
-                 if not (isinstance(t, tir.IntImm) and int(t.value) == 0)]
+        terms = [t for t in terms if not (isinstance(t, tir.IntImm) and int(t.value) == 0)]
         if not terms:
             return 0
         acc = terms[0]
@@ -981,47 +940,29 @@ class IsaEmitterPass:
         has_fp = has_fp or reduce
         if reduce:
             if len(op.buffer_args) != 1:
-                raise IsaEmissionError(
-                    f"{op.kind} expects 1 buffer_arg (src region); "
-                    f"got {len(op.buffer_args)}"
-                )
+                raise IsaEmissionError(f"{op.kind} expects 1 buffer_arg (src region); got {len(op.buffer_args)}")
             expected_scalar = 1
         elif has_fp:
             if len(op.buffer_args) != 2:
-                raise IsaEmissionError(
-                    f"{op.kind} expects 2 buffer_args (src/dst regions); "
-                    f"got {len(op.buffer_args)}"
-                )
+                raise IsaEmissionError(f"{op.kind} expects 2 buffer_args (src/dst regions); got {len(op.buffer_args)}")
             expected_scalar = 1
         else:
             if len(op.buffer_args) != 2:
-                raise IsaEmissionError(
-                    f"{op.kind} expects 2 buffer_args (src/dst regions); "
-                    f"got {len(op.buffer_args)}"
-                )
+                raise IsaEmissionError(f"{op.kind} expects 2 buffer_args (src/dst regions); got {len(op.buffer_args)}")
             expected_scalar = 0
         if len(op.scalar_args) != expected_scalar:
-            raise IsaEmissionError(
-                f"{op.kind} expects {expected_scalar} scalar_args; "
-                f"got {len(op.scalar_args)}"
-            )
-        for slot, name in enumerate(
-            ("src",) if reduce else ("src", "dst")
-        ):
+            raise IsaEmissionError(f"{op.kind} expects {expected_scalar} scalar_args; got {len(op.scalar_args)}")
+        for slot, name in enumerate(("src",) if reduce else ("src", "dst")):
             if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
                 raise IsaEmissionError(
-                    f"{op.kind} {name}: expected VramRegion, got "
-                    f"{type(op.buffer_args[slot]).__name__}"
+                    f"{op.kind} {name}: expected VramRegion, got {type(op.buffer_args[slot]).__name__}"
                 )
 
         src_region: _hlir.VramRegion = op.buffer_args[0]
         src = mod.get_buffer(src_region.parent)
         _check_scope(src, _scope.VRAM, op.kind, "src")
         if len(src_region.extents) != 4:
-            raise IsaEmissionError(
-                f"{op.kind} src: region must be 4D; got "
-                f"extents={tuple(src_region.extents)}"
-            )
+            raise IsaEmissionError(f"{op.kind} src: region must be 4D; got extents={tuple(src_region.extents)}")
         # All non-D extents must be 1 (one logical row per op).
         if any(int(e) != 1 for e in src_region.extents[:3]):
             raise IsaEmissionError(
@@ -1033,19 +974,21 @@ class IsaEmitterPass:
         fp_addr_expr = None
         if has_fp:
             fp_addr_expr = self._resolve_fp_scalar_addr_arg(
-                mod, op.scalar_args[0], op.kind, "fp",
+                mod,
+                op.scalar_args[0],
+                op.kind,
+                "fp",
             )
 
         src_base_off, src_mask_expr, src_info = self._logical_to_phys_row_offset(
-            src, src_region,
+            src,
+            src_region,
         )
         emit_v_mask = masked and src_mask_expr is not None
         use_mask_flag = 1 if emit_v_mask else 0
 
         mats = []
-        m_src = self.materializer.materialize(
-            tir.Add(tir.IntImm("int32", int(src.address)), src_base_off)
-        )
+        m_src = self.materializer.materialize(tir.Add(tir.IntImm("int32", int(src.address)), src_base_off))
         self.shim.compiler.generated_code += m_src.isa
         mats.append(m_src)
         gp_src = m_src.register
@@ -1073,8 +1016,7 @@ class IsaEmitterPass:
                 m_dst = self.materializer.materialize(fp_addr_expr)
                 self.shim.compiler.generated_code += m_dst.isa
                 mats.append(m_dst)
-                opcode = {"reduce_max": "V_RED_MAX",
-                          "reduce_sum": "V_RED_SUM"}[row_op]
+                opcode = {"reduce_max": "V_RED_MAX", "reduce_sum": "V_RED_SUM"}[row_op]
                 # V_RED_* accumulate into f1; load the FPRAM slot
                 # first so kernels that pre-seeded it see the seed.
                 # Across d_tiles, accumulate into the same f1.
@@ -1082,33 +1024,21 @@ class IsaEmitterPass:
                 for t in range(n_d_tiles):
                     lines.append(f"{opcode} f1, gp{gp_src}, {use_mask_flag}")
                     if t < n_d_tiles - 1:
-                        lines.append(
-                            f"S_ADDI_INT gp{gp_src}, gp{gp_src}, "
-                            f"{d_tile_stride_s}"
-                        )
+                        lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {d_tile_stride_s}")
                 lines.append(f"S_ST_FP f1, gp{m_dst.register}, 0")
             else:
                 dst_region: _hlir.VramRegion = op.buffer_args[1]
                 dst = mod.get_buffer(dst_region.parent)
                 _check_scope(dst, _scope.VRAM, op.kind, "dst")
                 if len(dst_region.extents) != 4:
-                    raise IsaEmissionError(
-                        f"{op.kind} dst: region must be 4D; got "
-                        f"extents={tuple(dst_region.extents)}"
-                    )
+                    raise IsaEmissionError(f"{op.kind} dst: region must be 4D; got extents={tuple(dst_region.extents)}")
                 if any(int(e) != 1 for e in dst_region.extents[:3]):
                     raise IsaEmissionError(
-                        f"{op.kind} dst: non-D extents must be 1; "
-                        f"got {tuple(dst_region.extents[:3])}"
+                        f"{op.kind} dst: non-D extents must be 1; got {tuple(dst_region.extents[:3])}"
                     )
-                dst_base_off, dst_mask_expr, dst_info = (
-                    self._logical_to_phys_row_offset(dst, dst_region)
-                )
+                dst_base_off, dst_mask_expr, dst_info = self._logical_to_phys_row_offset(dst, dst_region)
                 if emit_v_mask and dst_mask_expr is None:
-                    raise IsaEmissionError(
-                        f"{op.kind} src requires packed-head mask but dst "
-                        f"{dst.name!r} does not"
-                    )
+                    raise IsaEmissionError(f"{op.kind} src requires packed-head mask but dst {dst.name!r} does not")
                 if emit_v_mask and dst_region.parent != src_region.parent:
                     warnings.warn(
                         f"{op.kind}: masked V_*_V with dst "
@@ -1122,13 +1052,10 @@ class IsaEmitterPass:
                     )
                 if dst_info["d_tiles"] != n_d_tiles:
                     raise IsaEmissionError(
-                        f"{op.kind}: src/dst d_tiles mismatch "
-                        f"({n_d_tiles} vs {dst_info['d_tiles']})"
+                        f"{op.kind}: src/dst d_tiles mismatch ({n_d_tiles} vs {dst_info['d_tiles']})"
                     )
                 d_tile_stride_d = dst_info["d_tile_stride"]
-                m_dst = self.materializer.materialize(
-                    tir.Add(tir.IntImm("int32", int(dst.address)), dst_base_off)
-                )
+                m_dst = self.materializer.materialize(tir.Add(tir.IntImm("int32", int(dst.address)), dst_base_off))
                 self.shim.compiler.generated_code += m_dst.isa
                 mats.append(m_dst)
 
@@ -1136,19 +1063,10 @@ class IsaEmitterPass:
                     # exp / reci
                     opcode = {"exp": "V_EXP_V", "reci": "V_RECI_V"}[row_op]
                     for t in range(n_d_tiles):
-                        lines.append(
-                            f"{opcode} gp{m_dst.register}, gp{gp_src}, "
-                            f"{use_mask_flag}"
-                        )
+                        lines.append(f"{opcode} gp{m_dst.register}, gp{gp_src}, {use_mask_flag}")
                         if t < n_d_tiles - 1:
-                            lines.append(
-                                f"S_ADDI_INT gp{gp_src}, gp{gp_src}, "
-                                f"{d_tile_stride_s}"
-                            )
-                            lines.append(
-                                f"S_ADDI_INT gp{m_dst.register}, "
-                                f"gp{m_dst.register}, {d_tile_stride_d}"
-                            )
+                            lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {d_tile_stride_s}")
+                            lines.append(f"S_ADDI_INT gp{m_dst.register}, gp{m_dst.register}, {d_tile_stride_d}")
                 else:
                     # add / sub / mul with FP scalar
                     m_rhs = self.materializer.materialize(fp_addr_expr)
@@ -1157,26 +1075,13 @@ class IsaEmitterPass:
                     lines.append(f"S_LD_FP f1, gp{m_rhs.register}, 0")
                     for t in range(n_d_tiles):
                         if row_op == "sub":
-                            lines.append(
-                                f"V_SUB_VF gp{m_dst.register}, gp{gp_src}, "
-                                f"f1, {use_mask_flag}, 0"
-                            )
+                            lines.append(f"V_SUB_VF gp{m_dst.register}, gp{gp_src}, f1, {use_mask_flag}, 0")
                         else:
-                            opcode = {"add": "V_ADD_VF",
-                                      "mul": "V_MUL_VF"}[row_op]
-                            lines.append(
-                                f"{opcode} gp{m_dst.register}, gp{gp_src}, "
-                                f"f1, {use_mask_flag}"
-                            )
+                            opcode = {"add": "V_ADD_VF", "mul": "V_MUL_VF"}[row_op]
+                            lines.append(f"{opcode} gp{m_dst.register}, gp{gp_src}, f1, {use_mask_flag}")
                         if t < n_d_tiles - 1:
-                            lines.append(
-                                f"S_ADDI_INT gp{gp_src}, gp{gp_src}, "
-                                f"{d_tile_stride_s}"
-                            )
-                            lines.append(
-                                f"S_ADDI_INT gp{m_dst.register}, "
-                                f"gp{m_dst.register}, {d_tile_stride_d}"
-                            )
+                            lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {d_tile_stride_s}")
+                            lines.append(f"S_ADDI_INT gp{m_dst.register}, gp{m_dst.register}, {d_tile_stride_d}")
 
             if emit_v_mask:
                 lines.append(f"S_ADDI_INT gp{gp_mask}, gp0, 0")
@@ -1222,8 +1127,7 @@ class IsaEmitterPass:
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
         for vram_off, hbm_off in self._iter_tile_offsets(src):
             self.shim.compiler.generated_code += (
-                f"; dma_h2v tile  {src.name}[hbm+{hbm_off}] -> "
-                f"{dst.name}[vram+{vram_off}]\n"
+                f"; dma_h2v tile  {src.name}[hbm+{hbm_off}] -> {dst.name}[vram+{vram_off}]\n"
             )
             self.emitter.emit_load_tile_from_hbm(
                 hbm_addr=src.address,
@@ -1240,8 +1144,7 @@ class IsaEmitterPass:
         _check_scope(dst, _scope.MRAM, op.kind, "dst")
         for vram_off, hbm_off in self._iter_tile_offsets(src):
             self.shim.compiler.generated_code += (
-                f"; dma_h2m tile  {src.name}[hbm+{hbm_off}] -> "
-                f"{dst.name}[mram+{vram_off}]\n"
+                f"; dma_h2m tile  {src.name}[hbm+{hbm_off}] -> {dst.name}[mram+{vram_off}]\n"
             )
             self.emitter.emit_hbm_tile_to_mram(
                 hbm_addr=src.address,
@@ -1270,8 +1173,7 @@ class IsaEmitterPass:
             )
         for vram_off, hbm_off in self._iter_tile_offsets(dst):
             self.shim.compiler.generated_code += (
-                f"; dma_v2h tile  {src.name}[vram+{vram_off}] -> "
-                f"{dst.name}[hbm+{hbm_off}]\n"
+                f"; dma_v2h tile  {src.name}[vram+{vram_off}] -> {dst.name}[hbm+{hbm_off}]\n"
             )
             self.emitter.emit_store_tile_to_hbm(
                 vram_addr=src.address + vram_off,
@@ -1288,7 +1190,9 @@ class IsaEmitterPass:
     # clear error pointing at the next phase.
     # ------------------------------------------------------------------
     def _slice_offset_static(
-        self, parent: _hlir.Buffer, sl: _hlir.BufferSlice,
+        self,
+        parent: _hlir.Buffer,
+        sl: _hlir.BufferSlice,
     ) -> int:
         """Same math as `_build_slice_offset_expr`, restricted to all-int
         starts. Used in the static fast-path (avoids the extra
@@ -1297,7 +1201,7 @@ class IsaEmitterPass:
         shape = parent.shape
         for i, s in enumerate(sl.starts):
             stride_below = 1
-            for d in shape[i + 1:]:
+            for d in shape[i + 1 :]:
                 stride_below *= int(d)
             offset += int(s) * stride_below
         return offset
@@ -1307,7 +1211,9 @@ class IsaEmitterPass:
         return any(not isinstance(s, int) for s in sl.starts)
 
     def _build_slice_offset_expr(
-        self, parent: _hlir.Buffer, sl: _hlir.BufferSlice,
+        self,
+        parent: _hlir.Buffer,
+        sl: _hlir.BufferSlice,
     ):
         """Build a PrimExpr for the slice's element offset in `parent`'s
         HBM region. Mixes static (Python int / IntImm) and dynamic
@@ -1318,7 +1224,7 @@ class IsaEmitterPass:
         shape = parent.shape
         for i, s in enumerate(sl.starts):
             stride_below = 1
-            for d in shape[i + 1:]:
+            for d in shape[i + 1 :]:
                 stride_below *= int(d)
             if isinstance(s, int):
                 term = tir.IntImm("int32", s * stride_below)
@@ -1331,7 +1237,9 @@ class IsaEmitterPass:
         return offset
 
     def _check_slice_single_tile(
-        self, parent: _hlir.Buffer, sl: _hlir.BufferSlice,
+        self,
+        parent: _hlir.Buffer,
+        sl: _hlir.BufferSlice,
     ) -> None:
         """For input slices (h2v / h2m): must fit in exactly one mlen*mlen
         tile after H*D logical-2D collapse, since the destination
@@ -1341,8 +1249,7 @@ class IsaEmitterPass:
         ext = sl.extents
         if len(ext) != len(parent.shape):
             raise IsaEmissionError(
-                f"slice on {parent.name!r}: extents length {len(ext)} != "
-                f"parent ndim {len(parent.shape)}"
+                f"slice on {parent.name!r}: extents length {len(ext)} != parent ndim {len(parent.shape)}"
             )
         rows, cols = _hlir.logical_2d_extents(ext, parent.layout)
         if rows != mlen or cols != mlen:
@@ -1377,29 +1284,17 @@ class IsaEmitterPass:
         """
         mlen = self.shim.mlen
         if len(parent.shape) != 4:
-            raise IsaEmissionError(
-                f"per-head slice tiling requires 4D parent; got "
-                f"shape {parent.shape}"
-            )
+            raise IsaEmissionError(f"per-head slice tiling requires 4D parent; got shape {parent.shape}")
         # Permute parent shape and slice extents into canonical (B, S, H, D)
         # order per parent.layout. Downstream math works in BSHD.
         _B, _S, _H, _D = _hlir._select_axes(parent.shape, parent.layout)
         eb, es, eh, ed = _hlir._select_axes(sl.extents, parent.layout)
         if eb != 1:
-            raise IsaEmissionError(
-                f"per-head slice tiling does not support batch slicing "
-                f"(eb={eb})"
-            )
+            raise IsaEmissionError(f"per-head slice tiling does not support batch slicing (eb={eb})")
         if es != mlen:
-            raise IsaEmissionError(
-                f"per-head slice tiling requires es == mlen ({mlen}); "
-                f"got es={es}"
-            )
+            raise IsaEmissionError(f"per-head slice tiling requires es == mlen ({mlen}); got es={es}")
         if ed != mlen:
-            raise IsaEmissionError(
-                f"per-head slice tiling requires ed == mlen ({mlen}); "
-                f"got ed={ed}"
-            )
+            raise IsaEmissionError(f"per-head slice tiling requires ed == mlen ({mlen}); got ed={ed}")
         if eh < 1:
             raise IsaEmissionError(f"slice has no heads to iterate (eh={eh})")
         # Per-head HBM offset is h_idx * h_stride, where h_stride is
@@ -1410,14 +1305,17 @@ class IsaEmitterPass:
         # ``hbm_strides_for_layout`` returns the right number for any
         # layout we register.
         _hb, _hs, h_stride, _hd = _hlir.hbm_strides_for_layout(
-            parent.shape, parent.layout,
+            parent.shape,
+            parent.layout,
         )
         tile_elems = mlen * mlen
         for h_idx in range(eh):
             yield h_idx, h_idx * tile_elems, h_idx * int(h_stride)
 
     def _slice_is_single_logical_tile(
-        self, parent: _hlir.Buffer, sl: _hlir.BufferSlice,
+        self,
+        parent: _hlir.Buffer,
+        sl: _hlir.BufferSlice,
     ) -> bool:
         ext = sl.extents
         if len(ext) != len(parent.shape):
@@ -1426,13 +1324,15 @@ class IsaEmitterPass:
         return rows == self.shim.mlen and cols == self.shim.mlen
 
     def _materialise_slice_offset(
-        self, parent: _hlir.Buffer, sl: _hlir.BufferSlice,
+        self,
+        parent: _hlir.Buffer,
+        sl: _hlir.BufferSlice,
     ):
         """Returns either:
-            (None, int_offset)  -- all starts static; caller uses
-                                    existing int-offset emit path.
-            (MaterializedExpr, None) -- dynamic; caller uses *_reg emit
-                                    path and must release the result.
+        (None, int_offset)  -- all starts static; caller uses
+                                existing int-offset emit path.
+        (MaterializedExpr, None) -- dynamic; caller uses *_reg emit
+                                path and must release the result.
         """
         if not self._slice_has_dynamic_start(sl):
             return None, parent.hbm_offset + self._slice_offset_static(parent, sl)
@@ -1447,10 +1347,7 @@ class IsaEmitterPass:
 
     @staticmethod
     def _format_starts(sl: _hlir.BufferSlice) -> str:
-        return ",".join(
-            str(s) if isinstance(s, int) else f"<{type(s).__name__}>"
-            for s in sl.starts
-        )
+        return ",".join(str(s) if isinstance(s, int) else f"<{type(s).__name__}>" for s in sl.starts)
 
     def _slice_tile_grid(
         self,
@@ -1486,8 +1383,8 @@ class IsaEmitterPass:
                     f"be 4D for tile_layout-driven dst; got shape "
                     f"{tuple(parent.shape)}"
                 )
-            hbm_stride_b, hbm_stride_s, hbm_stride_h, _hbm_stride_d = (
-                _hlir.hbm_strides_for_layout(parent.shape, parent.layout)
+            hbm_stride_b, hbm_stride_s, hbm_stride_h, _hbm_stride_d = _hlir.hbm_strides_for_layout(
+                parent.shape, parent.layout
             )
             tl = dst.tile_layout
             inner_d = tl.d_inner
@@ -1499,8 +1396,12 @@ class IsaEmitterPass:
             s_tile_stride = tl.h_groups * inner_b
             d_tile_stride = tl.s_tiles * s_tile_stride
             return (
-                tl.d_tiles, tl.s_tiles, tl.h_groups, tl.logical_b,
-                tl.mlen, tl.lane_count,
+                tl.d_tiles,
+                tl.s_tiles,
+                tl.h_groups,
+                tl.logical_b,
+                tl.mlen,
+                tl.lane_count,
                 (hbm_stride_b, hbm_stride_s, hbm_stride_h),
                 (d_tile_stride, s_tile_stride, h_grp_stride, b_stride),
             )
@@ -1549,8 +1450,12 @@ class IsaEmitterPass:
             for d in pshape[-1:]:
                 hbm_row_stride = int(d)
         return (
-            d_tiles, s_tiles, 1, 1,
-            mlen, 1,
+            d_tiles,
+            s_tiles,
+            1,
+            1,
+            mlen,
+            1,
             (0, hbm_row_stride, 0),
             (d_tile_stride, s_tile_stride, 0, 0),
         )
@@ -1573,25 +1478,24 @@ class IsaEmitterPass:
             )
         dst = mod.get_buffer(_arg1)
         if not isinstance(sl, _hlir.BufferSlice):
-            raise IsaEmissionError(
-                f"dma_h2v_slice: buffer_args[0] must be BufferSlice, got "
-                f"{type(sl).__name__}"
-            )
+            raise IsaEmissionError(f"dma_h2v_slice: buffer_args[0] must be BufferSlice, got {type(sl).__name__}")
         parent = mod.get_buffer(sl.parent)
         _check_scope(parent, _scope.HBM, op.kind, "src.parent")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
 
-        (d_tiles, s_tiles, h_groups, logical_b,
-         inner_mlen, lane_count,
-         (hbm_stride_b, hbm_stride_s, hbm_stride_h),
-         (d_tile_stride, s_tile_stride, h_grp_stride, b_stride)) = (
-            self._slice_tile_grid(parent, sl, dst)
-        )
+        (
+            d_tiles,
+            s_tiles,
+            h_groups,
+            logical_b,
+            inner_mlen,
+            lane_count,
+            (hbm_stride_b, hbm_stride_s, hbm_stride_h),
+            (d_tile_stride, s_tile_stride, h_grp_stride, b_stride),
+        ) = self._slice_tile_grid(parent, sl, dst)
 
         m_off, slice_static = self._materialise_slice_offset(parent, sl)
-        base_static = parent.hbm_offset + (
-            slice_static if slice_static is not None else 0
-        )
+        base_static = parent.hbm_offset + (slice_static if slice_static is not None else 0)
 
         starts_s = self._format_starts(sl)
         self.shim.compiler.generated_code += (
@@ -1612,12 +1516,7 @@ class IsaEmitterPass:
                             + h_grp * lane_count * hbm_stride_h
                             + d_tile * inner_mlen
                         )
-                        vram_off = (
-                            d_tile * d_tile_stride
-                            + s_tile * s_tile_stride
-                            + h_grp * h_grp_stride
-                            + b * b_stride
-                        )
+                        vram_off = d_tile * d_tile_stride + s_tile * s_tile_stride + h_grp * h_grp_stride + b * b_stride
                         self.shim.compiler.generated_code += (
                             f";   tile (d={d_tile}, s={s_tile}, h={h_grp}, "
                             f"b={b}): hbm_off={hbm_off}  vram_off={vram_off}\n"
@@ -1646,9 +1545,7 @@ class IsaEmitterPass:
         sl = op.buffer_args[0]
         dst = mod.get_buffer(op.buffer_args[1])
         if not isinstance(sl, _hlir.BufferSlice):
-            raise IsaEmissionError(
-                "dma_h2m_slice: buffer_args[0] must be BufferSlice"
-            )
+            raise IsaEmissionError("dma_h2m_slice: buffer_args[0] must be BufferSlice")
         parent = mod.get_buffer(sl.parent)
         _check_scope(parent, _scope.HBM, op.kind, "src.parent")
         _check_scope(dst, _scope.MRAM, op.kind, "dst")
@@ -1662,9 +1559,11 @@ class IsaEmitterPass:
                 f"-> {dst.name}  (parent_off={static_off} elems)\n"
             )
             self.emitter.emit_hbm_tile_to_mram(
-                hbm_addr=parent.address, mram_addr=dst.address,
+                hbm_addr=parent.address,
+                mram_addr=dst.address,
                 hbm_offset=static_off,
-                hbm_scale=parent.hbm_scale_size, hbm_stride=parent.hbm_stride,
+                hbm_scale=parent.hbm_scale_size,
+                hbm_stride=parent.hbm_stride,
             )
         else:
             self.shim.compiler.generated_code += (
@@ -1672,9 +1571,11 @@ class IsaEmitterPass:
                 f"-> {dst.name}  (parent_off=gp{m_off.register} dyn)\n"
             )
             self.emitter.emit_hbm_tile_to_mram(
-                hbm_addr=parent.address, mram_addr=dst.address,
+                hbm_addr=parent.address,
+                mram_addr=dst.address,
                 hbm_offset_reg=m_off.register,
-                hbm_scale=parent.hbm_scale_size, hbm_stride=parent.hbm_stride,
+                hbm_scale=parent.hbm_scale_size,
+                hbm_stride=parent.hbm_stride,
             )
             m_off.release()
 
@@ -1690,21 +1591,23 @@ class IsaEmitterPass:
         src = mod.get_buffer(op.buffer_args[0])
         sl = op.buffer_args[1]
         if not isinstance(sl, _hlir.BufferSlice):
-            raise IsaEmissionError(
-                "dma_v2h_slice: buffer_args[1] must be BufferSlice"
-            )
+            raise IsaEmissionError("dma_v2h_slice: buffer_args[1] must be BufferSlice")
         parent = mod.get_buffer(sl.parent)
         _check_scope(src, _scope.VRAM, op.kind, "src")
         _check_scope(parent, _scope.HBM, op.kind, "dst.parent")
 
         ra = self.shim.compiler.register_allocator
 
-        (d_tiles, s_tiles, h_groups, logical_b,
-         inner_mlen, lane_count,
-         (hbm_stride_b, hbm_stride_s, hbm_stride_h),
-         (d_tile_stride, s_tile_stride, h_grp_stride, b_stride)) = (
-            self._slice_tile_grid(parent, sl, src)
-        )
+        (
+            d_tiles,
+            s_tiles,
+            h_groups,
+            logical_b,
+            inner_mlen,
+            lane_count,
+            (hbm_stride_b, hbm_stride_s, hbm_stride_h),
+            (d_tile_stride, s_tile_stride, h_grp_stride, b_stride),
+        ) = self._slice_tile_grid(parent, sl, src)
 
         m_base, static_base = self._materialise_slice_offset(parent, sl)
         is_dyn = m_base is not None
@@ -1728,12 +1631,7 @@ class IsaEmitterPass:
                             + h_grp * lane_count * hbm_stride_h
                             + d_tile * inner_mlen
                         )
-                        vram_off = (
-                            d_tile * d_tile_stride
-                            + s_tile * s_tile_stride
-                            + h_grp * h_grp_stride
-                            + b * b_stride
-                        )
+                        vram_off = d_tile * d_tile_stride + s_tile * s_tile_stride + h_grp * h_grp_stride + b * b_stride
                         tile_vram = src.address + vram_off
                         self.shim.compiler.generated_code += (
                             f";   tile (d={d_tile}, s={s_tile}, h={h_grp}, "
@@ -1748,11 +1646,11 @@ class IsaEmitterPass:
                                 tile_off_reg = ra.allocate_gp(1)[0]
                                 tile_off_owned = True
                                 self.shim.compiler.generated_code += (
-                                    f"S_ADDI_INT gp{tile_off_reg}, "
-                                    f"gp{m_base.register}, {tile_const}\n"
+                                    f"S_ADDI_INT gp{tile_off_reg}, gp{m_base.register}, {tile_const}\n"
                                 )
                             self.emitter.emit_store_tile_to_hbm(
-                                vram_addr=tile_vram, hbm_addr=parent.address,
+                                vram_addr=tile_vram,
+                                hbm_addr=parent.address,
                                 hbm_stride=parent.hbm_stride,
                                 hbm_scale_size=parent.hbm_scale_size,
                                 hbm_start_offset_reg=tile_off_reg,
@@ -1761,7 +1659,8 @@ class IsaEmitterPass:
                                 ra.free_gp([tile_off_reg])
                         else:
                             self.emitter.emit_store_tile_to_hbm(
-                                vram_addr=tile_vram, hbm_addr=parent.address,
+                                vram_addr=tile_vram,
+                                hbm_addr=parent.address,
                                 hbm_stride=parent.hbm_stride,
                                 hbm_scale_size=parent.hbm_scale_size,
                                 hbm_start_offset=base_static + tile_const,
@@ -1787,26 +1686,14 @@ class IsaEmitterPass:
         (multi-lane HW instruction spans every lane natively).
         """
         if len(op.buffer_args) != 3:
-            raise IsaEmissionError(
-                f"plena.btmm expects 3 buffer_args (regions); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"plena.btmm expects 3 buffer_args (regions); got {len(op.buffer_args)}")
         a_reg, b_reg, c_reg = op.buffer_args
         if not isinstance(a_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.btmm a: expected VramRegion, got "
-                f"{type(a_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.btmm a: expected VramRegion, got {type(a_reg).__name__}")
         if not isinstance(b_reg, _hlir.MramRegion):
-            raise IsaEmissionError(
-                f"plena.btmm b: expected MramRegion, got "
-                f"{type(b_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.btmm b: expected MramRegion, got {type(b_reg).__name__}")
         if not isinstance(c_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.btmm c: expected VramRegion, got "
-                f"{type(c_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.btmm c: expected VramRegion, got {type(c_reg).__name__}")
         lhs = mod.get_buffer(a_reg.parent)
         rhs = mod.get_buffer(b_reg.parent)
         dst = mod.get_buffer(c_reg.parent)
@@ -1847,26 +1734,14 @@ class IsaEmitterPass:
         offsets via ``_tile_layout_strides``.
         """
         if len(op.buffer_args) != 3:
-            raise IsaEmissionError(
-                f"plena.mv expects 3 buffer_args (a/b/c regions); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"plena.mv expects 3 buffer_args (a/b/c regions); got {len(op.buffer_args)}")
         a_reg, b_reg, c_reg = op.buffer_args
         if not isinstance(a_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.mv a: expected VramRegion, got "
-                f"{type(a_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.mv a: expected VramRegion, got {type(a_reg).__name__}")
         if not isinstance(b_reg, _hlir.MramRegion):
-            raise IsaEmissionError(
-                f"plena.mv b: expected MramRegion, got "
-                f"{type(b_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.mv b: expected MramRegion, got {type(b_reg).__name__}")
         if not isinstance(c_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.mv c: expected VramRegion, got "
-                f"{type(c_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.mv c: expected VramRegion, got {type(c_reg).__name__}")
         lhs = mod.get_buffer(a_reg.parent)
         rhs = mod.get_buffer(b_reg.parent)
         dst = mod.get_buffer(c_reg.parent)
@@ -1913,26 +1788,14 @@ class IsaEmitterPass:
         Region schema same as _emit_btmm; differs only in op kind.
         """
         if len(op.buffer_args) != 3:
-            raise IsaEmissionError(
-                f"plena.btmv expects 3 buffer_args (regions); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"plena.btmv expects 3 buffer_args (regions); got {len(op.buffer_args)}")
         a_reg, b_reg, c_reg = op.buffer_args
         if not isinstance(a_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.btmv a: expected VramRegion, got "
-                f"{type(a_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.btmv a: expected VramRegion, got {type(a_reg).__name__}")
         if not isinstance(b_reg, _hlir.MramRegion):
-            raise IsaEmissionError(
-                f"plena.btmv b: expected MramRegion, got "
-                f"{type(b_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.btmv b: expected MramRegion, got {type(b_reg).__name__}")
         if not isinstance(c_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.btmv c: expected VramRegion, got "
-                f"{type(c_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.btmv c: expected VramRegion, got {type(c_reg).__name__}")
         lhs = mod.get_buffer(a_reg.parent)
         rhs = mod.get_buffer(b_reg.parent)
         dst = mod.get_buffer(c_reg.parent)
@@ -1976,18 +1839,14 @@ class IsaEmitterPass:
             )
         if rhs_rows != self.shim.mlen:
             raise IsaEmissionError(
-                f"plena.mm rhs must have mlen rows; got logical 2D "
-                f"({rhs_rows}, {rhs_cols}) for buffer {rhs.name}"
+                f"plena.mm rhs must have mlen rows; got logical 2D ({rhs_rows}, {rhs_cols}) for buffer {rhs.name}"
             )
         if dst_rows != self.shim.mlen:
             raise IsaEmissionError(
-                f"plena.mm dst must have mlen rows; got logical 2D "
-                f"({dst_rows}, {dst_cols}) for buffer {dst.name}"
+                f"plena.mm dst must have mlen rows; got logical 2D ({dst_rows}, {dst_cols}) for buffer {dst.name}"
             )
         if rhs_cols != dst_cols:
-            raise IsaEmissionError(
-                f"plena.mm rhs/dst logical widths must match; got rhs={rhs_cols} dst={dst_cols}"
-            )
+            raise IsaEmissionError(f"plena.mm rhs/dst logical widths must match; got rhs={rhs_cols} dst={dst_cols}")
         # Use the hw-loop emitter (tens of static lines) instead of the
         # Python-unrolled emit_matmul (~2k lines per call). Dynamic
         # instruction count is identical; hw loops just shrink the ISA
@@ -2029,36 +1888,20 @@ class IsaEmitterPass:
                 (transpose_B, M_TMM).
         """
         if len(op.buffer_args) != 3:
-            raise IsaEmissionError(
-                f"plena.matmul expects 3 buffer_args (a/b/c regions); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"plena.matmul expects 3 buffer_args (a/b/c regions); got {len(op.buffer_args)}")
         a_reg, b_reg, c_reg = op.buffer_args
         if not isinstance(a_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.matmul a: expected VramRegion, got "
-                f"{type(a_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.matmul a: expected VramRegion, got {type(a_reg).__name__}")
         if not isinstance(b_reg, _hlir.MramRegion):
-            raise IsaEmissionError(
-                f"plena.matmul b: expected MramRegion, got "
-                f"{type(b_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.matmul b: expected MramRegion, got {type(b_reg).__name__}")
         if not isinstance(c_reg, _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"plena.matmul c: expected VramRegion, got "
-                f"{type(c_reg).__name__}"
-            )
+            raise IsaEmissionError(f"plena.matmul c: expected VramRegion, got {type(c_reg).__name__}")
         if len(op.scalar_args) != 3:
-            raise IsaEmissionError(
-                f"plena.matmul expects 3 scalar_args (a/b/c dim_roles); "
-                f"got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"plena.matmul expects 3 scalar_args (a/b/c dim_roles); got {len(op.scalar_args)}")
         a_roles, b_roles, c_roles = op.scalar_args
         if len(a_roles) != 4 or len(b_roles) != 4 or len(c_roles) != 4:
             raise IsaEmissionError(
-                f"plena.matmul dim_roles must each be 4-tuples; got "
-                f"a={a_roles!r} b={b_roles!r} c={c_roles!r}"
+                f"plena.matmul dim_roles must each be 4-tuples; got a={a_roles!r} b={b_roles!r} c={c_roles!r}"
             )
 
         lhs = mod.get_buffer(a_reg.parent)
@@ -2070,15 +1913,13 @@ class IsaEmitterPass:
 
         mlen = int(self.shim.mlen)
 
-        def _find_role_axis(roles: tuple[str, ...], role: str,
-                            operand: str) -> int | None:
+        def _find_role_axis(roles: tuple[str, ...], role: str, operand: str) -> int | None:
             hits = [i for i, r in enumerate(roles) if r == role]
             if not hits:
                 return None
             if len(hits) > 1:
                 raise IsaEmissionError(
-                    f"plena.matmul {operand}: role {role!r} appears at "
-                    f"multiple axes {hits} in roles {roles!r}"
+                    f"plena.matmul {operand}: role {role!r} appears at multiple axes {hits} in roles {roles!r}"
                 )
             return hits[0]
 
@@ -2089,40 +1930,30 @@ class IsaEmitterPass:
         b_K_axis = _find_role_axis(b_roles, "K", "b")
         b_N_axis = _find_role_axis(b_roles, "N", "b")
         for axis, name in (
-            (c_M_axis, "c.M"), (c_N_axis, "c.N"),
-            (a_M_axis, "a.M"), (a_K_axis, "a.K"),
-            (b_K_axis, "b.K"), (b_N_axis, "b.N"),
+            (c_M_axis, "c.M"),
+            (c_N_axis, "c.N"),
+            (a_M_axis, "a.M"),
+            (a_K_axis, "a.K"),
+            (b_K_axis, "b.K"),
+            (b_N_axis, "b.N"),
         ):
             if axis is None:
                 raise IsaEmissionError(
-                    f"plena.matmul: missing {name} axis in dim_roles; "
-                    f"a={a_roles!r} b={b_roles!r} c={c_roles!r}"
+                    f"plena.matmul: missing {name} axis in dim_roles; a={a_roles!r} b={b_roles!r} c={c_roles!r}"
                 )
 
         M = int(a_reg.extents[a_M_axis])
         K = int(a_reg.extents[a_K_axis])
         N = int(b_reg.extents[b_N_axis])
         if int(b_reg.extents[b_K_axis]) != K:
-            raise IsaEmissionError(
-                f"plena.matmul: a.K extent {K} != b.K extent "
-                f"{int(b_reg.extents[b_K_axis])}"
-            )
+            raise IsaEmissionError(f"plena.matmul: a.K extent {K} != b.K extent {int(b_reg.extents[b_K_axis])}")
         if int(c_reg.extents[c_M_axis]) != M:
-            raise IsaEmissionError(
-                f"plena.matmul: c.M extent {int(c_reg.extents[c_M_axis])} "
-                f"!= a.M extent {M}"
-            )
+            raise IsaEmissionError(f"plena.matmul: c.M extent {int(c_reg.extents[c_M_axis])} != a.M extent {M}")
         if int(c_reg.extents[c_N_axis]) != N:
-            raise IsaEmissionError(
-                f"plena.matmul: c.N extent {int(c_reg.extents[c_N_axis])} "
-                f"!= b.N extent {N}"
-            )
+            raise IsaEmissionError(f"plena.matmul: c.N extent {int(c_reg.extents[c_N_axis])} != b.N extent {N}")
 
         if M % mlen != 0 or K % mlen != 0:
-            raise IsaEmissionError(
-                f"plena.matmul: M ({M}) and K ({K}) must be multiples of "
-                f"MLEN ({mlen})"
-            )
+            raise IsaEmissionError(f"plena.matmul: M ({M}) and K ({K}) must be multiples of MLEN ({mlen})")
         M_tiles = M // mlen
         K_tiles = K // mlen
         # transpose_b: standard layout has B = (K, N) row-major, i.e.
@@ -2179,9 +2010,7 @@ class IsaEmitterPass:
                 # silently corrupting the offset.
                 self.shim.compiler.register_allocator.pin_gp(m.register)
                 return 0, m.register
-            raise IsaEmissionError(
-                f"plena.matmul {name} must be int or PrimExpr; got {raw!r}"
-            )
+            raise IsaEmissionError(f"plena.matmul {name} must be int or PrimExpr; got {raw!r}")
 
         # Pre-allocate the 7 scratch GPs the emitter needs and pin them
         # BEFORE materialising the dynamic offsets. Order matters: if we
@@ -2269,9 +2098,7 @@ class IsaEmitterPass:
                 f"got {type(lhs_row_offset_raw).__name__}: {lhs_row_offset_raw!r}"
             )
         if lhs_row_offset is not None and lhs_row_offset < 0:
-            raise IsaEmissionError(
-                f"plena.mm_slot lhs_row_offset must be >= 0; got {lhs_row_offset}"
-            )
+            raise IsaEmissionError(f"plena.mm_slot lhs_row_offset must be >= 0; got {lhs_row_offset}")
         if isinstance(rhs_col_offset_raw, tir.PrimExpr) and not isinstance(rhs_col_offset_raw, tir.IntImm):
             rhs_col_offset = None
             rhs_off_m = self.materializer.materialize(rhs_col_offset_raw)
@@ -2366,19 +2193,11 @@ class IsaEmitterPass:
         (f0 == 0 by convention).
         """
         if len(op.buffer_args) != 1:
-            raise IsaEmissionError(
-                f"v_zero expects 1 buffer_arg (dst region); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"v_zero expects 1 buffer_arg (dst region); got {len(op.buffer_args)}")
         if not isinstance(op.buffer_args[0], _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"v_zero dst: expected VramRegion, got "
-                f"{type(op.buffer_args[0]).__name__}"
-            )
+            raise IsaEmissionError(f"v_zero dst: expected VramRegion, got {type(op.buffer_args[0]).__name__}")
         if op.scalar_args:
-            raise IsaEmissionError(
-                f"v_zero expects 0 scalar_args; got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"v_zero expects 0 scalar_args; got {len(op.scalar_args)}")
         dst_region: _hlir.VramRegion = op.buffer_args[0]
         dst = mod.get_buffer(dst_region.parent)
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
@@ -2389,20 +2208,17 @@ class IsaEmitterPass:
         )
         for d_off, _ in self._vram_region_iter_chunks(dst, dst_region):
             dst_addr = tir.Add(
-                tir.IntImm("int32", int(dst.address)), d_off,
+                tir.IntImm("int32", int(dst.address)),
+                d_off,
             )
             m_dst = self.materializer.materialize(dst_addr)
             self.shim.compiler.generated_code += m_dst.isa
             try:
-                self.shim.compiler.generated_code += (
-                    f"V_MUL_VF gp{m_dst.register}, gp{m_dst.register}, "
-                    f"f0, 0\n"
-                )
+                self.shim.compiler.generated_code += f"V_MUL_VF gp{m_dst.register}, gp{m_dst.register}, f0, 0\n"
             finally:
                 m_dst.release()
 
-    def _emit_v_binary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
-                       *, binary_op: str) -> None:
+    def _emit_v_binary(self, mod: _hlir.HLIRModule, op: _hlir.Op, *, binary_op: str) -> None:
         """Region-based vector binary op:
         ``dst[region] = lhs[region] <binop> rhs[region]`` elementwise.
 
@@ -2428,21 +2244,14 @@ class IsaEmitterPass:
         }
         opcode = op_to_insn[binary_op]
         if len(op.buffer_args) != 3:
-            raise IsaEmissionError(
-                f"{op.kind} expects 3 buffer_args (lhs/rhs/dst regions); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"{op.kind} expects 3 buffer_args (lhs/rhs/dst regions); got {len(op.buffer_args)}")
         for slot, name in enumerate(("lhs", "rhs", "dst")):
             if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
                 raise IsaEmissionError(
-                    f"{op.kind} {name}: expected VramRegion, got "
-                    f"{type(op.buffer_args[slot]).__name__}"
+                    f"{op.kind} {name}: expected VramRegion, got {type(op.buffer_args[slot]).__name__}"
                 )
         if op.scalar_args:
-            raise IsaEmissionError(
-                f"{op.kind} expects 0 scalar_args (region carries shape); "
-                f"got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"{op.kind} expects 0 scalar_args (region carries shape); got {len(op.scalar_args)}")
         lhs_region: _hlir.VramRegion = op.buffer_args[0]
         rhs_region: _hlir.VramRegion = op.buffer_args[1]
         dst_region: _hlir.VramRegion = op.buffer_args[2]
@@ -2452,8 +2261,9 @@ class IsaEmitterPass:
         _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
         _check_scope(rhs, _scope.VRAM, op.kind, "rhs")
         _check_scope(dst, _scope.VRAM, op.kind, "dst")
-        if (tuple(lhs_region.extents) != tuple(dst_region.extents)
-                or tuple(rhs_region.extents) != tuple(dst_region.extents)):
+        if tuple(lhs_region.extents) != tuple(dst_region.extents) or tuple(rhs_region.extents) != tuple(
+            dst_region.extents
+        ):
             raise IsaEmissionError(
                 f"{op.kind}: lhs/rhs/dst region extents must match; "
                 f"lhs={tuple(lhs_region.extents)} "
@@ -2475,17 +2285,18 @@ class IsaEmitterPass:
         lhs_iter = self._vram_region_iter_chunks(lhs, lhs_region)
         rhs_iter = self._vram_region_iter_chunks(rhs, rhs_region)
         dst_iter = self._vram_region_iter_chunks(dst, dst_region)
-        for (l_off, _), (r_off, _), (d_off, _) in zip(
-            lhs_iter, rhs_iter, dst_iter
-        ):
+        for (l_off, _), (r_off, _), (d_off, _) in zip(lhs_iter, rhs_iter, dst_iter):
             lhs_addr = tir.Add(
-                tir.IntImm("int32", int(lhs.address)), l_off,
+                tir.IntImm("int32", int(lhs.address)),
+                l_off,
             )
             rhs_addr = tir.Add(
-                tir.IntImm("int32", int(rhs.address)), r_off,
+                tir.IntImm("int32", int(rhs.address)),
+                r_off,
             )
             dst_addr = tir.Add(
-                tir.IntImm("int32", int(dst.address)), d_off,
+                tir.IntImm("int32", int(dst.address)),
+                d_off,
             )
             m_lhs = self.materializer.materialize(lhs_addr)
             self.shim.compiler.generated_code += m_lhs.isa
@@ -2495,8 +2306,7 @@ class IsaEmitterPass:
             self.shim.compiler.generated_code += m_dst.isa
             try:
                 self.shim.compiler.generated_code += (
-                    f"{opcode} gp{m_dst.register}, gp{m_lhs.register}, "
-                    f"gp{m_rhs.register}, 0\n"
+                    f"{opcode} gp{m_dst.register}, gp{m_lhs.register}, gp{m_rhs.register}, 0\n"
                 )
             finally:
                 m_dst.release()
@@ -2513,8 +2323,7 @@ class IsaEmitterPass:
     def _emit_v_mul(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_v_binary(mod, op, binary_op="mul")
 
-    def _emit_v_unary(self, mod: _hlir.HLIRModule, op: _hlir.Op,
-                      *, opcode: str) -> None:
+    def _emit_v_unary(self, mod: _hlir.HLIRModule, op: _hlir.Op, *, opcode: str) -> None:
         """Region-based vector unary op: ``dst[region] = op(src[region])``.
 
         Schema (region layer):
@@ -2524,21 +2333,14 @@ class IsaEmitterPass:
             scalar_args = []
         """
         if len(op.buffer_args) != 2:
-            raise IsaEmissionError(
-                f"{op.kind} expects 2 buffer_args (src/dst regions); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"{op.kind} expects 2 buffer_args (src/dst regions); got {len(op.buffer_args)}")
         for slot, name in enumerate(("src", "dst")):
             if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
                 raise IsaEmissionError(
-                    f"{op.kind} {name}: expected VramRegion, got "
-                    f"{type(op.buffer_args[slot]).__name__}"
+                    f"{op.kind} {name}: expected VramRegion, got {type(op.buffer_args[slot]).__name__}"
                 )
         if op.scalar_args:
-            raise IsaEmissionError(
-                f"{op.kind} expects 0 scalar_args (region carries shape); "
-                f"got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"{op.kind} expects 0 scalar_args (region carries shape); got {len(op.scalar_args)}")
         src_region: _hlir.VramRegion = op.buffer_args[0]
         dst_region: _hlir.VramRegion = op.buffer_args[1]
         src = mod.get_buffer(src_region.parent)
@@ -2561,19 +2363,19 @@ class IsaEmitterPass:
         dst_iter = self._vram_region_iter_chunks(dst, dst_region)
         for (s_off, _), (d_off, _) in zip(src_iter, dst_iter):
             src_addr = tir.Add(
-                tir.IntImm("int32", int(src.address)), s_off,
+                tir.IntImm("int32", int(src.address)),
+                s_off,
             )
             dst_addr = tir.Add(
-                tir.IntImm("int32", int(dst.address)), d_off,
+                tir.IntImm("int32", int(dst.address)),
+                d_off,
             )
             m_src = self.materializer.materialize(src_addr)
             self.shim.compiler.generated_code += m_src.isa
             m_dst = self.materializer.materialize(dst_addr)
             self.shim.compiler.generated_code += m_dst.isa
             try:
-                self.shim.compiler.generated_code += (
-                    f"{opcode} gp{m_dst.register}, gp{m_src.register}, 0\n"
-                )
+                self.shim.compiler.generated_code += f"{opcode} gp{m_dst.register}, gp{m_src.register}, 0\n"
             finally:
                 m_dst.release()
                 m_src.release()
@@ -2598,11 +2400,12 @@ class IsaEmitterPass:
         FPRAM destination address (allowed to be a PrimExpr — the
         materialiser folds in the fragment's allocated FPRAM base)."""
         if len(op.scalar_args) != 1:
-            raise IsaEmissionError(
-                f"{op.kind} expects 1 scalar address arg, got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"{op.kind} expects 1 scalar address arg, got {len(op.scalar_args)}")
         dst_addr_expr = self._resolve_fp_scalar_addr_arg(
-            mod, op.scalar_args[0], op.kind, "dst",
+            mod,
+            op.scalar_args[0],
+            op.kind,
+            "dst",
         )
         m_dst = self.materializer.materialize(dst_addr_expr)
         self.shim.compiler.generated_code += m_dst.isa
@@ -2642,12 +2445,20 @@ class IsaEmitterPass:
     # for narrow packed D tiles.
     def _emit_row_reduce_max_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_row_scalar_op_at(
-            mod, op, row_op="reduce_max", reduce=True, masked=True,
+            mod,
+            op,
+            row_op="reduce_max",
+            reduce=True,
+            masked=True,
         )
 
     def _emit_row_reduce_sum_at(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_row_scalar_op_at(
-            mod, op, row_op="reduce_sum", reduce=True, masked=True,
+            mod,
+            op,
+            row_op="reduce_sum",
+            reduce=True,
+            masked=True,
         )
 
     # Single-row VRAM × FPRAM-scalar ops. One HLIR op = one HW
@@ -2764,12 +2575,14 @@ class IsaEmitterPass:
                     acc = tir.Add(acc, t)
                 return acc
 
-            base_off = _sum_s([
-                _mul_s(_start_plus_simple(0), row_strides[0]),
-                _mul_s(_start_plus_simple(1), row_strides[1]),
-                _mul_s(_start_plus_simple(2), row_strides[2]),
-                _start_plus_simple(3),
-            ])
+            base_off = _sum_s(
+                [
+                    _mul_s(_start_plus_simple(0), row_strides[0]),
+                    _mul_s(_start_plus_simple(1), row_strides[1]),
+                    _mul_s(_start_plus_simple(2), row_strides[2]),
+                    _start_plus_simple(3),
+                ]
+            )
             fp_elems = 0
             for c in range(chunks):
                 if c == 0:
@@ -2787,17 +2600,22 @@ class IsaEmitterPass:
             # uniformly without a separate code path.
             b_sz, s_sz, h_sz, d_sz = (int(x) for x in parent.shape)
             tl = _hlir.TileLayout(
-                logical_b=b_sz, logical_s=s_sz, logical_h=h_sz, logical_d=d_sz,
-                d_tiles=1, s_tiles=1, h_groups=1,
-                mlen=self.shim.mlen, lane_count=1,
+                logical_b=b_sz,
+                logical_s=s_sz,
+                logical_h=h_sz,
+                logical_d=d_sz,
+                d_tiles=1,
+                s_tiles=1,
+                h_groups=1,
+                mlen=self.shim.mlen,
+                lane_count=1,
                 d_inner=d_sz if d_sz > 0 else self.shim.mlen,
             )
 
         eb, es, eh, ed = (int(x) for x in extents)
         if ed % tl.d_inner != 0:
             raise IsaEmissionError(
-                f"VramRegion(parent={region.parent!r}): innermost extent "
-                f"ed={ed} not a multiple of D_INNER={tl.d_inner}"
+                f"VramRegion(parent={region.parent!r}): innermost extent ed={ed} not a multiple of D_INNER={tl.d_inner}"
             )
         d_chunks = ed // tl.d_inner
 
@@ -2877,10 +2695,7 @@ class IsaEmitterPass:
             return tir.Mul(expr, tir.IntImm("int32", int(k)))
 
         def _sum(terms):
-            non_zero = [
-                t for t in terms
-                if not (isinstance(t, tir.IntImm) and int(t.value) == 0)
-            ]
+            non_zero = [t for t in terms if not (isinstance(t, tir.IntImm) and int(t.value) == 0)]
             if not non_zero:
                 return tir.IntImm("int32", 0)
             acc = non_zero[0]
@@ -2932,24 +2747,21 @@ class IsaEmitterPass:
         mod: _hlir.HLIRModule,
         op: _hlir.Op,
         *,
-        direction: str,                          # "v_to_fp" or "fp_to_v"
+        direction: str,  # "v_to_fp" or "fp_to_v"
     ) -> None:
         if len(op.buffer_args) != 1 or not isinstance(op.buffer_args[0], _hlir.VramRegion):
-            raise IsaEmissionError(
-                f"{op.kind}: buffer_args[0] must be VramRegion; "
-                f"got {op.buffer_args!r}"
-            )
+            raise IsaEmissionError(f"{op.kind}: buffer_args[0] must be VramRegion; got {op.buffer_args!r}")
         if len(op.scalar_args) != 1:
-            raise IsaEmissionError(
-                f"{op.kind}: expected 1 scalar arg (fp_addr); "
-                f"got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"{op.kind}: expected 1 scalar arg (fp_addr); got {len(op.scalar_args)}")
         region: _hlir.VramRegion = op.buffer_args[0]
         vram = mod.get_buffer(region.parent)
         _check_scope(vram, _scope.VRAM, op.kind, "vram")
 
         fp_addr_base = self._resolve_fp_scalar_addr_arg(
-            mod, op.scalar_args[0], op.kind, "fp",
+            mod,
+            op.scalar_args[0],
+            op.kind,
+            "fp",
         )
         opcode = "S_MAP_FP_V" if direction == "v_to_fp" else "S_MAP_V_FP"
 
@@ -2963,34 +2775,31 @@ class IsaEmitterPass:
                 tir.IntImm("int32", int(vram.address)),
                 vram_off_expr,
             )
-            fp_chunk_addr = (
-                fp_addr_base if fp_step == 0
-                else tir.Add(fp_addr_base, tir.IntImm("int32", int(fp_step)))
-            )
+            fp_chunk_addr = fp_addr_base if fp_step == 0 else tir.Add(fp_addr_base, tir.IntImm("int32", int(fp_step)))
             m_vram = self.materializer.materialize(vram_addr_expr)
             self.shim.compiler.generated_code += m_vram.isa
             m_fp = self.materializer.materialize(fp_chunk_addr)
             self.shim.compiler.generated_code += m_fp.isa
             try:
                 if direction == "v_to_fp":
-                    self.shim.compiler.generated_code += (
-                        f"{opcode} gp{m_fp.register}, gp{m_vram.register}, 0\n"
-                    )
+                    self.shim.compiler.generated_code += f"{opcode} gp{m_fp.register}, gp{m_vram.register}, 0\n"
                 else:
-                    self.shim.compiler.generated_code += (
-                        f"{opcode} gp{m_vram.register}, gp{m_fp.register}, 0\n"
-                    )
+                    self.shim.compiler.generated_code += f"{opcode} gp{m_vram.register}, gp{m_fp.register}, 0\n"
             finally:
                 m_fp.release()
                 m_vram.release()
 
     def _emit_v_fp_transfer_slice_v_to_fp(
-        self, mod: _hlir.HLIRModule, op: _hlir.Op,
+        self,
+        mod: _hlir.HLIRModule,
+        op: _hlir.Op,
     ) -> None:
         self._emit_v_fp_transfer_slice(mod, op, direction="v_to_fp")
 
     def _emit_v_fp_transfer_slice_fp_to_v(
-        self, mod: _hlir.HLIRModule, op: _hlir.Op,
+        self,
+        mod: _hlir.HLIRModule,
+        op: _hlir.Op,
     ) -> None:
         self._emit_v_fp_transfer_slice(mod, op, direction="fp_to_v")
 
@@ -3005,21 +2814,14 @@ class IsaEmitterPass:
         f0 == 0 by convention so ``src + 0`` is just src.
         """
         if len(op.buffer_args) != 2:
-            raise IsaEmissionError(
-                f"copy_v_to_v expects 2 buffer_args (src/dst regions); "
-                f"got {len(op.buffer_args)}"
-            )
+            raise IsaEmissionError(f"copy_v_to_v expects 2 buffer_args (src/dst regions); got {len(op.buffer_args)}")
         for slot, name in enumerate(("src", "dst")):
             if not isinstance(op.buffer_args[slot], _hlir.VramRegion):
                 raise IsaEmissionError(
-                    f"copy_v_to_v {name}: expected VramRegion, got "
-                    f"{type(op.buffer_args[slot]).__name__}"
+                    f"copy_v_to_v {name}: expected VramRegion, got {type(op.buffer_args[slot]).__name__}"
                 )
         if op.scalar_args:
-            raise IsaEmissionError(
-                f"copy_v_to_v expects 0 scalar_args; "
-                f"got {len(op.scalar_args)}"
-            )
+            raise IsaEmissionError(f"copy_v_to_v expects 0 scalar_args; got {len(op.scalar_args)}")
         src_region: _hlir.VramRegion = op.buffer_args[0]
         dst_region: _hlir.VramRegion = op.buffer_args[1]
         src = mod.get_buffer(src_region.parent)
@@ -3041,20 +2843,19 @@ class IsaEmitterPass:
         dst_iter = self._vram_region_iter_chunks(dst, dst_region)
         for (s_off, _), (d_off, _) in zip(src_iter, dst_iter):
             src_addr = tir.Add(
-                tir.IntImm("int32", int(src.address)), s_off,
+                tir.IntImm("int32", int(src.address)),
+                s_off,
             )
             dst_addr = tir.Add(
-                tir.IntImm("int32", int(dst.address)), d_off,
+                tir.IntImm("int32", int(dst.address)),
+                d_off,
             )
             m_src = self.materializer.materialize(src_addr)
             self.shim.compiler.generated_code += m_src.isa
             m_dst = self.materializer.materialize(dst_addr)
             self.shim.compiler.generated_code += m_dst.isa
             try:
-                self.shim.compiler.generated_code += (
-                    f"V_ADD_VF gp{m_dst.register}, gp{m_src.register}, "
-                    f"f0, 0\n"
-                )
+                self.shim.compiler.generated_code += f"V_ADD_VF gp{m_dst.register}, gp{m_src.register}, f0, 0\n"
             finally:
                 m_dst.release()
                 m_src.release()
@@ -3094,9 +2895,7 @@ class IsaEmitterPass:
         extent = op.annotations.get("extent")
         init = op.annotations.get("init", 0)
         if loop_var is None or extent is None:
-            raise IsaEmissionError(
-                f"for-op missing loop_var or extent annotation: {op!r}"
-            )
+            raise IsaEmissionError(f"for-op missing loop_var or extent annotation: {op!r}")
         if not isinstance(extent, (int, tir.IntImm)):
             raise IsaEmissionError(
                 f"for-op extent must be a compile-time integer (PLENA's "
@@ -3105,10 +2904,7 @@ class IsaEmitterPass:
                 f"at TIR-construction time."
             )
         if not isinstance(init, (int, tir.IntImm)):
-            raise IsaEmissionError(
-                f"for-op init must be a compile-time integer. Got "
-                f"{type(init).__name__}: {init!r}."
-            )
+            raise IsaEmissionError(f"for-op init must be a compile-time integer. Got {type(init).__name__}: {init!r}.")
         extent_imm = int(extent.value) if isinstance(extent, tir.IntImm) else int(extent)
         init_imm = int(init.value) if isinstance(init, tir.IntImm) else int(init)
         if loop_var in self.symbol_table:
@@ -3132,8 +2928,7 @@ class IsaEmitterPass:
         if loop_kind in ("unroll", "unrolled"):
             gp_idx = ra.allocate_gp(1)[0]
             self.shim.compiler.generated_code += (
-                f"; unroll for {loop_var.name} in "
-                f"[{init_imm}, {init_imm + extent_imm}) -- idx gp{gp_idx}\n"
+                f"; unroll for {loop_var.name} in [{init_imm}, {init_imm + extent_imm}) -- idx gp{gp_idx}\n"
             )
             self.symbol_table[loop_var] = gp_idx
             ra.pin_gp(gp_idx)
@@ -3141,15 +2936,13 @@ class IsaEmitterPass:
                 for i in range(extent_imm):
                     iter_val = init_imm + i
                     self.shim.compiler.generated_code += (
-                        f"; ... unroll iter {i} -> {loop_var.name}={iter_val}\n"
-                        f"S_ADDI_INT gp{gp_idx}, gp0, {iter_val}\n"
+                        f"; ... unroll iter {i} -> {loop_var.name}={iter_val}\nS_ADDI_INT gp{gp_idx}, gp0, {iter_val}\n"
                     )
                     for j, sub_op in enumerate(op.body or []):
                         handler = self._dispatch.get(sub_op.kind)
                         if handler is None:
                             raise IsaEmissionError(
-                                f"no ISA dispatcher for nested op kind "
-                                f"{sub_op.kind!r} inside unrolled for-loop"
+                                f"no ISA dispatcher for nested op kind {sub_op.kind!r} inside unrolled for-loop"
                             )
                         ra.push_site(f"unroll[{i}].body[{j}] {sub_op.kind}")
                         try:
@@ -3200,10 +2993,7 @@ class IsaEmitterPass:
             for j, sub_op in enumerate(op.body or []):
                 handler = self._dispatch.get(sub_op.kind)
                 if handler is None:
-                    raise IsaEmissionError(
-                        f"no ISA dispatcher for nested op kind {sub_op.kind!r} "
-                        f"inside for-loop"
-                    )
+                    raise IsaEmissionError(f"no ISA dispatcher for nested op kind {sub_op.kind!r} inside for-loop")
                 ra.push_site(f"for[{loop_var.name}].body[{j}] {sub_op.kind}")
                 try:
                     handler(mod, sub_op)
@@ -3237,10 +3027,7 @@ def _check_scope(buf: _hlir.Buffer, expected: str, op_kind: str, role: str) -> N
     # rules for each instruction) is identical. Keep `buf.scope` as the
     # original string so JSON dumps / debug output retain the global flag.
     if _scope.physical_scope(buf.scope) != expected:
-        raise IsaEmissionError(
-            f"{op_kind} {role} buffer {buf.name!r} must be in scope {expected!r}, "
-            f"got {buf.scope!r}"
-        )
+        raise IsaEmissionError(f"{op_kind} {role} buffer {buf.name!r} must be in scope {expected!r}, got {buf.scope!r}")
 
 
 __all__ = ["IsaEmissionError", "IsaEmitterPass"]

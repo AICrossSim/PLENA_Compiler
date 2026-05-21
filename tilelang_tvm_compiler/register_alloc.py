@@ -63,6 +63,7 @@ class _SpillRecord:
 class BorrowToken:
     """Opaque handle returned from ``spill_borrow``. Pass back to
     ``spill_return`` to release the borrow and reload spilled GPs."""
+
     borrowed: list[int]
     spilled: list[_SpillRecord] = field(default_factory=list)
 
@@ -142,13 +143,13 @@ class RegisterAllocator:
         replay the timeline without reconstructing it from deltas."""
         row: dict[str, object] = {
             "asm_line": self._asm_line(),
-            "site":     self._site(),
-            "event":    event,
+            "site": self._site(),
+            "event": event,
         }
         row.update(fields)
         # Snapshot pool state AFTER the event, so a reader can compare
         # consecutive rows to spot leaks / double-frees / pinning bugs.
-        row["free"]   = ",".join(str(r) for r in self._gp_free)
+        row["free"] = ",".join(str(r) for r in self._gp_free)
         row["in_use"] = ",".join(str(r) for r in self._gp_in_use)
         row["pinned"] = ",".join(str(r) for r in sorted(self._pinned_gp))
         self._trace.append(row)
@@ -226,10 +227,7 @@ class RegisterAllocator:
         for r in candidates:
             slot = self._claim_spill_slot()
             addr = SPILL_BASE + slot
-            self.compiler.generated_code += (
-                f"; auto-spill gp{r} -> intram[{addr}]\n"
-                f"S_ST_INT gp{r}, gp0, {addr}\n"
-            )
+            self.compiler.generated_code += f"; auto-spill gp{r} -> intram[{addr}]\nS_ST_INT gp{r}, gp0, {addr}\n"
             self._gp_in_use.remove(r)
             self._gp_free.insert(0, r)
             # Record the spill keyed by the register number — when the
@@ -237,7 +235,10 @@ class RegisterAllocator:
             # reload its contents into the same physical GP.
             self._auto_spills_by_borrow[r] = _SpillRecord(orig_reg=r, slot=slot)
             self._record(
-                "auto_spill", regs=str(r), slot=slot, addr=addr,
+                "auto_spill",
+                regs=str(r),
+                slot=slot,
+                addr=addr,
             )
 
     def free_gp(self, regs: Iterable[int]) -> None:
@@ -262,15 +263,17 @@ class RegisterAllocator:
                 addr = SPILL_BASE + rec.slot
                 if self.compiler is not None:
                     self.compiler.generated_code += (
-                        f"; auto-reload gp{r} <- intram[{addr}]\n"
-                        f"S_LD_INT gp{r}, gp0, {addr}\n"
+                        f"; auto-reload gp{r} <- intram[{addr}]\nS_LD_INT gp{r}, gp0, {addr}\n"
                     )
                 self._release_spill_slot(rec.slot)
                 # Reg goes back to in-use (its outer-scope owner still
                 # holds it). Don't push to free pool.
                 self._gp_in_use.append(r)
                 self._record(
-                    "auto_reload", regs=str(r), slot=rec.slot, addr=addr,
+                    "auto_reload",
+                    regs=str(r),
+                    slot=rec.slot,
+                    addr=addr,
                 )
                 continue
             self._gp_free.insert(0, r)
@@ -326,21 +329,24 @@ class RegisterAllocator:
             for r in candidates:
                 slot = self._claim_spill_slot()
                 addr = SPILL_BASE + slot
-                compiler.generated_code += (
-                    f"; spill gp{r} -> intram[{addr}]\n"
-                    f"S_ST_INT gp{r}, gp0, {addr}\n"
-                )
+                compiler.generated_code += f"; spill gp{r} -> intram[{addr}]\nS_ST_INT gp{r}, gp0, {addr}\n"
                 spilled.append(_SpillRecord(orig_reg=r, slot=slot))
                 self._gp_in_use.remove(r)
                 self._gp_free.insert(0, r)
                 self._record(
-                    "borrow_spill", regs=str(r), slot=slot, addr=addr,
+                    "borrow_spill",
+                    regs=str(r),
+                    slot=slot,
+                    addr=addr,
                 )
 
         borrowed = self.allocate_gp(n)
-        self._record("spill_borrow", n=n,
-                     regs=",".join(str(r) for r in borrowed),
-                     spilled=",".join(str(s.orig_reg) for s in spilled))
+        self._record(
+            "spill_borrow",
+            n=n,
+            regs=",".join(str(r) for r in borrowed),
+            spilled=",".join(str(s.orig_reg) for s in spilled),
+        )
         return borrowed, BorrowToken(borrowed=borrowed, spilled=spilled)
 
     def spill_return(self, token: BorrowToken, *, compiler) -> None:
@@ -360,13 +366,14 @@ class RegisterAllocator:
             self._gp_in_use.append(rec.orig_reg)
             addr = SPILL_BASE + rec.slot
             compiler.generated_code += (
-                f"; reload gp{rec.orig_reg} <- intram[{addr}]\n"
-                f"S_LD_INT gp{rec.orig_reg}, gp0, {addr}\n"
+                f"; reload gp{rec.orig_reg} <- intram[{addr}]\nS_LD_INT gp{rec.orig_reg}, gp0, {addr}\n"
             )
             self._release_spill_slot(rec.slot)
             self._record(
-                "borrow_reload", regs=str(rec.orig_reg),
-                slot=rec.slot, addr=addr,
+                "borrow_reload",
+                regs=str(rec.orig_reg),
+                slot=rec.slot,
+                addr=addr,
             )
 
     def _claim_spill_slot(self) -> int:
@@ -375,8 +382,7 @@ class RegisterAllocator:
                 self._spill_slots_in_use[i] = True
                 return i
         raise RegisterExhausted(
-            f"spill slots exhausted ({SPILL_SLOTS} used). Bump SPILL_SLOTS "
-            f"or reduce simultaneous register pressure."
+            f"spill slots exhausted ({SPILL_SLOTS} used). Bump SPILL_SLOTS or reduce simultaneous register pressure."
         )
 
     def _release_spill_slot(self, slot: int) -> None:
@@ -398,8 +404,7 @@ class RegisterAllocator:
                 self._record("claim_idx_slot", slot=i, addr=IDX_BASE + i)
                 return IDX_BASE + i
         raise RegisterExhausted(
-            f"idx slots exhausted ({IDX_SLOTS} used). Bump IDX_SLOTS or "
-            f"reduce simultaneous loop nesting depth."
+            f"idx slots exhausted ({IDX_SLOTS} used). Bump IDX_SLOTS or reduce simultaneous loop nesting depth."
         )
 
     def release_idx_slot(self, addr: int) -> None:
@@ -416,13 +421,13 @@ class RegisterAllocator:
     # ------------------------------------------------------------------
     def allocate_addr(self, n: int) -> list[int]:
         if n > len(self._addr_free):
-            raise RegisterExhausted(
-                f"requested {n} addr registers but only {len(self._addr_free)} free"
-            )
+            raise RegisterExhausted(f"requested {n} addr registers but only {len(self._addr_free)} free")
         out = self._addr_free[:n]
         self._addr_free = self._addr_free[n:]
         self._record(
-            "allocate_addr", n=n, regs=",".join(f"a{r}" for r in out),
+            "allocate_addr",
+            n=n,
+            regs=",".join(f"a{r}" for r in out),
         )
         return out
 

@@ -45,7 +45,8 @@ def _subst_expr(expr, mapping: dict[tir.Var, tir.PrimExpr]):
         return tir.Cast(expr.dtype, _subst_expr(expr.value, mapping))
     if isinstance(expr, tir.Call):
         return tir.Call(
-            expr.dtype, expr.op,
+            expr.dtype,
+            expr.op,
             [_subst_expr(a, mapping) for a in expr.args],
         )
     if isinstance(expr, tir.BufferLoad):
@@ -91,7 +92,9 @@ def _walk(stmt, mapping: dict[tir.Var, tir.PrimExpr]):
         )
     if isinstance(stmt, tir.Block):
         return tir.Block(
-            iter_vars=stmt.iter_vars, reads=stmt.reads, writes=stmt.writes,
+            iter_vars=stmt.iter_vars,
+            reads=stmt.reads,
+            writes=stmt.writes,
             name_hint=stmt.name_hint,
             body=_walk(stmt.body, mapping),
             init=_walk(stmt.init, mapping) if stmt.init is not None else None,
@@ -147,9 +150,7 @@ def _walk(stmt, mapping: dict[tir.Var, tir.PrimExpr]):
             _walk(stmt.body, mapping),
             stmt.annotations,
         )
-    raise InlineLetStmtsError(
-        f"unhandled stmt type {type(stmt).__name__}: {stmt!r}"
-    )
+    raise InlineLetStmtsError(f"unhandled stmt type {type(stmt).__name__}: {stmt!r}")
 
 
 def run(func: tir.PrimFunc) -> tir.PrimFunc:

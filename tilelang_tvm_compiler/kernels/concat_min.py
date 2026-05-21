@@ -80,27 +80,23 @@ def make_concat_min(
             # A -> first a_dim columns of Y.
             for blk in T.serial(a_blocks):
                 T.copy(
-                    A_hbm[0, s_block * rows : (s_block + 1) * rows,
-                          0, blk * MLEN : (blk + 1) * MLEN],
+                    A_hbm[0, s_block * rows : (s_block + 1) * rows, 0, blk * MLEN : (blk + 1) * MLEN],
                     A_sh,
                 )
                 T.copy(
                     A_sh,
-                    Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                          0, blk * MLEN : (blk + 1) * MLEN],
+                    Y_hbm[0, s_block * rows : (s_block + 1) * rows, 0, blk * MLEN : (blk + 1) * MLEN],
                 )
 
             # B -> next b_dim columns of Y (shifted by a_dim).
             for blk in T.serial(b_blocks):
                 T.copy(
-                    B_hbm[0, s_block * rows : (s_block + 1) * rows,
-                          0, blk * MLEN : (blk + 1) * MLEN],
+                    B_hbm[0, s_block * rows : (s_block + 1) * rows, 0, blk * MLEN : (blk + 1) * MLEN],
                     B_sh,
                 )
                 T.copy(
                     B_sh,
-                    Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                          0, a_dim + blk * MLEN : a_dim + (blk + 1) * MLEN],
+                    Y_hbm[0, s_block * rows : (s_block + 1) * rows, 0, a_dim + blk * MLEN : a_dim + (blk + 1) * MLEN],
                 )
 
     lowered = concat_min

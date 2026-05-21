@@ -62,12 +62,25 @@ from __future__ import annotations
 from tvm import tir
 
 from ..ir import (
-    BinOp, UnaryOp, ReduceOp,
-    AxisRole, AxisInfo,
-    BufferDef, BufferRef, Slice, VarRef,
-    Elementwise, Broadcast, Reduce,
-    Gemm, Dma, RawStore, For, MidFunc,
-    ParallelAxis, ParallelKind,
+    BinOp,
+    UnaryOp,
+    ReduceOp,
+    AxisRole,
+    AxisInfo,
+    BufferDef,
+    BufferRef,
+    Slice,
+    VarRef,
+    Elementwise,
+    Broadcast,
+    Reduce,
+    Gemm,
+    Dma,
+    RawStore,
+    For,
+    MidFunc,
+    ParallelAxis,
+    ParallelKind,
 )
 
 
@@ -130,9 +143,7 @@ _active_registry: _VarRegistry | None = None
 def _vref(var) -> VarRef:
     """Canonical ``VarRef`` for ``var`` in the active fold call."""
     if _active_registry is None:
-        raise FoldError(
-            "_vref called outside a fold ``run`` — registry not active"
-        )
+        raise FoldError("_vref called outside a fold ``run`` — registry not active")
     return _active_registry.ref(var)
 
 
@@ -140,6 +151,7 @@ def _assert_no_str_in_indices(stmts) -> None:
     """Walk ``stmts`` and assert no BufferRef.indices entry is a bare
     ``str``. Bare-string indices were the pre-VarRef cheat; fold output
     must be VarRef-only."""
+
     def visit_ref(ref: BufferRef) -> None:
         for i, idx in enumerate(ref.indices):
             _check_idx(idx, ref.buffer.name, i)
@@ -238,10 +250,7 @@ def _shape_ints(buf: tir.Buffer) -> list[int]:
         elif isinstance(d, int):
             out.append(int(d))
         else:
-            raise FoldError(
-                f"buffer {buf.name!r} has symbolic dim {d!r}; mid_ir is "
-                f"int-shape-only at this stage"
-            )
+            raise FoldError(f"buffer {buf.name!r} has symbolic dim {d!r}; mid_ir is int-shape-only at this stage")
     return out
 
 
@@ -312,21 +321,22 @@ def _index_expr(expr) -> int | VarRef | dict:
     if isinstance(expr, tir.Ramp):
         return {
             "op": "ramp",
-            "args": [_index_expr(expr.base), _index_expr(expr.stride),
-                     int(expr.lanes)],
+            "args": [_index_expr(expr.base), _index_expr(expr.stride), int(expr.lanes)],
         }
-    raise FoldError(
-        f"unsupported index expression type {type(expr).__name__}: {expr!r}"
-    )
+    raise FoldError(f"unsupported index expression type {type(expr).__name__}: {expr!r}")
 
 
 def _is_full_range_ramp_for_dim(idx, dim_extent: int) -> bool:
     """True if ``idx`` is a Ramp(0, 1, dim_extent) — equivalent to a
     whole-axis Slice on a buffer dim of size ``dim_extent``."""
     if isinstance(idx, tir.Ramp):
-        if (isinstance(idx.base, tir.IntImm) and int(idx.base.value) == 0
-                and isinstance(idx.stride, tir.IntImm) and int(idx.stride.value) == 1
-                and int(idx.lanes) == dim_extent):
+        if (
+            isinstance(idx.base, tir.IntImm)
+            and int(idx.base.value) == 0
+            and isinstance(idx.stride, tir.IntImm)
+            and int(idx.stride.value) == 1
+            and int(idx.lanes) == dim_extent
+        ):
             return True
     return False
 
@@ -336,8 +346,7 @@ def _is_full_range_ramp_for_dim(idx, dim_extent: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _region_to_ref(call: tir.Call,
-                   buf_table: dict[str, BufferDef]) -> BufferRef:
+def _region_to_ref(call: tir.Call, buf_table: dict[str, BufferDef]) -> BufferRef:
     """Convert ``tl.tileop.region(BufferLoad(buf, [starts]), mode, *extents)``
     into a BufferRef.
 
@@ -373,8 +382,7 @@ def _region_to_ref(call: tir.Call,
             dim_extent = int(buf_def.shape[axis]) if axis < len(buf_def.shape) else None
             if isinstance(idx, tir.IntImm) and int(idx.value) == 0:
                 indices.append(Slice())
-            elif (dim_extent is not None
-                    and _is_full_range_ramp_for_dim(idx, dim_extent)):
+            elif dim_extent is not None and _is_full_range_ramp_for_dim(idx, dim_extent):
                 indices.append(Slice())
             else:
                 indices.append(_index_expr(idx))
@@ -389,9 +397,7 @@ def _region_to_ref(call: tir.Call,
     starts = list(load.indices)
     extents = list(args[2:])  # args[1] is mode
     if len(starts) != len(extents):
-        raise FoldError(
-            f"region rank mismatch: starts={len(starts)} extents={len(extents)}"
-        )
+        raise FoldError(f"region rank mismatch: starts={len(starts)} extents={len(extents)}")
     # Reconcile to a BufferDef (the buffer may have been seen via
     # decl_buffer here for the first time).
     buf_def = buf_table.get(load.buffer.name)
@@ -401,10 +407,7 @@ def _region_to_ref(call: tir.Call,
     indices: list = []
     for axis, (s, e) in enumerate(zip(starts, extents)):
         if not isinstance(e, tir.IntImm):
-            raise FoldError(
-                f"region extent on axis {axis} of {buf_def.name!r} is "
-                f"non-static: {e!r}"
-            )
+            raise FoldError(f"region extent on axis {axis} of {buf_def.name!r} is non-static: {e!r}")
         e_int = int(e.value)
         # Slice when extent matches buffer dim AND the start is 0
         # OR start is a full-range Ramp (vectorized whole-axis load).
@@ -417,10 +420,12 @@ def _region_to_ref(call: tir.Call,
             # via a compound "ranged_slice" expression so downstream passes
             # (to_plena _ref_extents / _render_idx) can recover the tile
             # width. Keeps the mid_ir IndexExpr taxonomy unchanged.
-            indices.append({
-                "op": "ranged_slice",
-                "args": [_index_expr(s), e_int],
-            })
+            indices.append(
+                {
+                    "op": "ranged_slice",
+                    "args": [_index_expr(s), e_int],
+                }
+            )
         else:
             indices.append(_index_expr(s))
     return BufferRef(buffer=buf_def, indices=indices)
@@ -473,6 +478,7 @@ def _peel_cast_roundtrip(expr, target_dtype: str | None = None):
     inner_dtype = getattr(inner, "dtype", None)
     if inner_dtype is not None and str(inner_dtype) == target:
         return inner
+
     # Rule 3: widen-op-narrow over arithmetic. Peel each operand and,
     # if every operand is either a leaf already in ``target`` or a
     # ``Cast(_, x)`` from ``target``, rebuild the arith expression at
@@ -542,8 +548,7 @@ def _try_unary_call(node) -> UnaryOp | None:
 # ---------------------------------------------------------------------------
 
 
-def _store_to_ref(store: tir.BufferStore,
-                  buf_table: dict[str, BufferDef]) -> BufferRef:
+def _store_to_ref(store: tir.BufferStore, buf_table: dict[str, BufferDef]) -> BufferRef:
     name = store.buffer.name
     if name not in buf_table:
         buf_table[name] = _buffer_def(store.buffer, default_scope="shared")
@@ -553,8 +558,7 @@ def _store_to_ref(store: tir.BufferStore,
     )
 
 
-def _load_to_ref(load: tir.BufferLoad,
-                 buf_table: dict[str, BufferDef]) -> BufferRef:
+def _load_to_ref(load: tir.BufferLoad, buf_table: dict[str, BufferDef]) -> BufferRef:
     name = load.buffer.name
     if name not in buf_table:
         buf_table[name] = _buffer_def(load.buffer, default_scope="shared")
@@ -564,8 +568,7 @@ def _load_to_ref(load: tir.BufferLoad,
     )
 
 
-def _try_fold_parallel(for_stmt: tir.For,
-                       buf_table: dict[str, BufferDef]) -> Elementwise | None:
+def _try_fold_parallel(for_stmt: tir.For, buf_table: dict[str, BufferDef]) -> Elementwise | None:
     """``for i in T.Parallel(N): dst[..., i] = expr(loads_at_..._i)``
     → Elementwise.
 
@@ -577,10 +580,13 @@ def _try_fold_parallel(for_stmt: tir.For,
     body = for_stmt.body
     if not isinstance(body, tir.BufferStore):
         return None
-    extent = (int(for_stmt.extent.value)
-              if isinstance(for_stmt.extent, tir.IntImm) else 1)
+    extent = int(for_stmt.extent.value) if isinstance(for_stmt.extent, tir.IntImm) else 1
     return _try_fold_store(
-        body, for_stmt.loop_var, buf_table, axis=-1, size=extent,
+        body,
+        for_stmt.loop_var,
+        buf_table,
+        axis=-1,
+        size=extent,
     )
 
 
@@ -593,7 +599,7 @@ def _index_exprs_equal(a, b) -> bool:
     if isinstance(a, int) and isinstance(b, int):
         return a == b
     if isinstance(a, VarRef) and isinstance(b, VarRef):
-        return a == b   # identity-based equality
+        return a == b  # identity-based equality
     if isinstance(a, dict) and isinstance(b, dict):
         if a.get("op") != b.get("op"):
             return False
@@ -604,11 +610,12 @@ def _index_exprs_equal(a, b) -> bool:
     return False
 
 
-def _wrap_src(load: tir.BufferLoad,
-              dst_indices: list,
-              buf_table: dict[str, BufferDef],
-              dst_buf: BufferDef | None = None,
-              ) -> BufferRef | Broadcast | None:
+def _wrap_src(
+    load: tir.BufferLoad,
+    dst_indices: list,
+    buf_table: dict[str, BufferDef],
+    dst_buf: BufferDef | None = None,
+) -> BufferRef | Broadcast | None:
     """Convert a BufferLoad src into either a plain BufferRef (when
     its index tuple matches dst's exactly) or a Broadcast (when it's
     a prefix — fewer trailing dims).
@@ -646,15 +653,14 @@ def _wrap_src(load: tir.BufferLoad,
             return src_ref
     elif len(src_idx) < len(dst_indices):
         # Broadcast: src must equal a prefix of dst.
-        prefix = dst_indices[:len(src_idx)]
+        prefix = dst_indices[: len(src_idx)]
         if all(_index_exprs_equal(s, p) for s, p in zip(src_idx, prefix)):
             broadcast_dims = list(range(len(src_idx), len(dst_indices)))
             return Broadcast(src=src_ref, broadcast_dims=broadcast_dims)
     return None
 
 
-def _to_raw_store(store: tir.BufferStore,
-                  buf_table: dict[str, BufferDef]) -> RawStore:
+def _to_raw_store(store: tir.BufferStore, buf_table: dict[str, BufferDef]) -> RawStore:
     """Wrap a BufferStore as an opaque RawStore.
 
     The ``dst`` BufferRef is computed from the store's indices via the
@@ -668,9 +674,7 @@ def _to_raw_store(store: tir.BufferStore,
     )
 
 
-def _axes_for_ref(ref: BufferRef,
-                  simd_axis: int | None,
-                  simd_size: int) -> list[AxisInfo]:
+def _axes_for_ref(ref: BufferRef, simd_axis: int | None, simd_size: int) -> list[AxisInfo]:
     """Build per-axis AxisInfo for a BufferRef given the op's SIMD context.
 
     Each axis carries its **buffer-declared extent** plus a role:
@@ -692,10 +696,7 @@ def _axes_for_ref(ref: BufferRef,
     """
     out: list[AxisInfo] = []
     rank = len(ref.indices)
-    normalised_simd = (
-        simd_axis + rank if (simd_axis is not None and simd_axis < 0)
-        else simd_axis
-    )
+    normalised_simd = simd_axis + rank if (simd_axis is not None and simd_axis < 0) else simd_axis
     for dim, extent_decl in enumerate(ref.buffer.shape):
         full = int(extent_decl)
         if normalised_simd is not None and dim == normalised_simd:
@@ -726,10 +727,7 @@ def _axes_for_broadcast_src(
     # dim from outside).
     rank_src = len(bc.src.indices)
     if simd_axis is None:
-        return [
-            AxisInfo(role=AxisRole.SIMD, extent=int(d))
-            for d in bc.src.buffer.shape
-        ]
+        return [AxisInfo(role=AxisRole.SIMD, extent=int(d)) for d in bc.src.buffer.shape]
     # Map dst-side simd index → src-side index by counting how many
     # broadcast_dims sit at or before it.
     bd_set = set(bc.broadcast_dims)
@@ -745,11 +743,13 @@ def _axes_for_broadcast_src(
     return _axes_for_ref(bc.src, src_simd, simd_size)
 
 
-def _try_fold_store(store: tir.BufferStore,
-                    parallel_var: tir.Var | None,
-                    buf_table: dict[str, BufferDef],
-                    axis: int | None = None,
-                    size: int = 1) -> Elementwise | None:
+def _try_fold_store(
+    store: tir.BufferStore,
+    parallel_var: tir.Var | None,
+    buf_table: dict[str, BufferDef],
+    axis: int | None = None,
+    size: int = 1,
+) -> Elementwise | None:
     """Recognise the RHS of ``store`` as a mid_ir-expressible
     Elementwise. Returns None on no-match — caller is responsible for
     falling back to ``RawStore`` rather than raising. Never raises.
@@ -778,9 +778,7 @@ def _try_fold_store(store: tir.BufferStore,
         return (
             _axes_for_ref(dst, axis, size),
             [
-                _axes_for_broadcast_src(s, axis, size)
-                if isinstance(s, Broadcast)
-                else _axes_for_ref(s, axis, size)
+                _axes_for_broadcast_src(s, axis, size) if isinstance(s, Broadcast) else _axes_for_ref(s, axis, size)
                 for s in srcs
             ],
         )
@@ -792,9 +790,13 @@ def _try_fold_store(store: tir.BufferStore,
             return None
         dst_axes, src_axes = _build_axes([])
         return Elementwise(
-            dst=dst, srcs=[], op=UnaryOp.COPY,
-            axis=axis, size=size,
-            dst_axes=dst_axes, src_axes=src_axes,
+            dst=dst,
+            srcs=[],
+            op=UnaryOp.COPY,
+            axis=axis,
+            size=size,
+            dst_axes=dst_axes,
+            src_axes=src_axes,
         )
 
     # Unary: T.exp(x), T.sqrt(x).
@@ -810,26 +812,32 @@ def _try_fold_store(store: tir.BufferStore,
             return None
         dst_axes, src_axes = _build_axes([wrapped])
         return Elementwise(
-            dst=dst, srcs=[wrapped], op=unary,
-            axis=axis, size=size,
-            dst_axes=dst_axes, src_axes=src_axes,
+            dst=dst,
+            srcs=[wrapped],
+            op=unary,
+            axis=axis,
+            size=size,
+            dst_axes=dst_axes,
+            src_axes=src_axes,
         )
 
     # Reciprocal: 1.0 / x.
     if isinstance(expr, tir.Div):
         a = _peel_cast_roundtrip(expr.a)
         b = _peel_cast_roundtrip(expr.b)
-        if (isinstance(a, (tir.IntImm, tir.FloatImm))
-                and float(a.value) == 1.0
-                and isinstance(b, tir.BufferLoad)):
+        if isinstance(a, (tir.IntImm, tir.FloatImm)) and float(a.value) == 1.0 and isinstance(b, tir.BufferLoad):
             wrapped = _wrap_src(b, dst.indices, buf_table, dst_buf=dst.buffer)
             if wrapped is None:
                 return None
             dst_axes, src_axes = _build_axes([wrapped])
             return Elementwise(
-                dst=dst, srcs=[wrapped], op=UnaryOp.RECI,
-                axis=axis, size=size,
-                dst_axes=dst_axes, src_axes=src_axes,
+                dst=dst,
+                srcs=[wrapped],
+                op=UnaryOp.RECI,
+                axis=axis,
+                size=size,
+                dst_axes=dst_axes,
+                src_axes=src_axes,
             )
         return None
 
@@ -840,9 +848,13 @@ def _try_fold_store(store: tir.BufferStore,
             return None
         dst_axes, src_axes = _build_axes([wrapped])
         return Elementwise(
-            dst=dst, srcs=[wrapped], op=UnaryOp.COPY,
-            axis=axis, size=size,
-            dst_axes=dst_axes, src_axes=src_axes,
+            dst=dst,
+            srcs=[wrapped],
+            op=UnaryOp.COPY,
+            axis=axis,
+            size=size,
+            dst_axes=dst_axes,
+            src_axes=src_axes,
         )
 
     # Binary: A op B (each a BufferLoad — may broadcast independently).
@@ -861,9 +873,13 @@ def _try_fold_store(store: tir.BufferStore,
                 return None
         dst_axes, src_axes = _build_axes(srcs)
         return Elementwise(
-            dst=dst, srcs=srcs, op=binop,
-            axis=axis, size=size,
-            dst_axes=dst_axes, src_axes=src_axes,
+            dst=dst,
+            srcs=srcs,
+            op=binop,
+            axis=axis,
+            size=size,
+            dst_axes=dst_axes,
+            src_axes=src_axes,
         )
 
     return None
@@ -881,8 +897,7 @@ _REDUCE_OPS_BY_NAME = {
 }
 
 
-def _fold_reduce(call: tir.Call,
-                 buf_table: dict[str, BufferDef]) -> Reduce:
+def _fold_reduce(call: tir.Call, buf_table: dict[str, BufferDef]) -> Reduce:
     """``tl.tileop.reduce(src, dst, op_name, dim, clear)``.
 
     Tilelang's reduce ABI varies — args[0] / args[1] are always
@@ -910,13 +925,9 @@ def _fold_reduce(call: tir.Call,
         if op_name is not None and axis is not None:
             break
     if op_name is None:
-        raise FoldError(
-            f"tl.tileop.reduce: cannot determine op kind from args={args!r}"
-        )
+        raise FoldError(f"tl.tileop.reduce: cannot determine op kind from args={args!r}")
     if axis is None:
-        raise FoldError(
-            f"tl.tileop.reduce: cannot determine dim from args={args!r}"
-        )
+        raise FoldError(f"tl.tileop.reduce: cannot determine dim from args={args!r}")
     op = _REDUCE_OPS_BY_NAME.get(op_name)
     if op is None:
         raise FoldError(f"unknown reduce op {op_name!r}")
@@ -939,18 +950,22 @@ def _fold_reduce(call: tir.Call,
     for dim, ext in enumerate(dst_ref.buffer.shape):
         dst_axes.append(AxisInfo(role=AxisRole.BATCH, extent=int(ext)))
     return Reduce(
-        dst=dst_ref, src=src_ref, op=op, axis=axis,
-        dst_axes=dst_axes, src_axes=src_axes,
+        dst=dst_ref,
+        src=src_ref,
+        op=op,
+        axis=axis,
+        dst_axes=dst_axes,
+        src_axes=src_axes,
     )
 
 
-def _fold_dma(call: tir.Call,
-              buf_table: dict[str, BufferDef]) -> Dma:
+def _fold_dma(call: tir.Call, buf_table: dict[str, BufferDef]) -> Dma:
     args = _call_args(call)
     if len(args) < 2:
         raise FoldError(f"tl.tileop.copy: expected 2 args, got {len(args)}")
     src_ref = _region_to_ref(args[0], buf_table)
     dst_ref = _region_to_ref(args[1], buf_table)
+
     # Default DMA axis tagging: the innermost dim is SIMD (one HW
     # vector load/store moves a contiguous mlen-aligned run along it),
     # every other dim is BATCH (the kernel fans out one HW issue per
@@ -964,16 +979,16 @@ def _fold_dma(call: tir.Call,
             role = AxisRole.SIMD if i == len(shape) - 1 else AxisRole.BATCH
             out.append(AxisInfo(role=role, extent=int(d)))
         return out
+
     return Dma(
-        src=src_ref, dst=dst_ref,
+        src=src_ref,
+        dst=dst_ref,
         src_axes=_default_axes(src_ref),
         dst_axes=_default_axes(dst_ref),
     )
 
 
-def _fold_gemm(call: tir.Call,
-               kind: str,
-               buf_table: dict[str, BufferDef]) -> Gemm:
+def _fold_gemm(call: tir.Call, kind: str, buf_table: dict[str, BufferDef]) -> Gemm:
     args = _call_args(call)
     if len(args) < 3:
         raise FoldError(f"tl.tileop.gemm_py: expected ≥3 args, got {len(args)}")
@@ -989,6 +1004,7 @@ def _fold_gemm(call: tir.Call,
         ta = bool(int(flags[0].value))
     if len(flags) >= 2:
         tb = bool(int(flags[1].value))
+
     # Tag Gemm operand axes with their algebra roles. At fold time the
     # refs are rank-2 (pre-split lane prepend), so the labelling is
     # unambiguous from the matmul algebra:
@@ -1009,17 +1025,18 @@ def _fold_gemm(call: tir.Call,
             # leave axes empty — downstream paths will need to handle
             # it explicitly.
             return []
-        return [
-            AxisInfo(role=roles[i], extent=int(ref.buffer.shape[i]))
-            for i in range(rank)
-        ]
+        return [AxisInfo(role=roles[i], extent=int(ref.buffer.shape[i])) for i in range(rank)]
 
     a_roles = (AxisRole.GEMM_K, AxisRole.GEMM_M) if ta else (AxisRole.GEMM_M, AxisRole.GEMM_K)
     b_roles = (AxisRole.GEMM_N, AxisRole.GEMM_K) if tb else (AxisRole.GEMM_K, AxisRole.GEMM_N)
     c_roles = (AxisRole.GEMM_M, AxisRole.GEMM_N)
     return Gemm(
-        a=a, b=b, c=c,
-        transpose_a=ta, transpose_b=tb, kind=kind,
+        a=a,
+        b=b,
+        c=c,
+        transpose_a=ta,
+        transpose_b=tb,
+        kind=kind,
         a_axes=_pair(a, a_roles),
         b_axes=_pair(b, b_roles),
         c_axes=_pair(c, c_roles),
@@ -1051,9 +1068,7 @@ def _mid_for_kind(name: str) -> str:
     return "serial"
 
 
-def _outer_loop_matches_buffer_axis(dst: BufferRef,
-                                    loop_var: tir.Var,
-                                    extent: int) -> bool:
+def _outer_loop_matches_buffer_axis(dst: BufferRef, loop_var: tir.Var, extent: int) -> bool:
     """True when ``dst.indices`` references ``loop_var`` (by identity)
     on a non-last axis whose buffer extent equals ``extent``. Used to
     decide whether an outer ``for row`` is redundant on top of an
@@ -1065,8 +1080,7 @@ def _outer_loop_matches_buffer_axis(dst: BufferRef,
     for axis, idx in enumerate(dst.indices):
         if axis == len(dst.indices) - 1:
             continue  # inner axis = the one Elementwise(axis=-1) already covers
-        if (isinstance(idx, VarRef) and idx == target
-                and int(shape[axis]) == extent):
+        if isinstance(idx, VarRef) and idx == target and int(shape[axis]) == extent:
             return True
     return False
 
@@ -1082,8 +1096,7 @@ def _index_expr_uses_varref(idx, target: VarRef) -> bool:
     if isinstance(idx, VarRef):
         return idx == target
     if isinstance(idx, dict):
-        return any(_index_expr_uses_varref(a, target)
-                   for a in idx.get("args", []))
+        return any(_index_expr_uses_varref(a, target) for a in idx.get("args", []))
     return False
 
 
@@ -1114,9 +1127,7 @@ def _is_serial_for(stmt: tir.For) -> bool:
     return stmt.kind == tir.ForKind.SERIAL
 
 
-def _walk_stmt(stmt,
-               buf_table: dict[str, BufferDef],
-               current_kind: str | None) -> list:
+def _walk_stmt(stmt, buf_table: dict[str, BufferDef], current_kind: str | None) -> list:
     """Walk one TIR Stmt, return a list of mid_ir Stmt items.
 
     A single TIR construct may unfold into 0, 1, or more mid_ir items
@@ -1140,27 +1151,26 @@ def _walk_stmt(stmt,
             v = stmt.value
             kind = v.value if isinstance(v, tir.StringImm) else str(v)
             return _walk_stmt(stmt.body, buf_table, current_kind=kind)
-        if (stmt.attr_key == "thread_extent"
-                and isinstance(stmt.node, tir.IterVar)):
+        if stmt.attr_key == "thread_extent" and isinstance(stmt.node, tir.IterVar):
             iv = stmt.node
             inner = _walk_stmt(stmt.body, buf_table, current_kind)
             ext_val = stmt.value
             if not isinstance(ext_val, tir.IntImm):
-                raise FoldError(
-                    f"thread_extent {iv.var.name!r} non-static: {ext_val!r}"
-                )
+                raise FoldError(f"thread_extent {iv.var.name!r} non-static: {ext_val!r}")
             # blockIdx grid binding from T.Kernel → ParallelAxis(BLOCK_IDX).
             # Mid-IR keeps multi-thread semantics: this is NOT a serial
             # for, it's an SPMD parallel axis. Pass_8_to_plena flattens
             # to a serial outer for at HLIR generation time.
-            return [ParallelAxis(
-                axis_name=iv.var.name,
-                extent=int(ext_val.value),
-                body=inner,
-                kind=ParallelKind.BLOCK_IDX,
-                thread_tag=str(iv.thread_tag) if iv.thread_tag else None,
-                axis_var=_vref(iv.var),
-            )]
+            return [
+                ParallelAxis(
+                    axis_name=iv.var.name,
+                    extent=int(ext_val.value),
+                    body=inner,
+                    kind=ParallelKind.BLOCK_IDX,
+                    thread_tag=str(iv.thread_tag) if iv.thread_tag else None,
+                    axis_var=_vref(iv.var),
+                )
+            ]
         # Unknown attr — pass through.
         return _walk_stmt(stmt.body, buf_table, current_kind)
     if isinstance(stmt, tir.For):
@@ -1177,11 +1187,13 @@ def _walk_stmt(stmt,
         # default ``size=1`` mis-types it as a single scalar and FPRAM
         # unrolling won't kick in).
         if _is_serial_for(stmt) and isinstance(stmt.body, tir.BufferStore):
-            extent = (int(stmt.extent.value)
-                      if isinstance(stmt.extent, tir.IntImm) else 1)
+            extent = int(stmt.extent.value) if isinstance(stmt.extent, tir.IntImm) else 1
             ew = _try_fold_store(
-                stmt.body, parallel_var=stmt.loop_var,
-                buf_table=buf_table, axis=-1, size=extent,
+                stmt.body,
+                parallel_var=stmt.loop_var,
+                buf_table=buf_table,
+                axis=-1,
+                size=extent,
             )
             if ew is not None:
                 return [ew]
@@ -1193,36 +1205,37 @@ def _walk_stmt(stmt,
         # the inner Elementwise iterates over (typically the row axis
         # of dst). Without this we'd emit the same whole-buffer op
         # ``rows`` times.
-        if (_is_serial_for(stmt) or _tir_for_kind_name(stmt) == "unrolled"):
+        if _is_serial_for(stmt) or _tir_for_kind_name(stmt) == "unrolled":
             inner_body = stmt.body
-            if (isinstance(inner_body, tir.For)
-                    and inner_body.kind == tir.ForKind.PARALLEL):
+            if isinstance(inner_body, tir.For) and inner_body.kind == tir.ForKind.PARALLEL:
                 inner_ew = _try_fold_parallel(inner_body, buf_table)
-                if (inner_ew is not None
-                        and isinstance(stmt.extent, tir.IntImm)
-                        and _outer_loop_matches_buffer_axis(
-                            inner_ew.dst, stmt.loop_var, int(stmt.extent.value),
-                        )
-                        # Don't absorb if any Broadcast src still uses
-                        # the outer loop var — e.g. ``dst[row,col] =
-                        # a[row,col] * b[row]`` folds the parallel ``col``
-                        # away but the ``b[row]`` Broadcast still needs
-                        # ``row`` bound by an enclosing for. Absorbing it
-                        # would leave ``row`` referenced but unbound,
-                        # crashing ExprMaterializer later. Pass through
-                        # as a regular For instead so the outer loop
-                        # keeps its scope.
-                        and not _elementwise_refs_var(
-                            inner_ew, _vref(stmt.loop_var),
-                        )):
+                if (
+                    inner_ew is not None
+                    and isinstance(stmt.extent, tir.IntImm)
+                    and _outer_loop_matches_buffer_axis(
+                        inner_ew.dst,
+                        stmt.loop_var,
+                        int(stmt.extent.value),
+                    )
+                    # Don't absorb if any Broadcast src still uses
+                    # the outer loop var — e.g. ``dst[row,col] =
+                    # a[row,col] * b[row]`` folds the parallel ``col``
+                    # away but the ``b[row]`` Broadcast still needs
+                    # ``row`` bound by an enclosing for. Absorbing it
+                    # would leave ``row`` referenced but unbound,
+                    # crashing ExprMaterializer later. Pass through
+                    # as a regular For instead so the outer loop
+                    # keeps its scope.
+                    and not _elementwise_refs_var(
+                        inner_ew,
+                        _vref(stmt.loop_var),
+                    )
+                ):
                     return [inner_ew]
         # Pass through as a regular For. Body is recursively walked;
         # any nested BufferStore that doesn't fold becomes a RawStore.
         if not isinstance(stmt.extent, tir.IntImm):
-            raise FoldError(
-                f"non-static loop extent on {stmt.loop_var.name!r}: "
-                f"{stmt.extent!r}"
-            )
+            raise FoldError(f"non-static loop extent on {stmt.loop_var.name!r}: {stmt.extent!r}")
         body = _walk_stmt(stmt.body, buf_table, current_kind)
         kind_name = _tir_for_kind_name(stmt)
         if kind_name == "parallel":
@@ -1232,21 +1245,25 @@ def _walk_stmt(stmt,
             # concurrent program instances. Pass_3 may later split it
             # into (LOGICAL_GRID number, CLUSTER phase) just like a
             # blockIdx-bound axis.
-            return [ParallelAxis(
-                axis_name=stmt.loop_var.name,
+            return [
+                ParallelAxis(
+                    axis_name=stmt.loop_var.name,
+                    extent=int(stmt.extent.value),
+                    body=body,
+                    kind=ParallelKind.LOGICAL_GRID,
+                    thread_tag=None,
+                    axis_var=_vref(stmt.loop_var),
+                )
+            ]
+        return [
+            For(
+                loop_var=stmt.loop_var.name,
                 extent=int(stmt.extent.value),
                 body=body,
-                kind=ParallelKind.LOGICAL_GRID,
-                thread_tag=None,
-                axis_var=_vref(stmt.loop_var),
-            )]
-        return [For(
-            loop_var=stmt.loop_var.name,
-            extent=int(stmt.extent.value),
-            body=body,
-            kind=_mid_for_kind(kind_name),
-            loop_var_var=_vref(stmt.loop_var),
-        )]
+                kind=_mid_for_kind(kind_name),
+                loop_var_var=_vref(stmt.loop_var),
+            )
+        ]
     if isinstance(stmt, tir.LetStmt):
         # Should be eliminated by inline_let_stmts; if it lingers,
         # walk through and warn implicitly by losing the binding.
@@ -1268,9 +1285,7 @@ def _walk_stmt(stmt,
                     scope="shared",
                 )
             except Exception as e:
-                raise FoldError(
-                    f"could not build BufferDef from raw Allocate {name!r}: {e}"
-                )
+                raise FoldError(f"could not build BufferDef from raw Allocate {name!r}: {e}")
         return _walk_stmt(stmt.body, buf_table, current_kind)
     if isinstance(stmt, tir.Evaluate):
         val = stmt.value
@@ -1280,8 +1295,7 @@ def _walk_stmt(stmt,
         if kind == _TILEOP_COPY:
             return [_fold_dma(val, buf_table)]
         if kind == _TILEOP_GEMM:
-            return [_fold_gemm(val, kind=current_kind or "overwrite",
-                               buf_table=buf_table)]
+            return [_fold_gemm(val, kind=current_kind or "overwrite", buf_table=buf_table)]
         if kind == _TILEOP_REDUCE:
             return [_fold_reduce(val, buf_table)]
         # Unknown extern: drop with a deliberate marker. Production
@@ -1350,10 +1364,7 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
         elif isinstance(raw, str):
             lane_axes = [raw]
         elif hasattr(raw, "__iter__"):
-            lane_axes = [
-                str(s.value) if isinstance(s, tir.StringImm) else str(s)
-                for s in raw
-            ]
+            lane_axes = [str(s.value) if isinstance(s, tir.StringImm) else str(s) for s in raw]
 
     # Carry select prim_func attrs forward so downstream passes (e.g.
     # to_plena reading ``plena.layout``) can find them. We unwrap TVM
@@ -1374,8 +1385,7 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
         if "plena.hoisted_constants" in func.attrs:
             raw = func.attrs["plena.hoisted_constants"]
             attrs_out["plena.hoisted_constants"] = {
-                str(name): float(val.value if hasattr(val, "value") else val)
-                for name, val in raw.items()
+                str(name): float(val.value if hasattr(val, "value") else val) for name, val in raw.items()
             }
 
     return MidFunc(
@@ -1384,7 +1394,7 @@ def _run_locked(func: tir.PrimFunc, name: str) -> MidFunc:
         allocs=allocs,
         body=body,
         lane_axes=lane_axes,
-        cluster_counts=[],   # filled by pass_3
+        cluster_counts=[],  # filled by pass_3
         attrs=attrs_out,
     )
 

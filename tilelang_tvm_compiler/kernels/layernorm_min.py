@@ -48,14 +48,9 @@ def make_layernorm_min(
 ):
     MLEN = 64
     if rows != MLEN:
-        raise ValueError(
-            f"layernorm_min requires rows == MLEN ({MLEN}), got {rows}"
-        )
+        raise ValueError(f"layernorm_min requires rows == MLEN ({MLEN}), got {rows}")
     if hidden_size % MLEN != 0:
-        raise ValueError(
-            f"hidden_size must be a multiple of MLEN ({MLEN}); "
-            f"got hidden_size={hidden_size}"
-        )
+        raise ValueError(f"hidden_size must be a multiple of MLEN ({MLEN}); got hidden_size={hidden_size}")
     if num_s_blocks < 1:
         raise ValueError(f"num_s_blocks must be >= 1, got {num_s_blocks}")
 
@@ -67,34 +62,34 @@ def make_layernorm_min(
 
     @T.prim_func
     def layernorm_min(
-        X_hbm:     T.Tensor((batch, seq_len, 1, H), "float16"),
+        X_hbm: T.Tensor((batch, seq_len, 1, H), "float16"),
         SCALE_hbm: T.Tensor((batch, seq_len, 1, H), "float16"),
-        BIAS_hbm:  T.Tensor((batch, seq_len, 1, H), "float16"),
-        Y_hbm:     T.Tensor((batch, seq_len, 1, H), "float16"),
+        BIAS_hbm: T.Tensor((batch, seq_len, 1, H), "float16"),
+        Y_hbm: T.Tensor((batch, seq_len, 1, H), "float16"),
     ):
         with T.Kernel(num_s_blocks, threads=128) as s_block:
             # HBM <-> on-chip staging (shared). No head packing (H=1 in
             # the BSHD layout); ``hidden_size > MLEN`` triggers the 7D
             # tile_layout with d_tiles = hidden_size/MLEN.
-            X_sh     = T.alloc_shared((rows, H), "float16")
+            X_sh = T.alloc_shared((rows, H), "float16")
             SCALE_sh = T.alloc_shared((rows, H), "float16")
-            BIAS_sh  = T.alloc_shared((rows, H), "float16")
-            Y_sh     = T.alloc_shared((rows, H), "float16")
+            BIAS_sh = T.alloc_shared((rows, H), "float16")
+            Y_sh = T.alloc_shared((rows, H), "float16")
 
-            X_loc    = T.alloc_fragment((rows, H), "float16")
-            SC_loc   = T.alloc_fragment((rows, H), "float16")
-            BI_loc   = T.alloc_fragment((rows, H), "float16")
-            SQ_loc   = T.alloc_fragment((rows, H), "float16")
-            Y_loc    = T.alloc_fragment((rows, H), "float16")
+            X_loc = T.alloc_fragment((rows, H), "float16")
+            SC_loc = T.alloc_fragment((rows, H), "float16")
+            BI_loc = T.alloc_fragment((rows, H), "float16")
+            SQ_loc = T.alloc_fragment((rows, H), "float16")
+            Y_loc = T.alloc_fragment((rows, H), "float16")
 
             # Per-row FP scratch (rank-1 -> FPRAM scalar slots).
             MEAN_SUM = T.alloc_fragment((rows,), "float16")
-            MU       = T.alloc_fragment((rows,), "float16")
-            VAR_SUM  = T.alloc_fragment((rows,), "float16")
-            VAR      = T.alloc_fragment((rows,), "float16")
-            VAR_EPS  = T.alloc_fragment((rows,), "float16")
-            NORM     = T.alloc_fragment((rows,), "float16")
-            INV      = T.alloc_fragment((rows,), "float16")
+            MU = T.alloc_fragment((rows,), "float16")
+            VAR_SUM = T.alloc_fragment((rows,), "float16")
+            VAR = T.alloc_fragment((rows,), "float16")
+            VAR_EPS = T.alloc_fragment((rows,), "float16")
+            NORM = T.alloc_fragment((rows,), "float16")
+            INV = T.alloc_fragment((rows,), "float16")
 
             # INV_N (1/hidden_size) and eps are inlined as
             # T.float16(...) literals below; the zero seed is
@@ -142,10 +137,10 @@ def make_layernorm_min(
             T.reduce_sum(SQ_loc, VAR_SUM, dim=1)
 
             for row in T.serial(rows):
-                VAR[row]     = VAR_SUM[row] * T.float16(inv_n_val)
+                VAR[row] = VAR_SUM[row] * T.float16(inv_n_val)
                 VAR_EPS[row] = VAR[row] + T.float16(eps)
-                NORM[row]    = T.sqrt(VAR_EPS[row])
-                INV[row]     = T.float16(1.0) / NORM[row]
+                NORM[row] = T.sqrt(VAR_EPS[row])
+                INV[row] = T.float16(1.0) / NORM[row]
 
             # Y = XC * scale (host-broadcast SCALE into (rows, H)).
             # Write directly into Y_loc so the in-place row_mul_fp_at

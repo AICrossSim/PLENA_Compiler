@@ -74,14 +74,9 @@ def make_conv2d_min(
     HLEN = 16
 
     if kh * kw != HLEN:
-        raise ValueError(
-            f"first-cut conv2d_min requires kh*kw == HLEN ({HLEN}); "
-            f"got kh={kh}, kw={kw}, kh*kw={kh*kw}"
-        )
+        raise ValueError(f"first-cut conv2d_min requires kh*kw == HLEN ({HLEN}); got kh={kh}, kw={kw}, kh*kw={kh * kw}")
     if w_in != MLEN:
-        raise ValueError(
-            f"first-cut conv2d_min requires w_in == MLEN ({MLEN}); got w_in={w_in}"
-        )
+        raise ValueError(f"first-cut conv2d_min requires w_in == MLEN ({MLEN}); got w_in={w_in}")
     if h_in <= 0:
         raise ValueError(f"h_in must be positive; got h_in={h_in}")
     if c_in <= 0 or c_out <= 0:
@@ -91,20 +86,21 @@ def make_conv2d_min(
     W = w_in
     KH = kh
     KW = kw
-    K_FLAT = KH * KW          # = HLEN, the unrolled-1D tap count
+    K_FLAT = KH * KW  # = HLEN, the unrolled-1D tap count
     C_IN = c_in
     C_OUT = c_out
-    OC_IC = C_OUT * C_IN       # number of (oc, ic) weight rows in B_cache
+    OC_IC = C_OUT * C_IN  # number of (oc, ic) weight rows in B_cache
 
     def _round_up_to_mlen(x: int) -> int:
         return (x + MLEN - 1) // MLEN * MLEN
+
     H_PAD = _round_up_to_mlen(H + KH - 1)
     W_PAD = _round_up_to_mlen(W + KW - 1)
 
     @T.prim_func
     def conv2d_min(
-        Input:  T.Tensor((1, C_IN,  H_PAD, W_PAD), "float16"),
-        Output: T.Tensor((1, C_OUT, H,     W),     "float16"),
+        Input: T.Tensor((1, C_IN, H_PAD, W_PAD), "float16"),
+        Output: T.Tensor((1, C_OUT, H, W), "float16"),
     ):
         T.func_attr({"plena.layout": "NCHW"})
         if False:
@@ -126,21 +122,20 @@ def make_conv2d_min(
             # fp src ``w_aux[0]`` fails to fold (same rank, no
             # broadcast path). 2D dst + 1D scalar src matches the
             # path flash_attention already uses.
-            A_sh     = T.alloc_shared((1, MLEN), "float16")
+            A_sh = T.alloc_shared((1, MLEN), "float16")
             A_sh_acc = T.alloc_shared((1, MLEN), "float16")
 
             # ``B_FP`` holds the full weight tensor after MLEN-padding:
             # OC_IC rows of MLEN slots each. The testbench's
             # ``fp_preload`` writes weights into FPRAM at this buffer's
             # allocated address before the kernel runs.
-            B_FP         = T.alloc_fragment((OC_IC * MLEN,), "float16",
-                                             scope="global.fpram")
+            B_FP = T.alloc_fragment((OC_IC * MLEN,), "float16", scope="global.fpram")
             # Per-tap weight scalar — 1D so the FPRAM-scalar fold path
             # accepts the multiply (`A_sh[m] = A_sh[m] * w_aux[0]`).
-            w_aux        = T.alloc_fragment((1,), "float16")
-            in_FP_aux    = T.alloc_fragment((MLEN,), "float16")
+            w_aux = T.alloc_fragment((1,), "float16")
+            in_FP_aux = T.alloc_fragment((MLEN,), "float16")
             in_FP_padded = T.alloc_fragment((MLEN + KW - 1,), "float16")
-            shift_FP     = T.alloc_fragment((MLEN,), "float16")
+            shift_FP = T.alloc_fragment((MLEN,), "float16")
 
             # Single-channel output tile, drained to HBM per oc.
             C_loc = T.alloc_shared((MLEN, MLEN), "float16")
@@ -210,12 +205,17 @@ def make_conv2d_min(
     lowered = conv2d_min
 
     constants = {
-        "H": H, "W": W,
-        "H_PAD": H_PAD, "W_PAD": W_PAD,
-        "KH": KH, "KW": KW,
+        "H": H,
+        "W": W,
+        "H_PAD": H_PAD,
+        "W_PAD": W_PAD,
+        "KH": KH,
+        "KW": KW,
         "K_FLAT": K_FLAT,
-        "MLEN": MLEN, "HLEN": HLEN,
-        "C_IN": C_IN, "C_OUT": C_OUT,
+        "MLEN": MLEN,
+        "HLEN": HLEN,
+        "C_IN": C_IN,
+        "C_OUT": C_OUT,
     }
     return lowered, constants
 

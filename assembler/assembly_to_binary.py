@@ -40,7 +40,17 @@ class AssemblyToBinary:
         binary_instruction = 0
         ow = self.operands_width
         opw = self.opcode_width
-        vector_ops_with_rmask = {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"}
+        vector_ops_with_rmask = {
+            "V_ADD_VV",
+            "V_ADD_VF",
+            "V_MUL_VV",
+            "V_SUB_VV",
+            "V_MUL_VF",
+            "V_EXP_V",
+            "V_RECI_V",
+            "V_RED_SUM",
+            "V_RED_MAX",
+        }
 
         if instruction.opcode in vector_ops_with_rmask and rmask is None:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
@@ -144,4 +154,3 @@ class AssemblyToBinary:
         # Write the binary instructions to a file
         self.write_binary_to_file(binary_instructions, output_file)
         return binary_instructions
-

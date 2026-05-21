@@ -61,8 +61,7 @@ def embedding_asm(
     rows_per_token = hidden_size // vlen
     hbm_bytes_per_vlen_chunk = voc_table_row_bytes // rows_per_token
     assert hbm_bytes_per_vlen_chunk * rows_per_token == voc_table_row_bytes, (
-        f"stride mismatch: {hbm_bytes_per_vlen_chunk} * {rows_per_token} "
-        f"!= {voc_table_row_bytes}"
+        f"stride mismatch: {hbm_bytes_per_vlen_chunk} * {rows_per_token} != {voc_table_row_bytes}"
     )
     assert hbm_bytes_per_vlen_chunk < (1 << 18), (
         f"hbm_bytes_per_vlen_chunk ({hbm_bytes_per_vlen_chunk}) exceeds S_ADDI_INT 18-bit immediate. "
@@ -88,12 +87,9 @@ def embedding_asm(
         generated_code += _load_large_int(hbm_offset_reg, hbm_byte_offset_start)
         for _ in range(rows_per_token):
             generated_code += (
-                f"H_PREFETCH_V gp{vram_dest_reg}, gp{hbm_offset_reg}, "
-                f"a{voc_table_base_addr_reg_index}, 0, 0 \n"
+                f"H_PREFETCH_V gp{vram_dest_reg}, gp{hbm_offset_reg}, a{voc_table_base_addr_reg_index}, 0, 0 \n"
             )
             generated_code += f"S_ADDI_INT gp{vram_dest_reg}, gp{vram_dest_reg}, {vlen} \n"
-            generated_code += (
-                f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {hbm_bytes_per_vlen_chunk} \n"
-            )
+            generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {hbm_bytes_per_vlen_chunk} \n"
 
     return generated_code

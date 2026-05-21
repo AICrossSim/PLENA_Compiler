@@ -35,12 +35,9 @@ import tilelang.language as T
 from tilelang_tvm_compiler.frontend.gemm_macros import KIND
 
 
-def build_raw_flash_attention_min(*,
-                                   rows: int = 64,
-                                   hlen: int = 16,
-                                   head_count: int = 4,
-                                   num_kv_blocks: int = 2,
-                                   num_q_blocks: int = 2):
+def build_raw_flash_attention_min(
+    *, rows: int = 64, hlen: int = 16, head_count: int = 4, num_kv_blocks: int = 2, num_q_blocks: int = 2
+):
     """Mirror of make_flash_attention_min in kernels/flash_attention_min.py
     but stops *before* compile_func — returns the raw tir.PrimFunc."""
 
@@ -51,9 +48,7 @@ def build_raw_flash_attention_min(*,
         raise ValueError(f"hlen must divide MLEN={MLEN}, got {hlen}")
     hardware_lane_count = MLEN // hlen
     if head_count % hardware_lane_count != 0:
-        raise ValueError(
-            f"head_count must be multiple of MLEN/hlen={hardware_lane_count}"
-        )
+        raise ValueError(f"head_count must be multiple of MLEN/hlen={hardware_lane_count}")
 
     kv_seq = num_kv_blocks * rows
     q_seq = num_q_blocks * rows
@@ -144,8 +139,7 @@ def build_raw_flash_attention_min(*,
 
 def main(argv) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--build-dir", type=Path, default=None,
-                        help="Where to dump <name>.midir.txt (default: skip)")
+    parser.add_argument("--build-dir", type=Path, default=None, help="Where to dump <name>.midir.txt (default: skip)")
     parser.add_argument("--num-q-blocks", type=int, default=2)
     parser.add_argument("--num-kv-blocks", type=int, default=2)
     parser.add_argument("--head-count", type=int, default=4)
@@ -161,6 +155,7 @@ def main(argv) -> int:
     # — these ARE pre-fold steps, not part of the new mid_ir pipeline.
     from tilelang_tvm_compiler.frontend.passes import inline_let_stmts
     from tilelang_tvm_compiler.frontend.passes import lower_compound_fp_stores
+
     raw = inline_let_stmts.run(raw)
     raw = lower_compound_fp_stores.run(raw)
 
@@ -177,9 +172,11 @@ def main(argv) -> int:
     from tilelang_tvm_compiler.frontend.mid_ir.passes.to_plena import run as to_plena_run
 
     raw = infer_run(raw)
-    print(f"[infer_lane_axis] picked: "
-          f"{raw.attrs['plena.lane_axis'] if raw.attrs and 'plena.lane_axis' in raw.attrs else None}",
-          file=sys.stderr)
+    print(
+        f"[infer_lane_axis] picked: "
+        f"{raw.attrs['plena.lane_axis'] if raw.attrs and 'plena.lane_axis' in raw.attrs else None}",
+        file=sys.stderr,
+    )
 
     midfn = fold_run(raw, name="flash_attention_min")
     midfn = mark_run(midfn)
@@ -193,6 +190,7 @@ def main(argv) -> int:
     hlir = to_plena_run(midfn, build_dir=args.build_dir)
 
     from tilelang_tvm_compiler.hlir import format_hlir
+
     print(format_hlir(hlir))
     return 0
 

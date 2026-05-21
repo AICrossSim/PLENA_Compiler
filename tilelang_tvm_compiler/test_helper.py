@@ -98,7 +98,7 @@ PreKernelStubBuilder = Callable[[dict], str]
 # FP preload builder:
 #   def build_fp_preload(io: dict, addrs: dict) -> torch.Tensor
 # ``io`` is the dict returned by ``build_inputs_and_golden``.
-FpPreloadBuilder = Callable[[dict, dict], Any]   # Any to avoid eager torch import
+FpPreloadBuilder = Callable[[dict, dict], Any]  # Any to avoid eager torch import
 
 # Comparison-params builder:
 #   def build_comparison_params(io: dict, addrs: dict) -> dict
@@ -188,6 +188,7 @@ class TvmTestbenchSpec:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 def _format_kwargs(kwargs: Mapping[str, Any]) -> str:
     return ",".join(f"{k}={v}" for k, v in kwargs.items())
 
@@ -206,14 +207,19 @@ def _compile_via_subprocess(
     venv_python = REPO_ROOT / spec.venv_name / "bin" / "python"
     if not venv_python.exists():
         raise RuntimeError(
-            f"venv python not found: {venv_python}. Set "
-            f"TvmTestbenchSpec.venv_name to a venv that exists."
+            f"venv python not found: {venv_python}. Set TvmTestbenchSpec.venv_name to a venv that exists."
         )
     cmd = [
-        str(venv_python), "-m", "tilelang_tvm_compiler", "compile",
-        "--kernel", spec.kernel,
-        "--asm-name", spec.asm_name,
-        "--mlen", str(spec.mlen),
+        str(venv_python),
+        "-m",
+        "tilelang_tvm_compiler",
+        "compile",
+        "--kernel",
+        spec.kernel,
+        "--asm-name",
+        spec.asm_name,
+        "--mlen",
+        str(spec.mlen),
     ]
     if spec.kernel_kwargs:
         cmd += ["--kernel-kwargs", _format_kwargs(spec.kernel_kwargs)]
@@ -236,18 +242,14 @@ def _compile_via_subprocess(
     if res.returncode != 0:
         sys.stderr.write(res.stderr)
         raise RuntimeError(
-            f"TVM compile subprocess failed (returncode={res.returncode}). "
-            f"See stderr above. Command: {' '.join(cmd)}"
+            f"TVM compile subprocess failed (returncode={res.returncode}). See stderr above. Command: {' '.join(cmd)}"
         )
     return res.stdout
 
 
 def _validate_io(io: dict) -> None:
     if not isinstance(io, dict):
-        raise TypeError(
-            f"build_inputs_and_golden must return a dict; got "
-            f"{type(io).__name__}"
-        )
+        raise TypeError(f"build_inputs_and_golden must return a dict; got {type(io).__name__}")
     missing = {"hbm_inputs", "golden_flat"} - set(io)
     if missing:
         raise KeyError(
@@ -255,15 +257,13 @@ def _validate_io(io: dict) -> None:
             f"{sorted(missing)} (must include 'hbm_inputs' and 'golden_flat')"
         )
     if not isinstance(io["hbm_inputs"], dict):
-        raise TypeError(
-            f"build_inputs_and_golden['hbm_inputs'] must be a dict, got "
-            f"{type(io['hbm_inputs']).__name__}"
-        )
+        raise TypeError(f"build_inputs_and_golden['hbm_inputs'] must be a dict, got {type(io['hbm_inputs']).__name__}")
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
 
 def run(spec: TvmTestbenchSpec) -> int:
     """Drive the full TVM testbench pipeline for ``spec``.
@@ -285,11 +285,12 @@ def run(spec: TvmTestbenchSpec) -> int:
     print(f"[1/4] Compiling TVM {spec.asm_name} kernel ...")
     hlir_path = build_dir / f"{spec.asm_name}.hlir.txt"
     addrs_path: Path | None = (
-        build_dir / f"{spec.asm_name}.buffer_addrs.json"
-        if spec.parse_buffer_addrs is not None else None
+        build_dir / f"{spec.asm_name}.buffer_addrs.json" if spec.parse_buffer_addrs is not None else None
     )
     kernel_isa = _compile_via_subprocess(
-        spec, hlir_path=hlir_path, addrs_path=addrs_path,
+        spec,
+        hlir_path=hlir_path,
+        addrs_path=addrs_path,
     )
 
     addrs: dict = {}
@@ -305,11 +306,7 @@ def run(spec: TvmTestbenchSpec) -> int:
     if spec.patch_isa is not None:
         patched = spec.patch_isa(isa_text)
         if patched != isa_text:
-            print(
-                f"      NB  patch_isa hook rewrote ASM "
-                f"({isa_text.count(chr(10))} -> "
-                f"{patched.count(chr(10))} lines)"
-            )
+            print(f"      NB  patch_isa hook rewrote ASM ({isa_text.count(chr(10))} -> {patched.count(chr(10))} lines)")
         isa_text = patched
     print(
         f"      OK  ({kernel_isa.count(chr(10))} kernel lines"
@@ -335,6 +332,7 @@ def run(spec: TvmTestbenchSpec) -> int:
     # here so per-kernel testbenches don't have to enumerate them.
     if addrs_path is not None and raw_addrs:
         import torch  # local — testbench venv has torch on sys.path here
+
         const_entries = [
             (int(entry["address"]), float(entry["value"]))
             for entry in raw_addrs.values()
@@ -353,13 +351,9 @@ def run(spec: TvmTestbenchSpec) -> int:
                 fp_preload[addr] = value
             print(f"           auto-preloaded {len(const_entries)} FP constant(s)")
 
-    input_feed = {
-        name: t.contiguous().reshape(1, -1) for name, t in hbm_inputs.items()
-    }
+    input_feed = {name: t.contiguous().reshape(1, -1) for name, t in hbm_inputs.items()}
     input_order = list(input_feed)
-    summary = ", ".join(
-        f"{n}={tuple(t.shape)}" for n, t in hbm_inputs.items()
-    )
+    summary = ", ".join(f"{n}={tuple(t.shape)}" for n, t in hbm_inputs.items())
     print(f"      OK  hbm_inputs: {summary}")
     print(f"           golden flat: {tuple(golden_flat.shape)}")
     if fp_preload is not None:

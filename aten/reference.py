@@ -166,7 +166,7 @@ def _attention_block_ref(
     o_heads = []
     for h in range(config.num_heads):
         kv_h = h // config.head_ratio
-        q_h = q_full[:, h * config.head_dim:(h + 1) * config.head_dim]
+        q_h = q_full[:, h * config.head_dim : (h + 1) * config.head_dim]
         q_h = _rope_ref(q_h, rope_matrix, cos_table, sin_table, precision)
         o_heads.append(_flash_attn_ref(q_h, k_heads[kv_h], v_heads[kv_h], scale, causal=True))
 
@@ -262,10 +262,12 @@ def _flash_attn_ref(Q, K, V, scale, causal=False):
 def _ksplit_matmul(A, B, mlen=64, max_k_tiles=_HW_MAX_K_TILES, to_inter=None, from_inter=None):
     """Matrix multiply matching hardware K-split BF16 precision."""
     if to_inter is None:
+
         def to_inter(x):
             return x.to(torch.bfloat16)
 
     if from_inter is None:
+
         def from_inter(x):
             return x.float()
 

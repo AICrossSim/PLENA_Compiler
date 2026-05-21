@@ -55,7 +55,9 @@ def _check(label, actual, expected) -> int:
 
 def _wrap(body, params=(), buffer_map=None) -> tir.PrimFunc:
     return tir.PrimFunc(
-        params=list(params), body=body, ret_type=None,
+        params=list(params),
+        body=body,
+        ret_type=None,
         buffer_map=buffer_map or {},
     )
 
@@ -69,13 +71,14 @@ def test_fold_dma() -> int:
     print("test_fold_dma")
     f16 = "float16"
     Q_hbm = tir.decl_buffer([1, 64, 4, 16], dtype=f16, name="Q_hbm", scope="global")
-    Q_sh  = tir.decl_buffer([64, 16], dtype=f16, name="Q_sh", scope="shared.dyn")
-    body = tir.Evaluate(_extern(
-        "tl.tileop.copy",
-        _region(Q_hbm, [_ii(0), _ii(0), tir.Var("by", "int32"), _ii(0)],
-                [_ii(1), _ii(64), _ii(1), _ii(16)]),
-        _region(Q_sh, [_ii(0), _ii(0)], [_ii(64), _ii(16)]),
-    ))
+    Q_sh = tir.decl_buffer([64, 16], dtype=f16, name="Q_sh", scope="shared.dyn")
+    body = tir.Evaluate(
+        _extern(
+            "tl.tileop.copy",
+            _region(Q_hbm, [_ii(0), _ii(0), tir.Var("by", "int32"), _ii(0)], [_ii(1), _ii(64), _ii(1), _ii(16)]),
+            _region(Q_sh, [_ii(0), _ii(0)], [_ii(64), _ii(16)]),
+        )
+    )
     func = _wrap(body, params=[Q_hbm.data], buffer_map={Q_hbm.data: Q_hbm})
     mid = fold_run(func, name="t_dma")
     failures = 0
@@ -106,15 +109,19 @@ def test_fold_gemm_btmm() -> int:
     K = tir.decl_buffer([64, 16], dtype=f16, name="K", scope="shared.dyn")
     S = tir.decl_buffer([64, 64], dtype=f16, name="S", scope="local.fragment")
     body = tir.AttrStmt(
-        _ii(0), "plena.gemm_kind", tir.StringImm("btmm"),
-        tir.Evaluate(_extern(
-            "tl.tileop.gemm_py",
-            _region(Q, [_ii(0)] * 2, list(Q.shape)),
-            _region(K, [_ii(0)] * 2, list(K.shape)),
-            _region(S, [_ii(0)] * 2, list(S.shape)),
-            _ii(0),  # transpose_a
-            _ii(1),  # transpose_b
-        )),
+        _ii(0),
+        "plena.gemm_kind",
+        tir.StringImm("btmm"),
+        tir.Evaluate(
+            _extern(
+                "tl.tileop.gemm_py",
+                _region(Q, [_ii(0)] * 2, list(Q.shape)),
+                _region(K, [_ii(0)] * 2, list(K.shape)),
+                _region(S, [_ii(0)] * 2, list(S.shape)),
+                _ii(0),  # transpose_a
+                _ii(1),  # transpose_b
+            )
+        ),
     )
     func = _wrap(body)
     mid = fold_run(func, name="t_gemm")
@@ -137,12 +144,14 @@ def test_fold_gemm_per_head() -> int:
     A = tir.decl_buffer([64, 64], dtype=f16, name="A", scope="local.fragment")
     B = tir.decl_buffer([64, 16], dtype=f16, name="B", scope="shared.dyn")
     C = tir.decl_buffer([64, 16], dtype=f16, name="C", scope="local.fragment")
-    body = tir.Evaluate(_extern(
-        "tl.tileop.gemm_py",
-        _region(A, [_ii(0)] * 2, list(A.shape)),
-        _region(B, [_ii(0)] * 2, list(B.shape)),
-        _region(C, [_ii(0)] * 2, list(C.shape)),
-    ))
+    body = tir.Evaluate(
+        _extern(
+            "tl.tileop.gemm_py",
+            _region(A, [_ii(0)] * 2, list(A.shape)),
+            _region(B, [_ii(0)] * 2, list(B.shape)),
+            _region(C, [_ii(0)] * 2, list(C.shape)),
+        )
+    )
     func = _wrap(body)
     mid = fold_run(func)
     failures = 0
@@ -158,14 +167,16 @@ def test_fold_reduce() -> int:
     f16 = "float16"
     src = tir.decl_buffer([64, 64], dtype=f16, name="src", scope="local.fragment")
     dst = tir.decl_buffer([64], dtype=f16, name="dst", scope="local.fragment")
-    body = tir.Evaluate(_extern(
-        "tl.tileop.reduce",
-        _region(src, [_ii(0), _ii(0)], [_ii(64), _ii(64)]),
-        _region(dst, [_ii(0)], [_ii(64)]),
-        _ii(1),                  # dim
-        _ii(0),                  # clear
-        tir.StringImm("max"),    # op
-    ))
+    body = tir.Evaluate(
+        _extern(
+            "tl.tileop.reduce",
+            _region(src, [_ii(0), _ii(0)], [_ii(64), _ii(64)]),
+            _region(dst, [_ii(0)], [_ii(64)]),
+            _ii(1),  # dim
+            _ii(0),  # clear
+            tir.StringImm("max"),  # op
+        )
+    )
     func = _wrap(body)
     mid = fold_run(func)
     failures = 0
@@ -194,9 +205,13 @@ def test_fold_parallel_add() -> int:
     row = tir.Var("row", "int32")
     col = tir.Var("col", "int32")
     inner = tir.For(
-        col, _ii(0), _ii(16), tir.ForKind.PARALLEL,
+        col,
+        _ii(0),
+        _ii(16),
+        tir.ForKind.PARALLEL,
         tir.BufferStore(
-            C, tir.BufferLoad(A, [row, col]) + tir.BufferLoad(B, [row, col]),
+            C,
+            tir.BufferLoad(A, [row, col]) + tir.BufferLoad(B, [row, col]),
             [row, col],
         ),
     )
@@ -205,10 +220,12 @@ def test_fold_parallel_add() -> int:
     mid = fold_run(func)
     failures = 0
     # Walk: outer For(row) → body has the fused Elementwise.
-    if (mid.body
-            and isinstance(mid.body[0], ir.For)
-            and mid.body[0].body
-            and isinstance(mid.body[0].body[0], ir.Elementwise)):
+    if (
+        mid.body
+        and isinstance(mid.body[0], ir.For)
+        and mid.body[0].body
+        and isinstance(mid.body[0].body[0], ir.Elementwise)
+    ):
         ew = mid.body[0].body[0]
         failures += _check("op", ew.op, ir.BinOp.ADD)
         failures += _check("# srcs", len(ew.srcs), 2)
@@ -230,15 +247,17 @@ def test_fold_parallel_zero() -> int:
     row = tir.Var("row", "int32")
     col = tir.Var("col", "int32")
     inner = tir.For(
-        col, _ii(0), _ii(16), tir.ForKind.PARALLEL,
+        col,
+        _ii(0),
+        _ii(16),
+        tir.ForKind.PARALLEL,
         tir.BufferStore(Z, tir.FloatImm(f16, 0.0), [row, col]),
     )
     outer = tir.For(row, _ii(0), _ii(64), tir.ForKind.SERIAL, inner)
     func = _wrap(outer)
     mid = fold_run(func)
     failures = 0
-    if (mid.body and isinstance(mid.body[0], ir.For)
-            and isinstance(mid.body[0].body[0], ir.Elementwise)):
+    if mid.body and isinstance(mid.body[0], ir.For) and isinstance(mid.body[0].body[0], ir.Elementwise):
         ew = mid.body[0].body[0]
         failures += _check("op (zero is COPY w/ srcs=[])", ew.op, ir.UnaryOp.COPY)
         failures += _check("# srcs (zero sentinel)", len(ew.srcs), 0)
@@ -254,9 +273,13 @@ def test_fold_parallel_exp() -> int:
     row = tir.Var("row", "int32")
     col = tir.Var("col", "int32")
     inner = tir.For(
-        col, _ii(0), _ii(64), tir.ForKind.PARALLEL,
+        col,
+        _ii(0),
+        _ii(64),
+        tir.ForKind.PARALLEL,
         tir.BufferStore(
-            A, tir.exp(tir.BufferLoad(A, [row, col])),
+            A,
+            tir.exp(tir.BufferLoad(A, [row, col])),
             [row, col],
         ),
     )
@@ -264,8 +287,7 @@ def test_fold_parallel_exp() -> int:
     func = _wrap(outer)
     mid = fold_run(func)
     failures = 0
-    if (mid.body and isinstance(mid.body[0], ir.For)
-            and isinstance(mid.body[0].body[0], ir.Elementwise)):
+    if mid.body and isinstance(mid.body[0], ir.For) and isinstance(mid.body[0].body[0], ir.Elementwise):
         ew = mid.body[0].body[0]
         failures += _check("op", ew.op, ir.UnaryOp.EXP)
         failures += _check("# srcs", len(ew.srcs), 1)
@@ -289,7 +311,10 @@ def test_fold_broadcast_sub_fp() -> int:
     row = tir.Var("row", "int32")
     col = tir.Var("col", "int32")
     inner = tir.For(
-        col, _ii(0), _ii(64), tir.ForKind.PARALLEL,
+        col,
+        _ii(0),
+        _ii(64),
+        tir.ForKind.PARALLEL,
         tir.BufferStore(
             S,
             tir.BufferLoad(S, [row, col]) - tir.BufferLoad(M_CURR, [row]),
@@ -300,8 +325,7 @@ def test_fold_broadcast_sub_fp() -> int:
     func = _wrap(outer)
     mid = fold_run(func)
     failures = 0
-    if not (mid.body and isinstance(mid.body[0], ir.For)
-            and isinstance(mid.body[0].body[0], ir.Elementwise)):
+    if not (mid.body and isinstance(mid.body[0], ir.For) and isinstance(mid.body[0].body[0], ir.Elementwise)):
         print(f"  [FAIL] expected For(row) → Elementwise, got {mid.body}")
         return 1
     ew = mid.body[0].body[0]
@@ -309,20 +333,26 @@ def test_fold_broadcast_sub_fp() -> int:
     failures += _check("# srcs", len(ew.srcs), 2)
     # First src is S (same rank as dst → BufferRef).
     failures += _check(
-        "src[0] is BufferRef", isinstance(ew.srcs[0], ir.BufferRef), True,
+        "src[0] is BufferRef",
+        isinstance(ew.srcs[0], ir.BufferRef),
+        True,
     )
     # Second src is M_CURR (rank 1, dst is rank 2 → Broadcast).
     failures += _check(
-        "src[1] is Broadcast", isinstance(ew.srcs[1], ir.Broadcast), True,
+        "src[1] is Broadcast",
+        isinstance(ew.srcs[1], ir.Broadcast),
+        True,
     )
     if isinstance(ew.srcs[1], ir.Broadcast):
         failures += _check(
             "broadcast dims",
-            ew.srcs[1].broadcast_dims, [1],
+            ew.srcs[1].broadcast_dims,
+            [1],
         )
         failures += _check(
             "broadcast src buffer",
-            ew.srcs[1].src.buffer.name, "M_CURR",
+            ew.srcs[1].src.buffer.name,
+            "M_CURR",
         )
     return failures
 
@@ -336,7 +366,10 @@ def test_fold_broadcast_mul_fp() -> int:
     row = tir.Var("row", "int32")
     col = tir.Var("col", "int32")
     inner = tir.For(
-        col, _ii(0), _ii(16), tir.ForKind.PARALLEL,
+        col,
+        _ii(0),
+        _ii(16),
+        tir.ForKind.PARALLEL,
         tir.BufferStore(
             O_loc,
             tir.BufferLoad(O_loc, [row, col]) * tir.BufferLoad(L_INV, [row]),
@@ -347,8 +380,7 @@ def test_fold_broadcast_mul_fp() -> int:
     func = _wrap(outer)
     mid = fold_run(func)
     failures = 0
-    if not (mid.body and isinstance(mid.body[0], ir.For)
-            and isinstance(mid.body[0].body[0], ir.Elementwise)):
+    if not (mid.body and isinstance(mid.body[0], ir.For) and isinstance(mid.body[0].body[0], ir.Elementwise)):
         return 1
     ew = mid.body[0].body[0]
     failures += _check("op", ew.op, ir.BinOp.MUL)
@@ -367,7 +399,10 @@ def test_fold_broadcast_left_operand() -> int:
     row = tir.Var("row", "int32")
     col = tir.Var("col", "int32")
     inner = tir.For(
-        col, _ii(0), _ii(16), tir.ForKind.PARALLEL,
+        col,
+        _ii(0),
+        _ii(16),
+        tir.ForKind.PARALLEL,
         tir.BufferStore(
             O_loc,
             tir.BufferLoad(SCALE, [row]) * tir.BufferLoad(O_loc, [row, col]),
@@ -377,8 +412,7 @@ def test_fold_broadcast_left_operand() -> int:
     outer = tir.For(row, _ii(0), _ii(64), tir.ForKind.SERIAL, inner)
     func = _wrap(outer)
     mid = fold_run(func)
-    if not (mid.body and isinstance(mid.body[0], ir.For)
-            and isinstance(mid.body[0].body[0], ir.Elementwise)):
+    if not (mid.body and isinstance(mid.body[0], ir.For) and isinstance(mid.body[0].body[0], ir.Elementwise)):
         return 1
     ew = mid.body[0].body[0]
     failures = 0
@@ -394,13 +428,14 @@ def test_fold_conv2d_zero_pad_init() -> int:
     must survive."""
     print("test_fold_conv2d_zero_pad_init — for k: padded[MLEN + k] = 0")
     f16 = "float16"
-    padded = tir.decl_buffer([67], dtype=f16, name="in_FP_padded",
-                             scope="local.fragment")
+    padded = tir.decl_buffer([67], dtype=f16, name="in_FP_padded", scope="local.fragment")
     k = tir.Var("k", "int32")
     body = tir.For(
-        k, _ii(0), _ii(3), tir.ForKind.SERIAL,
-        tir.BufferStore(padded, tir.FloatImm(f16, 0.0),
-                        [tir.IntImm("int32", 64) + k]),
+        k,
+        _ii(0),
+        _ii(3),
+        tir.ForKind.SERIAL,
+        tir.BufferStore(padded, tir.FloatImm(f16, 0.0), [tir.IntImm("int32", 64) + k]),
     )
     func = _wrap(body)
     mid = fold_run(func)
@@ -425,13 +460,14 @@ def test_fold_conv2d_serial_copy() -> int:
     into an Elementwise(COPY)."""
     print("test_fold_conv2d_serial_copy — for i: padded[i] = aux[i]")
     f16 = "float16"
-    padded = tir.decl_buffer([67], dtype=f16, name="in_FP_padded",
-                             scope="local.fragment")
-    aux = tir.decl_buffer([64], dtype=f16, name="in_FP_aux",
-                          scope="local.fragment")
+    padded = tir.decl_buffer([67], dtype=f16, name="in_FP_padded", scope="local.fragment")
+    aux = tir.decl_buffer([64], dtype=f16, name="in_FP_aux", scope="local.fragment")
     i = tir.Var("i", "int32")
     body = tir.For(
-        i, _ii(0), _ii(64), tir.ForKind.SERIAL,
+        i,
+        _ii(0),
+        _ii(64),
+        tir.ForKind.SERIAL,
         tir.BufferStore(padded, tir.BufferLoad(aux, [i]), [i]),
     )
     func = _wrap(body)
@@ -452,14 +488,15 @@ def test_fold_conv2d_shifted_copy() -> int:
     fold can't express this as Elementwise; For + RawStore preserved."""
     print("test_fold_conv2d_shifted_copy — for m: shift[m] = padded[m + kw]")
     f16 = "float16"
-    shift = tir.decl_buffer([64], dtype=f16, name="shift_FP",
-                            scope="local.fragment")
-    padded = tir.decl_buffer([67], dtype=f16, name="in_FP_padded",
-                             scope="local.fragment")
+    shift = tir.decl_buffer([64], dtype=f16, name="shift_FP", scope="local.fragment")
+    padded = tir.decl_buffer([67], dtype=f16, name="in_FP_padded", scope="local.fragment")
     m = tir.Var("m", "int32")
     kw = tir.Var("kw_idx", "int32")
     body = tir.For(
-        m, _ii(0), _ii(64), tir.ForKind.SERIAL,
+        m,
+        _ii(0),
+        _ii(64),
+        tir.ForKind.SERIAL,
         tir.BufferStore(shift, tir.BufferLoad(padded, [m + kw]), [m]),
     )
     func = _wrap(body)
@@ -498,9 +535,13 @@ def test_fold_unfoldable_falls_back_to_for() -> int:
     col = tir.Var("col", "int32")
     k = tir.Var("k", "int32")
     inner = tir.For(
-        col, _ii(0), _ii(16), tir.ForKind.PARALLEL,
+        col,
+        _ii(0),
+        _ii(16),
+        tir.ForKind.PARALLEL,
         tir.BufferStore(
-            C, tir.BufferLoad(A, [row, col]) + tir.BufferLoad(B, [row, k]),
+            C,
+            tir.BufferLoad(A, [row, col]) + tir.BufferLoad(B, [row, k]),
             [row, col],
         ),
     )
@@ -544,16 +585,21 @@ def test_fold_preserves_blockidx() -> int:
     by = tir.Var("by", "int32")
     by_iv = tir.IterVar(
         dom=tvm.ir.Range.from_min_extent(_ii(0), _ii(4)),
-        var=by, iter_type=tir.IterVar.ThreadIndex,
+        var=by,
+        iter_type=tir.IterVar.ThreadIndex,
         thread_tag="blockIdx.y",
     )
     col = tir.Var("col", "int32")
     body = tir.AttrStmt(
-        by_iv, "thread_extent", _ii(4),
+        by_iv,
+        "thread_extent",
+        _ii(4),
         tir.For(
-            col, _ii(0), _ii(16), tir.ForKind.PARALLEL,
-            tir.BufferStore(Z, tir.FloatImm(f16, 0.0),
-                            [tir.IntImm("int32", 0), col]),
+            col,
+            _ii(0),
+            _ii(16),
+            tir.ForKind.PARALLEL,
+            tir.BufferStore(Z, tir.FloatImm(f16, 0.0), [tir.IntImm("int32", 0), col]),
         ),
     )
     func = _wrap(body)
@@ -568,8 +614,7 @@ def test_fold_preserves_blockidx() -> int:
         failures += _check("outer axis_name", outer.axis_name, "by")
         failures += _check("outer extent", outer.extent, 4)
     else:
-        failures += _check("outer is ParallelAxis", type(mid.body[0]).__name__,
-                           "ParallelAxis")
+        failures += _check("outer is ParallelAxis", type(mid.body[0]).__name__, "ParallelAxis")
     return failures
 
 

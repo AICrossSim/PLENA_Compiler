@@ -52,7 +52,9 @@ def _block_idx(name: str, extent: int, tag: str, body) -> tir.Stmt:
     var = tir.Var(name, "int32")
     iv = tir.IterVar(
         dom=tvm.ir.Range.from_min_extent(_ii(0), _ii(extent)),
-        var=var, iter_type=tir.IterVar.ThreadIndex, thread_tag=tag,
+        var=var,
+        iter_type=tir.IterVar.ThreadIndex,
+        thread_tag=tag,
     )
     return tir.AttrStmt(iv, "thread_extent", _ii(extent), body)
 
@@ -111,8 +113,7 @@ def test_single_bare_indexed_grid_var_picked() -> int:
     by = tir.Var("by", "int32")
     Q = _decl_buffer("Q", [1, 64, 4, 16])
     load = tir.BufferLoad(Q, [_ii(0), _ii(0), by, _ii(0)])
-    body = _block_idx_with_var("by", _LANE, "blockIdx.y", by,
-                               _make_body_with_loads([load]))
+    body = _block_idx_with_var("by", _LANE, "blockIdx.y", by, _make_body_with_loads([load]))
     func = _wrap(body)
     out = infer_run(func)
     return _check("picked", _read_lane_axis(out), "by")
@@ -123,7 +124,9 @@ def _block_idx_with_var(name, extent, tag, var, body):
     can also be referenced inside the body's BufferLoads."""
     iv = tir.IterVar(
         dom=tvm.ir.Range.from_min_extent(_ii(0), _ii(extent)),
-        var=var, iter_type=tir.IterVar.ThreadIndex, thread_tag=tag,
+        var=var,
+        iter_type=tir.IterVar.ThreadIndex,
+        thread_tag=tag,
     )
     return tir.AttrStmt(iv, "thread_extent", _ii(extent), body)
 
@@ -139,8 +142,7 @@ def test_q_block_only_arithmetic_not_picked() -> int:
     Q = _decl_buffer("Q", [1, 64 * 2, 4, 16])
     # Q_hbm[0, q_block*64, by, 0] — by is bare, q_block is in q_block*64
     load = tir.BufferLoad(Q, [_ii(0), q_block * _ii(64), by, _ii(0)])
-    inner = _block_idx_with_var("by", _LANE, "blockIdx.y", by,
-                                _make_body_with_loads([load]))
+    inner = _block_idx_with_var("by", _LANE, "blockIdx.y", by, _make_body_with_loads([load]))
     outer = _block_idx_with_var("q_block", 2, "blockIdx.x", q_block, inner)
     func = _wrap(outer)
     out = infer_run(func)
@@ -155,8 +157,7 @@ def test_q_block_lane_eligible_only_when_bare() -> int:
     by = tir.Var("by", "int32")
     Q = _decl_buffer("Q", [1, 64 * 8, 4, 16])
     load = tir.BufferLoad(Q, [_ii(0), q_block * _ii(64), by, _ii(0)])
-    inner = _block_idx_with_var("by", _LANE, "blockIdx.y", by,
-                                _make_body_with_loads([load]))
+    inner = _block_idx_with_var("by", _LANE, "blockIdx.y", by, _make_body_with_loads([load]))
     outer = _block_idx_with_var("q_block", 8, "blockIdx.x", q_block, inner)
     func = _wrap(outer)
     out = infer_run(func)
@@ -168,8 +169,7 @@ def test_no_buffer_loads_no_attr() -> int:
     """No BufferLoad anywhere → no bare-index candidates → no attr."""
     print("test_no_buffer_loads_no_attr")
     by = tir.Var("by", "int32")
-    body = _block_idx_with_var("by", _LANE, "blockIdx.y", by,
-                               tir.Evaluate(_ii(0)))
+    body = _block_idx_with_var("by", _LANE, "blockIdx.y", by, tir.Evaluate(_ii(0)))
     func = _wrap(body)
     out = infer_run(func)
     return _check("no attr set", _read_lane_axis(out), None)
@@ -184,8 +184,7 @@ def test_multiple_bare_candidates_raise() -> int:
     Q = _decl_buffer("Q", [4, 4, 16])
     # Q[bx, by, 0] — both bare
     load = tir.BufferLoad(Q, [bx, by, _ii(0)])
-    inner = _block_idx_with_var("by", _LANE, "blockIdx.y", by,
-                                _make_body_with_loads([load]))
+    inner = _block_idx_with_var("by", _LANE, "blockIdx.y", by, _make_body_with_loads([load]))
     outer = _block_idx_with_var("bx", _LANE, "blockIdx.x", bx, inner)
     func = _wrap(outer)
     try:
@@ -202,8 +201,7 @@ def test_manual_override_preserved() -> int:
     by = tir.Var("by", "int32")
     Q = _decl_buffer("Q", [1, 64, 4, 16])
     load = tir.BufferLoad(Q, [_ii(0), _ii(0), by, _ii(0)])
-    body = _block_idx_with_var("by", _LANE, "blockIdx.y", by,
-                               _make_body_with_loads([load]))
+    body = _block_idx_with_var("by", _LANE, "blockIdx.y", by, _make_body_with_loads([load]))
     func = _wrap(body, attrs={_LANE_ATTR: "manual"})
     out = infer_run(func)
     return _check("preserved", _read_lane_axis(out), "manual")
@@ -216,12 +214,10 @@ def test_extent_not_multiple_of_lane() -> int:
     by = tir.Var("by", "int32")
     Q = _decl_buffer("Q", [3, 16])
     load = tir.BufferLoad(Q, [by, _ii(0)])
-    body = _block_idx_with_var("by", 3, "blockIdx.y", by,
-                               _make_body_with_loads([load]))
+    body = _block_idx_with_var("by", 3, "blockIdx.y", by, _make_body_with_loads([load]))
     func = _wrap(body)
     out = infer_run(func)
-    return _check("no attr (extent not lane-multiple)",
-                  _read_lane_axis(out), None)
+    return _check("no attr (extent not lane-multiple)", _read_lane_axis(out), None)
 
 
 # ---------------------------------------------------------------------------

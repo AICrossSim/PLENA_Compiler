@@ -416,10 +416,11 @@ class IsaCompiler(
             shape=shape,
             vram_addr=vram_addr,
             allocate_if_none=False,
-            )
+        )
 
     def free_vram_object(self, name: str, strict: bool = False):
         """Free a VRAM object by name (defaults to non-strict)."""
         return MemoryStateMixin.free_vram_object(self, name, strict=strict)
+
 
 __all__ = ["IsaCompiler"]

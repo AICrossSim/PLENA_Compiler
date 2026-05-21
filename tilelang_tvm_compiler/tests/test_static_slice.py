@@ -49,14 +49,12 @@ def test_isa_loads_correct_offset():
     # row_start in 2D logical = batch*seq_total + slice_start (with batch=0)
     # since we do H*D merge, the offset in elements = row_start * cols = slice_start * (H*D)
     expected_off = SLICE_START * (GROUP_HEADS * HLEN)
-    assert f"parent_off={expected_off} elems" in asm, (
-        f"expected slice comment to mention parent_off={expected_off}"
-    )
+    assert f"parent_off={expected_off} elems" in asm, f"expected slice comment to mention parent_off={expected_off}"
     # And the literal must be loaded into a register before the prefetch.
     assert re.search(rf"S_ADDI_INT gp\d+, gp0, {expected_off}\b", asm), (
         f"expected `S_ADDI_INT gpX, gp0, {expected_off}` (offset literal)"
     )
-    print(f"[ok] hbm_start_offset = {expected_off} (= {SLICE_START} * {GROUP_HEADS*HLEN})")
+    print(f"[ok] hbm_start_offset = {expected_off} (= {SLICE_START} * {GROUP_HEADS * HLEN})")
 
 
 def test_isa_uses_parent_scale_not_slice_scale():
@@ -71,9 +69,9 @@ def test_isa_uses_parent_scale_not_slice_scale():
         f"HLIR parent.hbm_scale_size={parent.hbm_scale_size}, want {parent_scale}"
     )
     # And the value must be loaded for C_SET_SCALE_REG.
-    assert re.search(
-        rf"S_ADDI_INT gp\d+, gp0, {parent_scale}\s*\n\s*C_SET_SCALE_REG", asm
-    ), f"expected `S_ADDI_INT ... {parent_scale}` then `C_SET_SCALE_REG`"
+    assert re.search(rf"S_ADDI_INT gp\d+, gp0, {parent_scale}\s*\n\s*C_SET_SCALE_REG", asm), (
+        f"expected `S_ADDI_INT ... {parent_scale}` then `C_SET_SCALE_REG`"
+    )
     print(f"[ok] SCALE_REG <- parent_full_size {parent_scale}")
 
 
@@ -83,9 +81,7 @@ def test_isa_uses_parent_stride():
     ck = compile_kernel(static_slice_dma, target=PlenaTarget(), name="static_slice")
     asm = ck.isa_text
     parent_stride = GROUP_HEADS * HLEN  # = 64
-    assert re.search(
-        rf"S_ADDI_INT gp\d+, gp0, {parent_stride}\s*\n\s*C_SET_STRIDE_REG", asm
-    )
+    assert re.search(rf"S_ADDI_INT gp\d+, gp0, {parent_stride}\s*\n\s*C_SET_STRIDE_REG", asm)
     print(f"[ok] STRIDE_REG <- parent_stride {parent_stride}")
 
 

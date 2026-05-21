@@ -54,9 +54,10 @@ class MaterializedExpr:
     consuming `register` (using it in a subsequent instruction) and
     calling `release()` when done, or copying its value elsewhere first.
     """
+
     register: int
     isa: str
-    owns_register: bool             # caller may free `register` via release()
+    owns_register: bool  # caller may free `register` via release()
     intermediates: list[int] = field(default_factory=list)
     _materializer: ExprMaterializer | None = None
 
@@ -132,9 +133,7 @@ class ExprMaterializer:
                 return self._materialize_unary_imm(b, "S_ADDI_INT", _int_value(a))
             if _is_intlike(b) and not _is_intlike(a) and 0 <= _int_value(b) <= _S_ADDI_MAX:
                 return self._materialize_unary_imm(a, "S_ADDI_INT", _int_value(b))
-            return self._materialize_binop(
-                a, b, "S_ADD_INT", lambda x, y: x + y, identity_const=0
-            )
+            return self._materialize_binop(a, b, "S_ADD_INT", lambda x, y: x + y, identity_const=0)
 
         if isinstance(expr, tir.Sub):
             # x - 0 -> x (but NOT 0 - x, which would be negation).
@@ -157,9 +156,7 @@ class ExprMaterializer:
             shift = _try_pow2_shift_amount(expr.a)
             if shift is not None:
                 return self._materialize_unary_imm(expr.b, "S_SLLI_INT", shift)
-            return self._materialize_binop(
-                expr.a, expr.b, "S_MUL_INT", lambda x, y: x * y, identity_const=1
-            )
+            return self._materialize_binop(expr.a, expr.b, "S_MUL_INT", lambda x, y: x * y, identity_const=1)
 
         # FloorDiv / FloorMod: PLENA ISA has no integer divide and no
         # shift, so we can ONLY handle the case where both operands are
@@ -189,9 +186,7 @@ class ExprMaterializer:
                 # Variable shift amount: S_SLL_INT rd, rs1, rs2.
                 return self._materialize_binop(lhs, rhs, reg_op, py)
 
-        raise ExprMaterializeError(
-            f"unsupported PrimExpr node: {type(expr).__name__} ({expr!r})"
-        )
+        raise ExprMaterializeError(f"unsupported PrimExpr node: {type(expr).__name__} ({expr!r})")
 
     # ------------------------------------------------------------------
     # leaf cases
@@ -206,17 +201,12 @@ class ExprMaterializer:
             # Two-instruction form: load upper 20 bits, then add lower 12.
             upper = n >> 12
             lower = n & 0xFFF
-            isa = (
-                f"S_LUI_INT gp{r}, {upper}\n"
-                f"S_ADDI_INT gp{r}, gp{r}, {lower}\n"
-            )
+            isa = f"S_LUI_INT gp{r}, {upper}\nS_ADDI_INT gp{r}, gp{r}, {lower}\n"
         else:
             # Negative immediates aren't part of typical PLENA use cases
             # (offsets, sizes are >=0). Surface this loudly when it
             # eventually comes up so we can decide on a proper encoding.
-            raise ExprMaterializeError(
-                f"negative int literal not supported yet: {n}"
-            )
+            raise ExprMaterializeError(f"negative int literal not supported yet: {n}")
         # Eager flush: write the ISA to generated_code immediately so
         # call-order matches emit-order. Lazy isa strings caused
         # cross-call register clobbering (a later allocate_gp triggered
@@ -224,9 +214,7 @@ class ExprMaterializer:
         # "S_LD_INT gp{r}, ..." -- the same physical reg ended up being
         # loaded twice with different values, second one winning).
         self.shim.compiler.generated_code += isa
-        return MaterializedExpr(
-            register=r, isa="", owns_register=True, _materializer=self
-        )
+        return MaterializedExpr(register=r, isa="", owns_register=True, _materializer=self)
 
     def _materialize_var(self, v: tir.Var) -> MaterializedExpr:
         """Look up a bound var in the symbol table.
@@ -243,14 +231,11 @@ class ExprMaterializer:
         """
         if v not in self.symbol_table:
             raise ExprMaterializeError(
-                f"unbound tir.Var {v.name!r}; not in symbol_table "
-                f"(known: {[x.name for x in self.symbol_table]!r})"
+                f"unbound tir.Var {v.name!r}; not in symbol_table (known: {[x.name for x in self.symbol_table]!r})"
             )
         binding = self.symbol_table[v]
         if isinstance(binding, int):
-            return MaterializedExpr(
-                register=binding, isa="", owns_register=False, _materializer=self
-            )
+            return MaterializedExpr(register=binding, isa="", owns_register=False, _materializer=self)
         if isinstance(binding, tuple) and len(binding) == 2 and binding[0] == "ram":
             ram_addr = int(binding[1])
             ra = self.shim.compiler.register_allocator
@@ -262,15 +247,10 @@ class ExprMaterializer:
             # to those spill instructions and silently corrupt the value
             # this load was supposed to deliver.
             self.shim.compiler.generated_code += (
-                f"; load ram-backed idx {v.name} <- intram[{ram_addr}]\n"
-                f"S_LD_INT gp{reg}, gp0, {ram_addr}\n"
+                f"; load ram-backed idx {v.name} <- intram[{ram_addr}]\nS_LD_INT gp{reg}, gp0, {ram_addr}\n"
             )
-            return MaterializedExpr(
-                register=reg, isa="", owns_register=True, _materializer=self
-            )
-        raise ExprMaterializeError(
-            f"symbol_table[{v.name!r}] has unsupported binding {binding!r}"
-        )
+            return MaterializedExpr(register=reg, isa="", owns_register=True, _materializer=self)
+        raise ExprMaterializeError(f"symbol_table[{v.name!r}] has unsupported binding {binding!r}")
 
     # ------------------------------------------------------------------
     # binary ops (Add / Sub / Mul share this skeleton)
@@ -327,8 +307,8 @@ class ExprMaterializer:
         # generated_code at construction time); we keep the `+ m.isa`
         # bits for any legacy MaterializedExpr that might still carry a
         # non-empty isa string.
-        self.shim.compiler.generated_code += m_lhs.isa + m_rhs.isa + (
-            f"{opcode} gp{out_reg}, gp{m_lhs.register}, gp{m_rhs.register}\n"
+        self.shim.compiler.generated_code += (
+            m_lhs.isa + m_rhs.isa + (f"{opcode} gp{out_reg}, gp{m_lhs.register}, gp{m_rhs.register}\n")
         )
         isa = ""
 
@@ -348,7 +328,6 @@ class ExprMaterializer:
             intermediates=intermediates,
             _materializer=self,
         )
-
 
     def _materialize_floordivmod(self, lhs, rhs, op_str: str, py_op) -> MaterializedExpr:
         """FloorDiv / FloorMod: only fold-or-identity-or-shift, never an
@@ -396,7 +375,6 @@ class ExprMaterializer:
             f"computed at compile time, or use a power-of-2 divisor."
         )
 
-
     def _materialize_unary_imm(
         self,
         operand,
@@ -432,9 +410,7 @@ class ExprMaterializer:
         # Eager flush (see _materialize_binop / _materialize_var for
         # the rationale -- lazy isa strings interleave incorrectly with
         # eager auto-spill / ram-idx loads).
-        self.shim.compiler.generated_code += m_operand.isa + (
-            f"{opcode} gp{out_reg}, gp{m_operand.register}, {imm}\n"
-        )
+        self.shim.compiler.generated_code += m_operand.isa + (f"{opcode} gp{out_reg}, gp{m_operand.register}, {imm}\n")
         isa = ""
         if m_operand.owns_register:
             ra.free_gp([m_operand.register])

@@ -50,9 +50,20 @@ from __future__ import annotations
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
     AxisInfo,
-    BufferDef, BufferRef, Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
-    For, Async, MultiLaneOp,
-    ParallelAxis, MidFunc, Stmt,
+    BufferDef,
+    BufferRef,
+    Dma,
+    Gemm,
+    Elementwise,
+    Broadcast,
+    Reduce,
+    RawStore,
+    For,
+    Async,
+    MultiLaneOp,
+    ParallelAxis,
+    MidFunc,
+    Stmt,
 )
 
 
@@ -120,8 +131,7 @@ def _collect_views(stmt: Stmt, table: dict[str, list[tuple[int, ...]]]) -> None:
     # RawStore: opaque, skip.
 
 
-def _agreed_perms(table: dict[str, list[tuple[int, ...]]]
-                  ) -> dict[str, tuple[int, ...]]:
+def _agreed_perms(table: dict[str, list[tuple[int, ...]]]) -> dict[str, tuple[int, ...]]:
     """For each buffer, verify all collected perms agree. Returns
     name → single perm. Raises on mismatch."""
     out: dict[str, tuple[int, ...]] = {}
@@ -144,10 +154,7 @@ def _agreed_perms(table: dict[str, list[tuple[int, ...]]]
 
 def _permute_buffer(buf: BufferDef, perm: tuple[int, ...]) -> BufferDef:
     if len(perm) != len(buf.shape):
-        raise BurnViewError(
-            f"buffer {buf.name!r} rank {len(buf.shape)} doesn't match "
-            f"perm rank {len(perm)}"
-        )
+        raise BurnViewError(f"buffer {buf.name!r} rank {len(buf.shape)} doesn't match perm rank {len(perm)}")
     # Track the cluster axis through the permutation: it lands at the
     # new position whose ``perm[i]`` equals the old cluster_dim.
     new_cluster: int | None = None
@@ -165,8 +172,7 @@ def _permute_buffer(buf: BufferDef, perm: tuple[int, ...]) -> BufferDef:
     )
 
 
-def _build_permuted_defs(func: MidFunc,
-                         perms: dict[str, tuple[int, ...]]) -> dict[str, BufferDef]:
+def _build_permuted_defs(func: MidFunc, perms: dict[str, tuple[int, ...]]) -> dict[str, BufferDef]:
     """Return name → permuted BufferDef for every lane-aware buffer that
     needs a non-identity perm. Identity perms still build a fresh def
     for uniformity (so callers swap to a single canonical def)."""
@@ -186,8 +192,7 @@ def _build_permuted_defs(func: MidFunc,
 # ---------------------------------------------------------------------------
 
 
-def _rewrite_ref(ref: BufferRef,
-                 new_defs: dict[str, BufferDef]) -> BufferRef:
+def _rewrite_ref(ref: BufferRef, new_defs: dict[str, BufferDef]) -> BufferRef:
     if ref.buffer.scope == "global" or ref.buffer.scope.startswith("global."):
         return ref
     new_def = new_defs.get(ref.buffer.name)
@@ -203,7 +208,7 @@ def _rewrite_ref(ref: BufferRef,
     return BufferRef(
         buffer=new_def,
         indices=new_indices,
-        view_perm=None,    # baked
+        view_perm=None,  # baked
     )
 
 

@@ -89,8 +89,12 @@ def test_emit_matmul_general_rejects_N_not_hlen_aligned():
     emitter = ISAEmitter(shim)
     try:
         emitter.emit_matmul_general(
-            M_tiles=1, K_tiles=1, N=20,   # not a multiple of hlen=16
-            lhs_vram_base=0, rhs_mram_base=0, dst_vram_base=0,
+            M_tiles=1,
+            K_tiles=1,
+            N=20,  # not a multiple of hlen=16
+            lhs_vram_base=0,
+            rhs_mram_base=0,
+            dst_vram_base=0,
         )
     except ValueError as exc:
         assert "divisible by hlen" in str(exc)
@@ -135,7 +139,8 @@ def test_codegen_handles_plena_matmul_call():
     from tvm import tir
     from tilelang_tvm_compiler.codegen import PlenaCodegen
     from tilelang_tvm_compiler.address_alloc import (
-        AddressAllocationPass, AddressAllocConfig,
+        AddressAllocationPass,
+        AddressAllocConfig,
     )
 
     extern_op = tvm.ir.Op.get("tir.call_extern")
@@ -148,26 +153,34 @@ def test_codegen_handles_plena_matmul_call():
     C_buf = tir.decl_buffer(shape=(64, 64), dtype="float16", name="C", data=C_data, scope="vram")
 
     call = tir.Call(
-        "handle", extern_op,
+        "handle",
+        extern_op,
         [
             tir.StringImm("plena.matmul"),
-            A_data, B_data, C_data,
-            tir.IntImm("int32", 1),   # M_tiles
-            tir.IntImm("int32", 1),   # K_tiles
+            A_data,
+            B_data,
+            C_data,
+            tir.IntImm("int32", 1),  # M_tiles
+            tir.IntImm("int32", 1),  # K_tiles
             tir.IntImm("int32", 64),  # N
-            tir.IntImm("int32", 0),   # lhs_offset
-            tir.IntImm("int32", 0),   # rhs_offset
-            tir.IntImm("int32", 0),   # dst_offset
-            tir.IntImm("int32", 0),   # dst_row_stride (0 -> default = N)
+            tir.IntImm("int32", 0),  # lhs_offset
+            tir.IntImm("int32", 0),  # rhs_offset
+            tir.IntImm("int32", 0),  # dst_offset
+            tir.IntImm("int32", 0),  # dst_row_stride (0 -> default = N)
         ],
     )
     body = tir.Block(
-        iter_vars=[], reads=[], writes=[], name_hint="root",
+        iter_vars=[],
+        reads=[],
+        writes=[],
+        name_hint="root",
         body=tir.Evaluate(call),
         alloc_buffers=[A_buf, B_buf, C_buf],
     )
     body = tir.BlockRealize(
-        iter_values=[], predicate=tir.IntImm("bool", True), block=body,
+        iter_values=[],
+        predicate=tir.IntImm("bool", True),
+        block=body,
     )
     func = tir.PrimFunc(params=[], body=body, ret_type=None, buffer_map={})
 

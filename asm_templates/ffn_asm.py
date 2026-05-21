@@ -385,15 +385,11 @@ def _emit_ffn_projection_unrolled(
         if not is_first:
             # V_ADD_VV output += scratch  for the entire output region.
             # Use w_actual_register as output pointer, w_temp_register as scratch ptr.
-            lines.append(
-                f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]\n"
-            )
+            lines.append(f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]\n")
             lines.append(_load_large_int(w_actual_register, result_base_value))
             lines.append(_load_large_int(w_temp_register, scratch_base_value))
             for _ in range(per_vlen_adds):
-                lines.append(
-                    f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 \n"
-                )
+                lines.append(f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 \n")
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {vlen} \n")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {vlen} \n")
 
@@ -492,15 +488,11 @@ def _emit_ffn_projection_chunk(
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n")
                 lines.append(
-                    _addi_large_int(
-                        w_hbm_offset_register, w_hbm_offset_register, mlen * weight_stride, w_temp_register
-                    )
+                    _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * weight_stride, w_temp_register)
                 )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n")
         else:
-            lines.append(
-                f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n"
-            )
+            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n")
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_base_register}, {(weight_row % (mlen // blen)) * blen} \n"
             )
@@ -528,16 +520,12 @@ def _emit_ffn_projection_chunk(
             for _ in range(k_tile_count):
                 lines.append(f"M_MM 0, gp{w_temp_register}, gp{a_actual_register} \n")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} \n")
-                lines.append(
-                    f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n"
-                )
+                lines.append(f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 \n")
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} \n")
 
         if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_size // blen - 1:
-            lines.append(
-                f"S_ADDI_INT gp{result_base_register}, gp{result_base_register}, {mlen * batch * seq_len} \n"
-            )
+            lines.append(f"S_ADDI_INT gp{result_base_register}, gp{result_base_register}, {mlen * batch * seq_len} \n")
 
     return "".join(lines)
 

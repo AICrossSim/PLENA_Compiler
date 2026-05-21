@@ -111,7 +111,7 @@ def test_mm_slot_lowering_targets_packed_slots():
     op = _hlir.Op(
         kind="mm_slot",
         buffer_args=["lhs", "rhs", "dst"],
-        scalar_args=[0, 16, 16, 16],   # lhs_row_offset, rhs_col_offset, dst_col_offset, col_count
+        scalar_args=[0, 16, 16, 16],  # lhs_row_offset, rhs_col_offset, dst_col_offset, col_count
         annotations={"intrinsic": "plena.mm_slot"},
     )
     emitter_pass._emit_mm_slot(mod, op)

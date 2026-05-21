@@ -12,10 +12,16 @@ def test_online_softmax_hbm_isa_contains_expected_ops():
     asm = ck.isa_text
     for needle in [
         "H_PREFETCH_V",
-        "V_RED_MAX", "V_RED_SUM",
-        "V_SUB_VF", "V_EXP_V",
-        "S_LD_FP", "S_ST_FP",
-        "S_SUB_FP", "S_EXP_FP", "S_MUL_FP", "S_ADD_FP",
+        "V_RED_MAX",
+        "V_RED_SUM",
+        "V_SUB_VF",
+        "V_EXP_V",
+        "S_LD_FP",
+        "S_ST_FP",
+        "S_SUB_FP",
+        "S_EXP_FP",
+        "S_MUL_FP",
+        "S_ADD_FP",
     ]:
         assert needle in asm, needle
     print("[ok] online_softmax_hbm ISA contains DMA + vector + scalar FP instructions")

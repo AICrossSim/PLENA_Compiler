@@ -95,9 +95,7 @@ def test_vram_fill_zero_all_column_blocks():
     code = prog.get_code()
 
     # 384/64 = 6 column blocks, each needs a V_MUL_VF zeroing loop
-    assert code.count("V_MUL_VF") >= 6, (
-        f"Expected >= 6 V_MUL_VF (one per column block), got {code.count('V_MUL_VF')}"
-    )
+    assert code.count("V_MUL_VF") >= 6, f"Expected >= 6 V_MUL_VF (one per column block), got {code.count('V_MUL_VF')}"
     print("  PASS test_vram_fill_zero_all_column_blocks")
 
 
@@ -112,9 +110,7 @@ def test_vram_add_all_column_blocks():
     code = prog.get_code()
 
     # 6 column blocks = 6 V_ADD_VV loops
-    assert code.count("V_ADD_VV") >= 6, (
-        f"Expected >= 6 V_ADD_VV (one per column block), got {code.count('V_ADD_VV')}"
-    )
+    assert code.count("V_ADD_VV") >= 6, f"Expected >= 6 V_ADD_VV (one per column block), got {code.count('V_ADD_VV')}"
     print("  PASS test_vram_add_all_column_blocks")
 
 
@@ -132,9 +128,7 @@ def test_alloc_at_correct_address():
     view = prog.alloc_at("X_cb2_view", 64, 64, view_addr)
 
     actual_addr = prog.get_vram_addr(view.name)
-    assert actual_addr == view_addr, (
-        f"alloc_at address mismatch: expected {view_addr}, got {actual_addr}"
-    )
+    assert actual_addr == view_addr, f"alloc_at address mismatch: expected {view_addr}, got {actual_addr}"
     print("  PASS test_alloc_at_correct_address")
 
 
@@ -151,16 +145,12 @@ def test_fix_large_immediates_roundtrip():
 
         if val < (1 << 18):
             # Should remain as S_ADDI_INT
-            assert f"S_ADDI_INT gp5, gp0, {val}" in fixed, (
-                f"Small value {val} was incorrectly converted"
-            )
+            assert f"S_ADDI_INT gp5, gp0, {val}" in fixed, f"Small value {val} was incorrectly converted"
         else:
             # Should be S_LUI_INT + optional S_ADDI_INT
             upper = val >> 12
             lower = val & 0xFFF
-            assert f"S_LUI_INT gp5, {upper}" in fixed, (
-                f"Large value {val}: missing S_LUI_INT gp5, {upper}"
-            )
+            assert f"S_LUI_INT gp5, {upper}" in fixed, f"Large value {val}: missing S_LUI_INT gp5, {upper}"
             # Verify roundtrip: upper << 12 + lower == val
             reconstructed = (upper << 12) + lower
             assert reconstructed == val, (
@@ -177,16 +167,12 @@ def test_fix_large_immediates_preserves_relative_adds():
     # Relative add: gp5 = gp3 + 300000 — should NOT be converted
     asm = "S_ADDI_INT gp5, gp3, 300000\n"
     fixed = _fix_large_immediates(asm)
-    assert "S_ADDI_INT gp5, gp3, 300000" in fixed, (
-        "Relative S_ADDI_INT was incorrectly converted"
-    )
+    assert "S_ADDI_INT gp5, gp3, 300000" in fixed, "Relative S_ADDI_INT was incorrectly converted"
 
     # Absolute load: gp5 = gp0 + 300000 — SHOULD be converted
     asm2 = "S_ADDI_INT gp5, gp0, 300000\n"
     fixed2 = _fix_large_immediates(asm2)
-    assert "S_LUI_INT" in fixed2, (
-        "Absolute S_ADDI_INT with large value was not converted"
-    )
+    assert "S_LUI_INT" in fixed2, "Absolute S_ADDI_INT with large value was not converted"
 
     print("  PASS test_fix_large_immediates_preserves_relative_adds")
 
@@ -198,9 +184,7 @@ def test_rotate_half_matrix_identity():
     R = _make_rotate_half_matrix(64)
     RR = R @ R
     expected = -torch.eye(64)
-    assert torch.allclose(RR, expected, atol=1e-6), (
-        f"R @ R should be -I, got max diff {(RR - expected).abs().max()}"
-    )
+    assert torch.allclose(RR, expected, atol=1e-6), f"R @ R should be -I, got max diff {(RR - expected).abs().max()}"
     print("  PASS test_rotate_half_matrix_identity")
 
 
@@ -209,9 +193,7 @@ def test_compile_native_hf_decoder_golden_vs_hf():
     from compiler.aten.plena_frontend import compile_native_hf_decoder
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(
-        "AICrossSim/clm-60m", torch_dtype=torch.float32
-    )
+    model = AutoModelForCausalLM.from_pretrained("AICrossSim/clm-60m", torch_dtype=torch.float32)
     model.eval()
 
     r = compile_native_hf_decoder(model, seq_len=64, num_layers=1)
@@ -220,9 +202,7 @@ def test_compile_native_hf_decoder_golden_vs_hf():
 
     diff = (golden - hf).abs()
     pct = (diff <= 0.2 + 0.2 * hf.abs()).float().mean() * 100
-    cos = torch.nn.functional.cosine_similarity(
-        golden.flatten().unsqueeze(0), hf.flatten().unsqueeze(0)
-    )
+    cos = torch.nn.functional.cosine_similarity(golden.flatten().unsqueeze(0), hf.flatten().unsqueeze(0))
 
     assert pct >= 95.0, f"Golden vs HF allclose {pct:.1f}% < 95%"
     assert cos.item() >= 0.99, f"Golden vs HF cosine {cos.item():.4f} < 0.99"
@@ -237,9 +217,7 @@ def test_native_compile_assembles():
     from compiler.aten.plena_frontend import compile_native_hf_decoder
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(
-        "AICrossSim/clm-60m", torch_dtype=torch.float32
-    )
+    model = AutoModelForCausalLM.from_pretrained("AICrossSim/clm-60m", torch_dtype=torch.float32)
     model.eval()
 
     r = compile_native_hf_decoder(model, seq_len=64, num_layers=1)

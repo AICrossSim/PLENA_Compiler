@@ -14,4 +14,3 @@ _compiler_root = Path(__file__).resolve().parent.parent
 _tools_root = _compiler_root.parent / "PLENA_Tools"
 
 __path__ = [str(_compiler_root), str(_tools_root)]
-

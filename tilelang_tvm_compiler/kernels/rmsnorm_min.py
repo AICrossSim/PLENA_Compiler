@@ -37,10 +37,7 @@ def make_rmsnorm_min(
         raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
     hardware_lane_count = MLEN // hlen
     if head_count % hardware_lane_count != 0:
-        raise ValueError(
-            f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; "
-            f"got {head_count}"
-        )
+        raise ValueError(f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; got {head_count}")
     if num_s_blocks < 1:
         raise ValueError(f"num_s_blocks must be >= 1, got {num_s_blocks}")
 
@@ -52,30 +49,30 @@ def make_rmsnorm_min(
 
     @T.prim_func
     def rmsnorm_min(
-        X_hbm:     T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        X_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
         SCALE_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        Y_hbm:     T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        Y_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
     ):
         with T.Kernel(num_s_blocks, head_count, threads=128) as (s_block, by):
             # HBM ↔ on-chip staging (shared).
-            X_sh     = T.alloc_shared((rows, hlen), "float16")
+            X_sh = T.alloc_shared((rows, hlen), "float16")
             SCALE_sh = T.alloc_shared((rows, hlen), "float16")
-            Y_sh     = T.alloc_shared((rows, hlen), "float16")
+            Y_sh = T.alloc_shared((rows, hlen), "float16")
 
             # Rank-2 VRAM work fragments — row_*_fp_at / tile_mul take
             # their dst/src from these. (rank-1 fragments would land on
             # FPRAM scalars, rank-2 stays on VRAM.)
-            X_loc   = T.alloc_fragment((rows, hlen), "float16")
-            SC_loc  = T.alloc_fragment((rows, hlen), "float16")
-            SQ_loc  = T.alloc_fragment((rows, hlen), "float16")
-            Y_loc   = T.alloc_fragment((rows, hlen), "float16")
+            X_loc = T.alloc_fragment((rows, hlen), "float16")
+            SC_loc = T.alloc_fragment((rows, hlen), "float16")
+            SQ_loc = T.alloc_fragment((rows, hlen), "float16")
+            Y_loc = T.alloc_fragment((rows, hlen), "float16")
 
             # Per-row FP scratch (rank-1 → FPRAM scalar slots).
-            SS     = T.alloc_fragment((rows,), "float16")
-            SS_N   = T.alloc_fragment((rows,), "float16")
+            SS = T.alloc_fragment((rows,), "float16")
+            SS_N = T.alloc_fragment((rows,), "float16")
             SS_EPS = T.alloc_fragment((rows,), "float16")
-            NORM   = T.alloc_fragment((rows,), "float16")
-            INV    = T.alloc_fragment((rows,), "float16")
+            NORM = T.alloc_fragment((rows,), "float16")
+            INV = T.alloc_fragment((rows,), "float16")
 
             # 1/hlen and eps are inlined as T.float16(...) literals
             # below; auto-hoisted into 1-slot global.fpram buffers.
@@ -109,11 +106,11 @@ def make_rmsnorm_min(
             T.reduce_sum(SQ_loc, SS, dim=1)
 
             for row in T.serial(rows):
-                SS_N[row]   = SS[row] * T.float16(inv_n_val)
+                SS_N[row] = SS[row] * T.float16(inv_n_val)
                 SS_EPS[row] = SS_N[row] + T.float16(eps)
-                NORM[row]   = T.sqrt(SS_EPS[row])
+                NORM[row] = T.sqrt(SS_EPS[row])
                 # literal-1 numerator so fold picks the reci pattern
-                INV[row]    = T.float16(1.0) / NORM[row]
+                INV[row] = T.float16(1.0) / NORM[row]
 
             # y = x * scale  (host has broadcast SCALE into (rows, hlen)).
             # Write directly into Y_loc — packed-head row_mul_fp_at below

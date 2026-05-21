@@ -32,10 +32,7 @@ def make_modulate_min(
         raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
     hardware_lane_count = MLEN // hlen
     if head_count % hardware_lane_count != 0:
-        raise ValueError(
-            f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; "
-            f"got {head_count}"
-        )
+        raise ValueError(f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; got {head_count}")
     if num_s_blocks < 1:
         raise ValueError(f"num_s_blocks must be >= 1, got {num_s_blocks}")
 
@@ -43,17 +40,17 @@ def make_modulate_min(
 
     @T.prim_func
     def modulate_min(
-        X_hbm:        T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        SCALE1P_hbm:  T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        SHIFT_hbm:    T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        Y_hbm:        T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        X_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        SCALE1P_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        SHIFT_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        Y_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
     ):
         with T.Kernel(num_s_blocks, head_count, threads=128) as (s_block, by):
-            X_sh       = T.alloc_shared((rows, hlen), "float16")
+            X_sh = T.alloc_shared((rows, hlen), "float16")
             SCALE1P_sh = T.alloc_shared((rows, hlen), "float16")
-            SHIFT_sh   = T.alloc_shared((rows, hlen), "float16")
-            TMP_sh     = T.alloc_shared((rows, hlen), "float16")
-            Y_sh       = T.alloc_shared((rows, hlen), "float16")
+            SHIFT_sh = T.alloc_shared((rows, hlen), "float16")
+            TMP_sh = T.alloc_shared((rows, hlen), "float16")
+            Y_sh = T.alloc_shared((rows, hlen), "float16")
 
             T.copy(
                 X_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],

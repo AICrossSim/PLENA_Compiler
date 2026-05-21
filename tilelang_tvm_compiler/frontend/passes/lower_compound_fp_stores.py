@@ -130,11 +130,7 @@ def _is_reci_pattern(expr) -> tir.PrimExpr | None:
 
 
 def _is_exp_call(expr) -> bool:
-    return (
-        isinstance(expr, tir.Call)
-        and getattr(expr.op, "name", None) == "tir.exp"
-        and len(expr.args) == 1
-    )
+    return isinstance(expr, tir.Call) and getattr(expr.op, "name", None) == "tir.exp" and len(expr.args) == 1
 
 
 def _is_already_single_op(value) -> bool:
@@ -176,8 +172,7 @@ class _Ctx:
         return buf
 
 
-def _to_leaf(expr, dst: tir.Buffer, indices, pre: list[tir.Stmt],
-             ctx: _Ctx) -> tir.PrimExpr:
+def _to_leaf(expr, dst: tir.Buffer, indices, pre: list[tir.Stmt], ctx: _Ctx) -> tir.PrimExpr:
     """Ensure ``expr`` is a leaf (BufferLoad or constant); if not, evaluate
     it into a fresh fragment and return a BufferLoad of that fragment.
 
@@ -197,25 +192,28 @@ def _to_leaf(expr, dst: tir.Buffer, indices, pre: list[tir.Stmt],
     if _is_exp_call(expr):
         inner = _to_leaf(expr.args[0], dst, indices, pre, ctx)
         tmp = ctx.fresh_tmp(dst)
-        pre.append(tir.BufferStore(
-            tmp,
-            tir.Call(expr.dtype, expr.op, [inner]),
-            list(indices),
-        ))
+        pre.append(
+            tir.BufferStore(
+                tmp,
+                tir.Call(expr.dtype, expr.op, [inner]),
+                list(indices),
+            )
+        )
         return tir.BufferLoad(tmp, list(indices))
     denom = _is_reci_pattern(expr)
     if denom is not None:
         inner = _to_leaf(denom, dst, indices, pre, ctx)
         tmp = ctx.fresh_tmp(dst)
-        pre.append(tir.BufferStore(
-            tmp,
-            tir.Div(tir.FloatImm(expr.dtype, 1.0), inner),
-            list(indices),
-        ))
+        pre.append(
+            tir.BufferStore(
+                tmp,
+                tir.Div(tir.FloatImm(expr.dtype, 1.0), inner),
+                list(indices),
+            )
+        )
         return tir.BufferLoad(tmp, list(indices))
     raise LowerCompoundFpStoresError(
-        f"unsupported subexpression in compound FP store RHS: "
-        f"{type(expr).__name__}: {expr!r}"
+        f"unsupported subexpression in compound FP store RHS: {type(expr).__name__}: {expr!r}"
     )
 
 
@@ -275,7 +273,9 @@ def _walk(stmt, ctx: _Ctx):
         )
     if isinstance(stmt, tir.Block):
         return tir.Block(
-            iter_vars=stmt.iter_vars, reads=stmt.reads, writes=stmt.writes,
+            iter_vars=stmt.iter_vars,
+            reads=stmt.reads,
+            writes=stmt.writes,
             name_hint=stmt.name_hint,
             body=_walk(stmt.body, ctx),
             init=_walk(stmt.init, ctx) if stmt.init is not None else None,
@@ -285,13 +285,20 @@ def _walk(stmt, ctx: _Ctx):
         )
     if isinstance(stmt, tir.AttrStmt):
         return tir.AttrStmt(
-            stmt.node, stmt.attr_key, stmt.value, _walk(stmt.body, ctx),
+            stmt.node,
+            stmt.attr_key,
+            stmt.value,
+            _walk(stmt.body, ctx),
         )
     if isinstance(stmt, tir.For):
         return tir.For(
-            stmt.loop_var, stmt.min, stmt.extent, stmt.kind,
+            stmt.loop_var,
+            stmt.min,
+            stmt.extent,
+            stmt.kind,
             _walk(stmt.body, ctx),
-            stmt.thread_binding, stmt.annotations,
+            stmt.thread_binding,
+            stmt.annotations,
         )
     if isinstance(stmt, tir.IfThenElse):
         return tir.IfThenElse(
@@ -308,8 +315,12 @@ def _walk(stmt, ctx: _Ctx):
         return stmt
     if isinstance(stmt, tir.Allocate):
         return tir.Allocate(
-            stmt.buffer_var, stmt.dtype, list(stmt.extents),
-            stmt.condition, _walk(stmt.body, ctx), stmt.annotations,
+            stmt.buffer_var,
+            stmt.dtype,
+            list(stmt.extents),
+            stmt.condition,
+            _walk(stmt.body, ctx),
+            stmt.annotations,
         )
     return stmt
 
@@ -345,26 +356,35 @@ def _inject_alloc_buffers(stmt, new_buffers: list[tir.Buffer]):
         )
     if isinstance(stmt, tir.Block):
         return tir.Block(
-            iter_vars=stmt.iter_vars, reads=stmt.reads, writes=stmt.writes,
-            name_hint=stmt.name_hint, body=stmt.body, init=stmt.init,
+            iter_vars=stmt.iter_vars,
+            reads=stmt.reads,
+            writes=stmt.writes,
+            name_hint=stmt.name_hint,
+            body=stmt.body,
+            init=stmt.init,
             alloc_buffers=list(stmt.alloc_buffers) + list(new_buffers),
             match_buffers=stmt.match_buffers,
             annotations=stmt.annotations,
         )
     if isinstance(stmt, tir.AttrStmt):
         return tir.AttrStmt(
-            stmt.node, stmt.attr_key, stmt.value,
+            stmt.node,
+            stmt.attr_key,
+            stmt.value,
             _inject_alloc_buffers(stmt.body, new_buffers),
         )
     if isinstance(stmt, tir.For):
         return tir.For(
-            stmt.loop_var, stmt.min, stmt.extent, stmt.kind,
+            stmt.loop_var,
+            stmt.min,
+            stmt.extent,
+            stmt.kind,
             _inject_alloc_buffers(stmt.body, new_buffers),
-            stmt.thread_binding, stmt.annotations,
+            stmt.thread_binding,
+            stmt.annotations,
         )
     if isinstance(stmt, tir.LetStmt):
-        return tir.LetStmt(stmt.var, stmt.value,
-                           _inject_alloc_buffers(stmt.body, new_buffers))
+        return tir.LetStmt(stmt.var, stmt.value, _inject_alloc_buffers(stmt.body, new_buffers))
     return stmt  # no Block found in this branch
 
 

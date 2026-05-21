@@ -42,29 +42,21 @@ def make_copy_offset_min(
         raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
     hardware_lane_count = MLEN // hlen
     if head_count % hardware_lane_count != 0:
-        raise ValueError(
-            f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; "
-            f"got {head_count}"
-        )
+        raise ValueError(f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; got {head_count}")
     if num_s_blocks < 1:
         raise ValueError(f"num_s_blocks must be >= 1, got {num_s_blocks}")
     if o_head_count is None:
         o_head_count = head_count
     if o_head_count < head_count:
-        raise ValueError(
-            f"o_head_count ({o_head_count}) must be >= head_count ({head_count})"
-        )
+        raise ValueError(f"o_head_count ({o_head_count}) must be >= head_count ({head_count})")
     if not (0 <= o_head_offset <= o_head_count - head_count):
         raise ValueError(
-            f"o_head_offset ({o_head_offset}) + head_count ({head_count}) "
-            f"must fit within o_head_count ({o_head_count})"
+            f"o_head_offset ({o_head_offset}) + head_count ({head_count}) must fit within o_head_count ({o_head_count})"
         )
     if fp_roundtrip is not None:
         compute = "id" if fp_roundtrip else "copy"
     if compute not in _COMPUTE_STAGES:
-        raise ValueError(
-            f"compute must be one of {_COMPUTE_STAGES}; got {compute!r}"
-        )
+        raise ValueError(f"compute must be one of {_COMPUTE_STAGES}; got {compute!r}")
 
     seq_len = num_s_blocks * rows
 
@@ -84,8 +76,7 @@ def make_copy_offset_min(
             T.copy(X_sh, Y_sh)
             T.copy(
                 Y_sh,
-                Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                      by + o_head_offset, 0:hlen],
+                Y_hbm[0, s_block * rows : (s_block + 1) * rows, by + o_head_offset, 0:hlen],
             )
 
     # ----- compute == "id": per-row FPRAM round-trip, identity -----
@@ -110,8 +101,7 @@ def make_copy_offset_min(
                 T.copy(Y_FP, Y_sh[row, 0])
             T.copy(
                 Y_sh,
-                Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                      by + o_head_offset, 0:hlen],
+                Y_hbm[0, s_block * rows : (s_block + 1) * rows, by + o_head_offset, 0:hlen],
             )
 
     # ----- compute == "mul": Y = X * X -----
@@ -136,8 +126,7 @@ def make_copy_offset_min(
                 T.copy(Y_FP, Y_sh[row, 0])
             T.copy(
                 Y_sh,
-                Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                      by + o_head_offset, 0:hlen],
+                Y_hbm[0, s_block * rows : (s_block + 1) * rows, by + o_head_offset, 0:hlen],
             )
 
     # ----- compute == "const_mul": Y = 0.5 * X  (hoisted-const mul) -----
@@ -162,8 +151,7 @@ def make_copy_offset_min(
                 T.copy(Y_FP, Y_sh[row, 0])
             T.copy(
                 Y_sh,
-                Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                      by + o_head_offset, 0:hlen],
+                Y_hbm[0, s_block * rows : (s_block + 1) * rows, by + o_head_offset, 0:hlen],
             )
 
     # ----- compute == "exp": Y = exp(X) -----
@@ -188,8 +176,7 @@ def make_copy_offset_min(
                 T.copy(Y_FP, Y_sh[row, 0])
             T.copy(
                 Y_sh,
-                Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                      by + o_head_offset, 0:hlen],
+                Y_hbm[0, s_block * rows : (s_block + 1) * rows, by + o_head_offset, 0:hlen],
             )
 
     # ----- compute == "reci": Y = 1.0 / X -----
@@ -214,8 +201,7 @@ def make_copy_offset_min(
                 T.copy(Y_FP, Y_sh[row, 0])
             T.copy(
                 Y_sh,
-                Y_hbm[0, s_block * rows : (s_block + 1) * rows,
-                      by + o_head_offset, 0:hlen],
+                Y_hbm[0, s_block * rows : (s_block + 1) * rows, by + o_head_offset, 0:hlen],
             )
 
     _STAGE_FUNCS = {

@@ -53,22 +53,31 @@ def _check(label, actual, expected) -> int:
 
 def _cluster(body):
     return ir.ParallelAxis(
-        axis_name="by_phase", extent=LANE, body=body,
-        kind=ir.ParallelKind.CLUSTER, thread_tag=None,
+        axis_name="by_phase",
+        extent=LANE,
+        body=body,
+        kind=ir.ParallelKind.CLUSTER,
+        thread_tag=None,
         parent_grid_axis_name="by_number",
     )
 
 
 def _grid(body):
     return ir.ParallelAxis(
-        axis_name="by_number", extent=1, body=body,
-        kind=ir.ParallelKind.BLOCK_IDX, thread_tag="blockIdx.y",
+        axis_name="by_number",
+        extent=1,
+        body=body,
+        kind=ir.ParallelKind.BLOCK_IDX,
+        thread_tag="blockIdx.y",
     )
 
 
 def _wrap(body, allocs=()):
     return ir.MidFunc(
-        name="t", params=[], allocs=list(allocs), body=list(body),
+        name="t",
+        params=[],
+        allocs=list(allocs),
+        body=list(body),
         lane_axes=["by"],
     )
 
@@ -83,19 +92,30 @@ def test_dma_lane_ref_bshd() -> int:
     print("test_dma_lane_ref_bshd — DMA dst gets BSHD view + prepend")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16], scope="shared")  # post-grow
-    fn = _wrap([_grid([_cluster([
-        ir.Dma(
-            src=_ref(Q_hbm, [0, ir.Slice(), "by", ir.Slice()]),
-            dst=_slice_ref(Q_sh, n=2),
-            marker=ir.Marker.DMA, can_async=True,
-        ),
-    ])])], allocs=[Q_sh])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Dma(
+                                src=_ref(Q_hbm, [0, ir.Slice(), "by", ir.Slice()]),
+                                dst=_slice_ref(Q_sh, n=2),
+                                marker=ir.Marker.DMA,
+                                can_async=True,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[Q_sh],
+    )
     out = view_run(fn)
     dma = out.body[0].body[0].body[0]
     failures = 0
     # On-chip dst: prepended phase, BSHD perm = [1, 0, 2]
-    failures += _check("Q_sh indices", dma.dst.indices,
-                       ["by_phase", ir.Slice(), ir.Slice()])
+    failures += _check("Q_sh indices", dma.dst.indices, ["by_phase", ir.Slice(), ir.Slice()])
     failures += _check("Q_sh view_perm (BSHD)", dma.dst.view_perm, [1, 0, 2])
     return failures
 
@@ -106,15 +126,28 @@ def test_btmm_output_bhsd() -> int:
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16], scope="shared")
     K_sh = _mk_buf("K_sh", [LANE, 64, 16], scope="shared")
     S_loc = _mk_buf("S_loc", [LANE, 64, 64], scope="fragment")
-    fn = _wrap([_grid([_cluster([
-        ir.Gemm(
-            a=_slice_ref(Q_sh, 2),
-            b=_slice_ref(K_sh, 2),
-            c=_slice_ref(S_loc, 2),
-            kind="btmm", transpose_b=True,
-            marker=ir.Marker.BTMM, can_async=True,
-        ),
-    ])])], allocs=[Q_sh, K_sh, S_loc])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Gemm(
+                                a=_slice_ref(Q_sh, 2),
+                                b=_slice_ref(K_sh, 2),
+                                c=_slice_ref(S_loc, 2),
+                                kind="btmm",
+                                transpose_b=True,
+                                marker=ir.Marker.BTMM,
+                                can_async=True,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[Q_sh, K_sh, S_loc],
+    )
     out = view_run(fn)
     g = out.body[0].body[0].body[0]
     failures = 0
@@ -130,12 +163,25 @@ def test_per_head_matmul_lhs_bhsd() -> int:
     S = _mk_buf("S", [LANE, 64, 64], scope="fragment")
     V = _mk_buf("V", [LANE, 64, 16], scope="shared")
     P = _mk_buf("P", [LANE, 64, 16], scope="fragment")
-    fn = _wrap([_grid([_cluster([
-        ir.Gemm(
-            a=_slice_ref(S, 2), b=_slice_ref(V, 2), c=_slice_ref(P, 2),
-            kind="overwrite",
-        ),
-    ])])], allocs=[S, V, P])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Gemm(
+                                a=_slice_ref(S, 2),
+                                b=_slice_ref(V, 2),
+                                c=_slice_ref(P, 2),
+                                kind="overwrite",
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[S, V, P],
+    )
     out = view_run(fn)
     g = out.body[0].body[0].body[0]
     failures = 0
@@ -150,12 +196,23 @@ def test_hbm_ref_lane_var_subst() -> int:
     print("test_hbm_ref_lane_var_subst")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16], scope="shared")
-    fn = _wrap([_grid([_cluster([
-        ir.Dma(
-            src=_ref(Q_hbm, [0, ir.Slice(), "by", ir.Slice()]),
-            dst=_slice_ref(Q_sh, 2),
-        ),
-    ])])], allocs=[Q_sh])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Dma(
+                                src=_ref(Q_hbm, [0, ir.Slice(), "by", ir.Slice()]),
+                                dst=_slice_ref(Q_sh, 2),
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[Q_sh],
+    )
     out = view_run(fn)
     src = out.body[0].body[0].body[0].src
     failures = 0
@@ -174,19 +231,31 @@ def test_broadcast_dims_shift() -> int:
     (prepend), so broadcast_dims must shift by 1 too. Use D<MLEN
     everywhere to avoid the cluster_guard skip path."""
     print("test_broadcast_dims_shift")
-    S = _mk_buf("S", [LANE, 64, 16], scope="fragment")    # D=16 < MLEN
-    M = _mk_buf("M", [LANE, 16], scope="fragment")        # D=16 < MLEN
-    fn = _wrap([_grid([_cluster([
-        ir.Elementwise(
-            dst=_slice_ref(S, 2),
-            srcs=[
-                _slice_ref(S, 2),
-                ir.Broadcast(src=_slice_ref(M, 1), broadcast_dims=[1]),
-            ],
-            op=ir.BinOp.SUB,
-            marker=ir.Marker.LANE_OP, can_async=False,
-        ),
-    ])])], allocs=[S, M])
+    S = _mk_buf("S", [LANE, 64, 16], scope="fragment")  # D=16 < MLEN
+    M = _mk_buf("M", [LANE, 16], scope="fragment")  # D=16 < MLEN
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Elementwise(
+                                dst=_slice_ref(S, 2),
+                                srcs=[
+                                    _slice_ref(S, 2),
+                                    ir.Broadcast(src=_slice_ref(M, 1), broadcast_dims=[1]),
+                                ],
+                                op=ir.BinOp.SUB,
+                                marker=ir.Marker.LANE_OP,
+                                can_async=False,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[S, M],
+    )
     out = view_run(fn)
     ew = out.body[0].body[0].body[0]
     failures = 0
@@ -207,11 +276,27 @@ def test_global_consistency_conflict() -> int:
     print("test_global_consistency_conflict")
     X = _mk_buf("X", [LANE, 64, 16], scope="fragment")
     K = _mk_buf("K", [LANE, 64, 16], scope="shared")
-    fn = _wrap([_grid([_cluster([
-        # btmm output → X gets BHSD
-        ir.Gemm(a=_slice_ref(X, 2), b=_slice_ref(K, 2), c=_slice_ref(X, 2),
-                kind="btmm", transpose_b=True),
-    ])])], allocs=[X, K])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            # btmm output → X gets BHSD
+                            ir.Gemm(
+                                a=_slice_ref(X, 2),
+                                b=_slice_ref(K, 2),
+                                c=_slice_ref(X, 2),
+                                kind="btmm",
+                                transpose_b=True,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[X, K],
+    )
     try:
         view_run(fn)
     except ViewConflictError as e:
@@ -226,22 +311,34 @@ def test_skip_when_no_lane_axes() -> int:
     print("test_skip_when_no_lane_axes")
     Q = _mk_buf("Q", [LANE, 64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
+        name="t",
+        params=[],
+        allocs=[Q],
         body=[ir.Dma(src=_slice_ref(Q, 3), dst=_slice_ref(Q, 3))],
         lane_axes=[],
     )
     out = view_run(fn)
-    return _check("body unchanged",
-                  out.body[0].src.view_perm, None)
+    return _check("body unchanged", out.body[0].src.view_perm, None)
 
 
 def test_skip_when_d_ge_mlen() -> int:
     """All non-global D >= MLEN → guard skips."""
     print("test_skip_when_d_ge_mlen")
     A = _mk_buf("A", [4, 64], scope="shared")  # D=64=MLEN
-    fn = _wrap([_grid([_cluster([
-        ir.Dma(src=_slice_ref(A, 2), dst=_slice_ref(A, 2)),
-    ])])], allocs=[A])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Dma(src=_slice_ref(A, 2), dst=_slice_ref(A, 2)),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[A],
+    )
     out = view_run(fn)
     dma = out.body[0].body[0].body[0]
     return _check("view_perm not set (skipped)", dma.src.view_perm, None)
@@ -251,9 +348,16 @@ def test_outside_cluster_untouched() -> int:
     """Op directly inside a grid (no cluster) — refs not rewritten."""
     print("test_outside_cluster_untouched")
     A = _mk_buf("A", [LANE, 64, 16])
-    fn = _wrap([_grid([
-        ir.Dma(src=_slice_ref(A, 3), dst=_slice_ref(A, 3)),
-    ])], allocs=[A])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    ir.Dma(src=_slice_ref(A, 3), dst=_slice_ref(A, 3)),
+                ]
+            )
+        ],
+        allocs=[A],
+    )
     out = view_run(fn)
     dma = out.body[0].body[0]
     return _check("view_perm None", dma.src.view_perm, None)

@@ -52,12 +52,24 @@ from dataclasses import dataclass
 
 from ..cluster_guard import should_skip_cluster, MLEN
 from ..ir import (
-    AxisRole, AxisInfo,
-    BufferDef, BufferRef, VarRef,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
-    For, Async, MultiLaneOp,
-    ParallelAxis, ParallelKind,
-    MidFunc, Stmt,
+    AxisRole,
+    AxisInfo,
+    BufferDef,
+    BufferRef,
+    VarRef,
+    Dma,
+    Gemm,
+    Elementwise,
+    Broadcast,
+    Reduce,
+    RawStore,
+    For,
+    Async,
+    MultiLaneOp,
+    ParallelAxis,
+    ParallelKind,
+    MidFunc,
+    Stmt,
 )
 
 
@@ -103,10 +115,10 @@ def _bshd_perm(rank: int) -> list[int]:
 
 @dataclass
 class _ClusterCtx:
-    phase_name: str            # "by_phase"
-    number_name: str            # "by_number"
+    phase_name: str  # "by_phase"
+    number_name: str  # "by_number"
     cluster_count: int
-    original_axis_name: str    # "by" (for HBM lane-var substitution)
+    original_axis_name: str  # "by" (for HBM lane-var substitution)
     # Identity channels — set by ``_walk`` from the CLUSTER ParallelAxis.
     phase_var: VarRef
     number_var: VarRef
@@ -198,8 +210,7 @@ def _forced_view_kind(buf: BufferDef) -> str | None:
     return None
 
 
-def _rewrite_lane_ref(ref: BufferRef, ctx: _ClusterCtx,
-                      view_kind: str) -> BufferRef:
+def _rewrite_lane_ref(ref: BufferRef, ctx: _ClusterCtx, view_kind: str) -> BufferRef:
     """Non-global ref: prepend cluster phase to indices, set view_perm.
 
     ``view_kind`` is "BHSD" (identity) or "BSHD" (swap dim 0/1) from the
@@ -239,9 +250,7 @@ def _axes_after_lane_rewrite(
     schedule, so this helper only prepends the CLUSTER entry. The
     permute on axes happens in burn_view alongside the index permute.
     """
-    return [
-        AxisInfo(role=AxisRole.CLUSTER, extent=int(ctx.cluster_count))
-    ] + list(pre_axes)
+    return [AxisInfo(role=AxisRole.CLUSTER, extent=int(ctx.cluster_count))] + list(pre_axes)
 
 
 def _axes_after_global_rewrite(
@@ -252,8 +261,7 @@ def _axes_after_global_rewrite(
     return list(pre_axes)
 
 
-def _rewrite_ref(ref: BufferRef, ctx: _ClusterCtx,
-                 view_kind: str) -> BufferRef:
+def _rewrite_ref(ref: BufferRef, ctx: _ClusterCtx, view_kind: str) -> BufferRef:
     # ``global`` / ``global.vram`` / ``global.mram`` / ``global.fpram``:
     # user-declared global tensors keep their declared rank verbatim.
     # No phase axis prepended, no view_perm, no lane-axis substitution
@@ -265,8 +273,10 @@ def _rewrite_ref(ref: BufferRef, ctx: _ClusterCtx,
 
 
 def _rewrite_ref_with_axes(
-    ref: BufferRef, pre_axes: list[AxisInfo],
-    ctx: _ClusterCtx, view_kind: str,
+    ref: BufferRef,
+    pre_axes: list[AxisInfo],
+    ctx: _ClusterCtx,
+    view_kind: str,
 ) -> tuple[BufferRef, list[AxisInfo]]:
     """Run the same rewrite the ref undergoes on its axes table.
 
@@ -275,9 +285,7 @@ def _rewrite_ref_with_axes(
     prepends a CLUSTER ``AxisInfo`` to its axes; a permute on
     ``view_perm`` permutes axes the same way.
     """
-    is_global = (
-        ref.buffer.scope == "global" or ref.buffer.scope.startswith("global.")
-    )
+    is_global = ref.buffer.scope == "global" or ref.buffer.scope.startswith("global.")
     if is_global:
         return _rewrite_global_ref(ref, ctx), _axes_after_global_rewrite(pre_axes)
     return (
@@ -303,8 +311,10 @@ def _rewrite_src(src, ctx: _ClusterCtx, view_kind: str):
 
 
 def _rewrite_src_with_axes(
-    src, pre_axes: list[AxisInfo],
-    ctx: _ClusterCtx, view_kind: str,
+    src,
+    pre_axes: list[AxisInfo],
+    ctx: _ClusterCtx,
+    view_kind: str,
 ):
     """Axes-aware src rewrite that mirrors ``_rewrite_src``.
 
@@ -314,7 +324,10 @@ def _rewrite_src_with_axes(
     if isinstance(src, Broadcast):
         new_dims = [d + 1 for d in src.broadcast_dims]
         new_inner, new_axes = _rewrite_ref_with_axes(
-            src.src, pre_axes, ctx, view_kind,
+            src.src,
+            pre_axes,
+            ctx,
+            view_kind,
         )
         return Broadcast(src=new_inner, broadcast_dims=new_dims), new_axes
     return _rewrite_ref_with_axes(src, pre_axes, ctx, view_kind)
@@ -389,9 +402,12 @@ def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
         new_src, new_src_axes = _rewrite_ref_with_axes(op.src, op.src_axes, ctx, kv_src)
         new_dst, new_dst_axes = _rewrite_ref_with_axes(op.dst, op.dst_axes, ctx, kv_dst)
         return Dma(
-            src=new_src, dst=new_dst,
-            src_axes=new_src_axes, dst_axes=new_dst_axes,
-            marker=op.marker, can_async=op.can_async,
+            src=new_src,
+            dst=new_dst,
+            src_axes=new_src_axes,
+            dst_axes=new_dst_axes,
+            marker=op.marker,
+            can_async=op.can_async,
         )
     if isinstance(op, Gemm):
         key = _gemm_kind_key(op)
@@ -399,10 +415,17 @@ def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
         new_b, new_b_axes = _rewrite_ref_with_axes(op.b, op.b_axes, ctx, _view_kind_for(key, "b"))
         new_c, new_c_axes = _rewrite_ref_with_axes(op.c, op.c_axes, ctx, _view_kind_for(key, "c"))
         return Gemm(
-            a=new_a, b=new_b, c=new_c,
-            a_axes=new_a_axes, b_axes=new_b_axes, c_axes=new_c_axes,
-            transpose_a=op.transpose_a, transpose_b=op.transpose_b,
-            kind=op.kind, marker=op.marker, can_async=op.can_async,
+            a=new_a,
+            b=new_b,
+            c=new_c,
+            a_axes=new_a_axes,
+            b_axes=new_b_axes,
+            c_axes=new_c_axes,
+            transpose_a=op.transpose_a,
+            transpose_b=op.transpose_b,
+            kind=op.kind,
+            marker=op.marker,
+            can_async=op.can_async,
         )
     if isinstance(op, Elementwise):
         # View follows the dst buffer's anchor: if dst was anchored to
@@ -418,10 +441,15 @@ def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
             new_srcs.append(new_s)
             new_src_axes.append(new_sa)
         return Elementwise(
-            dst=new_dst, srcs=new_srcs, op=op.op,
-            dst_axes=new_dst_axes, src_axes=new_src_axes,
-            axis=op.axis, size=op.size,
-            marker=op.marker, can_async=op.can_async,
+            dst=new_dst,
+            srcs=new_srcs,
+            op=op.op,
+            dst_axes=new_dst_axes,
+            src_axes=new_src_axes,
+            axis=op.axis,
+            size=op.size,
+            marker=op.marker,
+            can_async=op.can_async,
         )
     if isinstance(op, Reduce):
         # Reduce src is what determines layout (the row-reducible
@@ -431,9 +459,14 @@ def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
         new_dst, new_dst_axes = _rewrite_ref_with_axes(op.dst, op.dst_axes, ctx, view)
         new_src, new_src_axes = _rewrite_ref_with_axes(op.src, op.src_axes, ctx, view)
         return Reduce(
-            dst=new_dst, src=new_src, op=op.op, axis=op.axis,
-            dst_axes=new_dst_axes, src_axes=new_src_axes,
-            marker=op.marker, can_async=op.can_async,
+            dst=new_dst,
+            src=new_src,
+            op=op.op,
+            axis=op.axis,
+            dst_axes=new_dst_axes,
+            src_axes=new_src_axes,
+            marker=op.marker,
+            can_async=op.can_async,
         )
     if isinstance(op, RawStore):
         # RawStore is opaque; don't rewrite. (And it shouldn't appear
@@ -451,14 +484,11 @@ def _walk(stmt: Stmt, ctx: _ClusterCtx | None, bhsd_buffers: set) -> Stmt:
     if isinstance(stmt, ParallelAxis):
         if stmt.kind == ParallelKind.CLUSTER:
             if stmt.parent_grid_axis_name is None:
-                raise ViewError(
-                    f"cluster {stmt.axis_name!r} has no parent_grid_axis_name"
-                )
+                raise ViewError(f"cluster {stmt.axis_name!r} has no parent_grid_axis_name")
             original = stmt.original_axis_name
             if original is None:
                 raise ViewError(
-                    f"cluster {stmt.axis_name!r} missing original_axis_name; "
-                    f"pass_3_split should have set it"
+                    f"cluster {stmt.axis_name!r} missing original_axis_name; pass_3_split should have set it"
                 )
             # Identity channel from pass_3_split: phase axis carries
             # axis_var (phase var) + original_axis_var (pre-split user
@@ -472,14 +502,10 @@ def _walk(stmt: Stmt, ctx: _ClusterCtx | None, bhsd_buffers: set) -> Stmt:
             # the number axis. We grab its axis_var via a small
             # side-channel: walk-time companion below.
             if stmt.axis_var is None:
-                raise ViewError(
-                    f"cluster {stmt.axis_name!r} missing axis_var; "
-                    f"pass_3_split should have set it"
-                )
+                raise ViewError(f"cluster {stmt.axis_name!r} missing axis_var; pass_3_split should have set it")
             if stmt.original_axis_var is None:
                 raise ViewError(
-                    f"cluster {stmt.axis_name!r} missing original_axis_var; "
-                    f"pass_3_split should have set it"
+                    f"cluster {stmt.axis_name!r} missing original_axis_var; pass_3_split should have set it"
                 )
             number_var = _NUMBER_VAR_BY_NAME.get(stmt.parent_grid_axis_name)
             if number_var is None:
@@ -550,11 +576,10 @@ def _walk(stmt: Stmt, ctx: _ClusterCtx | None, bhsd_buffers: set) -> Stmt:
 # ---------------------------------------------------------------------------
 
 
-def _collect_views(stmt: Stmt,
-                   table: dict[str, list[tuple[list[int] | None, str]]]
-                   ) -> None:
+def _collect_views(stmt: Stmt, table: dict[str, list[tuple[list[int] | None, str]]]) -> None:
     """Walk; for every BufferRef record (view_perm, op_label) under the
     buffer's name. Only refs to non-global buffers tracked."""
+
     def visit_ref(ref: BufferRef, label: str) -> None:
         if ref.buffer.scope == "global":
             return

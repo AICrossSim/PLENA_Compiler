@@ -25,6 +25,7 @@ from tvm import tir
 
 from .address_alloc import AddressAllocationPass, AddressAllocConfig
 from . import dead_buffer_elim as _dead_buffer_elim
+
 # Direct submodule imports to avoid the legacy frontend package's
 # __init__ (which imports compile_func → frontend/pipeline.py →
 # ..pipeline.PlenaTarget, a circular import once we land here).
@@ -53,8 +54,8 @@ class PlenaTarget:
 
     mlen: int = 64
     blen: int = 4
-    btmm_lane_count: int = 4   # group_heads
-    btmm_hlen: int = 16        # head dim per BTMM lane
+    btmm_lane_count: int = 4  # group_heads
+    btmm_hlen: int = 16  # head dim per BTMM lane
 
 
 @dataclass
@@ -122,6 +123,7 @@ def compile_kernel(
     # even when later passes fail.
     if midir_dump_dir is not None:
         from .hlir import format_hlir as _fmt
+
         (midir_dump_dir / "post_to_plena.hlir.txt").write_text(_fmt(mod))
 
     # ---------- 1.5. drop unreachable buffers ----------
@@ -157,7 +159,9 @@ def compile_kernel(
     isa_text = isa_pass.run(mod)
 
     return CompiledKernel(
-        name=name, hlir=mod, isa_text=isa_text,
+        name=name,
+        hlir=mod,
+        isa_text=isa_text,
         gp_trace=allocator.trace_rows(),
     )
 

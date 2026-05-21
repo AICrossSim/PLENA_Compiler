@@ -75,15 +75,26 @@ from tvm import tir as _tir
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    BufferDef, BufferRef, VarRef,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
-    For, Async, MultiLaneOp,
-    ParallelAxis, ParallelKind,
-    MidFunc, Stmt,
+    BufferDef,
+    BufferRef,
+    VarRef,
+    Dma,
+    Gemm,
+    Elementwise,
+    Broadcast,
+    Reduce,
+    RawStore,
+    For,
+    Async,
+    MultiLaneOp,
+    ParallelAxis,
+    ParallelKind,
+    MidFunc,
+    Stmt,
 )
 
 
-_DEFAULT_LANE = 4   # MLEN / btmm_hlen for the current target
+_DEFAULT_LANE = 4  # MLEN / btmm_hlen for the current target
 
 
 class SplitError(RuntimeError):
@@ -275,8 +286,7 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
         cluster = ctx.cluster_counts[idx]
         if stmt.extent % cluster != 0:
             raise SplitError(
-                f"lane axis {stmt.axis_name!r} extent={stmt.extent} is "
-                f"not a multiple of cluster_count={cluster}"
+                f"lane axis {stmt.axis_name!r} extent={stmt.extent} is not a multiple of cluster_count={cluster}"
             )
         outer_extent = stmt.extent // cluster
         inner_body = [_walk_stmt(s, ctx) for s in stmt.body]
@@ -292,8 +302,7 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
         original_var_ref = stmt.axis_var
         if original_var_ref is None:
             raise SplitError(
-                f"split: lane-axis ParallelAxis {original_name!r} has no "
-                f"axis_var; fold must have populated it"
+                f"split: lane-axis ParallelAxis {original_name!r} has no axis_var; fold must have populated it"
             )
         # Mint fresh tir.Vars for the phase / number axes; they didn't
         # exist in the input TIR.
@@ -314,8 +323,8 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
             axis_name=number_name,
             extent=outer_extent,
             body=[phase_axis],
-            kind=stmt.kind,                 # BLOCK_IDX or LOGICAL_GRID
-            thread_tag=stmt.thread_tag,     # only set for BLOCK_IDX
+            kind=stmt.kind,  # BLOCK_IDX or LOGICAL_GRID
+            thread_tag=stmt.thread_tag,  # only set for BLOCK_IDX
             parent_grid_axis_name=None,
             original_axis_name=original_name,
             axis_var=VarRef(number_var_obj),
@@ -342,8 +351,7 @@ def _split_or_walk_parallel(stmt: ParallelAxis, ctx: _Ctx) -> Stmt:
 # ---------------------------------------------------------------------------
 
 
-def run(func: MidFunc,
-        cluster_counts: list[int] | None = None) -> MidFunc:
+def run(func: MidFunc, cluster_counts: list[int] | None = None) -> MidFunc:
     """Split each declared lane-axis blockIdx into (number, phase) and
     grow every non-global buffer by one outer cluster dim.
 
@@ -361,8 +369,7 @@ def run(func: MidFunc,
         cluster_counts = [_DEFAULT_LANE] * len(func.lane_axes)
     if len(cluster_counts) != len(func.lane_axes):
         raise SplitError(
-            f"cluster_counts has {len(cluster_counts)} entries but "
-            f"lane_axes has {len(func.lane_axes)}; must match"
+            f"cluster_counts has {len(cluster_counts)} entries but lane_axes has {len(func.lane_axes)}; must match"
         )
 
     # Build the grown-buffer map up front.
@@ -395,6 +402,7 @@ def run(func: MidFunc,
         elif hasattr(stmt, "body") and isinstance(getattr(stmt, "body"), list):
             for c in stmt.body:
                 _collect_axis_names(c)
+
     for s in func.body:
         _collect_axis_names(s)
     missing = [n for n in func.lane_axes if n not in found_axis_names]

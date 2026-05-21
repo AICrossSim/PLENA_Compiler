@@ -67,34 +67,24 @@ def make_flash_attention_min(
     """
     MLEN = 64
     if rows != MLEN:
-        raise ValueError(
-            f"flash_attention_min requires rows == MLEN ({MLEN}), got {rows}"
-        )
+        raise ValueError(f"flash_attention_min requires rows == MLEN ({MLEN}), got {rows}")
     if MLEN % hlen != 0:
-        raise ValueError(
-            f"hlen must divide MLEN ({MLEN}); got hlen={hlen}"
-        )
+        raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
     hardware_lane_count = MLEN // hlen
     # Backward compatibility for older scripts: `lane_count` used to mean
     # logical head count. New callers should pass `head_count`.
     if head_count is None:
         head_count = lane_count if lane_count is not None else hardware_lane_count
     elif lane_count is not None and lane_count != head_count:
-        raise ValueError(
-            f"head_count and legacy lane_count disagree: {head_count} vs {lane_count}"
-        )
+        raise ValueError(f"head_count and legacy lane_count disagree: {head_count} vs {lane_count}")
     if head_count < 1:
         raise ValueError(f"head_count must be >= 1, got {head_count}")
     if head_count % hardware_lane_count != 0:
         raise ValueError(
-            f"head_count must be a multiple of hardware lane width "
-            f"MLEN/hlen={hardware_lane_count}; got {head_count}"
+            f"head_count must be a multiple of hardware lane width MLEN/hlen={hardware_lane_count}; got {head_count}"
         )
     if not (0 <= active_lane < hardware_lane_count):
-        raise ValueError(
-            f"active_lane out of hardware lane range [0, {hardware_lane_count}): "
-            f"{active_lane}"
-        )
+        raise ValueError(f"active_lane out of hardware lane range [0, {hardware_lane_count}): {active_lane}")
     if num_kv_blocks < 1:
         raise ValueError(f"num_kv_blocks must be >= 1, got {num_kv_blocks}")
     if num_q_blocks < 1:
@@ -103,14 +93,10 @@ def make_flash_attention_min(
     if o_head_count is None:
         o_head_count = head_count
     if o_head_count < head_count:
-        raise ValueError(
-            f"o_head_count ({o_head_count}) must be >= head_count "
-            f"({head_count})"
-        )
+        raise ValueError(f"o_head_count ({o_head_count}) must be >= head_count ({head_count})")
     if not (0 <= o_head_offset <= o_head_count - head_count):
         raise ValueError(
-            f"o_head_offset ({o_head_offset}) + head_count ({head_count}) "
-            f"must fit within o_head_count ({o_head_count})"
+            f"o_head_offset ({o_head_offset}) + head_count ({head_count}) must fit within o_head_count ({o_head_count})"
         )
 
     grouped = hlen < MLEN
@@ -125,10 +111,10 @@ def make_flash_attention_min(
 
     @T.prim_func
     def flash_attention_min(
-        Q_hbm: T.Tensor((1, q_seq,  head_count, hlen), "float16"),
+        Q_hbm: T.Tensor((1, q_seq, head_count, hlen), "float16"),
         K_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
         V_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
-        O_hbm: T.Tensor((1, q_seq,  o_head_count, hlen), "float16"),
+        O_hbm: T.Tensor((1, q_seq, o_head_count, hlen), "float16"),
     ):
         with T.Kernel(num_q_blocks, head_count, threads=128) as (q_block, by):
             # Per-lane (rows, hlen) — col-pack expanded to 4D BSHD-packed.
@@ -137,7 +123,7 @@ def make_flash_attention_min(
             V_sh = T.alloc_shared((rows, hlen), "float16")  # matmul RHS → mram (via DMA + gemm)
             # Per-lane (rows, hlen) for output / per-head P@V — also col-packed.
             PV_loc = T.alloc_fragment((rows, hlen), "float16")
-            O_loc  = T.alloc_fragment((rows, hlen), "float16")
+            O_loc = T.alloc_fragment((rows, hlen), "float16")
             # BTMM output: per-lane (rows, MLEN), row-stack expanded to 4D BHSD.
             S_loc = T.alloc_fragment((rows, MLEN), "float16")
             # Per-lane FP softmax state. The compiler expands these
@@ -233,8 +219,7 @@ def make_flash_attention_min(
             # land in a head-slice of a wider output tensor (concat).
             T.copy(
                 O_loc,
-                O_hbm[0, q_block * rows : (q_block + 1) * rows,
-                      by + o_head_offset, 0:hlen],
+                O_hbm[0, q_block * rows : (q_block + 1) * rows, by + o_head_offset, 0:hlen],
             )
 
     # Return the raw PrimFunc. ``compile_kernel`` runs stmt prep + the

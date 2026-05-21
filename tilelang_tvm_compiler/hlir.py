@@ -32,7 +32,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-
 @dataclass(frozen=True)
 class TileLayout:
     """Physical multi-tile VRAM/MRAM layout for a 4D BSHD-shaped buffer.
@@ -75,6 +74,7 @@ class TileLayout:
     Total physical element count equals logical numel — the layout is
     just a permutation; AddressAllocationPass uses ``numel`` regardless.
     """
+
     # Logical 4D shape (B, S, H, D).
     logical_b: int
     logical_s: int
@@ -118,9 +118,7 @@ def _select_axes(values, layout: str):
     according to ``layout``. ``values`` is either a shape tuple or a starts
     PrimExpr tuple — same indexing rule applies to both."""
     if layout not in LAYOUT_AXES:
-        raise ValueError(
-            f"unknown layout {layout!r}; known: {sorted(LAYOUT_AXES)}"
-        )
+        raise ValueError(f"unknown layout {layout!r}; known: {sorted(LAYOUT_AXES)}")
     bi, ri, ci, di = LAYOUT_AXES[layout]
     return values[bi], values[ri], values[ci], values[di]
 
@@ -152,9 +150,7 @@ def logical_2d_extents(shape_or_extents, layout: str = DEFAULT_LAYOUT):
         # Keep the legacy "fold leading dims into rows, cols = D" rule.
         return (int(shape_or_extents[0]), int(shape_or_extents[1]) * int(shape_or_extents[2]))
     if n != 4:
-        raise ValueError(
-            f"logical_2d_extents only handles up to 4D; got {n}-D"
-        )
+        raise ValueError(f"logical_2d_extents only handles up to 4D; got {n}-D")
     bi, ri, ci, di = LAYOUT_AXES[layout]
     rows = int(shape_or_extents[bi]) * int(shape_or_extents[ri])
     cols = int(shape_or_extents[ci]) * int(shape_or_extents[di])
@@ -184,12 +180,18 @@ def hbm_strides_for_layout(shape, layout: str = DEFAULT_LAYOUT):
 
 
 def make_tile_layout(
-    *, shape=None, layout: str = DEFAULT_LAYOUT, mlen: int, hlen: int,
+    *,
+    shape=None,
+    layout: str = DEFAULT_LAYOUT,
+    mlen: int,
+    hlen: int,
     cluster_dim: int | None = None,
     # Legacy keyword form (b/s/h/d) kept for back-compat with any older
     # caller. New callers should pass ``shape=...`` plus ``layout=...``.
-    b: int | None = None, s: int | None = None,
-    h: int | None = None, d: int | None = None,
+    b: int | None = None,
+    s: int | None = None,
+    h: int | None = None,
+    d: int | None = None,
 ) -> TileLayout | None:
     """Build a TileLayout for a 4D buffer if (and only if) it needs
     multi-tile storage.
@@ -218,21 +220,13 @@ def make_tile_layout(
                 "legacy ``b``/``s``/``h``/``d`` kwargs, not both"
             )
         if len(shape) != 4:
-            raise ValueError(
-                f"make_tile_layout: shape must be 4D; got {tuple(shape)}"
-            )
+            raise ValueError(f"make_tile_layout: shape must be 4D; got {tuple(shape)}")
         b, s, h, d = (int(x) for x in _select_axes(shape, layout))
     else:
         if any(v is None for v in (b, s, h, d)):
-            raise ValueError(
-                "make_tile_layout: legacy form requires all four of "
-                "b/s/h/d"
-            )
+            raise ValueError("make_tile_layout: legacy form requires all four of b/s/h/d")
     if mlen <= 0 or hlen <= 0 or hlen > mlen or mlen % hlen != 0:
-        raise ValueError(
-            f"invalid mlen={mlen}, hlen={hlen}: require 0 < hlen <= mlen and "
-            f"mlen % hlen == 0"
-        )
+        raise ValueError(f"invalid mlen={mlen}, hlen={hlen}: require 0 < hlen <= mlen and mlen % hlen == 0")
 
     # Inner-tile shape derivation. D == mlen → LANE_COUNT = 1;
     # D < mlen (typically D == hlen) → LANE_COUNT = mlen // D.
@@ -241,18 +235,14 @@ def make_tile_layout(
         lane_count = 1
     else:
         if mlen % d != 0:
-            raise ValueError(
-                f"narrow-D tile requires mlen % d == 0; got mlen={mlen}, d={d}"
-            )
+            raise ValueError(f"narrow-D tile requires mlen % d == 0; got mlen={mlen}, d={d}")
         d_inner = d
         lane_count = mlen // d
 
     d_tiles = (d + mlen - 1) // mlen if d > mlen else 1
     s_tiles = (s + mlen - 1) // mlen
     if h % lane_count != 0:
-        raise ValueError(
-            f"H ({h}) must be a multiple of LANE_COUNT ({lane_count})"
-        )
+        raise ValueError(f"H ({h}) must be a multiple of LANE_COUNT ({lane_count})")
     h_groups = h // lane_count
 
     # Every 4D BSHD/NCHW buffer gets a TileLayout — even trivially
@@ -264,9 +254,16 @@ def make_tile_layout(
     # single tile or multi tile?" branches from every pass that
     # consumes TileLayout.
     return TileLayout(
-        logical_b=b, logical_s=s, logical_h=h, logical_d=d,
-        d_tiles=d_tiles, s_tiles=s_tiles, h_groups=h_groups,
-        mlen=mlen, lane_count=lane_count, d_inner=d_inner,
+        logical_b=b,
+        logical_s=s,
+        logical_h=h,
+        logical_d=d,
+        d_tiles=d_tiles,
+        s_tiles=s_tiles,
+        h_groups=h_groups,
+        mlen=mlen,
+        lane_count=lane_count,
+        d_inner=d_inner,
     )
 
 
@@ -275,13 +272,13 @@ class Buffer:
     """One tile/tensor with shape, scope, dtype, and (after Pass 2) address."""
 
     name: str
-    scope: str                       # one of scope.{HBM,VRAM,MRAM,FPRAM}
+    scope: str  # one of scope.{HBM,VRAM,MRAM,FPRAM}
     shape: tuple[int, ...]
     dtype: str
 
     # Filled by AddressAllocationPass. None until then.
-    address: int | None = None     # base address in the buffer's scope
-    hbm_offset: int = 0               # for HBM tiles that are sub-regions
+    address: int | None = None  # base address in the buffer's scope
+    hbm_offset: int = 0  # for HBM tiles that are sub-regions
     hbm_stride: int | None = None  # row stride in HBM (defaults to mlen)
     hbm_scale_size: int | None = None  # tile elem count (defaults to tile_elems)
 
@@ -348,9 +345,7 @@ class Buffer:
 
     @property
     def byte_size(self) -> int:
-        bits = {"float16": 16, "bfloat16": 16, "float32": 32, "int8": 8, "int32": 32}.get(
-            self.dtype, 32
-        )
+        bits = {"float16": 16, "bfloat16": 16, "float32": 32, "int8": 8, "int32": 32}.get(self.dtype, 32)
         return self.num_elements * bits // 8
 
 
@@ -379,9 +374,10 @@ class BufferSlice:
           decide row_blocks / col_blocks (BSHD-aware H*D merge same as
           for whole buffers).
     """
-    parent: str                               # name of parent Buffer
-    starts: tuple[Any, ...]                   # int | tir.PrimExpr per dim
-    extents: tuple[int, ...]                  # int per dim
+
+    parent: str  # name of parent Buffer
+    starts: tuple[Any, ...]  # int | tir.PrimExpr per dim
+    extents: tuple[int, ...]  # int per dim
 
 
 @dataclass
@@ -398,6 +394,7 @@ class VramRegion:
     ``tir.PrimExpr`` (loop-derived; materialised at ISA emit time).
     Each ``extents`` entry is a Python int.
     """
+
     parent: str
     starts: tuple[Any, ...]
     extents: tuple[int, ...]
@@ -414,6 +411,7 @@ class MramRegion:
     backing store an operand lives in (matmul's LHS is VRAM, RHS is
     MRAM; mixing them up would target the wrong HW unit).
     """
+
     parent: str
     starts: tuple[Any, ...]
     extents: tuple[int, ...]
@@ -453,7 +451,7 @@ class Op:
     kind: str
     # Each entry is either a buffer name (whole-buffer reference) or a
     # BufferSlice (a sub-region of a parent buffer).
-    buffer_args: list[Any]            # List[str | BufferSlice]
+    buffer_args: list[Any]  # List[str | BufferSlice]
     scalar_args: list[Any] = field(default_factory=list)  # int | float | str | tir.PrimExpr
     annotations: dict[str, Any] = field(default_factory=dict)  # debug/passes
     # Only set for structured ops (currently just "for"). Leaves leave it None.
@@ -498,7 +496,7 @@ class HLIRModule:
     """One PrimFunc lowered to HLIR. Buffers + linear op stream."""
 
     name: str
-    buffers: dict[str, Buffer]        # name -> Buffer
+    buffers: dict[str, Buffer]  # name -> Buffer
     ops: list[Op]
     # PrimFunc parameter names in their declaration order. Useful so
     # downstream passes know which buffers come in as inputs/outputs vs
@@ -507,10 +505,7 @@ class HLIRModule:
 
     def get_buffer(self, name: str) -> Buffer:
         if name not in self.buffers:
-            raise KeyError(
-                f"buffer {name!r} not found in HLIR. "
-                f"Known: {sorted(self.buffers.keys())}"
-            )
+            raise KeyError(f"buffer {name!r} not found in HLIR. Known: {sorted(self.buffers.keys())}")
         return self.buffers[name]
 
     def buffers_in_scope(self, scope: str) -> list[Buffer]:
@@ -536,14 +531,9 @@ def format_hlir(mod: HLIRModule) -> str:
         shape_s = "x".join(str(s) for s in b.shape)
         extras = ""
         if b.scope == "hbm":
-            extras = (
-                f"  stride={b.hbm_stride}"
-                f"  scale={b.hbm_scale_size}"
-                f"  hbm_offset={b.hbm_offset}"
-            )
+            extras = f"  stride={b.hbm_stride}  scale={b.hbm_scale_size}  hbm_offset={b.hbm_offset}"
         lines.append(
-            f"  {b.name:<{name_w}}  scope={b.scope:<5}  addr={addr:<8}  "
-            f"shape={shape_s}  dtype={b.dtype}{extras}"
+            f"  {b.name:<{name_w}}  scope={b.scope:<5}  addr={addr:<8}  shape={shape_s}  dtype={b.dtype}{extras}"
         )
     lines.append("")
 
@@ -562,10 +552,7 @@ def _format_ops(ops: list[Op], lines: list[str], indent: int, prefix: list[int])
             lv = op.annotations.get("loop_var")
             ext = op.annotations.get("extent")
             init = op.annotations.get("init", 0)
-            lines.append(
-                f"{ind}[{idx:2d}]  for  {getattr(lv, 'name', lv)} "
-                f"in [{init}, {ext}):"
-            )
+            lines.append(f"{ind}[{idx:2d}]  for  {getattr(lv, 'name', lv)} in [{init}, {ext}):")
             _format_ops(op.body or [], lines, indent + 4, prefix)
         else:
             bs = ", ".join(_fmt_buf_arg(a) for a in op.buffer_args) if op.buffer_args else "-"
@@ -625,9 +612,7 @@ def _fmt_scalar(x) -> str:
 def assert_addresses_resolved(mod: HLIRModule) -> None:
     missing = [b.name for b in mod.buffers.values() if b.address is None]
     if missing:
-        raise RuntimeError(
-            f"address allocation incomplete; buffers without address: {missing}"
-        )
+        raise RuntimeError(f"address allocation incomplete; buffers without address: {missing}")
 
 
 __all__ = [

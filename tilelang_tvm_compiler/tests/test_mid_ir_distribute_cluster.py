@@ -43,8 +43,11 @@ def _check(label, actual, expected) -> int:
 
 def _cluster(name, extent, body, parent="parent"):
     return ir.ParallelAxis(
-        axis_name=name, extent=extent, body=body,
-        kind=ir.ParallelKind.CLUSTER, thread_tag=None,
+        axis_name=name,
+        extent=extent,
+        body=body,
+        kind=ir.ParallelKind.CLUSTER,
+        thread_tag=None,
         parent_grid_axis_name=parent,
     )
 
@@ -54,7 +57,10 @@ def _wrap(body):
     # The test fixtures don't actually run pass_3_split, so the value
     # is just a placeholder.
     return ir.MidFunc(
-        name="t", params=[], allocs=[], body=list(body),
+        name="t",
+        params=[],
+        allocs=[],
+        body=list(body),
         lane_axes=["by"],
     )
 
@@ -68,11 +74,22 @@ def test_cluster_pure_unroll() -> int:
     """cluster {for_unroll {ops}} → for_unroll {cluster {ops}}."""
     print("test_cluster_pure_unroll")
     A = _mk_buf("A", [64, 16])
-    body = [_cluster("c_phase", 4, [
-        ir.For(loop_var="kh", extent=4, kind="unroll", body=[
-            ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-        ]),
-    ])]
+    body = [
+        _cluster(
+            "c_phase",
+            4,
+            [
+                ir.For(
+                    loop_var="kh",
+                    extent=4,
+                    kind="unroll",
+                    body=[
+                        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+                    ],
+                ),
+            ],
+        )
+    ]
     out = distribute_run(_wrap(body))
     failures = 0
     failures += _check("body length", len(out.body), 1)
@@ -84,14 +101,10 @@ def test_cluster_pure_unroll() -> int:
     failures += _check("For loop_var", for_node.loop_var, "kh")
     failures += _check("For body length", len(for_node.body), 1)
     if isinstance(for_node.body[0], ir.ParallelAxis):
-        failures += _check("inner ParallelAxis kind",
-                           for_node.body[0].kind, ir.ParallelKind.CLUSTER)
-        failures += _check("inner cluster axis_name",
-                           for_node.body[0].axis_name, "c_phase")
-        failures += _check("inner cluster body length",
-                           len(for_node.body[0].body), 1)
-        failures += _check("innermost is Dma",
-                           type(for_node.body[0].body[0]).__name__, "Dma")
+        failures += _check("inner ParallelAxis kind", for_node.body[0].kind, ir.ParallelKind.CLUSTER)
+        failures += _check("inner cluster axis_name", for_node.body[0].axis_name, "c_phase")
+        failures += _check("inner cluster body length", len(for_node.body[0].body), 1)
+        failures += _check("innermost is Dma", type(for_node.body[0].body[0]).__name__, "Dma")
     else:
         print(f"  [FAIL] inner not ParallelAxis: {for_node.body[0]}")
         failures += 1
@@ -102,13 +115,24 @@ def test_cluster_mixed_body() -> int:
     """cluster {pre; for_unroll; post} → cluster{pre}; for{cluster{...}}; cluster{post}."""
     print("test_cluster_mixed_body — 3-way split")
     A = _mk_buf("A", [64, 16])
-    body = [_cluster("c_phase", 4, [
-        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),       # pre
-        ir.For(loop_var="kh", extent=4, kind="unroll", body=[
-            ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-        ]),
-        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),       # post
-    ])]
+    body = [
+        _cluster(
+            "c_phase",
+            4,
+            [
+                ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),  # pre
+                ir.For(
+                    loop_var="kh",
+                    extent=4,
+                    kind="unroll",
+                    body=[
+                        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+                    ],
+                ),
+                ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),  # post
+            ],
+        )
+    ]
     out = distribute_run(_wrap(body))
     failures = 0
     failures += _check("top-level body length", len(out.body), 3)
@@ -123,8 +147,7 @@ def test_cluster_mixed_body() -> int:
         failures += _check("[1] kind", out.body[1].kind, "unroll")
         failures += _check("[1] body length", len(out.body[1].body), 1)
         if isinstance(out.body[1].body[0], ir.ParallelAxis):
-            failures += _check("[1] inner cluster",
-                               out.body[1].body[0].kind, ir.ParallelKind.CLUSTER)
+            failures += _check("[1] inner cluster", out.body[1].body[0].kind, ir.ParallelKind.CLUSTER)
     # [2] cluster {post}
     failures += _check("[2] type", type(out.body[2]).__name__, "ParallelAxis")
     return failures
@@ -134,22 +157,31 @@ def test_serial_for_not_distributed() -> int:
     """cluster {serial_for {ops}} stays as-is — only unroll triggers."""
     print("test_serial_for_not_distributed")
     A = _mk_buf("A", [64, 16])
-    body = [_cluster("c_phase", 4, [
-        ir.For(loop_var="kv", extent=4, kind="serial", body=[
-            ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-        ]),
-    ])]
+    body = [
+        _cluster(
+            "c_phase",
+            4,
+            [
+                ir.For(
+                    loop_var="kv",
+                    extent=4,
+                    kind="serial",
+                    body=[
+                        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+                    ],
+                ),
+            ],
+        )
+    ]
     out = distribute_run(_wrap(body))
     failures = 0
     # Top-level still ONE cluster, body still ONE For.
     failures += _check("top-level body length", len(out.body), 1)
     failures += _check("[0] type", type(out.body[0]).__name__, "ParallelAxis")
     if isinstance(out.body[0], ir.ParallelAxis):
-        failures += _check("cluster preserved", out.body[0].kind,
-                           ir.ParallelKind.CLUSTER)
+        failures += _check("cluster preserved", out.body[0].kind, ir.ParallelKind.CLUSTER)
         failures += _check("cluster body length", len(out.body[0].body), 1)
-        failures += _check("for inside cluster",
-                           type(out.body[0].body[0]).__name__, "For")
+        failures += _check("for inside cluster", type(out.body[0].body[0]).__name__, "For")
         failures += _check("for kind", out.body[0].body[0].kind, "serial")
     return failures
 
@@ -158,10 +190,16 @@ def test_cluster_no_unroll_pass_through() -> int:
     """cluster body has no unroll For → unchanged."""
     print("test_cluster_no_unroll_pass_through")
     A = _mk_buf("A", [64, 16])
-    body = [_cluster("c_phase", 4, [
-        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-    ])]
+    body = [
+        _cluster(
+            "c_phase",
+            4,
+            [
+                ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+                ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+            ],
+        )
+    ]
     out = distribute_run(_wrap(body))
     failures = 0
     failures += _check("body length", len(out.body), 1)
@@ -176,14 +214,30 @@ def test_two_unroll_fors_in_cluster() -> int:
     Two unroll Fors with no in-between ops → no extra cluster instances."""
     print("test_two_unroll_fors_in_cluster")
     A = _mk_buf("A", [64, 16])
-    body = [_cluster("c_phase", 4, [
-        ir.For(loop_var="kh", extent=2, kind="unroll", body=[
-            ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-        ]),
-        ir.For(loop_var="kw", extent=2, kind="unroll", body=[
-            ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-        ]),
-    ])]
+    body = [
+        _cluster(
+            "c_phase",
+            4,
+            [
+                ir.For(
+                    loop_var="kh",
+                    extent=2,
+                    kind="unroll",
+                    body=[
+                        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+                    ],
+                ),
+                ir.For(
+                    loop_var="kw",
+                    extent=2,
+                    kind="unroll",
+                    body=[
+                        ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+                    ],
+                ),
+            ],
+        )
+    ]
     out = distribute_run(_wrap(body))
     failures = 0
     # Should be exactly 2 stmts at top: two Fors, both with cluster inside.
@@ -192,8 +246,7 @@ def test_two_unroll_fors_in_cluster() -> int:
     failures += _check("[1] type", type(out.body[1]).__name__, "For")
     if isinstance(out.body[0], ir.For):
         failures += _check("[0] loop_var", out.body[0].loop_var, "kh")
-        failures += _check("[0] inner is cluster",
-                           type(out.body[0].body[0]).__name__, "ParallelAxis")
+        failures += _check("[0] inner is cluster", type(out.body[0].body[0]).__name__, "ParallelAxis")
     if isinstance(out.body[1], ir.For):
         failures += _check("[1] loop_var", out.body[1].loop_var, "kw")
     return failures
@@ -206,27 +259,38 @@ def test_grid_outside_cluster_preserved() -> int:
     A = _mk_buf("A", [64, 16])
     body = [
         ir.ParallelAxis(
-            axis_name="by_number", extent=1,
-            kind=ir.ParallelKind.BLOCK_IDX, thread_tag="blockIdx.y",
-            body=[_cluster("by_phase", 4, [
-                ir.For(loop_var="kh", extent=4, kind="unroll", body=[
-                    ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
-                ]),
-            ])],
+            axis_name="by_number",
+            extent=1,
+            kind=ir.ParallelKind.BLOCK_IDX,
+            thread_tag="blockIdx.y",
+            body=[
+                _cluster(
+                    "by_phase",
+                    4,
+                    [
+                        ir.For(
+                            loop_var="kh",
+                            extent=4,
+                            kind="unroll",
+                            body=[
+                                ir.Dma(src=_slice_ref(A), dst=_slice_ref(A)),
+                            ],
+                        ),
+                    ],
+                )
+            ],
         ),
     ]
     out = distribute_run(_wrap(body))
     failures = 0
     grid = out.body[0]
-    failures += _check("grid kind preserved", grid.kind,
-                       ir.ParallelKind.BLOCK_IDX)
+    failures += _check("grid kind preserved", grid.kind, ir.ParallelKind.BLOCK_IDX)
     # Inside the grid: should be the For (cluster pushed inside).
     failures += _check("grid body length", len(grid.body), 1)
     failures += _check("grid body[0] type", type(grid.body[0]).__name__, "For")
     if isinstance(grid.body[0], ir.For):
         failures += _check("inner For kind", grid.body[0].kind, "unroll")
-        failures += _check("inside For is cluster",
-                           type(grid.body[0].body[0]).__name__, "ParallelAxis")
+        failures += _check("inside For is cluster", type(grid.body[0].body[0]).__name__, "ParallelAxis")
     return failures
 
 

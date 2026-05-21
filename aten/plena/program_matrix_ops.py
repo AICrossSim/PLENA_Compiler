@@ -77,9 +77,7 @@ class ProgramMatrixOpsMixin:
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[:][mram_col_idx]
         Supports K-split: k_block_start/k_block_count select a subset of K tiles.
         """
-        vram_matrix, mram_input, target = self._prepare_projection(
-            vram_matrix, mram_input, target, auto_reset_mram
-        )
+        vram_matrix, mram_input, target = self._prepare_projection(vram_matrix, mram_input, target, auto_reset_mram)
         super().load_sub_matrix_col(
             name=mram_input.name,
             col_idx=mram_col_idx,
@@ -112,9 +110,7 @@ class ProgramMatrixOpsMixin:
         """
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[mram_row_idx][:]^T
         """
-        vram_matrix, mram_input, target = self._prepare_projection(
-            vram_matrix, mram_input, target, auto_reset_mram
-        )
+        vram_matrix, mram_input, target = self._prepare_projection(vram_matrix, mram_input, target, auto_reset_mram)
         super().load_sub_matrix_row(name=mram_input.name, row_idx=mram_row_idx)
         super().vram_sub_projection_T_to(
             vram_mat_name=vram_matrix.name,

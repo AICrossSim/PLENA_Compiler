@@ -125,7 +125,8 @@ class PlenaCodegen:
 
     @staticmethod
     def _buf_info_to_hlir(
-        info: _BufferInfo, kernel_layout: str = "BSHD",
+        info: _BufferInfo,
+        kernel_layout: str = "BSHD",
     ) -> _hlir.Buffer:
         return _hlir.Buffer(
             name=info.name,
@@ -163,14 +164,8 @@ class PlenaCodegen:
             # can be materialised by ExprMaterializer.
             body_ops: list[_hlir.Op] = []
             self._collect_ops(stmt.body, body_ops)
-            extent = (
-                int(stmt.extent.value) if isinstance(stmt.extent, tir.IntImm)
-                else stmt.extent
-            )
-            init = (
-                int(stmt.min.value) if isinstance(stmt.min, tir.IntImm)
-                else stmt.min
-            )
+            extent = int(stmt.extent.value) if isinstance(stmt.extent, tir.IntImm) else stmt.extent
+            init = int(stmt.min.value) if isinstance(stmt.min, tir.IntImm) else stmt.min
             # Capture loop kind so isa_pass can pick between hardware-loop
             # emission (C_LOOP_START/END) and full unrolling. T.unroll(...)
             # in the kernel maps to ForKind.UNROLLED here; isa_pass uses
@@ -218,20 +213,13 @@ class PlenaCodegen:
         """
         raw = list(val.args[1:])
         if len(raw) < 4:
-            raise CodegenError(
-                f"{name}: expected at least 4 args (src, dst, ndim, ...), got {len(raw)}"
-            )
+            raise CodegenError(f"{name}: expected at least 4 args (src, dst, ndim, ...), got {len(raw)}")
         src_var, dst_var, ndim_imm = raw[0], raw[1], raw[2]
         if not isinstance(ndim_imm, tir.IntImm):
-            raise CodegenError(
-                f"{name}: ndim must be a compile-time int, got {type(ndim_imm).__name__}"
-            )
+            raise CodegenError(f"{name}: ndim must be a compile-time int, got {type(ndim_imm).__name__}")
         ndim = int(ndim_imm.value)
         if len(raw) != 3 + 2 * ndim:
-            raise CodegenError(
-                f"{name}: with ndim={ndim} expected exactly {3 + 2 * ndim} args, "
-                f"got {len(raw)}"
-            )
+            raise CodegenError(f"{name}: with ndim={ndim} expected exactly {3 + 2 * ndim} args, got {len(raw)}")
         starts_raw = raw[3 : 3 + ndim]
         extents_raw = raw[3 + ndim : 3 + 2 * ndim]
 
@@ -244,16 +232,11 @@ class PlenaCodegen:
             elif isinstance(s, tir.PrimExpr):
                 starts.append(s)
             else:
-                raise CodegenError(
-                    f"{name}: start must be IntImm or PrimExpr, got {type(s).__name__}"
-                )
+                raise CodegenError(f"{name}: start must be IntImm or PrimExpr, got {type(s).__name__}")
         extents: list[int] = []
         for e in extents_raw:
             if not isinstance(e, tir.IntImm):
-                raise CodegenError(
-                    f"{name}: extent must be a compile-time int, got "
-                    f"{type(e).__name__}={e!r}"
-                )
+                raise CodegenError(f"{name}: extent must be a compile-time int, got {type(e).__name__}={e!r}")
             extents.append(int(e.value))
 
         # Look up parent buffers from the data-handle Vars.
@@ -267,23 +250,29 @@ class PlenaCodegen:
         # Decide which side is sliced based on the intrinsic.
         if name in ("plena.dma_h2v_slice", "plena.dma_h2m_slice"):
             sliced = _hlir.BufferSlice(
-                parent=src_info.name, starts=tuple(starts), extents=tuple(extents),
+                parent=src_info.name,
+                starts=tuple(starts),
+                extents=tuple(extents),
             )
             buffer_args: list[Any] = [sliced, dst_info.name]
         elif name == "plena.dma_v2h_slice":
             sliced = _hlir.BufferSlice(
-                parent=dst_info.name, starts=tuple(starts), extents=tuple(extents),
+                parent=dst_info.name,
+                starts=tuple(starts),
+                extents=tuple(extents),
             )
             buffer_args = [src_info.name, sliced]
         else:
             raise CodegenError(f"unhandled slice intrinsic: {name}")
 
-        ops.append(_hlir.Op(
-            kind=kind,
-            buffer_args=buffer_args,
-            scalar_args=[],
-            annotations={"intrinsic": name},
-        ))
+        ops.append(
+            _hlir.Op(
+                kind=kind,
+                buffer_args=buffer_args,
+                scalar_args=[],
+                annotations={"intrinsic": name},
+            )
+        )
 
     def _collect_op_from_evaluate(self, ev: tir.Evaluate, ops: list[_hlir.Op]) -> None:
         val = ev.value
@@ -293,7 +282,7 @@ class PlenaCodegen:
         if name is None or not name.startswith("plena."):
             return
         spec = _intrin.lookup(name)  # validates that the op is known
-        kind = name[len("plena."):]
+        kind = name[len("plena.") :]
 
         # Slice variants have a structured arg pack: src, dst, ndim,
         # *starts, *extents. Pack the variadic suffix into a BufferSlice
@@ -324,10 +313,12 @@ class PlenaCodegen:
             if isinstance(a, tir.BufferLoad) and a.buffer.data in self._buffers:
                 info = self._buffers[a.buffer.data]
                 if _scope.physical_scope(info.scope) == _scope.FPRAM:
-                    scalar_args.append(_hlir.BufferElement(
-                        buffer=info.name,
-                        indices=tuple(self._normalize_scalar_expr(i) for i in a.indices),
-                    ))
+                    scalar_args.append(
+                        _hlir.BufferElement(
+                            buffer=info.name,
+                            indices=tuple(self._normalize_scalar_expr(i) for i in a.indices),
+                        )
+                    )
                     scopes.append(None)
                     continue
             scopes.append(None)
@@ -347,12 +338,14 @@ class PlenaCodegen:
                 si += 1
         self._verify_scopes(spec, name, ordered_scopes)
 
-        ops.append(_hlir.Op(
-            kind=kind,
-            buffer_args=buffer_args,
-            scalar_args=scalar_args,
-            annotations={"intrinsic": name},
-        ))
+        ops.append(
+            _hlir.Op(
+                kind=kind,
+                buffer_args=buffer_args,
+                scalar_args=scalar_args,
+                annotations={"intrinsic": name},
+            )
+        )
 
     def run(self) -> str:
         self._collect_param_buffers()
@@ -389,10 +382,7 @@ class PlenaCodegen:
     def _record_buffer(self, buf: tir.Buffer, default_scope: str) -> None:
         scope = _normalize_scope(buf.scope() or default_scope)
         if not _scope.is_known(scope):
-            raise CodegenError(
-                f"buffer {buf.name!r} has unknown scope {scope!r}; "
-                f"expected one of {_scope.ALL_SCOPES}"
-            )
+            raise CodegenError(f"buffer {buf.name!r} has unknown scope {scope!r}; expected one of {_scope.ALL_SCOPES}")
         info = _BufferInfo(buf.name, scope, buf.shape, str(buf.dtype))
         self._buffers[buf.data] = info
         self._buffers_by_name[buf.name] = info
@@ -417,9 +407,7 @@ class PlenaCodegen:
             # We don't emit loop control yet -- just unroll-by-walking.
             # Real PLENA would lower this to C_LOOP_START/END. For the
             # skeleton kernel there are no loops.
-            self._isa_lines.append(
-                f"; for {stmt.loop_var.name_hint} in [{stmt.min}, {stmt.min} + {stmt.extent})"
-            )
+            self._isa_lines.append(f"; for {stmt.loop_var.name_hint} in [{stmt.min}, {stmt.min} + {stmt.extent})")
             self._walk_stmt(stmt.body)
             self._isa_lines.append(f"; end for {stmt.loop_var.name_hint}")
         elif isinstance(stmt, tir.Evaluate):
@@ -500,30 +488,20 @@ class PlenaCodegen:
             return a
         return str(a)
 
-    def _verify_scopes(
-        self, spec: _intrin.IntrinsicSpec, name: str, scopes: list[str | None]
-    ) -> None:
+    def _verify_scopes(self, spec: _intrin.IntrinsicSpec, name: str, scopes: list[str | None]) -> None:
         expected = list(spec.operand_scopes)
         if len(scopes) != len(expected):
-            raise CodegenError(
-                f"{name}: expected {len(expected)} operands, got {len(scopes)}"
-            )
+            raise CodegenError(f"{name}: expected {len(expected)} operands, got {len(scopes)}")
         for i, (want, got) in enumerate(zip(expected, scopes)):
             if want is None:
                 continue
             if got is None:
-                raise CodegenError(
-                    f"{name}: operand {i} must be a buffer in scope {want!r}, "
-                    f"got non-buffer value"
-                )
+                raise CodegenError(f"{name}: operand {i} must be a buffer in scope {want!r}, got non-buffer value")
             # `global.<phys>` operands satisfy a `<phys>` operand spec —
             # the user-declared global flag only changes lane-fusion
             # behaviour, not which physical RAM the operand reads/writes.
             if _scope.physical_scope(got) != want:
-                raise CodegenError(
-                    f"{name}: operand {i} must be in scope {want!r}, "
-                    f"but found {got!r}"
-                )
+                raise CodegenError(f"{name}: operand {i} must be in scope {want!r}, but found {got!r}")
 
     # ------------------------------------------------------------------
     # header / buffer directives
@@ -561,9 +539,7 @@ class PlenaCodegen:
                 _scope.MRAM: "ALLOC_MRAM",
                 _scope.FPRAM: "ALLOC_FPRAM",
             }[_scope.physical_scope(info.scope)]
-            self._isa_lines.append(
-                f"{scope_token}  {info.name}  shape={shape_str}  dtype={info.dtype}"
-            )
+            self._isa_lines.append(f"{scope_token}  {info.name}  shape={shape_str}  dtype={info.dtype}")
 
 
 def compile_module(mod: tvm.IRModule) -> dict[str, str]:

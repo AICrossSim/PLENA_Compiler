@@ -25,9 +25,7 @@ def test_kernel_has_nested_for_loops():
     assert len(kv_ops) == 1 and kv_ops[0].kind == "for", "third level must be a for (kv_block)"
     inner_body = kv_ops[0].body
     kinds = [op.kind for op in inner_body]
-    assert kinds == ["dma_h2v_slice", "dma_h2m_slice", "btmm", "dma_v2h_slice"], (
-        f"unexpected inner-body kinds: {kinds}"
-    )
+    assert kinds == ["dma_h2v_slice", "dma_h2m_slice", "btmm", "dma_v2h_slice"], f"unexpected inner-body kinds: {kinds}"
     print("[ok] nested for: q_block -> hg -> kv_block -> [4 inner ops]")
 
 
@@ -67,9 +65,7 @@ def test_v2h_slice_vram_offsets_are_head_major():
     asm = ck.isa_text
     expected_vram = [h * c["MLEN"] * c["MLEN"] for h in range(c["LANE_COUNT"])]
     actual_vram = [int(m) for m in re.findall(r"vram\[\+(\d+)\]", asm)]
-    assert actual_vram == expected_vram, (
-        f"per-head vram offsets: expected {expected_vram}, got {actual_vram}"
-    )
+    assert actual_vram == expected_vram, f"per-head vram offsets: expected {expected_vram}, got {actual_vram}"
     print(f"[ok] per-head vram offsets: {actual_vram} (head-major BHSD)")
 
 
@@ -86,8 +82,7 @@ def test_dma_v2h_uses_dynamic_base_reg():
     # h=1,2,3 (h=0 reuses base directly so no extra ADDI on it).
     extra_adds = re.findall(rf"S_ADDI_INT gp\d+, gp{base_reg}, \d+\b", asm)
     assert len(extra_adds) >= 3, (
-        f"expected >=3 `S_ADDI_INT _, gp{base_reg}, K` for per-head offsets, "
-        f"got {len(extra_adds)}"
+        f"expected >=3 `S_ADDI_INT _, gp{base_reg}, K` for per-head offsets, got {len(extra_adds)}"
     )
     print(f"[ok] dynamic base gp{base_reg} reused across {len(extra_adds)} per-head adds")
 
@@ -98,9 +93,9 @@ def test_scale_is_parent_full_size():
     # Parent C_hbm 2D collapse uses head_count, not lane_count:
     # cols = HEAD_COUNT * SEQ_K, rows = BATCH * SEQ_Q.
     parent_full = c["BATCH"] * c["SEQ_Q"] * c["HEAD_COUNT"] * c["SEQ_K"]
-    assert re.search(
-        rf"S_ADDI_INT gp\d+, gp0, {parent_full}\s*\n\s*C_SET_SCALE_REG", asm
-    ), f"expected SCALE_REG = {parent_full} (parent full element count)"
+    assert re.search(rf"S_ADDI_INT gp\d+, gp0, {parent_full}\s*\n\s*C_SET_SCALE_REG", asm), (
+        f"expected SCALE_REG = {parent_full} (parent full element count)"
+    )
     print(f"[ok] SCALE_REG <- {parent_full} (parent full size)")
 
 
@@ -108,9 +103,7 @@ def test_stride_is_parent_row_width():
     ck, c = _compile()
     asm = ck.isa_text
     parent_stride = c["HEAD_COUNT"] * c["SEQ_K"]
-    assert re.search(
-        rf"S_ADDI_INT gp\d+, gp0, {parent_stride}\s*\n\s*C_SET_STRIDE_REG", asm
-    )
+    assert re.search(rf"S_ADDI_INT gp\d+, gp0, {parent_stride}\s*\n\s*C_SET_STRIDE_REG", asm)
     print(f"[ok] STRIDE_REG <- {parent_stride} (parent row width = HEAD_COUNT*SEQ_K)")
 
 

@@ -37,11 +37,21 @@ from dataclasses import dataclass
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    BufferRef, Broadcast, VarRef,
-    Dma, Gemm, Elementwise, Reduce, RawStore,
-    For, Async, MultiLaneOp,
-    ParallelAxis, ParallelKind,
-    MidFunc, Stmt,
+    BufferRef,
+    Broadcast,
+    VarRef,
+    Dma,
+    Gemm,
+    Elementwise,
+    Reduce,
+    RawStore,
+    For,
+    Async,
+    MultiLaneOp,
+    ParallelAxis,
+    ParallelKind,
+    MidFunc,
+    Stmt,
 )
 
 
@@ -73,6 +83,7 @@ class _ClusterAxis:
     count)`` so multi-lane sync ops read the full cluster's chunk in
     one go.
     """
+
     phase_name: str
     number_name: str
     count: int
@@ -145,8 +156,7 @@ def _walk(stmt: Stmt, cluster_stack: list[_ClusterAxis]) -> Stmt:
         if stmt.kind == ParallelKind.CLUSTER:
             if stmt.parent_grid_axis_name is None:
                 raise FuseError(
-                    f"cluster axis {stmt.axis_name!r} missing "
-                    f"parent_grid_axis_name; pass_3_split should have set it"
+                    f"cluster axis {stmt.axis_name!r} missing parent_grid_axis_name; pass_3_split should have set it"
                 )
             # Read the user-visible original axis name straight off the
             # ParallelAxis (set by pass_3_split). Parsing string
@@ -156,14 +166,10 @@ def _walk(stmt: Stmt, cluster_stack: list[_ClusterAxis]) -> Stmt:
             phase = stmt.axis_name
             original = stmt.original_axis_name
             if original is None:
-                raise FuseError(
-                    f"cluster axis {phase!r} missing original_axis_name; "
-                    f"pass_3_split should have set it"
-                )
+                raise FuseError(f"cluster axis {phase!r} missing original_axis_name; pass_3_split should have set it")
             if stmt.axis_var is None or stmt.original_axis_var is None:
                 raise FuseError(
-                    f"cluster axis {phase!r}: identity fields "
-                    f"(axis_var / original_axis_var) must be set by split"
+                    f"cluster axis {phase!r}: identity fields (axis_var / original_axis_var) must be set by split"
                 )
             number_var = _NUMBER_VAR_BY_NAME.get(stmt.parent_grid_axis_name)
             if number_var is None:
@@ -172,15 +178,17 @@ def _walk(stmt: Stmt, cluster_stack: list[_ClusterAxis]) -> Stmt:
                     f"{stmt.parent_grid_axis_name!r} VarRef not recorded; "
                     f"split must emit ``number -> phase`` nesting"
                 )
-            new_stack = cluster_stack + [_ClusterAxis(
-                phase_name=phase,
-                number_name=stmt.parent_grid_axis_name,
-                count=stmt.extent,
-                original_name=original,
-                phase_var=stmt.axis_var,
-                number_var=number_var,
-                original_var=stmt.original_axis_var,
-            )]
+            new_stack = cluster_stack + [
+                _ClusterAxis(
+                    phase_name=phase,
+                    number_name=stmt.parent_grid_axis_name,
+                    count=stmt.extent,
+                    original_name=original,
+                    phase_var=stmt.axis_var,
+                    number_var=number_var,
+                    original_var=stmt.original_axis_var,
+                )
+            ]
             return ParallelAxis(
                 axis_name=stmt.axis_name,
                 extent=stmt.extent,
@@ -247,13 +255,10 @@ def _match_lane_composite(idx, axes: list[_ClusterAxis]):
             inner = args[1]
             if isinstance(inner, dict) and inner.get("op") == "mul":
                 m_args = inner.get("args", [])
-                if (len(m_args) == 2 and isinstance(m_args[0], VarRef)
-                        and isinstance(m_args[1], int)):
+                if len(m_args) == 2 and isinstance(m_args[0], VarRef) and isinstance(m_args[1], int):
                     number, count = m_args[0], m_args[1]
                     for ax in axes:
-                        if (phase == ax.phase_var
-                                and number == ax.number_var
-                                and count == ax.count):
+                        if phase == ax.phase_var and number == ax.number_var and count == ax.count:
                             return ax
     return None
 
@@ -334,8 +339,7 @@ def _collapse_ref(ref: BufferRef, axes: list[_ClusterAxis]) -> BufferRef:
     them with the un-split logical lane var ``by`` — fuse_pass widens
     that to a cluster-wide ``ranged_slice`` so the multi-lane sync
     wrap reads the full cluster's chunk (by_phase drops out)."""
-    if not (ref.buffer.scope == "global"
-            or ref.buffer.scope.startswith("global.")):
+    if not (ref.buffer.scope == "global" or ref.buffer.scope.startswith("global.")):
         return ref
     return BufferRef(
         buffer=ref.buffer,
@@ -411,20 +415,15 @@ def _fuse_async(stmt: Async, cluster_stack: list[_ClusterAxis]) -> Stmt:
     """
     if not cluster_stack:
         raise FuseError(
-            f"Async #{stmt.scope_id} found outside any cluster — "
-            f"this shouldn't happen if pass_4_async ran first"
+            f"Async #{stmt.scope_id} found outside any cluster — this shouldn't happen if pass_4_async ran first"
         )
     if len(stmt.body) != 1:
         raise FuseError(
-            f"Async #{stmt.scope_id} must hold exactly one op "
-            f"(got {len(stmt.body)}); pass_4 enforces one-async-one-op"
+            f"Async #{stmt.scope_id} must hold exactly one op (got {len(stmt.body)}); pass_4 enforces one-async-one-op"
         )
     inner = stmt.body[0]
     if isinstance(inner, (Async, MultiLaneOp, ParallelAxis, For)):
-        raise FuseError(
-            f"Async #{stmt.scope_id} body must be a leaf op, got "
-            f"{type(inner).__name__}"
-        )
+        raise FuseError(f"Async #{stmt.scope_id} body must be a leaf op, got {type(inner).__name__}")
     inner = _collapse_lane_in_op(inner, cluster_stack)
     axis_names = [ax.phase_name for ax in cluster_stack]
     axis_vars = [ax.phase_var for ax in cluster_stack]

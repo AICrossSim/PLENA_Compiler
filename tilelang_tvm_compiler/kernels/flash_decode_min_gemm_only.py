@@ -35,8 +35,7 @@ def make_flash_decode_min_gemm_only(
         head_count = hardware_lane_count
     if head_count % hardware_lane_count != 0:
         raise ValueError(
-            f"head_count must be a multiple of hardware_lane_count "
-            f"({hardware_lane_count}); got head_count={head_count}"
+            f"head_count must be a multiple of hardware_lane_count ({hardware_lane_count}); got head_count={head_count}"
         )
     if num_kv_blocks < 1:
         raise ValueError(f"num_kv_blocks must be >= 1, got {num_kv_blocks}")
@@ -49,16 +48,14 @@ def make_flash_decode_min_gemm_only(
         V_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
     ):
         with T.Kernel(1, head_count, threads=128) as (_, by):
-            Q_cache = T.alloc_shared((head_count, hlen), "float16",
-                                      scope="global.vram")
-            O_cache = T.alloc_shared((head_count, hlen), "float16",
-                                      scope="global.vram")
-            Q_sh   = T.alloc_shared((1, hlen), "float16")
-            K_sh   = T.alloc_shared((rows, hlen), "float16")
-            V_sh   = T.alloc_shared((rows, hlen), "float16")
-            S_loc  = T.alloc_fragment((1, MLEN), "float16")
+            Q_cache = T.alloc_shared((head_count, hlen), "float16", scope="global.vram")
+            O_cache = T.alloc_shared((head_count, hlen), "float16", scope="global.vram")
+            Q_sh = T.alloc_shared((1, hlen), "float16")
+            K_sh = T.alloc_shared((rows, hlen), "float16")
+            V_sh = T.alloc_shared((rows, hlen), "float16")
+            S_loc = T.alloc_fragment((1, MLEN), "float16")
             PV_loc = T.alloc_fragment((1, hlen), "float16")
-            O_loc  = T.alloc_fragment((1, hlen), "float16")
+            O_loc = T.alloc_fragment((1, hlen), "float16")
 
             T.copy(Q_cache[by, 0], Q_sh)
 

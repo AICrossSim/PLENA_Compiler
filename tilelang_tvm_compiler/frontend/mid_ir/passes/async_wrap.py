@@ -36,9 +36,16 @@ from __future__ import annotations
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    Dma, Gemm, Elementwise, Reduce,
-    For, Async, ParallelAxis, ParallelKind,
-    MidFunc, Stmt,
+    Dma,
+    Gemm,
+    Elementwise,
+    Reduce,
+    For,
+    Async,
+    ParallelAxis,
+    ParallelKind,
+    MidFunc,
+    Stmt,
 )
 
 
@@ -48,6 +55,7 @@ class AsyncWrapError(RuntimeError):
 
 class _IdCounter:
     """Module-global counter for generating fresh Async scope IDs."""
+
     def __init__(self) -> None:
         self.next = 0
 
@@ -67,8 +75,7 @@ def _walk(stmt: Stmt, in_cluster: bool, ids: _IdCounter) -> Stmt:
         if stmt.kind == ParallelKind.CLUSTER:
             if stmt.parent_grid_axis_name is None:
                 raise AsyncWrapError(
-                    f"cluster {stmt.axis_name!r} has no parent_grid_axis_name; "
-                    f"split should have set it"
+                    f"cluster {stmt.axis_name!r} has no parent_grid_axis_name; split should have set it"
                 )
             new_body = [_walk(s, in_cluster=True, ids=ids) for s in stmt.body]
             new_body = _wrap_async_runs(new_body, ids)
@@ -138,8 +145,7 @@ def _wrap_async_runs(stmts: list[Stmt], ids: _IdCounter) -> list[Stmt]:
 
 def _is_async_eligible(s: Stmt) -> bool:
     """True if ``s`` is a leaf op with ``can_async=True``."""
-    return isinstance(s, (Dma, Gemm, Elementwise, Reduce)) \
-        and getattr(s, "can_async", False)
+    return isinstance(s, (Dma, Gemm, Elementwise, Reduce)) and getattr(s, "can_async", False)
 
 
 # ---------------------------------------------------------------------------

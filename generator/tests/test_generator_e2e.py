@@ -46,6 +46,7 @@ def _load_model_for_weights(model_id: str, torch_dtype=None):
     AutoModelForCausalLM or AutoModelForVision2Seq in older transformers builds.
     """
     import transformers
+
     kwargs = {} if torch_dtype is None else {"torch_dtype": torch_dtype}
     try:
         return AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
@@ -53,6 +54,7 @@ def _load_model_for_weights(model_id: str, torch_dtype=None):
         pass
     # Try each architecture listed in the config.
     from transformers import AutoConfig
+
     cfg = AutoConfig.from_pretrained(model_id)
     for arch_name in getattr(cfg, "architectures", []):
         cls = getattr(transformers, arch_name, None)
@@ -63,6 +65,7 @@ def _load_model_for_weights(model_id: str, torch_dtype=None):
         f"Cannot load {model_id}: AutoModelForCausalLM failed and no supported "
         f"architecture found in config.architectures={getattr(cfg, 'architectures', [])}"
     )
+
 
 from assembler import AssemblyToBinary  # noqa: E402
 
@@ -75,8 +78,6 @@ from utils.load_config import load_toml_config  # noqa: E402
 # Use existing emulator runner for the Rust invocation.
 sys.path.insert(0, str(_REPO_ROOT / "transactional_emulator" / "testbench"))
 from emulator_runner import run_emulator  # noqa: E402
-
-
 
 
 def _build_hbm_from_hf_weights(
@@ -174,10 +175,7 @@ def _build_hbm_from_hf_weights(
                 return obj
         return None
 
-    embed = (
-        _get(root, "embed_tokens", "wte")
-        or _get(getattr(model, "text_model", model), "embed_tokens", "wte")
-    )
+    embed = _get(root, "embed_tokens", "wte") or _get(getattr(model, "text_model", model), "embed_tokens", "wte")
     q_proj = _get(layer0, "self_attn.q_proj", "attn.q_proj", "attention.q_proj")
     k_proj = _get(layer0, "self_attn.k_proj", "attn.k_proj", "attention.k_proj")
     v_proj = _get(layer0, "self_attn.v_proj", "attn.v_proj", "attention.v_proj")
@@ -185,9 +183,7 @@ def _build_hbm_from_hf_weights(
     gate_proj = _get(layer0, "mlp.gate_proj", "mlp.w1")
     up_proj = _get(layer0, "mlp.up_proj", "mlp.w3")
     down_proj = _get(layer0, "mlp.down_proj", "mlp.w2")
-    lm_head = _get(model, "lm_head") or _get(
-        getattr(model, "language_model", model), "lm_head"
-    )
+    lm_head = _get(model, "lm_head") or _get(getattr(model, "language_model", model), "lm_head")
 
     # Weights are written sequentially starting at byte 0.  The cumulative
     # byte offsets match the analytical formula used by code_gen_pass's
@@ -258,8 +254,7 @@ def _build_hbm_from_hf_weights(
             "bytes": after - before,
             "shape": tuple(tensor.shape),
         }
-        print(f"      wrote {name:14s} shape={tuple(tensor.shape)} "
-              f"offset={before} bytes={after - before}")
+        print(f"      wrote {name:14s} shape={tuple(tensor.shape)} offset={before} bytes={after - before}")
 
     # Pad / truncate back to requested size so the emulator's
     # preallocated buffer read doesn't panic on copy_from_slice.
@@ -275,16 +270,14 @@ def _build_hbm_from_hf_weights(
     # generated ASM may reference. emulator_runner.py reads this to size
     # the HBM allocation precisely instead of using a 2× heuristic.
     if summary:
-        max_hbm_byte = max(
-            (s["offset"] + s["bytes"]) for s in summary.values()
-        )
+        max_hbm_byte = max((s["offset"] + s["bytes"]) for s in summary.values())
         # Exact sizing: the generator ASM only reads from HBM (H_PREFETCH_V/M
         # for weights). No writes past the weight region. If KV cache writeback
         # is added later, the codegen should update this sidecar accordingly.
         hbm_required = ((max_hbm_byte + 63) // 64) * 64
         hbm_size_path = hbm_path.parent / "hbm_size.txt"
         hbm_size_path.write_text(str(hbm_required) + "\n")
-        print(f"      hbm_size.txt: {hbm_required} bytes ({hbm_required / (1024*1024):.1f} MiB)")
+        print(f"      hbm_size.txt: {hbm_required} bytes ({hbm_required / (1024 * 1024):.1f} MiB)")
 
     return summary
 
@@ -322,13 +315,13 @@ def _build_fp_sram_preload(
 
     num_slots = total_bytes // 2  # fp16 = 2 bytes each
     constants = [
-        inf_value,                  # slot 0: infinity
-        eps_value,                  # slot 1: eps
-        1.0 / hidden_size,          # slot 2: hid_reciprocal
-        1.0,                        # slot 3: silu_one (1.0; renamed from silu_e)
-        1.702,                      # slot 4: gelu_1702
+        inf_value,  # slot 0: infinity
+        eps_value,  # slot 1: eps
+        1.0 / hidden_size,  # slot 2: hid_reciprocal
+        1.0,  # slot 3: silu_one (1.0; renamed from silu_e)
+        1.702,  # slot 4: gelu_1702
         1.0 / math.sqrt(head_dim),  # slot 5: attn_scale
-    ] + [0.0] * (num_slots - 6)    # slots 6..N: reserved / zero pad
+    ] + [0.0] * (num_slots - 6)  # slots 6..N: reserved / zero pad
 
     arr = np.array(constants, dtype=np.float16)
     assert arr.nbytes == total_bytes, f"expected {total_bytes} bytes, got {arr.nbytes}"
@@ -360,15 +353,15 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     layers_note = f", num_layers={num_layers}" if num_layers is not None else ""
     print(f"[1/5] generator.runner codegen {model_id} (seq_len={seq_len}{layers_note})")
     codegen_cmd = [
-            "python3",
-            "-m",
-            "generator.runner",
-            "codegen",
-            model_id,
-            str(asm_path),
-            "--seq-len",
-            str(seq_len),
-        ]
+        "python3",
+        "-m",
+        "generator.runner",
+        "codegen",
+        model_id,
+        str(asm_path),
+        "--seq-len",
+        str(seq_len),
+    ]
     if num_layers is not None:
         codegen_cmd += ["--num-layers", str(num_layers)]
     result = subprocess.run(
@@ -412,9 +405,7 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     print("[3.0a/5] loading HF model (single load shared with FPRAM seed)")
     _hf_model = _load_model_for_weights(model_id, torch_dtype=torch.float32)
     _hf_model.eval()
-    _build_hbm_from_hf_weights(
-        model_id, seq_len, hbm_path, HBM_SIZE, preloaded_model=_hf_model
-    )
+    _build_hbm_from_hf_weights(model_id, seq_len, hbm_path, HBM_SIZE, preloaded_model=_hf_model)
 
     # FPRAM constant seeding — generator templates expect specific values
     # at fixed slots (mem_layout_lib.json::fp_sram).
@@ -429,9 +420,7 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     del _hf_model  # free memory — weights already written to HBM above
 
     print("[3.6/5] FPRAM seed: writing constants to fp_sram.bin")
-    fp_summary = _build_fp_sram_preload(
-        fpsram_path, hidden_size, head_dim, total_bytes=FPSRAM_BYTES
-    )
+    fp_summary = _build_fp_sram_preload(fpsram_path, hidden_size, head_dim, total_bytes=FPSRAM_BYTES)
     print(f"      seeded {fp_summary['slots_seeded']} fp_sram slots: {fp_summary['values']}")
 
     # int_sram: zero-fill only (no structured constants needed)
@@ -520,8 +509,7 @@ def run_test_aten(
     from compiler.aten.sliced_emulator_runner import run_sliced_emulator_check
 
     print("=" * 80)
-    print(f"Generator e2e harness (ATen backend) — {model_id} — "
-          f"seq_len={seq_len}, num_layers={num_layers}")
+    print(f"Generator e2e harness (ATen backend) — {model_id} — seq_len={seq_len}, num_layers={num_layers}")
     print("=" * 80)
 
     result = run_sliced_emulator_check(
@@ -532,8 +520,7 @@ def run_test_aten(
 
     if result.get("passed"):
         rate = result.get("allclose_match_rate", 0)
-        print(f"\n[PASS] ATen e2e — allclose={rate:.2f}%, "
-              f"elapsed={result.get('elapsed_s', 0):.1f}s")
+        print(f"\n[PASS] ATen e2e — allclose={rate:.2f}%, elapsed={result.get('elapsed_s', 0):.1f}s")
         return 0
     else:
         error = result.get("error", "numerical check failed")
@@ -543,19 +530,25 @@ def run_test_aten(
 
 if __name__ == "__main__":
     import argparse as _argparse
+
     _ap = _argparse.ArgumentParser(description="Generator e2e harness")
     _ap.add_argument("model_id", nargs="?", default="AICrossSim/clm-60m")
     _ap.add_argument("seq_len", nargs="?", type=int, default=128)
-    _ap.add_argument("--num-layers", type=int, default=None,
-                     help="Override num_hidden_layers (e.g. 1 for fast e2e runs, ~22x less ASM)")
-    _ap.add_argument("--aten", action="store_true",
-                     help="Use sim-sliced ATen harness instead of generator codegen")
+    _ap.add_argument(
+        "--num-layers",
+        type=int,
+        default=None,
+        help="Override num_hidden_layers (e.g. 1 for fast e2e runs, ~22x less ASM)",
+    )
+    _ap.add_argument("--aten", action="store_true", help="Use sim-sliced ATen harness instead of generator codegen")
     _args = _ap.parse_args()
     if _args.aten:
-        sys.exit(run_test_aten(
-            _args.model_id,
-            _args.seq_len,
-            num_layers=_args.num_layers if _args.num_layers is not None else 1,
-        ))
+        sys.exit(
+            run_test_aten(
+                _args.model_id,
+                _args.seq_len,
+                num_layers=_args.num_layers if _args.num_layers is not None else 1,
+            )
+        )
     else:
         sys.exit(run_test(_args.model_id, _args.seq_len, num_layers=_args.num_layers))

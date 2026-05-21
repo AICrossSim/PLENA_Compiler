@@ -81,10 +81,7 @@ class ISAEmitter:
             # Dynamic base + static residual: ``a = dyn_reg + static``.
             # The static piece carries per-tile constant offsets (one
             # invocation per inner tile in the multi-tile DMA grid).
-            generated_code += (
-                f"S_ADDI_INT gp{a_actual_register}, gp{hbm_start_offset_reg}, "
-                f"{int(hbm_start_offset)} \n"
-            )
+            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{hbm_start_offset_reg}, {int(hbm_start_offset)} \n"
         else:
             generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, {int(hbm_start_offset)} \n"
         generated_code += f"S_ADDI_INT gp{result_register}, gp0, {act_vram_offset} \n"
@@ -93,15 +90,10 @@ class ISAEmitter:
             elements_per_prefetch = vlen * preload_len
             for _ in range(math.ceil(hidden_size / elements_per_prefetch)):
                 generated_code += (
-                    f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, "
-                    f"a{activation_offset_reg}, 0, 0, 0 \n"
+                    f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, a{activation_offset_reg}, 0, 0, 0 \n"
                 )
-                generated_code += (
-                    f"S_ADDI_INT gp{result_register}, gp{result_register}, {elements_per_prefetch} \n"
-                )
-                generated_code += (
-                    f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {elements_per_prefetch} \n"
-                )
+                generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {elements_per_prefetch} \n"
+                generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {elements_per_prefetch} \n"
             return generated_code
 
         generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len} \n"
@@ -114,9 +106,7 @@ class ISAEmitter:
         generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, a{activation_offset_reg}, 1, 0 \n"
         generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len} \n"
         if batch > preload_len:
-            generated_code += (
-                f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {stride_len * preload_len} \n"
-            )
+            generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {stride_len * preload_len} \n"
             generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
         generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
@@ -155,10 +145,7 @@ class ISAEmitter:
         generated_code += f"C_SET_SCALE_REG gp{hbm_offset_reg}\n"
         if hbm_start_offset_reg is not None:
             # Dynamic base + static residual (see _emit_preload_tile_isa).
-            generated_code += (
-                f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_start_offset_reg}, "
-                f"{int(hbm_start_offset)}\n"
-            )
+            generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_start_offset_reg}, {int(hbm_start_offset)}\n"
         else:
             generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, {int(hbm_start_offset)}\n"
 
@@ -254,7 +241,9 @@ class ISAEmitter:
         # emit body, so protect it from being spilled.
         protect = [hbm_start_offset_reg] if hbm_start_offset_reg is not None else []
         borrowed, token = ra.spill_borrow(
-            6, compiler=self.program.compiler, protect=protect,
+            6,
+            compiler=self.program.compiler,
+            protect=protect,
         )
         gp_addr = [borrowed[0]]
         gp_preload = borrowed[1:6]
@@ -299,7 +288,9 @@ class ISAEmitter:
         addr_reg = ra.allocate_addr(1)[0]
         protect = [hbm_start_offset_reg] if hbm_start_offset_reg is not None else []
         borrowed, token = ra.spill_borrow(
-            6, compiler=self.program.compiler, protect=protect,
+            6,
+            compiler=self.program.compiler,
+            protect=protect,
         )
         gp_addr = [borrowed[0]]
         gp_store = borrowed[1:6]
@@ -476,9 +467,7 @@ class ISAEmitter:
             n = int(self.program.btmm_hlen)
         blen = int(self.program.blen)
         if n % blen != 0:
-            raise ValueError(
-                f"emit_mv: column extent n={n} must be a multiple of blen={blen}"
-            )
+            raise ValueError(f"emit_mv: column extent n={n} must be a multiple of blen={blen}")
         tiles = n // blen
 
         gp_regs = self.program.compiler.register_allocator.allocate_gp(3)
@@ -646,8 +635,7 @@ class ISAEmitter:
         # the entire emit, so nested ISAEmitter calls (none today, but
         # future-proof against a body sub-emit) cannot collide with them.
         gp_regs = ra.allocate_gp(6)
-        (gp_act_row_base, gp_mat_col_base, gp_result_col_base, gp_result,
-         gp_loop_outer, gp_loop_middle) = gp_regs
+        (gp_act_row_base, gp_mat_col_base, gp_result_col_base, gp_result, gp_loop_outer, gp_loop_middle) = gp_regs
 
         tiles_per_mlen = self.program.mlen // self.program.blen
         output_row_stride = self.program.blen * self.program.mlen
@@ -768,9 +756,7 @@ class ISAEmitter:
         if hlen <= 0:
             raise ValueError("emit_matmul_narrow_tile_hwloop requires positive hlen")
         if hlen > self.program.mlen:
-            raise ValueError(
-                f"emit_matmul_narrow_tile_hwloop requires hlen <= mlen={self.program.mlen}, got {hlen}"
-            )
+            raise ValueError(f"emit_matmul_narrow_tile_hwloop requires hlen <= mlen={self.program.mlen}, got {hlen}")
         if hlen % self.program.blen != 0:
             raise ValueError(
                 f"emit_matmul_narrow_tile_hwloop requires hlen divisible by blen={self.program.blen}, got {hlen}"
@@ -939,16 +925,13 @@ class ISAEmitter:
         # passes them in we don't free here either — caller owns the lifetime.
         if scratch_regs is not None:
             if len(scratch_regs) != 7:
-                raise ValueError(
-                    f"emit_matmul_general expects 7 scratch_regs, got {len(scratch_regs)}"
-                )
+                raise ValueError(f"emit_matmul_general expects 7 scratch_regs, got {len(scratch_regs)}")
             gp_regs = list(scratch_regs)
             caller_owns_scratch = True
         else:
             gp_regs = ra.allocate_gp(7)
             caller_owns_scratch = False
-        (gp_act_orow, gp_out_orow, gp_act, gp_mat, _gp_out,
-         gp_loop_orow, gp_loop_k) = gp_regs
+        (gp_act_orow, gp_out_orow, gp_act, gp_mat, _gp_out, gp_loop_orow, gp_loop_k) = gp_regs
 
         lines = [
             f"; matmul (general) task {task_id} "
@@ -963,17 +946,12 @@ class ISAEmitter:
             # the runtime offset in; otherwise we just load the absolute
             # static value.
             lhs_static_full = int(lhs_vram_base) + int(lhs_offset) + m * int(lhs_m_tile_stride)
-            lhs_static_dyn  = int(lhs_vram_base) + m * int(lhs_m_tile_stride)
+            lhs_static_dyn = int(lhs_vram_base) + m * int(lhs_m_tile_stride)
             dst_m_base_static_full = int(dst_vram_base) + int(dst_offset) + m * int(dst_m_tile_stride)
-            dst_m_base_static_dyn  = int(dst_vram_base) + m * int(dst_m_tile_stride)
+            dst_m_base_static_dyn = int(dst_vram_base) + m * int(dst_m_tile_stride)
             for n_mlen in range(N_mlen_tiles):
-                rhs_n_mlen_static_full = (
-                    int(rhs_mram_base) + int(rhs_offset)
-                    + n_mlen * int(rhs_n_mlen_tile_stride)
-                )
-                rhs_n_mlen_static_dyn = (
-                    int(rhs_mram_base) + n_mlen * int(rhs_n_mlen_tile_stride)
-                )
+                rhs_n_mlen_static_full = int(rhs_mram_base) + int(rhs_offset) + n_mlen * int(rhs_n_mlen_tile_stride)
+                rhs_n_mlen_static_dyn = int(rhs_mram_base) + n_mlen * int(rhs_n_mlen_tile_stride)
                 cols_here = min(mlen, N - n_mlen * mlen)
                 tiles_per_n_mlen = cols_here // blen
                 # Per-oc B offset within the current (mlen, mlen) tile:
@@ -990,22 +968,15 @@ class ISAEmitter:
                 for oc in range(tiles_per_n_mlen):
                     dst_col = n_mlen * mlen + oc * blen
                     if lhs_offset_reg is not None:
-                        lines.append(
-                            f"S_ADDI_INT gp{gp_act_orow}, gp{lhs_offset_reg}, "
-                            f"{lhs_static_dyn}"
-                        )
+                        lines.append(f"S_ADDI_INT gp{gp_act_orow}, gp{lhs_offset_reg}, {lhs_static_dyn}")
                     else:
                         lines.append(f"S_ADDI_INT gp{gp_act_orow}, gp0, {lhs_static_full}")
                     if dst_offset_reg is not None:
                         lines.append(
-                            f"S_ADDI_INT gp{gp_out_orow}, gp{dst_offset_reg}, "
-                            f"{dst_m_base_static_dyn + dst_col}"
+                            f"S_ADDI_INT gp{gp_out_orow}, gp{dst_offset_reg}, {dst_m_base_static_dyn + dst_col}"
                         )
                     else:
-                        lines.append(
-                            f"S_ADDI_INT gp{gp_out_orow}, gp0, "
-                            f"{dst_m_base_static_full + dst_col}"
-                        )
+                        lines.append(f"S_ADDI_INT gp{gp_out_orow}, gp0, {dst_m_base_static_full + dst_col}")
 
                     if unroll_loops:
                         # Fully unrolled body: emit ``tiles_per_mlen``
@@ -1018,16 +989,15 @@ class ISAEmitter:
                             dst_static = dst_m_base_static_full + dst_col + orow * c_orow_step
                             if lhs_offset_reg is not None:
                                 act_dyn = lhs_static_dyn + orow * a_orow_step
-                                lines.append(
-                                    f"S_ADDI_INT gp{gp_act}, gp{lhs_offset_reg}, "
-                                    f"{act_dyn}"
-                                )
+                                lines.append(f"S_ADDI_INT gp{gp_act}, gp{lhs_offset_reg}, {act_dyn}")
                             else:
-                                lines.append(
-                                    f"S_ADDI_INT gp{gp_act}, gp0, {act_static}"
-                                )
+                                lines.append(f"S_ADDI_INT gp{gp_act}, gp0, {act_static}")
                             for k in range(K_tiles):
-                                act_static + k * int(lhs_k_tile_stride) - (orow * a_orow_step + lhs_static_full - lhs_static_full)
+                                (
+                                    act_static
+                                    + k * int(lhs_k_tile_stride)
+                                    - (orow * a_orow_step + lhs_static_full - lhs_static_full)
+                                )
                                 # Recompute act/mat per k explicitly so
                                 # there is no incremental S_ADDI between
                                 # M_MMs (matches unroll-only style).
@@ -1040,36 +1010,18 @@ class ISAEmitter:
                                         )
                                     else:
                                         lines.append(
-                                            f"S_ADDI_INT gp{gp_act}, gp0, "
-                                            f"{act_static + k * int(lhs_k_tile_stride)}"
+                                            f"S_ADDI_INT gp{gp_act}, gp0, {act_static + k * int(lhs_k_tile_stride)}"
                                         )
-                                mat_static = (
-                                    rhs_n_mlen_static_full
-                                    + oc * oc_b_step
-                                    + k * int(rhs_k_tile_stride)
-                                )
+                                mat_static = rhs_n_mlen_static_full + oc * oc_b_step + k * int(rhs_k_tile_stride)
                                 if rhs_offset_reg is not None:
-                                    mat_dyn = (
-                                        rhs_n_mlen_static_dyn
-                                        + oc * oc_b_step
-                                        + k * int(rhs_k_tile_stride)
-                                    )
-                                    lines.append(
-                                        f"S_ADDI_INT gp{gp_mat}, "
-                                        f"gp{rhs_offset_reg}, {mat_dyn}"
-                                    )
+                                    mat_dyn = rhs_n_mlen_static_dyn + oc * oc_b_step + k * int(rhs_k_tile_stride)
+                                    lines.append(f"S_ADDI_INT gp{gp_mat}, gp{rhs_offset_reg}, {mat_dyn}")
                                 else:
-                                    lines.append(
-                                        f"S_ADDI_INT gp{gp_mat}, gp0, {mat_static}"
-                                    )
+                                    lines.append(f"S_ADDI_INT gp{gp_mat}, gp0, {mat_static}")
                                 if transpose_b:
-                                    lines.append(
-                                        f"M_TMM 0, gp{gp_act}, gp{gp_mat}"
-                                    )
+                                    lines.append(f"M_TMM 0, gp{gp_act}, gp{gp_mat}")
                                 else:
-                                    lines.append(
-                                        f"M_MM 0, gp{gp_mat}, gp{gp_act}"
-                                    )
+                                    lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
                             if dst_offset_reg is not None:
                                 lines.append(
                                     f"S_ADDI_INT gp{gp_out_orow}, "
@@ -1077,27 +1029,18 @@ class ISAEmitter:
                                     f"{dst_m_base_static_dyn + dst_col + orow * c_orow_step}"
                                 )
                             else:
-                                lines.append(
-                                    f"S_ADDI_INT gp{gp_out_orow}, gp0, "
-                                    f"{dst_static}"
-                                )
-                            lines.append(
-                                f"M_MM_WO gp{gp_out_orow}, gp0, 0"
-                            )
+                                lines.append(f"S_ADDI_INT gp{gp_out_orow}, gp0, {dst_static}")
+                            lines.append(f"M_MM_WO gp{gp_out_orow}, gp0, 0")
                         continue
 
                     lines.append(f"C_LOOP_START gp{gp_loop_orow}, {tiles_per_mlen}")
                     lines.append(f"S_ADDI_INT gp{gp_act}, gp{gp_act_orow}, 0")
                     if rhs_offset_reg is not None:
                         lines.append(
-                            f"S_ADDI_INT gp{gp_mat}, gp{rhs_offset_reg}, "
-                            f"{rhs_n_mlen_static_dyn + oc * oc_b_step}"
+                            f"S_ADDI_INT gp{gp_mat}, gp{rhs_offset_reg}, {rhs_n_mlen_static_dyn + oc * oc_b_step}"
                         )
                     else:
-                        lines.append(
-                            f"S_ADDI_INT gp{gp_mat}, gp0, "
-                            f"{rhs_n_mlen_static_full + oc * oc_b_step}"
-                        )
+                        lines.append(f"S_ADDI_INT gp{gp_mat}, gp0, {rhs_n_mlen_static_full + oc * oc_b_step}")
                     lines.append(f"C_LOOP_START gp{gp_loop_k}, {K_tiles}")
                     if transpose_b:
                         lines.append(f"M_TMM 0, gp{gp_act}, gp{gp_mat}")

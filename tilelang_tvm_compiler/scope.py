@@ -63,5 +63,5 @@ def physical_scope(scope: str) -> str:
     codegen, ISA emit) can call this to collapse `global.vram` and `vram`
     to the same answer (`vram`)."""
     if scope.startswith(GLOBAL_PREFIX):
-        return scope[len(GLOBAL_PREFIX):]
+        return scope[len(GLOBAL_PREFIX) :]
     return scope

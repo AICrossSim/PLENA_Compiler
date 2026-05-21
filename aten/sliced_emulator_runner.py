@@ -81,9 +81,7 @@ def run_sliced_emulator_check(
     # Resolve build directory
     if build_dir is None:
         safe_name = model_id.replace("/", "_")
-        build_dir = str(
-            Path("/tmp") / f"aten_sliced_{safe_name}_sl{seq_len}_l{layer_idx}"
-        )
+        build_dir = str(Path("/tmp") / f"aten_sliced_{safe_name}_sl{seq_len}_l{layer_idx}")
     build_path = Path(build_dir)
 
     # ------------------------------------------------------------------
@@ -100,8 +98,10 @@ def run_sliced_emulator_check(
             "model_id": model_id,
         }
     sim_dims = slice_dims_for_sim(full_dims, hidden_slice=hidden_size, inter_slice=inter_dim)
-    print(f"       Full dims: hidden={full_dims.hidden_size}, inter={full_dims.inter_dim}, "
-          f"heads={full_dims.num_heads}, kv_heads={full_dims.num_kv_heads}, head_dim={full_dims.head_dim}")
+    print(
+        f"       Full dims: hidden={full_dims.hidden_size}, inter={full_dims.inter_dim}, "
+        f"heads={full_dims.num_heads}, kv_heads={full_dims.num_kv_heads}, head_dim={full_dims.head_dim}"
+    )
     print(f"       Sim  dims: hidden={sim_dims.hidden_size}, inter={sim_dims.inter_dim}")
 
     if hidden_size > full_dims.head_dim:
@@ -165,14 +165,16 @@ def run_sliced_emulator_check(
                 **extra_kwargs,
             )
             comp_results, _comp_params = compare_emulator_output(layer_build)
-            results_per_layer.append({
-                "layer": current_layer,
-                "passed": True,
-                "allclose_match_rate": comp_results["allclose_match_rate"],
-                "max_error": comp_results["max_error"],
-                "mae": comp_results["mae"],
-                "mse": comp_results["mse"],
-            })
+            results_per_layer.append(
+                {
+                    "layer": current_layer,
+                    "passed": True,
+                    "allclose_match_rate": comp_results["allclose_match_rate"],
+                    "max_error": comp_results["max_error"],
+                    "mae": comp_results["mae"],
+                    "mse": comp_results["mse"],
+                }
+            )
         except SystemExit as e:
             if e.code == 0:
                 return {
@@ -182,20 +184,24 @@ def run_sliced_emulator_check(
                 }
             try:
                 comp_results, _comp_params = compare_emulator_output(layer_build)
-                results_per_layer.append({
-                    "layer": current_layer,
-                    "passed": False,
-                    "allclose_match_rate": comp_results["allclose_match_rate"],
-                    "max_error": comp_results["max_error"],
-                    "mae": comp_results["mae"],
-                    "mse": comp_results["mse"],
-                })
+                results_per_layer.append(
+                    {
+                        "layer": current_layer,
+                        "passed": False,
+                        "allclose_match_rate": comp_results["allclose_match_rate"],
+                        "max_error": comp_results["max_error"],
+                        "mae": comp_results["mae"],
+                        "mse": comp_results["mse"],
+                    }
+                )
             except Exception:
-                results_per_layer.append({
-                    "layer": current_layer,
-                    "passed": False,
-                    "error": f"Emulator comparison failed after exit code {e.code}",
-                })
+                results_per_layer.append(
+                    {
+                        "layer": current_layer,
+                        "passed": False,
+                        "error": f"Emulator comparison failed after exit code {e.code}",
+                    }
+                )
     else:
         # Multi-layer: chain N layers with residual connections (no RoPE)
         asm_name = f"aten_{model_id.split('/')[-1]}_chain{num_layers}"
@@ -224,14 +230,16 @@ def run_sliced_emulator_check(
                 **extra_kwargs,
             )
             comp_results, _comp_params = compare_emulator_output(chain_build)
-            results_per_layer.append({
-                "layer": f"chain_{num_layers}",
-                "passed": True,
-                "allclose_match_rate": comp_results["allclose_match_rate"],
-                "max_error": comp_results["max_error"],
-                "mae": comp_results["mae"],
-                "mse": comp_results["mse"],
-            })
+            results_per_layer.append(
+                {
+                    "layer": f"chain_{num_layers}",
+                    "passed": True,
+                    "allclose_match_rate": comp_results["allclose_match_rate"],
+                    "max_error": comp_results["max_error"],
+                    "mae": comp_results["mae"],
+                    "mse": comp_results["mse"],
+                }
+            )
         except SystemExit as e:
             if e.code == 0:
                 return {
@@ -241,20 +249,24 @@ def run_sliced_emulator_check(
                 }
             try:
                 comp_results, _comp_params = compare_emulator_output(chain_build)
-                results_per_layer.append({
-                    "layer": f"chain_{num_layers}",
-                    "passed": False,
-                    "allclose_match_rate": comp_results["allclose_match_rate"],
-                    "max_error": comp_results["max_error"],
-                    "mae": comp_results["mae"],
-                    "mse": comp_results["mse"],
-                })
+                results_per_layer.append(
+                    {
+                        "layer": f"chain_{num_layers}",
+                        "passed": False,
+                        "allclose_match_rate": comp_results["allclose_match_rate"],
+                        "max_error": comp_results["max_error"],
+                        "mae": comp_results["mae"],
+                        "mse": comp_results["mse"],
+                    }
+                )
             except Exception:
-                results_per_layer.append({
-                    "layer": f"chain_{num_layers}",
-                    "passed": False,
-                    "error": f"Emulator comparison failed after exit code {e.code}",
-                })
+                results_per_layer.append(
+                    {
+                        "layer": f"chain_{num_layers}",
+                        "passed": False,
+                        "error": f"Emulator comparison failed after exit code {e.code}",
+                    }
+                )
 
     elapsed = time.time() - t0
 
@@ -292,8 +304,10 @@ def run_sliced_emulator_check(
         print(f"  Layer {r.get('layer', '?')}: [{status}] allclose={match}")
 
     if all_passed:
-        print(f"\n[Sliced emulator PASSED] {model_id} — {num_layers} layer(s), "
-              f"allclose={first.get('allclose_match_rate', 0):.2f}%")
+        print(
+            f"\n[Sliced emulator PASSED] {model_id} — {num_layers} layer(s), "
+            f"allclose={first.get('allclose_match_rate', 0):.2f}%"
+        )
     else:
         print(f"\n[Sliced emulator FAILED] {model_id} — see per-layer results above")
 
@@ -311,22 +325,20 @@ def main():
         prog="python -m compiler.aten.sliced_emulator_runner",
     )
     parser.add_argument("model_id", help="HuggingFace model ID (e.g. AICrossSim/clm-60m)")
-    parser.add_argument("--seq-len", type=int, default=64,
-                        help="Sequence length (default: 64)")
-    parser.add_argument("--num-layers", type=int, default=1,
-                        help="Number of decoder layers to test (default: 1)")
-    parser.add_argument("--layer-idx", type=int, default=0,
-                        help="Starting layer index (default: 0)")
-    parser.add_argument("--hidden-size", type=int, default=64,
-                        help="Sliced hidden dimension for this harness (default: 64)")
-    parser.add_argument("--inter-dim", type=int, default=128,
-                        help="FFN intermediate dimension clipped to sim limits (default: 128)")
-    parser.add_argument("--build-dir", type=str, default=None,
-                        help="Build directory for sim artifacts (default: /tmp/aten_sliced_...)")
-    parser.add_argument("--trust-remote-code", action="store_true",
-                        help="Trust remote code for HF model loading")
-    parser.add_argument("--partial-load", action="store_true",
-                        help="Load only needed weight shards (for large models)")
+    parser.add_argument("--seq-len", type=int, default=64, help="Sequence length (default: 64)")
+    parser.add_argument("--num-layers", type=int, default=1, help="Number of decoder layers to test (default: 1)")
+    parser.add_argument("--layer-idx", type=int, default=0, help="Starting layer index (default: 0)")
+    parser.add_argument(
+        "--hidden-size", type=int, default=64, help="Sliced hidden dimension for this harness (default: 64)"
+    )
+    parser.add_argument(
+        "--inter-dim", type=int, default=128, help="FFN intermediate dimension clipped to sim limits (default: 128)"
+    )
+    parser.add_argument(
+        "--build-dir", type=str, default=None, help="Build directory for sim artifacts (default: /tmp/aten_sliced_...)"
+    )
+    parser.add_argument("--trust-remote-code", action="store_true", help="Trust remote code for HF model loading")
+    parser.add_argument("--partial-load", action="store_true", help="Load only needed weight shards (for large models)")
 
     args = parser.parse_args()
 
@@ -342,6 +354,7 @@ def main():
         partial_load=args.partial_load,
     )
     sys.exit(0 if result["passed"] else 1)
+
 
 # Backwards-compatible alias for older callers.
 run_aten_e2e = run_sliced_emulator_check

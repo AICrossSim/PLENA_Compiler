@@ -254,9 +254,7 @@ class IsaMatrixMixin:
     ) -> str:
         """Emit VRAM[row][:] @ MRAM[:][col] projection."""
         gp_regs = self._default_projection_gp_regs(gp_regs)
-        vram_layout, mram_layout, vram_row_blocks = self._projection_context(
-            vram_mat_name, vram_row_idx, mram_mat_name
-        )
+        vram_layout, mram_layout, vram_row_blocks = self._projection_context(vram_mat_name, vram_row_idx, mram_mat_name)
         mram_col_blocks = mram_layout.get_col_blocks(mram_col_idx)
         if k_block_count is not None:
             mram_col_blocks = mram_col_blocks[k_block_start : k_block_start + k_block_count]
@@ -308,9 +306,7 @@ class IsaMatrixMixin:
     ) -> str:
         """Emit VRAM[row][:] @ MRAM[row][:]^T projection."""
         gp_regs = self._default_projection_gp_regs(gp_regs)
-        vram_layout, mram_layout, vram_row_blocks = self._projection_context(
-            vram_mat_name, vram_row_idx, mram_mat_name
-        )
+        vram_layout, mram_layout, vram_row_blocks = self._projection_context(vram_mat_name, vram_row_idx, mram_mat_name)
         mram_row_blocks = mram_layout.get_row_blocks(mram_row_idx)
 
         if len(vram_row_blocks) != len(mram_row_blocks):

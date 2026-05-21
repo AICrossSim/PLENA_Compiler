@@ -29,7 +29,10 @@ from . import scope as _scope
 
 
 def _row_stride_for_layout(
-    shape: tuple[int, ...], layout: str, *, fallback: int,
+    shape: tuple[int, ...],
+    layout: str,
+    *,
+    fallback: int,
 ) -> int:
     """Element distance between row r and row r+1 *within the same
     channel* of a 4D buffer laid out row-major in HBM under ``layout``.
@@ -85,9 +88,9 @@ _FPRAM_BASE = FPRAM_USER_BASE
 class AddressAllocConfig:
     mlen: int
     blen: int
-    hlen: int = 16        # narrow head dim — typically MLEN/4. Used for
-                          # tile_layout detection on 4D BSHD-shaped local
-                          # buffers. Default matches PlenaTarget.btmm_hlen.
+    hlen: int = 16  # narrow head dim — typically MLEN/4. Used for
+    # tile_layout detection on 4D BSHD-shaped local
+    # buffers. Default matches PlenaTarget.btmm_hlen.
     hbm_base: int = _HBM_BASE
     vram_base: int = _VRAM_BASE
     mram_base: int = _MRAM_BASE
@@ -99,10 +102,10 @@ class AddressAllocConfig:
     # lay out tensors in `hbm_for_behave_sim.bin`. We must match them
     # exactly here, otherwise our ISA's HBM addresses point into the wrong
     # tensor (or padding) and emulator reads garbage.
-    hbm_row_width: int = 512   # bytes -- BEHAVIOR.CONFIG.HBM_WIDTH
-    hbm_elem_bits: int = 8     # FP4: sign(1)+exp(4)+mant(3) = 8 bits per element
-    hbm_scale_bits: int = 8    # 1 byte per scale (Fp(s=0,e=8,m=0))
-    hbm_block_size: int = 8    # 1 scale per 8 elements
+    hbm_row_width: int = 512  # bytes -- BEHAVIOR.CONFIG.HBM_WIDTH
+    hbm_elem_bits: int = 8  # FP4: sign(1)+exp(4)+mant(3) = 8 bits per element
+    hbm_scale_bits: int = 8  # 1 byte per scale (Fp(s=0,e=8,m=0))
+    hbm_block_size: int = 8  # 1 scale per 8 elements
 
     # Per-buffer address pins. Used by multi-kernel drivers (e.g.
     # tvm_single_stream_block_test) that pre-plan a global HBM layout
@@ -187,7 +190,9 @@ class AddressAllocationPass:
                 # data on every per-tile DMA stride between rows.
                 if buf.hbm_stride is None:
                     buf.hbm_stride = _row_stride_for_layout(
-                        buf.shape, buf.layout, fallback=cols,
+                        buf.shape,
+                        buf.layout,
+                        fallback=cols,
                     )
                 # scale_size = total elements of the HBM region (rows*cols),
                 # NOT one tile. The runtime ValueManager always uses the HBM
@@ -219,7 +224,8 @@ class AddressAllocationPass:
                     buf.tile_layout = _hlir.make_tile_layout(
                         shape=tuple(int(x) for x in buf.shape),
                         layout=buf.layout,
-                        mlen=self.cfg.mlen, hlen=self.cfg.hlen,
+                        mlen=self.cfg.mlen,
+                        hlen=self.cfg.hlen,
                     )
             elif phys == _scope.MRAM:
                 buf.address = mram_cur
@@ -228,7 +234,8 @@ class AddressAllocationPass:
                     buf.tile_layout = _hlir.make_tile_layout(
                         shape=tuple(int(x) for x in buf.shape),
                         layout=buf.layout,
-                        mlen=self.cfg.mlen, hlen=self.cfg.hlen,
+                        mlen=self.cfg.mlen,
+                        hlen=self.cfg.hlen,
                     )
             elif phys == _scope.FPRAM:
                 # FPRAM stores scalar FP values; address them in element units

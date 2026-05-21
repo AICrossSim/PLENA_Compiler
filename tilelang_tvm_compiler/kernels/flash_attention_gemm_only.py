@@ -32,36 +32,29 @@ def make_flash_attention_gemm_only(
 ):
     MLEN = 64
     if rows != MLEN:
-        raise ValueError(
-            f"flash_attention_gemm_only requires rows == MLEN ({MLEN}), got {rows}"
-        )
+        raise ValueError(f"flash_attention_gemm_only requires rows == MLEN ({MLEN}), got {rows}")
     if MLEN % hlen != 0:
-        raise ValueError(
-            f"hlen must divide MLEN ({MLEN}); got hlen={hlen}"
-        )
+        raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
     hardware_lane_count = MLEN // hlen
     if head_count is None:
         head_count = hardware_lane_count
     if head_count % hardware_lane_count != 0:
-        raise ValueError(
-            f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; "
-            f"got {head_count}"
-        )
+        raise ValueError(f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; got {head_count}")
 
     kv_seq = num_kv_blocks * rows
     q_seq = num_q_blocks * rows
 
     @T.prim_func
     def flash_attention_gemm_only(
-        Q_hbm: T.Tensor((1, q_seq,  head_count, hlen), "float16"),
+        Q_hbm: T.Tensor((1, q_seq, head_count, hlen), "float16"),
         K_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
         V_hbm: T.Tensor((1, kv_seq, head_count, hlen), "float16"),
-        O_hbm: T.Tensor((1, q_seq,  head_count, hlen), "float16"),
+        O_hbm: T.Tensor((1, q_seq, head_count, hlen), "float16"),
     ):
         with T.Kernel(num_q_blocks, head_count, threads=128) as (q_block, by):
             Q_sh = T.alloc_shared((rows, hlen), "float16")
-            K_sh = T.alloc_shared((rows, hlen), "float16")   # gemm RHS → mram
-            V_sh = T.alloc_shared((rows, hlen), "float16")   # matmul RHS → mram
+            K_sh = T.alloc_shared((rows, hlen), "float16")  # gemm RHS → mram
+            V_sh = T.alloc_shared((rows, hlen), "float16")  # matmul RHS → mram
             S_loc = T.alloc_fragment((rows, MLEN), "float16")  # BTMM output
             PV_loc = T.alloc_fragment((rows, hlen), "float16")
             O_loc = T.alloc_fragment((rows, hlen), "float16")

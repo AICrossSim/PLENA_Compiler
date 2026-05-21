@@ -62,9 +62,7 @@ def make_flash_decode_min(
 ):
     MLEN = 64
     if rows != MLEN:
-        raise ValueError(
-            f"flash_decode_min requires rows == MLEN ({MLEN}), got {rows}"
-        )
+        raise ValueError(f"flash_decode_min requires rows == MLEN ({MLEN}), got {rows}")
     if MLEN % hlen != 0:
         raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
     hardware_lane_count = MLEN // hlen
@@ -72,8 +70,7 @@ def make_flash_decode_min(
         head_count = hardware_lane_count
     if head_count % hardware_lane_count != 0:
         raise ValueError(
-            f"head_count must be a multiple of hardware_lane_count "
-            f"({hardware_lane_count}); got head_count={head_count}"
+            f"head_count must be a multiple of hardware_lane_count ({hardware_lane_count}); got head_count={head_count}"
         )
     if num_kv_blocks < 1:
         raise ValueError(f"num_kv_blocks must be >= 1, got {num_kv_blocks}")
@@ -98,33 +95,31 @@ def make_flash_decode_min(
             # of MLEN = lane_count * hlen. Marked global.vram so
             # allocate_group_memory does not try to re-expand its head
             # axis (the head dim is already explicit in the shape).
-            Q_cache = T.alloc_shared((head_count, hlen), "float16",
-                                      scope="global.vram")
+            Q_cache = T.alloc_shared((head_count, hlen), "float16", scope="global.vram")
             # Symmetric output cache. Kernel writes O_loc -> O_cache[by, 0]
             # via vram→vram T.copy (V_ADD_VF f0=0). Testbench compares the
             # VRAM region directly — no FPRAM round-trip needed. Same
             # global.vram rationale as Q_cache.
-            O_cache = T.alloc_shared((head_count, hlen), "float16",
-                                      scope="global.vram")
+            O_cache = T.alloc_shared((head_count, hlen), "float16", scope="global.vram")
             # VRAM staging so BTMV can read Q from VRAM.
             # 2D rows=1 → col-packed to (1, 1, lane_count, hlen).
-            Q_sh   = T.alloc_shared((1, hlen), "float16")
+            Q_sh = T.alloc_shared((1, hlen), "float16")
             # MRAM tiles for K and V (gemm RHS).
-            K_sh   = T.alloc_shared((rows, hlen), "float16")
-            V_sh   = T.alloc_shared((rows, hlen), "float16")
+            K_sh = T.alloc_shared((rows, hlen), "float16")
+            V_sh = T.alloc_shared((rows, hlen), "float16")
             # BTMV output: 2D rows=1 → row-stacked to (1, lane_count, 1, MLEN).
-            S_loc  = T.alloc_fragment((1, MLEN), "float16")
+            S_loc = T.alloc_fragment((1, MLEN), "float16")
             # P @ V partial output and running accumulator: 2D rows=1.
             PV_loc = T.alloc_fragment((1, hlen), "float16")
-            O_loc  = T.alloc_fragment((1, hlen), "float16")
+            O_loc = T.alloc_fragment((1, hlen), "float16")
             # Online softmax state: rank-1 → lane-stacked (lane_count, 1).
-            M_OLD  = T.alloc_fragment((1,), "float16")
+            M_OLD = T.alloc_fragment((1,), "float16")
             M_CURR = T.alloc_fragment((1,), "float16")
-            M_RES  = T.alloc_fragment((1,), "float16")
-            L_OLD  = T.alloc_fragment((1,), "float16")
-            L_NEW  = T.alloc_fragment((1,), "float16")
-            P_SUM  = T.alloc_fragment((1,), "float16")
-            L_INV  = T.alloc_fragment((1,), "float16")
+            M_RES = T.alloc_fragment((1,), "float16")
+            L_OLD = T.alloc_fragment((1,), "float16")
+            L_NEW = T.alloc_fragment((1,), "float16")
+            P_SUM = T.alloc_fragment((1,), "float16")
+            L_INV = T.alloc_fragment((1,), "float16")
             # SCALE / M_INIT / L_INIT are no longer declared buffers —
             # the kernel body embeds the literals directly as
             # ``T.float16(...)`` and the ``hoist_float_constants``

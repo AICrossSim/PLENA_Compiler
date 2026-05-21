@@ -1,5 +1,6 @@
 """Register allocation helpers for the ATen PLENA compiler path."""
 
+
 class RegisterAllocator:
     """Register Allocator: Manages address registers and GP registers"""
 
@@ -62,5 +63,3 @@ class RegisterAllocator:
                 self.fp_registers.append(reg)
         # Keep sorted so allocate_fp's tail-slice continues to return descending IDs.
         self.fp_registers.sort()
-
-

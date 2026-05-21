@@ -45,22 +45,15 @@ def make_rope_min(
 ):
     full_dim = half_dim * 2
     if full_dim != hlen:
-        raise ValueError(
-            f"full_dim (= 2*half_dim = {full_dim}) must equal hlen ({hlen})"
-        )
+        raise ValueError(f"full_dim (= 2*half_dim = {full_dim}) must equal hlen ({hlen})")
     MLEN = 64
     if rows != MLEN:
-        raise ValueError(
-            f"rope_min requires rows == MLEN ({MLEN}), got {rows}"
-        )
+        raise ValueError(f"rope_min requires rows == MLEN ({MLEN}), got {rows}")
     if MLEN % hlen != 0:
         raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
     hardware_lane_count = MLEN // hlen
     if head_count % hardware_lane_count != 0:
-        raise ValueError(
-            f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; "
-            f"got {head_count}"
-        )
+        raise ValueError(f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; got {head_count}")
     if num_s_blocks < 1:
         raise ValueError(f"num_s_blocks must be >= 1, got {num_s_blocks}")
 
@@ -68,26 +61,26 @@ def make_rope_min(
 
     @T.prim_func
     def rope_min(
-        XQ_hbm:      T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        COS_hbm:     T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        SIN_hbm:     T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        XQ_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        COS_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        SIN_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
         NEG_SIN_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        Q_OUT_hbm:   T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        Q_OUT_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
     ):
         with T.Kernel(num_s_blocks, head_count, threads=128) as (s_block, by):
-            XQ_sh      = T.alloc_shared((rows, hlen), "float16")
-            COS_sh     = T.alloc_shared((rows, hlen), "float16")
-            SIN_sh     = T.alloc_shared((rows, hlen), "float16")
+            XQ_sh = T.alloc_shared((rows, hlen), "float16")
+            COS_sh = T.alloc_shared((rows, hlen), "float16")
+            SIN_sh = T.alloc_shared((rows, hlen), "float16")
             NEG_SIN_sh = T.alloc_shared((rows, hlen), "float16")
-            Q_OUT_sh   = T.alloc_shared((rows, hlen), "float16")
+            Q_OUT_sh = T.alloc_shared((rows, hlen), "float16")
 
             # FPRAM scratch — one (hlen,) fragment per source.
             # Allocated at kernel scope; same FPRAM offsets are reused
             # across every row of every (s_block, head) tile.
-            X_FP   = T.alloc_fragment((hlen,), "float16")
-            C_FP   = T.alloc_fragment((hlen,), "float16")
-            S_FP   = T.alloc_fragment((hlen,), "float16")
-            NS_FP  = T.alloc_fragment((hlen,), "float16")
+            X_FP = T.alloc_fragment((hlen,), "float16")
+            C_FP = T.alloc_fragment((hlen,), "float16")
+            S_FP = T.alloc_fragment((hlen,), "float16")
+            NS_FP = T.alloc_fragment((hlen,), "float16")
             OUT_FP = T.alloc_fragment((hlen,), "float16")
 
             T.copy(
@@ -108,9 +101,9 @@ def make_rope_min(
             )
 
             for row in T.serial(rows):
-                T.copy(XQ_sh     [row, 0], X_FP)
-                T.copy(COS_sh    [row, 0], C_FP)
-                T.copy(SIN_sh    [row, 0], S_FP)
+                T.copy(XQ_sh[row, 0], X_FP)
+                T.copy(COS_sh[row, 0], C_FP)
+                T.copy(SIN_sh[row, 0], S_FP)
                 T.copy(NEG_SIN_sh[row, 0], NS_FP)
 
                 for i in T.unroll(half_dim):

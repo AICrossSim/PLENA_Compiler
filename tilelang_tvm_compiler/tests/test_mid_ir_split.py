@@ -52,8 +52,11 @@ def _check(label, actual, expected) -> int:
 
 def _block_idx(name, extent, body, tag="blockIdx.y"):
     return ir.ParallelAxis(
-        axis_name=name, extent=extent, body=body,
-        kind=ir.ParallelKind.BLOCK_IDX, thread_tag=tag,
+        axis_name=name,
+        extent=extent,
+        body=body,
+        kind=ir.ParallelKind.BLOCK_IDX,
+        thread_tag=tag,
         axis_var=ir.VarRef(_tir.Var(name, "int32")),
     )
 
@@ -66,13 +69,20 @@ def _block_idx(name, extent, body, tag="blockIdx.y"):
 def test_split_extent_eq_cluster() -> int:
     print("test_split_extent_eq_cluster — head_count == LANE")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
-    Q_sh  = _mk_buf("Q_sh",  [64, 16])
+    Q_sh = _mk_buf("Q_sh", [64, 16])
     fn = ir.MidFunc(
         name="t",
-        params=[Q_hbm], allocs=[Q_sh],
-        body=[_block_idx("by", LANE, [
-            ir.Dma(src=_slice_ref(Q_hbm), dst=_slice_ref(Q_sh)),
-        ])],
+        params=[Q_hbm],
+        allocs=[Q_sh],
+        body=[
+            _block_idx(
+                "by",
+                LANE,
+                [
+                    ir.Dma(src=_slice_ref(Q_hbm), dst=_slice_ref(Q_sh)),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
@@ -92,10 +102,8 @@ def test_split_extent_eq_cluster() -> int:
     failures += _check("by_phase extent", by_phase.extent, LANE)
     failures += _check("by_phase thread_tag", by_phase.thread_tag, None)
     # cluster → grid back-link
-    failures += _check("by_phase parent_grid_axis_name",
-                       by_phase.parent_grid_axis_name, "by_number")
-    failures += _check("by_number parent_grid_axis_name",
-                       by_number.parent_grid_axis_name, None)
+    failures += _check("by_phase parent_grid_axis_name", by_phase.parent_grid_axis_name, "by_number")
+    failures += _check("by_number parent_grid_axis_name", by_number.parent_grid_axis_name, None)
     return failures
 
 
@@ -103,37 +111,51 @@ def test_split_extent_multiple() -> int:
     print("test_split_extent_multiple — head_count == 2*LANE")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[_block_idx("by", 2 * LANE, [
-            ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
-        ])],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[
+            _block_idx(
+                "by",
+                2 * LANE,
+                [
+                    ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
     out = split_run(fn)
     by_number = out.body[0]
     by_phase = by_number.body[0]
-    return (_check("by_number extent", by_number.extent, 2)
-            + _check("by_phase extent", by_phase.extent, LANE))
+    return _check("by_number extent", by_number.extent, 2) + _check("by_phase extent", by_phase.extent, LANE)
 
 
 def test_split_buffer_growth() -> int:
     print("test_split_buffer_growth")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
-    Q_sh  = _mk_buf("Q_sh",  [64, 16], scope="shared")
+    Q_sh = _mk_buf("Q_sh", [64, 16], scope="shared")
     S_loc = _mk_buf("S_loc", [64, 64], scope="fragment")
     fn = ir.MidFunc(
-        name="t", params=[Q_hbm], allocs=[Q_sh, S_loc],
-        body=[_block_idx("by", LANE, [
-            ir.Dma(src=_slice_ref(Q_hbm), dst=_slice_ref(Q_sh)),
-        ])],
+        name="t",
+        params=[Q_hbm],
+        allocs=[Q_sh, S_loc],
+        body=[
+            _block_idx(
+                "by",
+                LANE,
+                [
+                    ir.Dma(src=_slice_ref(Q_hbm), dst=_slice_ref(Q_sh)),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
     out = split_run(fn)
     failures = 0
-    failures += _check("Q_hbm shape (global)", out.params[0].shape,
-                       [1, 64, 4, 16])
+    failures += _check("Q_hbm shape (global)", out.params[0].shape, [1, 64, 4, 16])
     Q_sh_grown = next(b for b in out.allocs if b.name == "Q_sh")
     S_loc_grown = next(b for b in out.allocs if b.name == "S_loc")
     failures += _check("Q_sh shape", Q_sh_grown.shape, [LANE, 64, 16])
@@ -147,10 +169,18 @@ def test_split_indices_unchanged() -> int:
     print("test_split_indices_unchanged")
     Q_sh = _mk_buf("Q_sh", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q_sh],
-        body=[_block_idx("by", LANE, [
-            ir.Dma(src=_slice_ref(Q_sh), dst=_slice_ref(Q_sh)),
-        ])],
+        name="t",
+        params=[],
+        allocs=[Q_sh],
+        body=[
+            _block_idx(
+                "by",
+                LANE,
+                [
+                    ir.Dma(src=_slice_ref(Q_sh), dst=_slice_ref(Q_sh)),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
@@ -168,12 +198,25 @@ def test_split_non_lane_blockidx_preserved() -> int:
     print("test_split_non_lane_blockidx_preserved — q_block stays")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[_block_idx("q_block", 2, [
-            _block_idx("by", LANE, [
-                ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
-            ]),
-        ], tag="blockIdx.x")],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[
+            _block_idx(
+                "q_block",
+                2,
+                [
+                    _block_idx(
+                        "by",
+                        LANE,
+                        [
+                            ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
+                        ],
+                    ),
+                ],
+                tag="blockIdx.x",
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
@@ -195,18 +238,28 @@ def test_split_for_serial_preserved() -> int:
     print("test_split_for_serial_preserved")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[ir.For(loop_var="oc", extent=4, body=[
-            ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
-        ])],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[
+            ir.For(
+                loop_var="oc",
+                extent=4,
+                body=[
+                    ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
     out = split_run(fn)
     f = out.body[0]
-    return (_check("type", type(f).__name__, "For")
-            + _check("loop_var", f.loop_var, "oc")
-            + _check("kind", f.kind, "serial"))
+    return (
+        _check("type", type(f).__name__, "For")
+        + _check("loop_var", f.loop_var, "oc")
+        + _check("kind", f.kind, "serial")
+    )
 
 
 def test_split_parallel_axis_inside_for() -> int:
@@ -216,12 +269,24 @@ def test_split_parallel_axis_inside_for() -> int:
     print("test_split_parallel_axis_inside_for")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[ir.For(loop_var="oc", extent=4, body=[
-            _block_idx("by", LANE, [
-                ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
-            ]),
-        ])],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[
+            ir.For(
+                loop_var="oc",
+                extent=4,
+                body=[
+                    _block_idx(
+                        "by",
+                        LANE,
+                        [
+                            ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
+                        ],
+                    ),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
@@ -231,8 +296,7 @@ def test_split_parallel_axis_inside_for() -> int:
     failures += _check("outer For preserved", type(f).__name__, "For")
     failures += _check("outer For loop_var", f.loop_var, "oc")
     inner_number = f.body[0]
-    failures += _check("inner is ParallelAxis", type(inner_number).__name__,
-                       "ParallelAxis")
+    failures += _check("inner is ParallelAxis", type(inner_number).__name__, "ParallelAxis")
     failures += _check("inner axis_name", inner_number.axis_name, "by_number")
     inner_phase = inner_number.body[0]
     failures += _check("phase axis_name", inner_phase.axis_name, "by_phase")
@@ -247,13 +311,19 @@ def test_split_logical_grid_axis() -> int:
     print("test_split_logical_grid_axis — LOGICAL_GRID can also be split")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[ir.ParallelAxis(
-            axis_name="m", extent=LANE, kind=ir.ParallelKind.LOGICAL_GRID,
-            thread_tag=None,
-            body=[ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q))],
-            axis_var=ir.VarRef(_tir.Var("m", "int32")),
-        )],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[
+            ir.ParallelAxis(
+                axis_name="m",
+                extent=LANE,
+                kind=ir.ParallelKind.LOGICAL_GRID,
+                thread_tag=None,
+                body=[ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q))],
+                axis_var=ir.VarRef(_tir.Var("m", "int32")),
+            )
+        ],
         lane_axes=["m"],
     )
     fn = mark_run(fn)
@@ -263,14 +333,12 @@ def test_split_logical_grid_axis() -> int:
         return 1
     m_number = out.body[0]
     failures += _check("m_number axis_name", m_number.axis_name, "m_number")
-    failures += _check("m_number kind preserved",
-                       m_number.kind, ir.ParallelKind.LOGICAL_GRID)
+    failures += _check("m_number kind preserved", m_number.kind, ir.ParallelKind.LOGICAL_GRID)
     failures += _check("m_number thread_tag", m_number.thread_tag, None)
     m_phase = m_number.body[0]
     failures += _check("m_phase axis_name", m_phase.axis_name, "m_phase")
     failures += _check("m_phase kind", m_phase.kind, ir.ParallelKind.CLUSTER)
-    failures += _check("m_phase parent_grid_axis_name",
-                       m_phase.parent_grid_axis_name, "m_number")
+    failures += _check("m_phase parent_grid_axis_name", m_phase.parent_grid_axis_name, "m_number")
     return failures
 
 
@@ -278,10 +346,18 @@ def test_split_extent_not_divisible_raises() -> int:
     print("test_split_extent_not_divisible_raises")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[_block_idx("by", LANE + 1, [
-            ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
-        ])],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[
+            _block_idx(
+                "by",
+                LANE + 1,
+                [
+                    ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
@@ -299,7 +375,9 @@ def test_split_no_lane_axes_no_op() -> int:
     print("test_split_no_lane_axes_no_op")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
+        name="t",
+        params=[],
+        allocs=[Q],
         body=[ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q))],
         lane_axes=[],
     )
@@ -318,21 +396,28 @@ def test_split_skipped_when_d_ge_mlen() -> int:
     a no-op even with lane_axes declared. One lane already fills a
     whole HW vector."""
     print("test_split_skipped_when_d_ge_mlen — D=64 buffers don't need cluster")
-    A = _mk_buf("A", [4, 64], scope="shared")    # last dim = 64 = MLEN
-    B = _mk_buf("B", [4, 128], scope="fragment") # last dim = 128 > MLEN
+    A = _mk_buf("A", [4, 64], scope="shared")  # last dim = 64 = MLEN
+    B = _mk_buf("B", [4, 128], scope="fragment")  # last dim = 128 > MLEN
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[A, B],
-        body=[_block_idx("by", LANE, [
-            ir.Dma(src=_slice_ref(A), dst=_slice_ref(B)),
-        ])],
-        lane_axes=["by"],   # declared but unneeded
+        name="t",
+        params=[],
+        allocs=[A, B],
+        body=[
+            _block_idx(
+                "by",
+                LANE,
+                [
+                    ir.Dma(src=_slice_ref(A), dst=_slice_ref(B)),
+                ],
+            )
+        ],
+        lane_axes=["by"],  # declared but unneeded
     )
     fn = mark_run(fn)
     out = split_run(fn)
     failures = 0
     # Body should be unchanged: still one ParallelAxis(BLOCK_IDX, "by", extent=4)
-    failures += _check("body[0] is ParallelAxis",
-                       type(out.body[0]).__name__, "ParallelAxis")
+    failures += _check("body[0] is ParallelAxis", type(out.body[0]).__name__, "ParallelAxis")
     failures += _check("axis_name unchanged", out.body[0].axis_name, "by")
     failures += _check("extent unchanged", out.body[0].extent, 4)
     failures += _check("A shape unchanged", out.allocs[0].shape, [4, 64])
@@ -343,34 +428,57 @@ def test_split_skipped_when_d_ge_mlen() -> int:
 def test_split_runs_when_one_buffer_d_lt_mlen() -> int:
     """Even one buffer with D<MLEN forces full cluster pipeline."""
     print("test_split_runs_when_one_buffer_d_lt_mlen — D=16 forces cluster")
-    A = _mk_buf("A", [4, 64], scope="shared")    # D=64=MLEN → would skip alone
+    A = _mk_buf("A", [4, 64], scope="shared")  # D=64=MLEN → would skip alone
     B = _mk_buf("B", [4, 16], scope="fragment")  # D=16<MLEN → forces cluster
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[A, B],
-        body=[_block_idx("by", LANE, [
-            ir.Dma(src=_slice_ref(A), dst=_slice_ref(B)),
-        ])],
+        name="t",
+        params=[],
+        allocs=[A, B],
+        body=[
+            _block_idx(
+                "by",
+                LANE,
+                [
+                    ir.Dma(src=_slice_ref(A), dst=_slice_ref(B)),
+                ],
+            )
+        ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
     out = split_run(fn)
     # Should split into number → cluster phase
     by_number = out.body[0]
-    return (_check("split happened", by_number.axis_name, "by_number")
-            + _check("cluster_counts set", out.cluster_counts, [LANE])
-            + _check("A grown", out.allocs[0].shape, [LANE, 4, 64]))
+    return (
+        _check("split happened", by_number.axis_name, "by_number")
+        + _check("cluster_counts set", out.cluster_counts, [LANE])
+        + _check("A grown", out.allocs[0].shape, [LANE, 4, 64])
+    )
 
 
 def test_split_multi_axis() -> int:
     print("test_split_multi_axis — lane_axes=['q_block', 'by']")
     Q = _mk_buf("Q", [64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[_block_idx("q_block", LANE, [
-            _block_idx("by", LANE, [
-                ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
-            ]),
-        ], tag="blockIdx.x")],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[
+            _block_idx(
+                "q_block",
+                LANE,
+                [
+                    _block_idx(
+                        "by",
+                        LANE,
+                        [
+                            ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
+                        ],
+                    ),
+                ],
+                tag="blockIdx.x",
+            )
+        ],
         lane_axes=["q_block", "by"],
     )
     fn = mark_run(fn)

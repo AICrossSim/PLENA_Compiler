@@ -62,8 +62,18 @@ from __future__ import annotations
 
 
 from ..ir import (
-    Dma, Gemm, Elementwise, Reduce, RawStore, For, Async, MultiLaneOp,
-    Broadcast, Marker, MidFunc, Stmt,
+    Dma,
+    Gemm,
+    Elementwise,
+    Reduce,
+    RawStore,
+    For,
+    Async,
+    MultiLaneOp,
+    Broadcast,
+    Marker,
+    MidFunc,
+    Stmt,
     ParallelAxis,
 )
 
@@ -80,9 +90,12 @@ class MarkError(RuntimeError):
 def _mark_dma(op: Dma) -> Dma:
     # DMA is always a single multi-lane HW instruction.
     return Dma(
-        src=op.src, dst=op.dst,
-        src_axes=list(op.src_axes), dst_axes=list(op.dst_axes),
-        marker=Marker.DMA, can_async=True,
+        src=op.src,
+        dst=op.dst,
+        src_axes=list(op.src_axes),
+        dst_axes=list(op.dst_axes),
+        marker=Marker.DMA,
+        can_async=True,
     )
 
 
@@ -92,8 +105,11 @@ def _mark_gemm(op: Gemm) -> Gemm:
     # loop → not async.
     is_btmm = op.kind == "btmm"
     return Gemm(
-        a=op.a, b=op.b, c=op.c,
-        transpose_a=op.transpose_a, transpose_b=op.transpose_b,
+        a=op.a,
+        b=op.b,
+        c=op.c,
+        transpose_a=op.transpose_a,
+        transpose_b=op.transpose_b,
         kind=op.kind,
         a_axes=list(op.a_axes),
         b_axes=list(op.b_axes),
@@ -124,15 +140,15 @@ def _mark_elementwise(op: Elementwise) -> Elementwise:
     #   * Any elementwise with a Broadcast src (``S[r,c] - M_CURR[r]``)
     #     → lowers to ``row_*_fp`` per row, also not async-eligible.
     is_fpram_dst = (
-        op.dst.buffer.scope in ("fragment", "local.fragment", "fragment.fpram")
-        and len(op.dst.buffer.shape) == 1
+        op.dst.buffer.scope in ("fragment", "local.fragment", "fragment.fpram") and len(op.dst.buffer.shape) == 1
     )
-    can_async = (
-        not _has_broadcast_src(op)
-        and not is_fpram_dst
-    )
+    can_async = not _has_broadcast_src(op) and not is_fpram_dst
     return Elementwise(
-        dst=op.dst, srcs=op.srcs, op=op.op, axis=op.axis, size=op.size,
+        dst=op.dst,
+        srcs=op.srcs,
+        op=op.op,
+        axis=op.axis,
+        size=op.size,
         dst_axes=list(op.dst_axes),
         src_axes=[list(s) for s in op.src_axes],
         marker=Marker.LANE_OP,
@@ -144,7 +160,10 @@ def _mark_reduce(op: Reduce) -> Reduce:
     # Reduce on PLENA is ``row_reduce_max_at`` / ``row_reduce_sum_at`` —
     # per-row, never async.
     return Reduce(
-        dst=op.dst, src=op.src, op=op.op, axis=op.axis,
+        dst=op.dst,
+        src=op.src,
+        op=op.op,
+        axis=op.axis,
         dst_axes=list(op.dst_axes),
         src_axes=list(op.src_axes),
         marker=Marker.LANE_OP,

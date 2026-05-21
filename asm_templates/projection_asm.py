@@ -192,7 +192,9 @@ def projection_asm(
                     )
                     lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
                     lines.extend(
-                        _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register)
+                        _addi_large_int(
+                            w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register
+                        )
                     )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
             else:
@@ -247,15 +249,11 @@ def projection_asm(
             )
 
             if not is_first:
-                lines.append(
-                    f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]"
-                )
+                lines.append(f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]")
                 lines.extend(_load_large_int(w_actual_register, result_base_address))
                 lines.extend(_load_large_int(w_temp_register, scratch_base_address))
                 for _ in range(per_vlen_adds):
-                    lines.append(
-                        f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 "
-                    )
+                    lines.append(f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 ")
                     lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {vlen} ")
                     lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {vlen} ")
 

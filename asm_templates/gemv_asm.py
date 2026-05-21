@@ -77,7 +77,11 @@ def gemv_asm(
                     f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
-                lines.extend(_addi_large_int_list(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register))
+                lines.extend(
+                    _addi_large_int_list(
+                        w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register
+                    )
+                )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")

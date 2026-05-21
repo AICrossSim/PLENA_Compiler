@@ -79,7 +79,7 @@ def _safe_value_token(value: float) -> str:
 def _dtype_token(dtype: str) -> str:
     """``float16`` → ``f16``, ``float32`` → ``f32``."""
     if dtype.startswith("float"):
-        return "f" + dtype[len("float"):]
+        return "f" + dtype[len("float") :]
     return dtype
 
 
@@ -119,7 +119,10 @@ class _ConstantTable:
         # (product of empty seq = 1) — single slot, exactly what we
         # want.
         buf = tir.decl_buffer(
-            shape=(), dtype=dtype, name=unique, scope="global.fpram",
+            shape=(),
+            dtype=dtype,
+            name=unique,
+            scope="global.fpram",
         )
         self._table[key] = (buf, unique)
         self._order.append(key)
@@ -160,8 +163,7 @@ def _is_skip_expr(expr) -> bool:
     return False
 
 
-def _rewrite_expr(expr, table: _ConstantTable, skip_top: bool,
-                  broadcast_index=None):
+def _rewrite_expr(expr, table: _ConstantTable, skip_top: bool, broadcast_index=None):
     """Recursively rewrite FloatImms inside ``expr``.
 
     ``skip_top`` policy:
@@ -204,11 +206,13 @@ def _rewrite_expr(expr, table: _ConstantTable, skip_top: bool,
         return _make_synth_load(buf, broadcast_index)
     if isinstance(expr, tir.Cast):
         return tir.Cast(
-            expr.dtype, _rewrite_expr(expr.value, table, False, broadcast_index),
+            expr.dtype,
+            _rewrite_expr(expr.value, table, False, broadcast_index),
         )
     if isinstance(expr, tir.Call):
         return tir.Call(
-            expr.dtype, expr.op,
+            expr.dtype,
+            expr.op,
             [_rewrite_expr(a, table, False, broadcast_index) for a in expr.args],
         )
     if isinstance(expr, tir.BufferLoad):
@@ -262,14 +266,11 @@ def _make_synth_load(buf, broadcast_index):
     return tir.BufferLoad(buf, [])
 
 
-def _walk(stmt, table: _ConstantTable, root_block_name: str,
-          extra_allocs: list[tir.Buffer]):
+def _walk(stmt, table: _ConstantTable, root_block_name: str, extra_allocs: list[tir.Buffer]):
     if stmt is None:
         return None
     if isinstance(stmt, tir.SeqStmt):
-        return tir.SeqStmt(
-            [_walk(c, table, root_block_name, extra_allocs) for c in stmt.seq]
-        )
+        return tir.SeqStmt([_walk(c, table, root_block_name, extra_allocs) for c in stmt.seq])
     if isinstance(stmt, tir.BlockRealize):
         return tir.BlockRealize(
             iter_values=list(stmt.iter_values),
@@ -278,8 +279,7 @@ def _walk(stmt, table: _ConstantTable, root_block_name: str,
         )
     if isinstance(stmt, tir.Block):
         new_body = _walk(stmt.body, table, root_block_name, extra_allocs)
-        new_init = _walk(stmt.init, table, root_block_name, extra_allocs) \
-            if stmt.init is not None else None
+        new_init = _walk(stmt.init, table, root_block_name, extra_allocs) if stmt.init is not None else None
         # Attach the synthesized buffers to the kernel-root Block —
         # tilelang's `T.Kernel(...)` macro emits a Block named
         # ``"tilelang_root"`` that owns every user alloc_buffer. Adding
@@ -290,7 +290,9 @@ def _walk(stmt, table: _ConstantTable, root_block_name: str,
         else:
             new_allocs = stmt.alloc_buffers
         return tir.Block(
-            iter_vars=stmt.iter_vars, reads=stmt.reads, writes=stmt.writes,
+            iter_vars=stmt.iter_vars,
+            reads=stmt.reads,
+            writes=stmt.writes,
             name_hint=stmt.name_hint,
             body=new_body,
             init=new_init,
@@ -300,27 +302,33 @@ def _walk(stmt, table: _ConstantTable, root_block_name: str,
         )
     if isinstance(stmt, tir.AttrStmt):
         return tir.AttrStmt(
-            stmt.node, stmt.attr_key, stmt.value,
+            stmt.node,
+            stmt.attr_key,
+            stmt.value,
             _walk(stmt.body, table, root_block_name, extra_allocs),
         )
     if isinstance(stmt, tir.For):
         return tir.For(
-            stmt.loop_var, stmt.min, stmt.extent, stmt.kind,
+            stmt.loop_var,
+            stmt.min,
+            stmt.extent,
+            stmt.kind,
             _walk(stmt.body, table, root_block_name, extra_allocs),
-            stmt.thread_binding, stmt.annotations,
+            stmt.thread_binding,
+            stmt.annotations,
         )
     if isinstance(stmt, tir.IfThenElse):
         return tir.IfThenElse(
             stmt.condition,
             _walk(stmt.then_case, table, root_block_name, extra_allocs),
-            _walk(stmt.else_case, table, root_block_name, extra_allocs)
-            if stmt.else_case is not None else None,
+            _walk(stmt.else_case, table, root_block_name, extra_allocs) if stmt.else_case is not None else None,
         )
     if isinstance(stmt, tir.LetStmt):
         # inline_let_stmts runs before us, so this shouldn't appear in
         # practice — but if it does, we recurse for robustness.
         return tir.LetStmt(
-            stmt.var, stmt.value,
+            stmt.var,
+            stmt.value,
             _walk(stmt.body, table, root_block_name, extra_allocs),
         )
     if isinstance(stmt, tir.BufferStore):
@@ -344,7 +352,9 @@ def _walk(stmt, table: _ConstantTable, root_block_name: str,
         return tir.Evaluate(_rewrite_expr(stmt.value, table, False))
     if isinstance(stmt, tir.Allocate):
         return tir.Allocate(
-            stmt.buffer_var, stmt.dtype, list(stmt.extents),
+            stmt.buffer_var,
+            stmt.dtype,
+            list(stmt.extents),
             stmt.condition,
             _walk(stmt.body, table, root_block_name, extra_allocs),
             stmt.annotations,
@@ -360,9 +370,7 @@ def _walk(stmt, table: _ConstantTable, root_block_name: str,
 DEFAULT_ROOT_BLOCK_NAME = "tilelang_root"
 
 
-def run(func: tir.PrimFunc,
-        *,
-        root_block_name: str = DEFAULT_ROOT_BLOCK_NAME) -> tir.PrimFunc:
+def run(func: tir.PrimFunc, *, root_block_name: str = DEFAULT_ROOT_BLOCK_NAME) -> tir.PrimFunc:
     """Hoist FP literals to ``global.fpram`` buffers. See module docstring.
 
     No-op on kernels with no hoistable FloatImms (most kernels today).

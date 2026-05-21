@@ -72,14 +72,9 @@ class ProgramAttentionMixin:
         vlen = mlen
 
         if ratio != blen:
-            raise ValueError(
-                f"GQA ratio hq/hkv={ratio} must equal blen={blen} "
-                "(hardware packs heads into blen)."
-            )
+            raise ValueError(f"GQA ratio hq/hkv={ratio} must equal blen={blen} (hardware packs heads into blen).")
         if ratio * h_qkv != mlen:
-            raise ValueError(
-                f"GQA constraint: (hq/hkv)*h_qkv = {ratio * h_qkv} must equal mlen={mlen}."
-            )
+            raise ValueError(f"GQA constraint: (hq/hkv)*h_qkv = {ratio * h_qkv} must equal mlen={mlen}.")
 
         s_q, _q_total_dim = Q.shape
         s_kv, _k_total_dim = K.shape

@@ -46,9 +46,9 @@ def _fix_large_immediates(isa_code: str) -> str:
     splits them into S_LUI_INT (upper 22 bits, shifted <<12) + S_ADDI_INT
     (lower 12 bits), matching asm_templates._imm.load_large_int.
     """
-    pattern = re.compile(r'^(\s*)S_ADDI_INT gp(\d+), gp0, (\d+)(.*)')
+    pattern = re.compile(r"^(\s*)S_ADDI_INT gp(\d+), gp0, (\d+)(.*)")
     out = []
-    for line in isa_code.split('\n'):
+    for line in isa_code.split("\n"):
         m = pattern.match(line)
         if m:
             indent, rd, imm_str, rest = m.groups()
@@ -61,7 +61,7 @@ def _fix_large_immediates(isa_code: str) -> str:
                     out.append(f"{indent}S_ADDI_INT gp{rd}, gp{rd}, {lower}{rest}")
                 continue
         out.append(line)
-    return '\n'.join(out)
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +275,7 @@ def compile_native_hf_decoder(
     verbose: bool = False,
 ) -> dict:
     """Compile a HuggingFace decoder model at native dimensions to PLENA ISA metadata."""
+
     def _verbose(message: str = ""):
         if verbose:
             print(message)
@@ -292,8 +293,7 @@ def compile_native_hf_decoder(
     layers = root.layers
     n_layers = num_layers if num_layers is not None else len(layers)
     assert layer_idx_start + n_layers <= len(layers), (
-        f"Requested layers [{layer_idx_start}, {layer_idx_start + n_layers}) "
-        f"but model only has {len(layers)} layers"
+        f"Requested layers [{layer_idx_start}, {layer_idx_start + n_layers}) but model only has {len(layers)} layers"
     )
 
     scale = 1.0 / math.sqrt(head_dim)
@@ -301,10 +301,7 @@ def compile_native_hf_decoder(
 
     print("=" * 80)
     print(f"Model Compiler - {model_cfg.model_type} ({n_layers} layer{'s' if n_layers != 1 else ''})")
-    print(
-        f"  decoder: hidden={hidden}, inter={inter}, heads={num_heads}/{num_kv_heads}, "
-        f"head_dim={head_dim}"
-    )
+    print(f"  decoder: hidden={hidden}, inter={inter}, heads={num_heads}/{num_kv_heads}, head_dim={head_dim}")
     print(f"  compile: seq_len={seq_len}, mlen={mlen}, blen={blen}, total_q_dim={total_q_dim}")
     print("=" * 80)
 
@@ -333,10 +330,7 @@ def compile_native_hf_decoder(
             token_embeds = token_embeds.squeeze(0)
         # Slice to the model hidden width.
         token_embeds = token_embeds[:, :hidden]
-        _verbose(
-            f"\nEmbedding lookup: input_ids shape={input_ids.shape}, "
-            f"token_embeds={token_embeds.shape}"
-        )
+        _verbose(f"\nEmbedding lookup: input_ids shape={input_ids.shape}, token_embeds={token_embeds.shape}")
     else:
         token_embeds = torch.randn(seq_len, hidden)
         print(f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}")
@@ -410,9 +404,7 @@ def compile_native_hf_decoder(
 
     # Causal mask: (mlen, mlen) with 0 on/below diagonal, -inf above
     causal_mask_data = torch.zeros(mlen, mlen)
-    causal_mask_data.masked_fill_(
-        torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
-    )
+    causal_mask_data.masked_fill_(torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float("-inf"))
     causal_mask_input = prog.input("causal_mask", shape=(mlen, mlen))
     CAUSAL_MASK = prog.load_batch(causal_mask_input, name="CAUSAL_MASK")
 
@@ -529,8 +521,10 @@ def compile_native_hf_decoder(
         "isa_lines": len(lines),
     }
 
-    print(f"\nCompilation complete: {info['isa_lines']} ISA lines, "
-          f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
+    print(
+        f"\nCompilation complete: {info['isa_lines']} ISA lines, "
+        f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}"
+    )
     return {
         "isa": isa_code,
         "golden_output": golden_out,
@@ -542,5 +536,7 @@ def compile_native_hf_decoder(
         "info": info,
         "golden_precision": golden_precision,
     }
+
+
 # Backwards-compatible alias for older callers.
 compile_hf_model = compile_native_hf_decoder

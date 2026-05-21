@@ -77,10 +77,7 @@ def make_linear_min(
     """
     MLEN = 64
     if m_blocks < 1 or n_blocks < 1 or k_blocks < 1:
-        raise ValueError(
-            f"m_blocks/n_blocks/k_blocks must be >= 1; "
-            f"got m={m_blocks}, n={n_blocks}, k={k_blocks}"
-        )
+        raise ValueError(f"m_blocks/n_blocks/k_blocks must be >= 1; got m={m_blocks}, n={n_blocks}, k={k_blocks}")
     M = m_blocks * MLEN
     N = n_blocks * MLEN
     K = k_blocks * MLEN
@@ -89,19 +86,11 @@ def make_linear_min(
         c_wide_n = N
     C_WIDE_N = c_wide_n
     if C_WIDE_N < N:
-        raise ValueError(
-            f"c_wide_n ({C_WIDE_N}) must be >= N ({N})"
-        )
+        raise ValueError(f"c_wide_n ({C_WIDE_N}) must be >= N ({N})")
     if c_col_offset % MLEN != 0:
-        raise ValueError(
-            f"c_col_offset ({c_col_offset}) must be a multiple of MLEN "
-            f"({MLEN})"
-        )
+        raise ValueError(f"c_col_offset ({c_col_offset}) must be a multiple of MLEN ({MLEN})")
     if c_col_offset + N > C_WIDE_N:
-        raise ValueError(
-            f"c_col_offset ({c_col_offset}) + N ({N}) must fit within "
-            f"c_wide_n ({C_WIDE_N})"
-        )
+        raise ValueError(f"c_col_offset ({c_col_offset}) + N ({N}) must fit within c_wide_n ({C_WIDE_N})")
 
     # PLENA's DMA-slice lowering expects HBM tensors to carry the full
     # 4D BSHD shape (batch, seq, head, hlen). Linear has no real head
@@ -109,23 +98,24 @@ def make_linear_min(
     # along the (seq, hlen) pair: A_hbm[1, M, 1, K], B_hbm[1, N, 1, K],
     # C_hbm[1, M, 1, N], BIAS_hbm[1, M, 1, N].
     if with_bias:
+
         @T.prim_func
         def linear_min(
-            A_hbm:    T.Tensor((1, M, 1, K), "float16"),
-            B_hbm:    T.Tensor((1, N, 1, K), "float16"),
+            A_hbm: T.Tensor((1, M, 1, K), "float16"),
+            B_hbm: T.Tensor((1, N, 1, K), "float16"),
             BIAS_hbm: T.Tensor((1, M, 1, N), "float16"),
-            C_hbm:    T.Tensor((1, M, 1, C_WIDE_N), "float16"),
+            C_hbm: T.Tensor((1, M, 1, C_WIDE_N), "float16"),
         ):
             # Grid: one program per (n_block, m_block) tile — same axis
             # order tilelang_kernels/linear.py uses (bx along N, by along
             # M) so cache-line / coalescing intuition carries over.
             with T.Kernel(n_blocks, m_blocks, threads=128) as (bx, by):
-                A_sh    = T.alloc_shared((MLEN, MLEN), "float16")
-                B_sh    = T.alloc_shared((MLEN, MLEN), "float16")
+                A_sh = T.alloc_shared((MLEN, MLEN), "float16")
+                B_sh = T.alloc_shared((MLEN, MLEN), "float16")
                 BIAS_sh = T.alloc_shared((MLEN, MLEN), "float16")
-                C_sh    = T.alloc_shared((MLEN, MLEN), "float16")
+                C_sh = T.alloc_shared((MLEN, MLEN), "float16")
 
-                C_loc   = T.alloc_fragment((MLEN, MLEN), "float16")
+                C_loc = T.alloc_fragment((MLEN, MLEN), "float16")
                 SCR_loc = T.alloc_fragment((MLEN, MLEN), "float16")
 
                 # Zero C_loc so the first K iteration's add behaves as
@@ -136,10 +126,7 @@ def make_linear_min(
 
                 for k_block in T.serial(k_blocks):
                     T.copy(
-                        A_hbm[0,
-                              by * MLEN : (by + 1) * MLEN,
-                              0,
-                              k_block * MLEN : (k_block + 1) * MLEN],
+                        A_hbm[0, by * MLEN : (by + 1) * MLEN, 0, k_block * MLEN : (k_block + 1) * MLEN],
                         A_sh,
                     )
                     # B is (N, K) row-major — same convention as
@@ -149,10 +136,7 @@ def make_linear_min(
                     # array. The slice walks N along the seq axis and K
                     # along the hlen axis.
                     T.copy(
-                        B_hbm[0,
-                              bx * MLEN : (bx + 1) * MLEN,
-                              0,
-                              k_block * MLEN : (k_block + 1) * MLEN],
+                        B_hbm[0, bx * MLEN : (bx + 1) * MLEN, 0, k_block * MLEN : (k_block + 1) * MLEN],
                         B_sh,
                     )
 
@@ -163,10 +147,7 @@ def make_linear_min(
                             C_loc[row, col] = C_loc[row, col] + SCR_loc[row, col]
 
                 T.copy(
-                    BIAS_hbm[0,
-                             by * MLEN : (by + 1) * MLEN,
-                             0,
-                             bx * MLEN : (bx + 1) * MLEN],
+                    BIAS_hbm[0, by * MLEN : (by + 1) * MLEN, 0, bx * MLEN : (bx + 1) * MLEN],
                     BIAS_sh,
                 )
                 for row in T.serial(MLEN):
@@ -178,13 +159,12 @@ def make_linear_min(
                 # C_hbm: shift the col block by c_col_offset.
                 T.copy(
                     C_sh,
-                    C_hbm[0,
-                          by * MLEN : (by + 1) * MLEN,
-                          0,
-                          bx * MLEN + c_col_offset
-                          : bx * MLEN + c_col_offset + MLEN],
+                    C_hbm[
+                        0, by * MLEN : (by + 1) * MLEN, 0, bx * MLEN + c_col_offset : bx * MLEN + c_col_offset + MLEN
+                    ],
                 )
     else:
+
         @T.prim_func
         def linear_min(
             A_hbm: T.Tensor((1, M, 1, K), "float16"),
@@ -196,7 +176,7 @@ def make_linear_min(
                 B_sh = T.alloc_shared((MLEN, MLEN), "float16")
                 C_sh = T.alloc_shared((MLEN, MLEN), "float16")
 
-                C_loc   = T.alloc_fragment((MLEN, MLEN), "float16")
+                C_loc = T.alloc_fragment((MLEN, MLEN), "float16")
                 SCR_loc = T.alloc_fragment((MLEN, MLEN), "float16")
 
                 for row in T.serial(MLEN):
@@ -205,17 +185,11 @@ def make_linear_min(
 
                 for k_block in T.serial(k_blocks):
                     T.copy(
-                        A_hbm[0,
-                              by * MLEN : (by + 1) * MLEN,
-                              0,
-                              k_block * MLEN : (k_block + 1) * MLEN],
+                        A_hbm[0, by * MLEN : (by + 1) * MLEN, 0, k_block * MLEN : (k_block + 1) * MLEN],
                         A_sh,
                     )
                     T.copy(
-                        B_hbm[0,
-                              bx * MLEN : (bx + 1) * MLEN,
-                              0,
-                              k_block * MLEN : (k_block + 1) * MLEN],
+                        B_hbm[0, bx * MLEN : (bx + 1) * MLEN, 0, k_block * MLEN : (k_block + 1) * MLEN],
                         B_sh,
                     )
 
@@ -230,19 +204,23 @@ def make_linear_min(
                 # C_hbm: shift the col block by c_col_offset.
                 T.copy(
                     C_sh,
-                    C_hbm[0,
-                          by * MLEN : (by + 1) * MLEN,
-                          0,
-                          bx * MLEN + c_col_offset
-                          : bx * MLEN + c_col_offset + MLEN],
+                    C_hbm[
+                        0, by * MLEN : (by + 1) * MLEN, 0, bx * MLEN + c_col_offset : bx * MLEN + c_col_offset + MLEN
+                    ],
                 )
 
     lowered = linear_min
     constants = {
-        "M": M, "N": N, "K": K, "MLEN": MLEN,
-        "M_BLOCKS": m_blocks, "N_BLOCKS": n_blocks, "K_BLOCKS": k_blocks,
+        "M": M,
+        "N": N,
+        "K": K,
+        "MLEN": MLEN,
+        "M_BLOCKS": m_blocks,
+        "N_BLOCKS": n_blocks,
+        "K_BLOCKS": k_blocks,
         "WITH_BIAS": with_bias,
-        "C_WIDE_N": C_WIDE_N, "C_COL_OFFSET": c_col_offset,
+        "C_WIDE_N": C_WIDE_N,
+        "C_COL_OFFSET": c_col_offset,
     }
     return lowered, constants
 

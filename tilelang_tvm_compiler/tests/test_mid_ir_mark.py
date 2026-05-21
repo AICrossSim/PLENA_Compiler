@@ -54,18 +54,16 @@ def test_mark_elementwise_pure_async() -> int:
     A = _mk_buf("A", [64, 16])
     B = _mk_buf("B", [64, 16])
     C = _mk_buf("C", [64, 16])
-    fn = _wrap([
-        # v_add: dst, srcA, srcB all same shape
-        ir.Elementwise(dst=_slice_ref(C),
-                       srcs=[_slice_ref(A), _slice_ref(B)],
-                       op=ir.BinOp.ADD),
-        # v_exp_v: unary
-        ir.Elementwise(dst=_slice_ref(A),
-                       srcs=[_slice_ref(A)],
-                       op=ir.UnaryOp.EXP),
-        # zero_v: srcs=[]
-        ir.Elementwise(dst=_slice_ref(C), srcs=[], op=ir.UnaryOp.COPY),
-    ])
+    fn = _wrap(
+        [
+            # v_add: dst, srcA, srcB all same shape
+            ir.Elementwise(dst=_slice_ref(C), srcs=[_slice_ref(A), _slice_ref(B)], op=ir.BinOp.ADD),
+            # v_exp_v: unary
+            ir.Elementwise(dst=_slice_ref(A), srcs=[_slice_ref(A)], op=ir.UnaryOp.EXP),
+            # zero_v: srcs=[]
+            ir.Elementwise(dst=_slice_ref(C), srcs=[], op=ir.UnaryOp.COPY),
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     for i, label in enumerate(["v_add", "v_exp_v", "zero_v"]):
@@ -80,14 +78,18 @@ def test_mark_elementwise_with_broadcast_not_async() -> int:
     print("test_mark_elementwise_with_broadcast_not_async — row_sub_fp_at")
     S = _mk_buf("S", [64, 64], scope="fragment")
     M = _mk_buf("M_CURR", [64], scope="fragment")
-    fn = _wrap([ir.Elementwise(
-        dst=_slice_ref(S),
-        srcs=[
-            _slice_ref(S),
-            ir.Broadcast(src=ir.BufferRef(M, [ir.Slice()]), broadcast_dims=[1]),
-        ],
-        op=ir.BinOp.SUB,
-    )])
+    fn = _wrap(
+        [
+            ir.Elementwise(
+                dst=_slice_ref(S),
+                srcs=[
+                    _slice_ref(S),
+                    ir.Broadcast(src=ir.BufferRef(M, [ir.Slice()]), broadcast_dims=[1]),
+                ],
+                op=ir.BinOp.SUB,
+            )
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     failures += _check("marker", out.body[0].marker, ir.Marker.LANE_OP)
@@ -100,10 +102,16 @@ def test_mark_reduce_not_async() -> int:
     print("test_mark_reduce_not_async")
     src = _mk_buf("src", [64, 64], scope="fragment")
     dst = _mk_buf("dst", [64], scope="fragment")
-    fn = _wrap([ir.Reduce(
-        dst=_slice_ref(dst), src=_slice_ref(src),
-        op=ir.ReduceOp.MAX, axis=1,
-    )])
+    fn = _wrap(
+        [
+            ir.Reduce(
+                dst=_slice_ref(dst),
+                src=_slice_ref(src),
+                op=ir.ReduceOp.MAX,
+                axis=1,
+            )
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     failures += _check("marker", out.body[0].marker, ir.Marker.LANE_OP)
@@ -128,10 +136,17 @@ def test_mark_gemm_btmm_async() -> int:
     Q = _mk_buf("Q", [64, 16])
     K = _mk_buf("K", [64, 16])
     S = _mk_buf("S", [64, 64], scope="fragment")
-    fn = _wrap([ir.Gemm(
-        a=_slice_ref(Q), b=_slice_ref(K), c=_slice_ref(S),
-        kind="btmm", transpose_b=True,
-    )])
+    fn = _wrap(
+        [
+            ir.Gemm(
+                a=_slice_ref(Q),
+                b=_slice_ref(K),
+                c=_slice_ref(S),
+                kind="btmm",
+                transpose_b=True,
+            )
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     failures += _check("marker", out.body[0].marker, ir.Marker.BTMM)
@@ -144,10 +159,16 @@ def test_mark_gemm_per_head_not_async() -> int:
     A = _mk_buf("A", [64, 64], scope="fragment")
     B = _mk_buf("B", [64, 16])
     C = _mk_buf("C", [64, 16], scope="fragment")
-    fn = _wrap([ir.Gemm(
-        a=_slice_ref(A), b=_slice_ref(B), c=_slice_ref(C),
-        kind="overwrite",
-    )])
+    fn = _wrap(
+        [
+            ir.Gemm(
+                a=_slice_ref(A),
+                b=_slice_ref(B),
+                c=_slice_ref(C),
+                kind="overwrite",
+            )
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     failures += _check("marker", out.body[0].marker, None)
@@ -158,19 +179,29 @@ def test_mark_gemm_per_head_not_async() -> int:
 def test_mark_raw_store_pass_through() -> int:
     print("test_mark_raw_store_pass_through — RawStore stays unmarked")
     buf = _mk_buf("padded", [67], scope="fragment")
-    fn = _wrap([ir.For(loop_var="k", extent=3, body=[
-        ir.RawStore(
-            dst=ir.BufferRef(buf, [{"op": "add", "args": [64, "k"]}]),
-            value="<opaque>",
-        ),
-    ])])
+    fn = _wrap(
+        [
+            ir.For(
+                loop_var="k",
+                extent=3,
+                body=[
+                    ir.RawStore(
+                        dst=ir.BufferRef(buf, [{"op": "add", "args": [64, "k"]}]),
+                        value="<opaque>",
+                    ),
+                ],
+            )
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     # The For is preserved, body still has the RawStore unchanged.
     f = out.body[0]
     failures += _check("body type", type(f.body[0]).__name__, "RawStore")
     failures += _check(
-        "RawStore has no marker attr", hasattr(f.body[0], "marker"), False,
+        "RawStore has no marker attr",
+        hasattr(f.body[0], "marker"),
+        False,
     )
     return failures
 
@@ -179,10 +210,18 @@ def test_mark_inside_for() -> int:
     print("test_mark_inside_for — ops nested inside a For still get marked")
     A = _mk_buf("A", [64, 16])
     B = _mk_buf("B", [64, 16])
-    fn = _wrap([ir.For(loop_var="row", extent=64, body=[
-        ir.Dma(src=_slice_ref(A), dst=_slice_ref(B)),
-        ir.Elementwise(dst=_slice_ref(B), srcs=[], op=ir.UnaryOp.COPY),
-    ])])
+    fn = _wrap(
+        [
+            ir.For(
+                loop_var="row",
+                extent=64,
+                body=[
+                    ir.Dma(src=_slice_ref(A), dst=_slice_ref(B)),
+                    ir.Elementwise(dst=_slice_ref(B), srcs=[], op=ir.UnaryOp.COPY),
+                ],
+            )
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     body = out.body[0].body
@@ -198,7 +237,9 @@ def test_mark_idempotent() -> int:
     once = mark_run(fn)
     twice = mark_run(once)
     return _check(
-        "marker after 2x", twice.body[0].marker, ir.Marker.DMA,
+        "marker after 2x",
+        twice.body[0].marker,
+        ir.Marker.DMA,
     )
 
 
@@ -209,14 +250,18 @@ def test_mark_elementwise_with_broadcast_src() -> int:
     print("test_mark_elementwise_with_broadcast_src")
     S = _mk_buf("S", [64, 64], scope="fragment")
     M = _mk_buf("M_CURR", [64], scope="fragment")
-    fn = _wrap([ir.Elementwise(
-        dst=_slice_ref(S),
-        srcs=[
-            _slice_ref(S),
-            ir.Broadcast(src=ir.BufferRef(M, [ir.Slice()]), broadcast_dims=[1]),
-        ],
-        op=ir.BinOp.SUB,
-    )])
+    fn = _wrap(
+        [
+            ir.Elementwise(
+                dst=_slice_ref(S),
+                srcs=[
+                    _slice_ref(S),
+                    ir.Broadcast(src=ir.BufferRef(M, [ir.Slice()]), broadcast_dims=[1]),
+                ],
+                op=ir.BinOp.SUB,
+            )
+        ]
+    )
     out = mark_run(fn)
     failures = 0
     ew = out.body[0]
@@ -224,10 +269,14 @@ def test_mark_elementwise_with_broadcast_src() -> int:
     # Confirm the Broadcast src is preserved structurally + has no
     # marker attribute.
     failures += _check(
-        "src[1] type after mark", type(ew.srcs[1]).__name__, "Broadcast",
+        "src[1] type after mark",
+        type(ew.srcs[1]).__name__,
+        "Broadcast",
     )
     failures += _check(
-        "Broadcast has no marker attr", hasattr(ew.srcs[1], "marker"), False,
+        "Broadcast has no marker attr",
+        hasattr(ew.srcs[1], "marker"),
+        False,
     )
     failures += _check("broadcast dims", ew.srcs[1].broadcast_dims, [1])
     return failures
@@ -238,35 +287,50 @@ def test_mark_full_kernel_shape() -> int:
     one of each op kind. Verify all markers in one shot."""
     print("test_mark_full_kernel_shape — flash_attention_min slice")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
-    Q_sh  = _mk_buf("Q_sh",  [64, 16])
-    K_sh  = _mk_buf("K_sh",  [64, 16])
+    Q_sh = _mk_buf("Q_sh", [64, 16])
+    K_sh = _mk_buf("K_sh", [64, 16])
     S_loc = _mk_buf("S_loc", [64, 64], scope="fragment")
     M_CURR = _mk_buf("M_CURR", [64], scope="fragment")
     O_loc = _mk_buf("O_loc", [64, 16], scope="fragment")
     PV_loc = _mk_buf("PV_loc", [64, 16], scope="fragment")
     V_sh = _mk_buf("V_sh", [64, 16])
 
-    fn = _wrap([
-        ir.Dma(src=_slice_ref(Q_hbm), dst=_slice_ref(Q_sh)),                  # → DMA
-        ir.Gemm(a=_slice_ref(Q_sh), b=_slice_ref(K_sh), c=_slice_ref(S_loc),  # → BTMM
-                kind="btmm", transpose_b=True),
-        ir.Reduce(dst=_slice_ref(M_CURR), src=_slice_ref(S_loc),              # → LANE_OP
-                  op=ir.ReduceOp.MAX, axis=1),
-        ir.Gemm(a=_slice_ref(S_loc), b=_slice_ref(V_sh), c=_slice_ref(PV_loc),  # → no marker
-                kind="overwrite"),
-        ir.Elementwise(dst=_slice_ref(O_loc), srcs=[], op=ir.UnaryOp.COPY),    # → LANE_OP
-    ])
+    fn = _wrap(
+        [
+            ir.Dma(src=_slice_ref(Q_hbm), dst=_slice_ref(Q_sh)),  # → DMA
+            ir.Gemm(
+                a=_slice_ref(Q_sh),
+                b=_slice_ref(K_sh),
+                c=_slice_ref(S_loc),  # → BTMM
+                kind="btmm",
+                transpose_b=True,
+            ),
+            ir.Reduce(
+                dst=_slice_ref(M_CURR),
+                src=_slice_ref(S_loc),  # → LANE_OP
+                op=ir.ReduceOp.MAX,
+                axis=1,
+            ),
+            ir.Gemm(
+                a=_slice_ref(S_loc),
+                b=_slice_ref(V_sh),
+                c=_slice_ref(PV_loc),  # → no marker
+                kind="overwrite",
+            ),
+            ir.Elementwise(dst=_slice_ref(O_loc), srcs=[], op=ir.UnaryOp.COPY),  # → LANE_OP
+        ]
+    )
     out = mark_run(fn)
     failures = 0
-    failures += _check("[0] Dma marker",          out.body[0].marker, ir.Marker.DMA)
-    failures += _check("[0] Dma can_async",       out.body[0].can_async, True)
-    failures += _check("[1] btmm Gemm marker",    out.body[1].marker, ir.Marker.BTMM)
+    failures += _check("[0] Dma marker", out.body[0].marker, ir.Marker.DMA)
+    failures += _check("[0] Dma can_async", out.body[0].can_async, True)
+    failures += _check("[1] btmm Gemm marker", out.body[1].marker, ir.Marker.BTMM)
     failures += _check("[1] btmm Gemm can_async", out.body[1].can_async, True)
-    failures += _check("[2] Reduce marker",       out.body[2].marker, ir.Marker.LANE_OP)
-    failures += _check("[2] Reduce can_async",    out.body[2].can_async, False)
-    failures += _check("[3] per-head Gemm marker",   out.body[3].marker, None)
+    failures += _check("[2] Reduce marker", out.body[2].marker, ir.Marker.LANE_OP)
+    failures += _check("[2] Reduce can_async", out.body[2].can_async, False)
+    failures += _check("[3] per-head Gemm marker", out.body[3].marker, None)
     failures += _check("[3] per-head Gemm can_async", out.body[3].can_async, False)
-    failures += _check("[4] Elementwise marker",  out.body[4].marker, ir.Marker.LANE_OP)
+    failures += _check("[4] Elementwise marker", out.body[4].marker, ir.Marker.LANE_OP)
     # Pure elementwise (zero_v) → can async
     failures += _check("[4] Elementwise can_async", out.body[4].can_async, True)
     return failures

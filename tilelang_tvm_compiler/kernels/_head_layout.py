@@ -38,23 +38,15 @@ def unpack_heads(x_packed: torch.Tensor, num_heads: int, head_dim: int) -> torch
     last-dim of the packed tensor.
     """
     if x_packed.dim() != 4:
-        raise ValueError(
-            f"unpack_heads expects 4D B,S,1,H*D; got shape {tuple(x_packed.shape)}"
-        )
+        raise ValueError(f"unpack_heads expects 4D B,S,1,H*D; got shape {tuple(x_packed.shape)}")
     if x_packed.shape[2] != 1:
-        raise ValueError(
-            f"unpack_heads expects head-axis == 1 (packed); got shape "
-            f"{tuple(x_packed.shape)}"
-        )
+        raise ValueError(f"unpack_heads expects head-axis == 1 (packed); got shape {tuple(x_packed.shape)}")
     if not x_packed.is_contiguous():
-        raise ValueError(
-            "unpack_heads requires a contiguous tensor (view-only op)."
-        )
+        raise ValueError("unpack_heads requires a contiguous tensor (view-only op).")
     B, S, _, HD = x_packed.shape
     if HD != num_heads * head_dim:
         raise ValueError(
-            f"unpack_heads: packed last-dim {HD} != num_heads*head_dim "
-            f"{num_heads}*{head_dim} = {num_heads * head_dim}"
+            f"unpack_heads: packed last-dim {HD} != num_heads*head_dim {num_heads}*{head_dim} = {num_heads * head_dim}"
         )
     return x_packed.view(B, S, num_heads, head_dim)
 

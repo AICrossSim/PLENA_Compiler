@@ -69,8 +69,9 @@ class ReduceOp(Enum):
 class Marker(Enum):
     """Tag attached to op sites by pass_2_mark. Drives async/cluster handling
     downstream. Untagged ops stay sequential, never get lane-fused."""
-    DMA = "dma"        # HBM ↔ on-chip transfer
-    BTMM = "btmm"      # head-fused matmul
+
+    DMA = "dma"  # HBM ↔ on-chip transfer
+    BTMM = "btmm"  # head-fused matmul
     LANE_OP = "lane_op"  # an elementwise/reduce that lives inside the cluster
 
 
@@ -97,6 +98,7 @@ class AxisRole(Enum):
                 them natively; one HW instruction covers their full
                 extents (modulo BATCH outer fan-out wrap, if any).
     """
+
     BATCH = "batch"
     SIMD = "simd"
     REDUCE = "reduce"
@@ -110,6 +112,7 @@ class AxisRole(Enum):
 @dataclass
 class AxisInfo:
     """Per-axis metadata for a BufferRef on one op operand."""
+
     role: AxisRole
     extent: int
 
@@ -137,8 +140,9 @@ class BufferDef:
     Downstream addressing reads this directly instead of guessing the
     lane position from shape values.
     """
+
     name: str
-    shape: list[int]           # logical extents (int-only; symbolic later)
+    shape: list[int]  # logical extents (int-only; symbolic later)
     dtype: str
     scope: str = "global"
     cluster_dim: int | None = None
@@ -176,6 +180,7 @@ class BufferRef:
     ``view_perm=[1, 0, 2]`` means the op sees ``[S=64, lane=4, D=16]``
     (BSHD view of a BHSD-shell buffer).
     """
+
     buffer: BufferDef
     indices: list[IndexExpr]
     view_perm: list[int] | None = None
@@ -185,6 +190,7 @@ class BufferRef:
 class Slice:
     """``:`` — whole-axis access. May carry an explicit range later
     if needed; for now whole-axis is the only kind we care about."""
+
     pass
 
 
@@ -213,6 +219,7 @@ class VarRef:
     ``name`` attribute (real ``tir.Var`` already satisfies this; tests
     can pass any duck-type).
     """
+
     __slots__ = ("var",)
 
     def __init__(self, var):
@@ -283,6 +290,7 @@ class Elementwise:
     scalar). pass_2_mark sets this; pass_4_async only wraps ops with
     can_async=True in Async regions.
     """
+
     dst: BufferRef
     srcs: list[BufferRef | Broadcast]
     op: BinOp | UnaryOp
@@ -305,6 +313,7 @@ class Broadcast:
     ``src`` repeats. E.g. dst is rank 3, src is rank 1 with values per
     last-axis position → broadcast_dims = [0, 1].
     """
+
     src: BufferRef
     broadcast_dims: list[int]
 
@@ -325,6 +334,7 @@ class Reduce:
     (``row_reduce_max_at`` / ``row_reduce_sum_at``), one row at a time
     into a per-row fp scalar slot. No multi-lane reduce HW op exists.
     """
+
     dst: BufferRef
     src: BufferRef
     op: ReduceOp
@@ -357,6 +367,7 @@ class Gemm:
     instruction); False for kind=="overwrite" (per-head matmul that
     runs inside the lane loop, one matmul per lane).
     """
+
     a: BufferRef
     b: BufferRef
     c: BufferRef
@@ -388,6 +399,7 @@ class Dma:
     ``can_async`` is always True — DMA is always a single multi-lane
     HW instruction (``H_LOAD_V`` / ``H_STORE_V`` etc.).
     """
+
     src: BufferRef
     dst: BufferRef
     src_axes: list[AxisInfo] = field(default_factory=list)
@@ -418,8 +430,9 @@ class RawStore:
     ``value`` is held as an opaque object (typically a tir.PrimExpr
     captured from raw TIR). Mid-IR walkers don't touch it.
     """
+
     dst: BufferRef
-    value: object   # tir.PrimExpr or similar — opaque to mid_ir passes
+    value: object  # tir.PrimExpr or similar — opaque to mid_ir passes
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +464,7 @@ class ParallelKind(Enum):
     Never converted to a For during mid-IR. pass_8_to_plena flattens
     every kind into the appropriate HLIR form.
     """
+
     BLOCK_IDX = "blockIdx"
     LOGICAL_GRID = "logical_grid"
     CLUSTER = "cluster"
@@ -494,6 +508,7 @@ class ParallelAxis:
     both carry it so HBM-lane-substitution / cluster-collapse can
     identify the pre-split var without name matching.
     """
+
     axis_name: str
     extent: int
     body: list[Stmt]
@@ -522,10 +537,11 @@ class For:
     identity-based handle that downstream passes can match against
     ``BufferRef.indices`` entries. Optional during transitional period.
     """
+
     loop_var: str
     extent: int
     body: list[Stmt]
-    kind: str = "serial"                # "serial" | "unroll"
+    kind: str = "serial"  # "serial" | "unroll"
     loop_var_var: VarRef | None = None
 
 
@@ -536,8 +552,9 @@ class Async:
     (each Async ends up in its own for, fused into a multi-lane HW op
     by pass_6_fuse).
     """
+
     body: list[Stmt]
-    scope_id: int                       # unique per async region
+    scope_id: int  # unique per async region
 
 
 @dataclass
@@ -570,6 +587,7 @@ class MultiLaneOp:
                                 Pass_7_perm reads this when deciding
                                 where each cluster axis sits physically.
     """
+
     inner: Op
     cluster_axis_names: list[str]
     dim_map: dict[str, list[int]]
@@ -577,8 +595,7 @@ class MultiLaneOp:
 
 
 # A "statement" is anything that appears in a body list.
-Stmt = Union[ParallelAxis, For, Async, Dma, Gemm, Elementwise, Broadcast,
-             Reduce, RawStore, MultiLaneOp]
+Stmt = Union[ParallelAxis, For, Async, Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore, MultiLaneOp]
 
 # An "Op" is the leaf-level op kinds (no structure).
 Op = Union[Dma, Gemm, Elementwise, Reduce]
@@ -610,6 +627,7 @@ class MidFunc:
     "blockIdx.*")`` for both untouched grid axes and the *_number
     halves of split lane axes.
     """
+
     name: str
     params: list[BufferDef]
     allocs: list[BufferDef]
@@ -687,11 +705,8 @@ def _print_stmt(s: Stmt, indent: int, out: list[str]) -> None:
             suffix = ""
         else:
             keyword = "cluster"
-            suffix = (f" ← {s.parent_grid_axis_name}"
-                      if s.parent_grid_axis_name else "")
-        out.append(
-            f"{pad}{keyword} {s.axis_name} in 0..{s.extent}{suffix}:"
-        )
+            suffix = f" ← {s.parent_grid_axis_name}" if s.parent_grid_axis_name else ""
+        out.append(f"{pad}{keyword} {s.axis_name} in 0..{s.extent}{suffix}:")
         for b in s.body:
             _print_stmt(b, indent + 1, out)
         return
@@ -708,14 +723,8 @@ def _print_stmt(s: Stmt, indent: int, out: list[str]) -> None:
         out.append(f"{pad}}}")
         return
     if isinstance(s, Dma):
-        out.append(
-            f"{pad}dma {_fmt_ref(s.src)} -> {_fmt_ref(s.dst)}"
-            f"{_fmt_marker(s.marker, s.can_async)}"
-        )
-        out.append(
-            f"{pad}  src_axes={_fmt_axes(s.src_axes)} "
-            f"dst_axes={_fmt_axes(s.dst_axes)}"
-        )
+        out.append(f"{pad}dma {_fmt_ref(s.src)} -> {_fmt_ref(s.dst)}{_fmt_marker(s.marker, s.can_async)}")
+        out.append(f"{pad}  src_axes={_fmt_axes(s.src_axes)} dst_axes={_fmt_axes(s.dst_axes)}")
         return
     if isinstance(s, Gemm):
         ta = "ᵀ" if s.transpose_a else ""
@@ -725,23 +734,16 @@ def _print_stmt(s: Stmt, indent: int, out: list[str]) -> None:
             f"{_fmt_ref(s.a)}{ta} @ {_fmt_ref(s.b)}{tb}"
             f"{_fmt_marker(s.marker, s.can_async)}"
         )
-        out.append(
-            f"{pad}  a_axes={_fmt_axes(s.a_axes)} "
-            f"b_axes={_fmt_axes(s.b_axes)} c_axes={_fmt_axes(s.c_axes)}"
-        )
+        out.append(f"{pad}  a_axes={_fmt_axes(s.a_axes)} b_axes={_fmt_axes(s.b_axes)} c_axes={_fmt_axes(s.c_axes)}")
         return
     if isinstance(s, Elementwise):
         srcs = ", ".join(_fmt_src(x) for x in s.srcs)
         axis = f" axis={s.axis}" if s.axis is not None else ""
         out.append(
-            f"{pad}elementwise[{s.op.value}] {_fmt_ref(s.dst)} = "
-            f"f({srcs}){axis}{_fmt_marker(s.marker, s.can_async)}"
+            f"{pad}elementwise[{s.op.value}] {_fmt_ref(s.dst)} = f({srcs}){axis}{_fmt_marker(s.marker, s.can_async)}"
         )
         src_axes_strs = [_fmt_axes(sa) for sa in (s.src_axes or [])]
-        out.append(
-            f"{pad}  dst_axes={_fmt_axes(s.dst_axes)} "
-            f"src_axes=[{', '.join(src_axes_strs)}]"
-        )
+        out.append(f"{pad}  dst_axes={_fmt_axes(s.dst_axes)} src_axes=[{', '.join(src_axes_strs)}]")
         return
     if isinstance(s, Reduce):
         out.append(
@@ -749,19 +751,13 @@ def _print_stmt(s: Stmt, indent: int, out: list[str]) -> None:
             f"{_fmt_ref(s.dst)} = R({_fmt_ref(s.src)})"
             f"{_fmt_marker(s.marker, s.can_async)}"
         )
-        out.append(
-            f"{pad}  src_axes={_fmt_axes(s.src_axes)} "
-            f"dst_axes={_fmt_axes(s.dst_axes)}"
-        )
+        out.append(f"{pad}  src_axes={_fmt_axes(s.src_axes)} dst_axes={_fmt_axes(s.dst_axes)}")
         return
     if isinstance(s, RawStore):
         out.append(f"{pad}raw_store {_fmt_ref(s.dst)} = <opaque>")
         return
     if isinstance(s, MultiLaneOp):
-        out.append(
-            f"{pad}multi_lane (cluster_axes={s.cluster_axis_names}, "
-            f"dim_map={s.dim_map}) {{"
-        )
+        out.append(f"{pad}multi_lane (cluster_axes={s.cluster_axis_names}, dim_map={s.dim_map}) {{")
         _print_stmt(s.inner, indent + 1, out)
         out.append(f"{pad}}}")
         return
@@ -771,13 +767,10 @@ def _print_stmt(s: Stmt, indent: int, out: list[str]) -> None:
 def format_func(fn: MidFunc) -> str:
     """Return a multi-line text dump of ``fn`` for eyeballing."""
     out: list[str] = []
-    params = ", ".join(
-        f"{p.name}: {p.dtype}{tuple(p.shape)} @{p.scope}" for p in fn.params
-    )
+    params = ", ".join(f"{p.name}: {p.dtype}{tuple(p.shape)} @{p.scope}" for p in fn.params)
     out.append(f"func @{fn.name}({params})")
     if fn.lane_axes:
-        out.append(f"  // lane_axes = {fn.lane_axes}, "
-                   f"cluster_counts = {fn.cluster_counts}")
+        out.append(f"  // lane_axes = {fn.lane_axes}, cluster_counts = {fn.cluster_counts}")
     if fn.allocs:
         out.append("  allocs:")
         for a in fn.allocs:

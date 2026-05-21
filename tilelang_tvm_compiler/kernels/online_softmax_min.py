@@ -38,9 +38,7 @@ def make_online_softmax_hbm(
     if hlen <= 0 or hlen > MLEN or MLEN % hlen != 0:
         raise ValueError(f"hlen must be a positive divisor of MLEN={MLEN}, got {hlen}")
     if lane_count * hlen != MLEN:
-        raise ValueError(
-            f"lane_count * hlen must equal MLEN ({lane_count} * {hlen} == {MLEN})"
-        )
+        raise ValueError(f"lane_count * hlen must equal MLEN ({lane_count} * {hlen} == {MLEN})")
     if not (0 <= active_lane < lane_count):
         raise ValueError(f"active_lane must be in [0, {lane_count}), got {active_lane}")
 
@@ -50,12 +48,12 @@ def make_online_softmax_hbm(
 
     fp_state_elems = lane_count * rows
     bases = _slot_bases(fp_state_elems)
-    M_OLD  = bases["M_OLD"]
+    M_OLD = bases["M_OLD"]
     M_CURR = bases["M_CURR"]
-    M_RES  = bases["M_RES"]
-    L_OLD  = bases["L_OLD"]
-    L_NEW  = bases["L_NEW"]
-    P_SUM  = bases["P_SUM"]
+    M_RES = bases["M_RES"]
+    L_OLD = bases["L_OLD"]
+    L_NEW = bases["L_NEW"]
+    P_SUM = bases["P_SUM"]
 
     @T.prim_func
     def online_softmax_hbm(
@@ -64,70 +62,151 @@ def make_online_softmax_hbm(
     ):
         Score_v = T.alloc_buffer(SCORE_SHAPE, "float16", scope="vram")
 
-        T.evaluate(T.call_extern(
-            "handle", "plena.dma_h2v_slice",
-            Score_hbm.data, Score_v.data,
-            4,
-            0, 0, 0, 0,
-            1, rows, lane_count, hlen,
-        ))
+        T.evaluate(
+            T.call_extern(
+                "handle",
+                "plena.dma_h2v_slice",
+                Score_hbm.data,
+                Score_v.data,
+                4,
+                0,
+                0,
+                0,
+                0,
+                1,
+                rows,
+                lane_count,
+                hlen,
+            )
+        )
         for lane in T.serial(lane_count):
             for row in T.serial(rows):
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_copy_at",
-                    M_OLD + lane * rows + row, M_CURR + lane * rows + row,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.row_reduce_max_at",
-                    Score_v.data, M_CURR + lane * rows + row, row, lane,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_sub_at",
-                    M_OLD + lane * rows + row, M_CURR + lane * rows + row, M_RES + lane * rows + row,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_exp_at",
-                    M_RES + lane * rows + row, M_RES + lane * rows + row,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.row_sub_fp_at",
-                    Score_v.data, M_CURR + lane * rows + row, Score_v.data, row, lane,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.row_exp_at",
-                    Score_v.data, Score_v.data, row, lane,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_sub_at",
-                    P_SUM + lane * rows + row, P_SUM + lane * rows + row, P_SUM + lane * rows + row,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.row_reduce_sum_at",
-                    Score_v.data, P_SUM + lane * rows + row, row, lane,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_mul_at",
-                    L_OLD + lane * rows + row, M_RES + lane * rows + row, L_NEW + lane * rows + row,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_add_at",
-                    L_NEW + lane * rows + row, P_SUM + lane * rows + row, L_NEW + lane * rows + row,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_copy_at",
-                    M_CURR + lane * rows + row, M_OLD + lane * rows + row,
-                ))
-                T.evaluate(T.call_extern(
-                    "handle", "plena.fp_copy_at",
-                    L_NEW + lane * rows + row, L_OLD + lane * rows + row,
-                ))
-        T.evaluate(T.call_extern(
-            "handle", "plena.dma_v2h_slice",
-            Score_v.data, Score_out_hbm.data,
-            4,
-            0, 0, 0, 0,
-            1, rows, lane_count, hlen,
-        ))
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_copy_at",
+                        M_OLD + lane * rows + row,
+                        M_CURR + lane * rows + row,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.row_reduce_max_at",
+                        Score_v.data,
+                        M_CURR + lane * rows + row,
+                        row,
+                        lane,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_sub_at",
+                        M_OLD + lane * rows + row,
+                        M_CURR + lane * rows + row,
+                        M_RES + lane * rows + row,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_exp_at",
+                        M_RES + lane * rows + row,
+                        M_RES + lane * rows + row,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.row_sub_fp_at",
+                        Score_v.data,
+                        M_CURR + lane * rows + row,
+                        Score_v.data,
+                        row,
+                        lane,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.row_exp_at",
+                        Score_v.data,
+                        Score_v.data,
+                        row,
+                        lane,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_sub_at",
+                        P_SUM + lane * rows + row,
+                        P_SUM + lane * rows + row,
+                        P_SUM + lane * rows + row,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.row_reduce_sum_at",
+                        Score_v.data,
+                        P_SUM + lane * rows + row,
+                        row,
+                        lane,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_mul_at",
+                        L_OLD + lane * rows + row,
+                        M_RES + lane * rows + row,
+                        L_NEW + lane * rows + row,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_add_at",
+                        L_NEW + lane * rows + row,
+                        P_SUM + lane * rows + row,
+                        L_NEW + lane * rows + row,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_copy_at",
+                        M_CURR + lane * rows + row,
+                        M_OLD + lane * rows + row,
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "handle",
+                        "plena.fp_copy_at",
+                        L_NEW + lane * rows + row,
+                        L_OLD + lane * rows + row,
+                    )
+                )
+        T.evaluate(
+            T.call_extern(
+                "handle",
+                "plena.dma_v2h_slice",
+                Score_v.data,
+                Score_out_hbm.data,
+                4,
+                0,
+                0,
+                0,
+                0,
+                1,
+                rows,
+                lane_count,
+                hlen,
+            )
+        )
 
     constants = {
         "ROWS": rows,
@@ -150,9 +229,16 @@ def make_online_softmax_hbm(
 
 
 def build_hbm_module(
-    *, rows: int = 64, hlen: int = 16, lane_count: int = 4, active_lane: int = 0,
+    *,
+    rows: int = 64,
+    hlen: int = 16,
+    lane_count: int = 4,
+    active_lane: int = 0,
 ) -> tvm.IRModule:
     func, _ = make_online_softmax_hbm(
-        rows=rows, hlen=hlen, lane_count=lane_count, active_lane=active_lane,
+        rows=rows,
+        hlen=hlen,
+        lane_count=lane_count,
+        active_lane=active_lane,
     )
     return tvm.IRModule({"online_softmax_hbm": func})

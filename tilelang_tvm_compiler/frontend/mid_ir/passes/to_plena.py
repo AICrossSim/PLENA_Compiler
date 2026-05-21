@@ -67,13 +67,29 @@ from .... import hlir as _hlir
 from .... import scope as _scope
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    BinOp, UnaryOp, ReduceOp,
-    AxisRole, AxisInfo,
-    BufferDef, BufferRef, Slice, VarRef,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
-    For, Async, MultiLaneOp,
-    ParallelAxis, ParallelKind,
-    MidFunc, Stmt, format_func,
+    BinOp,
+    UnaryOp,
+    ReduceOp,
+    AxisRole,
+    AxisInfo,
+    BufferDef,
+    BufferRef,
+    Slice,
+    VarRef,
+    Dma,
+    Gemm,
+    Elementwise,
+    Broadcast,
+    Reduce,
+    RawStore,
+    For,
+    Async,
+    MultiLaneOp,
+    ParallelAxis,
+    ParallelKind,
+    MidFunc,
+    Stmt,
+    format_func,
 )
 
 
@@ -117,8 +133,7 @@ def _for_loop_var(for_stmt: For) -> _tir.Var:
 # ---------------------------------------------------------------------------
 
 
-def _map_scope(scope: str, rank: int,
-               override: str | None = None) -> str:
+def _map_scope(scope: str, rank: int, override: str | None = None) -> str:
     """mid_ir scope string → HLIR scope string.
 
     ``override`` is set by the use-driven inference (e.g. a buffer used
@@ -153,7 +168,8 @@ def _map_scope(scope: str, rank: int,
 
 
 def _pad_to_4d_shape(
-    shape: tuple[int, ...], heads_at_h: bool = False,
+    shape: tuple[int, ...],
+    heads_at_h: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
     """Pad a 1D / 2D shape up to canonical 4D for downstream uniformity.
 
@@ -187,10 +203,7 @@ def _pad_to_4d_shape(
     if rank == 1:
         n = int(shape[0])
         return (1, 1, 1, n), (0, 1, 2)
-    raise ToPlenaError(
-        f"_pad_to_4d_shape: only 1D/2D/4D supported; got "
-        f"rank-{rank} shape={tuple(shape)}"
-    )
+    raise ToPlenaError(f"_pad_to_4d_shape: only 1D/2D/4D supported; got rank-{rank} shape={tuple(shape)}")
 
 
 def _make_hlir_buffer(
@@ -285,9 +298,9 @@ def _make_hlir_buffer(
 # Lane-expansion modes for the 4D-BSHD rewrite below. Strings match the
 # graph_passes/expand_buffers vocabulary so anyone reading both layers
 # sees the same names.
-_MODE_COL_PACK = "col_pack"   # H carries lane: (1, S, lane, D_narrow)
-_MODE_ROW_STACK = "row_stack" # B carries lane: (lane, S, 1, MLEN)
-_MODE_FP_LANE = "fp_lane"     # FPRAM: (lane, N)
+_MODE_COL_PACK = "col_pack"  # H carries lane: (1, S, lane, D_narrow)
+_MODE_ROW_STACK = "row_stack"  # B carries lane: (lane, S, 1, MLEN)
+_MODE_FP_LANE = "fp_lane"  # FPRAM: (lane, N)
 _MODE_BSHD_LIFT = "bshd_lift"  # No lane fusion: (1, S, 1, D)
 
 
@@ -391,15 +404,14 @@ def _infer_lane_modes(func: MidFunc) -> dict[str, str]:
         if _is_global_scope(buf.scope):
             continue
         if buf.name not in modes:
-            modes[buf.name] = (
-                _MODE_FP_LANE if buf.scope == "fragment.fpram"
-                else _MODE_BSHD_LIFT
-            )
+            modes[buf.name] = _MODE_FP_LANE if buf.scope == "fragment.fpram" else _MODE_BSHD_LIFT
     return modes
 
 
 def _expand_buffer_shape_with_cluster(
-    buf: BufferDef, lane_count: int, mode: str,
+    buf: BufferDef,
+    lane_count: int,
+    mode: str,
 ) -> tuple[list[int], int | None]:
     """Reshape to canonical 4D BSHD (or 2D for FPRAM) and report which
     axis holds the cluster (lane) dim in the new shape.
@@ -419,14 +431,12 @@ def _expand_buffer_shape_with_cluster(
     if mode == _MODE_FP_LANE:
         if len(buf.shape) != 2:
             raise ToPlenaError(
-                f"{buf.name!r}: FP_LANE expansion expects post-grow rank 2 "
-                f"(lane, N); got shape={list(buf.shape)}"
+                f"{buf.name!r}: FP_LANE expansion expects post-grow rank 2 (lane, N); got shape={list(buf.shape)}"
             )
         return [int(buf.shape[0]), int(buf.shape[1])], 0
     if len(buf.shape) != 3:
         raise ToPlenaError(
-            f"{buf.name!r}: 2D-lane expansion expects post-grow rank 3; "
-            f"got shape={list(buf.shape)} mode={mode}"
+            f"{buf.name!r}: 2D-lane expansion expects post-grow rank 3; got shape={list(buf.shape)} mode={mode}"
         )
     if mode == _MODE_ROW_STACK:
         rows = int(buf.shape[1])
@@ -452,9 +462,9 @@ def _expand_buffer_shape_with_cluster(
 # This must stay consistent with the new ``cluster_dim`` value
 # returned by :func:`_expand_buffer_shape_with_cluster`.
 _CLUSTER_MODE_NEW_LANE_DIM: dict[str, int | None] = {
-    _MODE_COL_PACK:  2,    # lane → H
-    _MODE_ROW_STACK: 0,    # lane → B
-    _MODE_BSHD_LIFT: None, # no lane in scope
+    _MODE_COL_PACK: 2,  # lane → H
+    _MODE_ROW_STACK: 0,  # lane → B
+    _MODE_BSHD_LIFT: None,  # no lane in scope
 }
 
 
@@ -491,10 +501,7 @@ def _rewrite_ref_for_cluster_mode(
     if mode == _MODE_FP_LANE:
         return starts_or_extents
     if len(starts_or_extents) != 3:
-        raise ToPlenaError(
-            f"cluster mode {mode!r} expects rank-3 ref tuple, got "
-            f"{tuple(starts_or_extents)}"
-        )
+        raise ToPlenaError(f"cluster mode {mode!r} expects rank-3 ref tuple, got {tuple(starts_or_extents)}")
     if mode not in _CLUSTER_MODE_NEW_LANE_DIM:
         raise ToPlenaError(f"no ref-rewrite rule for cluster mode {mode!r}")
     new_lane_dim = _CLUSTER_MODE_NEW_LANE_DIM[mode]
@@ -514,9 +521,7 @@ def _rewrite_ref_for_cluster_mode(
     # lane position; it stays as ``fill``.
     non_lane_sources = [i for i in range(3) if i != old_cluster_dim]
     if len(non_lane_sources) != 2:
-        raise ToPlenaError(
-            f"unexpected non-lane source count {len(non_lane_sources)}"
-        )
+        raise ToPlenaError(f"unexpected non-lane source count {len(non_lane_sources)}")
     s_src, d_src = non_lane_sources[0], non_lane_sources[1]
 
     out: list[Any] = [fill] * 4
@@ -525,13 +530,15 @@ def _rewrite_ref_for_cluster_mode(
         out[new_lane_dim] = int(new_shape[new_lane_dim])
     else:
         out[new_lane_dim] = 0
-    out[1] = starts_or_extents[s_src]   # S
-    out[3] = starts_or_extents[d_src]   # D
+    out[1] = starts_or_extents[s_src]  # S
+    out[3] = starts_or_extents[d_src]  # D
     return tuple(out)
 
 
 def _expand_buffer_shape(
-    buf: BufferDef, lane_count: int, mode: str,
+    buf: BufferDef,
+    lane_count: int,
+    mode: str,
 ) -> list[int]:
     """Back-compat shape-only wrapper. New code should use
     ``_expand_buffer_shape_with_cluster``."""
@@ -715,7 +722,8 @@ _PAD_INSERTS: dict[str, tuple[int, ...]] = {}
 # here so axes-aware helpers can translate mid_ir-side (rank-3) axes
 # tables onto the post-expansion 4D HLIR shape.
 _CLUSTER_MODES: dict[
-    str, tuple[str, int | None, tuple[int, ...]],
+    str,
+    tuple[str, int | None, tuple[int, ...]],
 ] = {}
 
 # Per-buffer HLIR-side ``buffer_axes`` (post pad-to-4D / cluster-expand).
@@ -832,8 +840,7 @@ def _populate_lane_axis_info(
     for axis_name, count in zip(lane_axes, cluster_counts):
         phase_axis = None
         for ax in axes_by_name.values():
-            if (ax.kind == ParallelKind.CLUSTER
-                    and ax.original_axis_name == axis_name):
+            if ax.kind == ParallelKind.CLUSTER and ax.original_axis_name == axis_name:
                 phase_axis = ax
                 break
         if phase_axis is None:
@@ -847,9 +854,7 @@ def _populate_lane_axis_info(
                 f"{phase_axis.axis_name!r} references unknown number "
                 f"axis {phase_axis.parent_grid_axis_name!r}"
             )
-        if (phase_axis.axis_var is None
-                or phase_axis.original_axis_var is None
-                or number_axis.axis_var is None):
+        if phase_axis.axis_var is None or phase_axis.original_axis_var is None or number_axis.axis_var is None:
             raise ToPlenaError(
                 f"lane axis {axis_name!r}: identity (axis_var) fields "
                 f"missing on CLUSTER {phase_axis.axis_name!r} or "
@@ -912,9 +917,7 @@ def _render_idx_as_primexpr(idx):
             return _tir.floordiv(rendered[0], rendered[1])
         if op == "fmod":
             return _tir.floormod(rendered[0], rendered[1])
-        raise ToPlenaError(
-            f"unhandled compound index op {op!r} in _render_idx_as_primexpr"
-        )
+        raise ToPlenaError(f"unhandled compound index op {op!r} in _render_idx_as_primexpr")
     return idx
 
 
@@ -995,9 +998,7 @@ def _dma_kind_from_scopes(src_scope: str, dst_scope: str) -> str:
         return "dma_h2m"
     if src_scope == _scope.VRAM and dst_scope == _scope.HBM:
         return "dma_v2h"
-    raise ToPlenaError(
-        f"unsupported DMA src→dst: {src_scope}→{dst_scope}"
-    )
+    raise ToPlenaError(f"unsupported DMA src→dst: {src_scope}→{dst_scope}")
 
 
 def _dma_kind_slice_variant(base: str) -> str:
@@ -1006,18 +1007,22 @@ def _dma_kind_slice_variant(base: str) -> str:
     return f"{base}_slice"
 
 
-def _lower_multi_lane_dma(op: Dma, lane_count: int,
-                          buf_name_to_hlir: dict[str, _hlir.Buffer],
-                          cluster_axis_name: str | None = None,
-                          cluster_axis_var: VarRef | None = None,
-                          ) -> _hlir.Op:
+def _lower_multi_lane_dma(
+    op: Dma,
+    lane_count: int,
+    buf_name_to_hlir: dict[str, _hlir.Buffer],
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
+) -> _hlir.Op:
     src_scope = buf_name_to_hlir[op.src.buffer.name].scope
     dst_scope = buf_name_to_hlir[op.dst.buffer.name].scope
     # VRAM → VRAM "copy" isn't a HW DMA — emit ``copy_v_to_v``
     # (V_ADD_VF dst, src, f0=0) instead.
     if src_scope == _scope.VRAM and dst_scope == _scope.VRAM:
         return _lower_vram_to_vram_copy(
-            op, buf_name_to_hlir, cluster_axis_name=cluster_axis_name,
+            op,
+            buf_name_to_hlir,
+            cluster_axis_name=cluster_axis_name,
             cluster_axis_var=cluster_axis_var,
         )
     # VRAM ↔ FPRAM: not a DMA either — single S_MAP_FP_V / S_MAP_V_FP
@@ -1025,19 +1030,24 @@ def _lower_multi_lane_dma(op: Dma, lane_count: int,
     # rely on us to route them to the right HW path.
     if src_scope == _scope.VRAM and dst_scope == _scope.FPRAM:
         return _lower_v_fp_transfer(
-            op, "v_to_fp", buf_name_to_hlir, cluster_axis_name,
+            op,
+            "v_to_fp",
+            buf_name_to_hlir,
+            cluster_axis_name,
             cluster_axis_var=cluster_axis_var,
         )
     if src_scope == _scope.FPRAM and dst_scope == _scope.VRAM:
         return _lower_v_fp_transfer(
-            op, "fp_to_v", buf_name_to_hlir, cluster_axis_name,
+            op,
+            "fp_to_v",
+            buf_name_to_hlir,
+            cluster_axis_name,
             cluster_axis_var=cluster_axis_var,
         )
     base = _dma_kind_from_scopes(src_scope, dst_scope)
     src_arg = _make_buffer_arg(op.src)
     dst_arg = _make_buffer_arg(op.dst)
-    has_slice = isinstance(src_arg, _hlir.BufferSlice) \
-        or isinstance(dst_arg, _hlir.BufferSlice)
+    has_slice = isinstance(src_arg, _hlir.BufferSlice) or isinstance(dst_arg, _hlir.BufferSlice)
     kind = _dma_kind_slice_variant(base) if has_slice else base
     return _hlir.Op(
         kind=kind,
@@ -1047,8 +1057,7 @@ def _lower_multi_lane_dma(op: Dma, lane_count: int,
     )
 
 
-def _ref_flat_offset(ref: BufferRef,
-                     phase_var_zero: VarRef | None = None) -> _tir.PrimExpr:
+def _ref_flat_offset(ref: BufferRef, phase_var_zero: VarRef | None = None) -> _tir.PrimExpr:
     """Compute ``ref``'s starting element offset in row-major flat layout.
 
     Iterates buffer.shape backwards accumulating stride; concrete indices
@@ -1064,37 +1073,47 @@ def _ref_flat_offset(ref: BufferRef,
     for dim, idx in zip(reversed(ref.buffer.shape), reversed(ref.indices)):
         if isinstance(idx, Slice):
             pass  # whole-axis access — start is 0
-        elif (phase_var_zero is not None
-                and isinstance(idx, VarRef) and idx == phase_var_zero):
+        elif phase_var_zero is not None and isinstance(idx, VarRef) and idx == phase_var_zero:
             pass  # cluster phase axis under sync wrap — contributes 0
         elif isinstance(idx, dict) and idx.get("op") == "ranged_slice":
             start_expr = _render_idx_as_primexpr(idx["args"][0])
-            scaled = start_expr if stride == 1 else _tir.Mul(
-                start_expr, _tir.IntImm(_INT32, int(stride)),
+            scaled = (
+                start_expr
+                if stride == 1
+                else _tir.Mul(
+                    start_expr,
+                    _tir.IntImm(_INT32, int(stride)),
+                )
             )
-            offset = scaled if (
-                isinstance(offset, _tir.IntImm) and int(offset.value) == 0
-            ) else _tir.Add(offset, scaled)
+            offset = (
+                scaled if (isinstance(offset, _tir.IntImm) and int(offset.value) == 0) else _tir.Add(offset, scaled)
+            )
         else:
             term = _render_idx_as_primexpr(idx)
             if isinstance(term, _tir.IntImm) and int(term.value) == 0:
                 pass
             else:
-                scaled = term if stride == 1 else _tir.Mul(
-                    term, _tir.IntImm(_INT32, int(stride)),
+                scaled = (
+                    term
+                    if stride == 1
+                    else _tir.Mul(
+                        term,
+                        _tir.IntImm(_INT32, int(stride)),
+                    )
                 )
-                offset = scaled if (
-                    isinstance(offset, _tir.IntImm) and int(offset.value) == 0
-                ) else _tir.Add(offset, scaled)
+                offset = (
+                    scaled if (isinstance(offset, _tir.IntImm) and int(offset.value) == 0) else _tir.Add(offset, scaled)
+                )
         stride *= int(dim)
     return offset
 
 
-def _lower_vram_to_vram_copy(op: Dma,
-                             buf_name_to_hlir: dict[str, _hlir.Buffer],
-                             cluster_axis_name: str | None = None,
-                             cluster_axis_var: VarRef | None = None,
-                             ) -> _hlir.Op:
+def _lower_vram_to_vram_copy(
+    op: Dma,
+    buf_name_to_hlir: dict[str, _hlir.Buffer],
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
+) -> _hlir.Op:
     """``T.copy(vram_src, vram_dst)`` → region-schema ``copy_v_to_v``.
 
     Emits one VramRegion per side, at each buffer's PRE-expansion
@@ -1112,6 +1131,7 @@ def _lower_vram_to_vram_copy(op: Dma,
     the logical region is the same on both sides (it's a sync-wrap
     multi-lane copy).
     """
+
     def _ref_region(ref: BufferRef) -> _hlir.VramRegion:
         starts: list[Any] = []
         extents: list[int] = []
@@ -1119,8 +1139,7 @@ def _lower_vram_to_vram_copy(op: Dma,
             if isinstance(idx, Slice):
                 starts.append(_tir.IntImm(_INT32, 0))
                 extents.append(int(dim))
-            elif (cluster_axis_var is not None
-                    and isinstance(idx, VarRef) and idx == cluster_axis_var):
+            elif cluster_axis_var is not None and isinstance(idx, VarRef) and idx == cluster_axis_var:
                 starts.append(_tir.IntImm(_INT32, 0))
                 extents.append(int(dim))
             elif isinstance(idx, dict) and idx.get("op") == "ranged_slice":
@@ -1133,7 +1152,8 @@ def _lower_vram_to_vram_copy(op: Dma,
                 extents.append(1)
         return _hlir.VramRegion(
             parent=ref.buffer.name,
-            starts=tuple(starts), extents=tuple(extents),
+            starts=tuple(starts),
+            extents=tuple(extents),
         )
 
     src_region = _ref_region(op.src)
@@ -1158,7 +1178,8 @@ def _is_zero_imm(expr) -> bool:
 
 
 def _ref_per_dim_starts(
-    ref: BufferRef, phase_var_zero: VarRef | None = None,
+    ref: BufferRef,
+    phase_var_zero: VarRef | None = None,
 ) -> tuple[Any, ...]:
     """Per-dim start indices for a BufferRef, mirroring ``_ref_extents``.
 
@@ -1172,8 +1193,7 @@ def _ref_per_dim_starts(
     for idx in ref.indices:
         if isinstance(idx, Slice):
             out.append(0)
-        elif (phase_var_zero is not None
-                and isinstance(idx, VarRef) and idx == phase_var_zero):
+        elif phase_var_zero is not None and isinstance(idx, VarRef) and idx == phase_var_zero:
             out.append(0)
         elif isinstance(idx, dict) and idx.get("op") == "ranged_slice":
             out.append(_render_idx_as_primexpr(idx["args"][0]))
@@ -1184,7 +1204,7 @@ def _ref_per_dim_starts(
 
 def _lower_v_fp_transfer(
     op: Dma,
-    direction: str,                          # "v_to_fp" or "fp_to_v"
+    direction: str,  # "v_to_fp" or "fp_to_v"
     buf_name_to_hlir: dict[str, _hlir.Buffer],
     cluster_axis_name: str | None = None,
     cluster_axis_var: VarRef | None = None,
@@ -1232,7 +1252,8 @@ def _lower_v_fp_transfer(
 
 
 def _zero_cluster_axis_in_fp_indices(
-    ref: BufferRef, cluster_axis_name: str | None,
+    ref: BufferRef,
+    cluster_axis_name: str | None,
 ) -> tuple:
     """Render ``ref.indices`` to PrimExprs, replacing the cluster-phase
     axis with 0 when the enclosing MultiLaneOp covers all lanes in one
@@ -1241,9 +1262,7 @@ def _zero_cluster_axis_in_fp_indices(
     """
     indices = list(ref.indices)
     cluster_dim = getattr(ref.buffer, "cluster_dim", None)
-    if (cluster_axis_name is not None
-            and cluster_dim is not None
-            and 0 <= cluster_dim < len(indices)):
+    if cluster_axis_name is not None and cluster_dim is not None and 0 <= cluster_dim < len(indices):
         indices[cluster_dim] = 0
     return tuple(_render_idx_as_primexpr(i) for i in indices)
 
@@ -1263,9 +1282,11 @@ def _ref_touch_count(ref: BufferRef) -> int:
     return count
 
 
-def _lower_multi_lane_btmm(op: Gemm, lane_count: int,
-                           buf_name_to_hlir: dict[str, _hlir.Buffer] | None = None,
-                           ) -> _hlir.Op:
+def _lower_multi_lane_btmm(
+    op: Gemm,
+    lane_count: int,
+    buf_name_to_hlir: dict[str, _hlir.Buffer] | None = None,
+) -> _hlir.Op:
     """MultiLaneOp(Gemm) → region-schema btmm / btmv op.
 
     Like the bare per-head gemm path, but the cluster axis is folded
@@ -1276,10 +1297,7 @@ def _lower_multi_lane_btmm(op: Gemm, lane_count: int,
     rows = _logical_rows_from_buf(op.a)
     kind = "btmv" if rows == 1 else "btmm"
     if buf_name_to_hlir is None:
-        raise ToPlenaError(
-            f"multi-lane Gemm[{kind}]: buf_name_to_hlir is required for "
-            f"region-schema lowering"
-        )
+        raise ToPlenaError(f"multi-lane Gemm[{kind}]: buf_name_to_hlir is required for region-schema lowering")
     a_buf = buf_name_to_hlir[op.a.buffer.name]
     b_buf = buf_name_to_hlir[op.b.buffer.name]
     c_buf = buf_name_to_hlir[op.c.buffer.name]
@@ -1302,8 +1320,7 @@ def _lower_multi_lane_btmm(op: Gemm, lane_count: int,
     )
 
 
-def _find_role(axes: list[AxisInfo], role: AxisRole
-                ) -> tuple[int | None, AxisInfo | None]:
+def _find_role(axes: list[AxisInfo], role: AxisRole) -> tuple[int | None, AxisInfo | None]:
     """Return ``(dim_index, AxisInfo)`` of the first entry tagged
     ``role``, or ``(None, None)`` if not found."""
     for i, a in enumerate(axes):
@@ -1333,9 +1350,7 @@ def _axes_to_hlir_tuple(
     follow the same convention as ``_pad_tuple_at`` — ascending
     indices in OUTPUT coords.
     """
-    out: list[tuple[str, int]] = [
-        (a.role.value, int(a.extent)) for a in axes
-    ]
+    out: list[tuple[str, int]] = [(a.role.value, int(a.extent)) for a in axes]
     for pos in inserts:
         out.insert(pos, ("batch", 1))
     return tuple(out)
@@ -1360,15 +1375,13 @@ def _split_axes_by_role(axes: list[AxisInfo]):
         elif a.role in (AxisRole.SIMD, AxisRole.CLUSTER):
             inner *= int(a.extent)
         else:
-            raise ToPlenaError(
-                f"_split_axes_by_role: unsupported role {a.role!r} in axes "
-                f"{axes!r}"
-            )
+            raise ToPlenaError(f"_split_axes_by_role: unsupported role {a.role!r} in axes {axes!r}")
     return batch_extents, inner
 
 
 def _lower_multi_lane_elementwise(
-    op: Elementwise, lane_count: int,
+    op: Elementwise,
+    lane_count: int,
     buf_name_to_hlir: dict[str, _hlir.Buffer] | None = None,
     cluster_axis_name: str | None = None,
     cluster_axis_var: VarRef | None = None,
@@ -1385,22 +1398,22 @@ def _lower_multi_lane_elementwise(
     Falls back to the FPRAM and per-row unary paths when the dst scope
     or axes shape demand them.
     """
-    if (buf_name_to_hlir is not None
-            and buf_name_to_hlir[op.dst.buffer.name].scope == _scope.FPRAM):
+    if buf_name_to_hlir is not None and buf_name_to_hlir[op.dst.buffer.name].scope == _scope.FPRAM:
         return _lower_bare_fp_scalar_elementwise(
-            op, lane_count, cluster_axis_name,
+            op,
+            lane_count,
+            cluster_axis_name,
             cluster_axis_var=cluster_axis_var,
         )
     # COPY has a multi-lane ``copy_v_to_v`` intrin (handled below) and
     # no per-row variant — keep it on the v_copy path even when the
     # dst's row footprint is 1 (an artifact of fold absorbing
     # T.Parallel rather than a request for a row_<op> emission).
-    if (op.op in _UNARY_TO_INTRIN
-            and op.op != UnaryOp.COPY
-            and len(op.srcs) == 1
-            and _row_footprint(op.dst) == 1):
+    if op.op in _UNARY_TO_INTRIN and op.op != UnaryOp.COPY and len(op.srcs) == 1 and _row_footprint(op.dst) == 1:
         return _lower_per_row_unary(
-            op, cluster_axis_name, cluster_axis_var=cluster_axis_var,
+            op,
+            cluster_axis_name,
+            cluster_axis_var=cluster_axis_var,
         )
     if op.op in _BINOP_TO_INTRIN:
         kind = _BINOP_TO_INTRIN[op.op]
@@ -1414,8 +1427,7 @@ def _lower_multi_lane_elementwise(
     for s in op.srcs:
         if isinstance(s, Broadcast):
             raise ToPlenaError(
-                "MultiLaneOp Elementwise with Broadcast src — pass_2_mark "
-                "should have set can_async=False"
+                "MultiLaneOp Elementwise with Broadcast src — pass_2_mark should have set can_async=False"
             )
         buffer_args.append(s.buffer.name)
     buffer_args.append(op.dst.buffer.name)
@@ -1452,14 +1464,11 @@ def _lower_multi_lane_elementwise(
     #   * other batch axis ext > 1   -> fresh row var, outer for-op,
     #         region.start=var, region.extent=1
     # Slot 3 (SIMD/D) is always start=0, extent=D_full.
-    if kind in ("v_add", "v_sub", "v_mul",
-                "v_exp", "v_reci", "v_sqrt",
-                "v_zero", "copy_v_to_v"):
+    if kind in ("v_add", "v_sub", "v_mul", "v_exp", "v_reci", "v_sqrt", "v_zero", "copy_v_to_v"):
         dst_hlir_axes = _axes_of(op.dst.buffer.name)
         if dst_hlir_axes is None or len(dst_hlir_axes) != 4:
             raise ToPlenaError(
-                f"v_* lowering: dst {op.dst.buffer.name!r} has no 4D "
-                f"hlir axes table; got {dst_hlir_axes!r}"
+                f"v_* lowering: dst {op.dst.buffer.name!r} has no 4D hlir axes table; got {dst_hlir_axes!r}"
             )
         starts: list[Any] = []
         extents: list[int] = []
@@ -1481,7 +1490,9 @@ def _lower_multi_lane_elementwise(
 
         region_args = [
             _hlir.VramRegion(
-                parent=name, starts=tuple(starts), extents=tuple(extents),
+                parent=name,
+                starts=tuple(starts),
+                extents=tuple(extents),
             )
             for name in buffer_args
         ]
@@ -1545,21 +1556,18 @@ def _lower_per_row_unary(
     rendered by the walker.
     """
     if op.op not in _UNARY_TO_ROW_INTRIN:
-        raise ToPlenaError(
-            f"per-row unary op {op.op!r} has no row_<op> intrinsic"
-        )
+        raise ToPlenaError(f"per-row unary op {op.op!r} has no row_<op> intrinsic")
     intrin = _UNARY_TO_ROW_INTRIN[op.op]
     (src,) = op.srcs
     if isinstance(src, Broadcast):
-        raise ToPlenaError(
-            "per-row unary expects a direct BufferRef src, got Broadcast"
-        )
+        raise ToPlenaError("per-row unary expects a direct BufferRef src, got Broadcast")
     # Pick row_var from the dst's BATCH axis index (mid_ir source of
     # truth via op.dst_axes). The kernel-written ``for row`` /
     # ``for oh`` / ... wraps this op; the dst index at that axis is
     # exactly the bound loop var we need.
     row_axis = _row_axis_index_from_axes(
-        op.dst_axes, ctx=f"per-row unary {intrin} dst",
+        op.dst_axes,
+        ctx=f"per-row unary {intrin} dst",
     )
     row_var = _render_idx_as_primexpr(op.dst.indices[row_axis])
     if cluster_axis_name is not None:
@@ -1569,11 +1577,15 @@ def _lower_per_row_unary(
     else:
         lane_var = _fresh_var("lane")
     src_region = _build_row_at_region(
-        src.buffer.name, row_var=row_var, lane_var=lane_var,
+        src.buffer.name,
+        row_var=row_var,
+        lane_var=lane_var,
         ctx=f"per-row unary {intrin} src",
     )
     dst_region = _build_row_at_region(
-        op.dst.buffer.name, row_var=row_var, lane_var=lane_var,
+        op.dst.buffer.name,
+        row_var=row_var,
+        lane_var=lane_var,
         ctx=f"per-row unary {intrin} dst",
     )
     return _hlir.Op(
@@ -1584,9 +1596,7 @@ def _lower_per_row_unary(
     )
 
 
-def _lower_multi_lane(mlo: MultiLaneOp,
-                      buf_name_to_hlir: dict[str, _hlir.Buffer],
-                      lane_count: int) -> _hlir.Op:
+def _lower_multi_lane(mlo: MultiLaneOp, buf_name_to_hlir: dict[str, _hlir.Buffer], lane_count: int) -> _hlir.Op:
     """Single MultiLaneOp → single HLIR Op with lane_count scalar.
 
     ``lane_count`` is the enclosing cluster's extent (e.g. 4 for a
@@ -1600,7 +1610,9 @@ def _lower_multi_lane(mlo: MultiLaneOp,
     inner = mlo.inner
     if isinstance(inner, Dma):
         return _lower_multi_lane_dma(
-            inner, lane_count, buf_name_to_hlir,
+            inner,
+            lane_count,
+            buf_name_to_hlir,
             cluster_axis_name=axis_name,
             cluster_axis_var=axis_var,
         )
@@ -1608,16 +1620,16 @@ def _lower_multi_lane(mlo: MultiLaneOp,
         return _lower_multi_lane_btmm(inner, lane_count, buf_name_to_hlir)
     if isinstance(inner, Elementwise):
         return _lower_multi_lane_elementwise(
-            inner, lane_count, buf_name_to_hlir, axis_name,
+            inner,
+            lane_count,
+            buf_name_to_hlir,
+            axis_name,
             cluster_axis_var=axis_var,
         )
-    raise ToPlenaError(
-        f"unsupported MultiLaneOp inner: {type(inner).__name__}"
-    )
+    raise ToPlenaError(f"unsupported MultiLaneOp inner: {type(inner).__name__}")
 
 
-def _lane_loop_var(cluster_axis_name: str | None,
-                   cluster_axis_var: VarRef | None = None) -> _tir.Var:
+def _lane_loop_var(cluster_axis_name: str | None, cluster_axis_var: VarRef | None = None) -> _tir.Var:
     """Pick a loop_var for the synthetic ``for lane`` that wraps a
     bare op inside a cluster. Prefer the cluster axis's VarRef (so the
     loop_var identity matches the in-buffer phase var); fall back to
@@ -1679,13 +1691,10 @@ def _axes_to_dim_roles(axes: list[AxisInfo]) -> tuple[str, ...]:
     up extents; other axes contribute via region.starts/extents in
     the usual way (lane idx, batch fan-out).
     """
-    return tuple(
-        _GEMM_ROLE_TO_LABEL.get(a.role, "_") for a in axes
-    )
+    return tuple(_GEMM_ROLE_TO_LABEL.get(a.role, "_") for a in axes)
 
 
-def _align_dim_roles_to_4d(buf_name: str,
-                           mid_axes: list[AxisInfo]) -> tuple[str, ...]:
+def _align_dim_roles_to_4d(buf_name: str, mid_axes: list[AxisInfo]) -> tuple[str, ...]:
     """Align a mid_ir per-axis roles table onto the HLIR buffer's
     post-expansion 4D shape, returning a 4-tuple of dim-role labels
     ("M"/"K"/"N"/"_") suitable for the gemm Region+roles schema.
@@ -1746,8 +1755,7 @@ def _align_dim_roles_to_4d(buf_name: str,
         non_lane_sources = [i for i in range(3) if i != old_cluster_dim]
         if len(non_lane_sources) != 2:
             raise ToPlenaError(
-                f"_align_dim_roles_to_4d: unexpected non-lane source count "
-                f"{len(non_lane_sources)} for {buf_name!r}"
+                f"_align_dim_roles_to_4d: unexpected non-lane source count {len(non_lane_sources)} for {buf_name!r}"
             )
         s_src, d_src = non_lane_sources
         out = ["_"] * 4
@@ -1760,8 +1768,7 @@ def _align_dim_roles_to_4d(buf_name: str,
     deficit = 4 - len(base)
     if deficit < 0:
         raise ToPlenaError(
-            f"_align_dim_roles_to_4d: {buf_name!r} mid axes rank "
-            f"{len(base)} > 4 with no pad/cluster record"
+            f"_align_dim_roles_to_4d: {buf_name!r} mid axes rank {len(base)} > 4 with no pad/cluster record"
         )
     return tuple(["_"] * deficit) + base
 
@@ -1806,16 +1813,17 @@ def _gemm_full_region(
     starts: list[Any] = []
     extents: list[int] = []
     for i, dim_extent in enumerate(shape):
-        if (cluster_dim is not None
-                and i == cluster_dim
-                and lane_axis_name is not None):
+        if cluster_dim is not None and i == cluster_dim and lane_axis_name is not None:
             starts.append(_make_loop_var(lane_axis_name))
             extents.append(1)
         else:
             starts.append(_tir.IntImm(_INT32, 0))
             extents.append(int(dim_extent))
     return _make_onchip_region(
-        ref.buffer.name, buf, tuple(starts), tuple(extents),
+        ref.buffer.name,
+        buf,
+        tuple(starts),
+        tuple(extents),
     )
 
 
@@ -1873,9 +1881,7 @@ def _lower_bare_per_head_gemm(
     else:
         use_mv = _logical_rows_from_buf(op.a) == 1
 
-    inside_cluster = (
-        cluster_extent is not None and cluster_axis_name is not None
-    )
+    inside_cluster = cluster_extent is not None and cluster_axis_name is not None
     lane_axis_name = cluster_axis_name if inside_cluster else None
 
     a_region = _gemm_full_region(op.a, a_buf, lane_axis_name=lane_axis_name)
@@ -1887,9 +1893,12 @@ def _lower_bare_per_head_gemm(
 
     annotations: dict[str, Any] = {
         "source": (
-            "per-head Gemm(rows=1) inside cluster" if (use_mv and inside_cluster)
-            else "per-head Gemm(rows=1)"            if use_mv
-            else "per-head Gemm(overwrite) inside cluster" if inside_cluster
+            "per-head Gemm(rows=1) inside cluster"
+            if (use_mv and inside_cluster)
+            else "per-head Gemm(rows=1)"
+            if use_mv
+            else "per-head Gemm(overwrite) inside cluster"
+            if inside_cluster
             else "per-head Gemm(overwrite)"
         ),
     }
@@ -1919,9 +1928,7 @@ def _row_axis_index_of_buf(name: str, shape, cluster_dim: int | None) -> int:
     cluster_dim heuristic doesn't."""
     shape = [int(d) for d in shape]
     if len(shape) < 2:
-        raise ToPlenaError(
-            f"buffer {name!r} rank {len(shape)} has no row axis"
-        )
+        raise ToPlenaError(f"buffer {name!r} rank {len(shape)} has no row axis")
     inner = len(shape) - 1
     for axis in range(len(shape)):
         if axis == inner:
@@ -1930,8 +1937,7 @@ def _row_axis_index_of_buf(name: str, shape, cluster_dim: int | None) -> int:
             continue
         return axis
     raise ToPlenaError(
-        f"buffer {name!r} shape={shape} cluster_dim={cluster_dim}: "
-        "no row axis available (only inner + cluster?)"
+        f"buffer {name!r} shape={shape} cluster_dim={cluster_dim}: no row axis available (only inner + cluster?)"
     )
 
 
@@ -1939,7 +1945,9 @@ def _row_axis_index(ref: BufferRef) -> int:
     """Row axis index for a mid_ir BufferRef. Delegates to the
     buffer-only form below."""
     return _row_axis_index_of_buf(
-        ref.buffer.name, ref.buffer.shape, ref.buffer.cluster_dim,
+        ref.buffer.name,
+        ref.buffer.shape,
+        ref.buffer.cluster_dim,
     )
 
 
@@ -1965,10 +1973,7 @@ def _row_axis_index_from_axes(
             rows_extent = int(a.extent)
             rows_axis = i
     if rows_axis < 0:
-        raise ToPlenaError(
-            f"{ctx}: no BATCH axis in axes {axes!r}; cannot locate "
-            f"rows dimension"
-        )
+        raise ToPlenaError(f"{ctx}: no BATCH axis in axes {axes!r}; cannot locate rows dimension")
     return rows_axis
 
 
@@ -2082,9 +2087,7 @@ def _build_row_at_region(
     """
     axes = _axes_of(buf_name)
     if axes is None or len(axes) != 4:
-        raise ToPlenaError(
-            f"{ctx}: buffer {buf_name!r} has no 4D hlir axes; got {axes!r}"
-        )
+        raise ToPlenaError(f"{ctx}: buffer {buf_name!r} has no 4D hlir axes; got {axes!r}")
     starts: list[Any] = []
     extents: list[int] = []
     rows_slot: int | None = None
@@ -2115,11 +2118,12 @@ def _build_row_at_region(
     )
 
 
-def _lower_bare_reduce(op: Reduce,
-                       cluster_extent: int | None,
-                       cluster_axis_name: str | None = None,
-                       cluster_axis_var: VarRef | None = None,
-                       ) -> _hlir.Op:
+def _lower_bare_reduce(
+    op: Reduce,
+    cluster_extent: int | None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
+) -> _hlir.Op:
     """Bare reduce → single-row ``row_reduce_*_at`` leaf op,
     optionally wrapped in a synthesised ``for row``.
 
@@ -2155,15 +2159,18 @@ def _lower_bare_reduce(op: Reduce,
         # already bound the index; we just thread its VarRef /
         # IntImm through the rendered tree.
         row_axis = _row_axis_index_from_axes(
-            op.src_axes, ctx=f"reduce[{op.op.value}] src",
+            op.src_axes,
+            ctx=f"reduce[{op.op.value}] src",
         )
         row_var = _render_idx_as_primexpr(op.src.indices[row_axis])
         wrap_rows = None
     fp_addr = _hlir.BufferElement(
         buffer=op.dst.buffer.name,
         indices=_render_ref_with_role_axes(
-            op.dst, op.dst_axes,
-            row_var=row_var, lane_var=lane_var,
+            op.dst,
+            op.dst_axes,
+            row_var=row_var,
+            lane_var=lane_var,
             ctx=f"reduce[{op.op.value}] dst",
         ),
     )
@@ -2171,7 +2178,9 @@ def _lower_bare_reduce(op: Reduce,
     # the lane var, the largest non-cluster batch slot gets the row
     # var, everything else is 0). One mlen-row covers all of D.
     src_region = _build_row_at_region(
-        op.src.buffer.name, row_var=row_var, lane_var=lane_var,
+        op.src.buffer.name,
+        row_var=row_var,
+        lane_var=lane_var,
         ctx="reduce src",
     )
     leaf = _hlir.Op(
@@ -2206,9 +2215,7 @@ def _lower_bare_broadcast_elementwise(
         will render it; we just emit the leaf.
     """
     if op.op not in _ROW_FP_BINOP_TO_INTRIN:
-        raise ToPlenaError(
-            f"unsupported broadcast Elementwise op {op.op!r}"
-        )
+        raise ToPlenaError(f"unsupported broadcast Elementwise op {op.op!r}")
     intrin = _ROW_FP_BINOP_TO_INTRIN[op.op]
     bcast_src = None
     bcast_axes = None
@@ -2220,9 +2227,7 @@ def _lower_bare_broadcast_elementwise(
         else:
             direct_src = s
     if bcast_src is None or direct_src is None:
-        raise ToPlenaError(
-            "broadcast Elementwise expected one BufferRef + one Broadcast src"
-        )
+        raise ToPlenaError("broadcast Elementwise expected one BufferRef + one Broadcast src")
     row_footprint = _row_footprint(op.dst)
     if row_footprint > 1:
         row_var = _fresh_var("row")
@@ -2234,7 +2239,8 @@ def _lower_bare_broadcast_elementwise(
         # — int IntImm or VarRef rendered with name-cached identity
         # so symbol_table lookups match.
         row_axis = _row_axis_index_from_axes(
-            op.dst_axes, ctx=f"row_*_fp[{op.op.value}] dst",
+            op.dst_axes,
+            ctx=f"row_*_fp[{op.op.value}] dst",
         )
         row_var = _render_idx_as_primexpr(op.dst.indices[row_axis])
         wrap_rows = None
@@ -2254,17 +2260,23 @@ def _lower_bare_broadcast_elementwise(
     fp_addr = _hlir.BufferElement(
         buffer=bcast_src.src.buffer.name,
         indices=_render_ref_with_role_axes(
-            bcast_src.src, bcast_axes,
-            row_var=row_var, lane_var=lane_var,
+            bcast_src.src,
+            bcast_axes,
+            row_var=row_var,
+            lane_var=lane_var,
             ctx=f"row_*_fp[{op.op.value}] bcast src",
         ),
     )
     src_region = _build_row_at_region(
-        direct_src.buffer.name, row_var=row_var, lane_var=lane_var,
+        direct_src.buffer.name,
+        row_var=row_var,
+        lane_var=lane_var,
         ctx="row_*_fp src",
     )
     dst_region = _build_row_at_region(
-        op.dst.buffer.name, row_var=row_var, lane_var=lane_var,
+        op.dst.buffer.name,
+        row_var=row_var,
+        lane_var=lane_var,
         ctx="row_*_fp dst",
     )
     leaf = _hlir.Op(
@@ -2321,9 +2333,7 @@ def _lower_bare_fp_scalar_elementwise(
         if op.op == UnaryOp.COPY and not op.srcs:
             intrin = "fp_zero_at"
     else:
-        raise ToPlenaError(
-            f"unsupported FPRAM Elementwise op {op.op!r}"
-        )
+        raise ToPlenaError(f"unsupported FPRAM Elementwise op {op.op!r}")
     # _emit_fp_scalar_op_at signature: for unary/copy, scalar_args =
     # (src_addr, dst_addr); for binary, (lhs_addr, rhs_addr, dst_addr).
     src_elements = [_fp_buffer_element_from_ref(s) for s in op.srcs]
@@ -2343,9 +2353,9 @@ def _lower_bare_fp_scalar_elementwise(
         # rank 1 — (row_var,). Skip the cluster axis (if present) and the
         # remaining single VarRef is the SIMD axis.
         candidates = [
-            i for i in op.dst.indices
-            if isinstance(i, VarRef)
-            and (cluster_axis_name is None or i.name != cluster_axis_name)
+            i
+            for i in op.dst.indices
+            if isinstance(i, VarRef) and (cluster_axis_name is None or i.name != cluster_axis_name)
         ]
         if len(candidates) != 1:
             raise ToPlenaError(
@@ -2365,25 +2375,38 @@ def _lower_bare_fp_scalar_elementwise(
 # ---------------------------------------------------------------------------
 
 
-_MULTI_LANE_OP_KINDS = frozenset({
-    "dma_h2v", "dma_h2m", "dma_v2h",
-    "dma_h2v_slice", "dma_h2m_slice", "dma_v2h_slice",
-    "btmm", "btmv",
-    "v_add", "v_sub", "v_mul", "v_exp", "v_reci",
-    "v_sqrt", "v_zero",
-    # vram→vram copy: one V_ADD_VF (f0=0) spans a full MLEN-wide row;
-    # under sync wrap the by_phase index is already folded to 0, so the
-    # op covers all cluster lanes in one issue — don't re-wrap in a
-    # synthetic for-lane loop.
-    "copy_v_to_v",
-    # vram↔fpram transfer: the ``v_fp_transfer_slice_*`` ops carry
-    # the whole logical region; isa_emit splits it into per-MLEN
-    # S_MAP_FP_V / S_MAP_V_FP issues. Each issue natively spans all
-    # cluster lanes (sync wrap zeroes the cluster phase axis on both
-    # sides), so the op is multi-lane in hardware and must not be
-    # re-wrapped in a synthetic for-lane loop.
-    "v_fp_transfer_slice_v_to_fp", "v_fp_transfer_slice_fp_to_v",
-})
+_MULTI_LANE_OP_KINDS = frozenset(
+    {
+        "dma_h2v",
+        "dma_h2m",
+        "dma_v2h",
+        "dma_h2v_slice",
+        "dma_h2m_slice",
+        "dma_v2h_slice",
+        "btmm",
+        "btmv",
+        "v_add",
+        "v_sub",
+        "v_mul",
+        "v_exp",
+        "v_reci",
+        "v_sqrt",
+        "v_zero",
+        # vram→vram copy: one V_ADD_VF (f0=0) spans a full MLEN-wide row;
+        # under sync wrap the by_phase index is already folded to 0, so the
+        # op covers all cluster lanes in one issue — don't re-wrap in a
+        # synthetic for-lane loop.
+        "copy_v_to_v",
+        # vram↔fpram transfer: the ``v_fp_transfer_slice_*`` ops carry
+        # the whole logical region; isa_emit splits it into per-MLEN
+        # S_MAP_FP_V / S_MAP_V_FP issues. Each issue natively spans all
+        # cluster lanes (sync wrap zeroes the cluster phase axis on both
+        # sides), so the op is multi-lane in hardware and must not be
+        # re-wrapped in a synthetic for-lane loop.
+        "v_fp_transfer_slice_v_to_fp",
+        "v_fp_transfer_slice_fp_to_v",
+    }
+)
 
 
 def _op_fires_once_across_lanes(op: _hlir.Op) -> bool:
@@ -2416,43 +2439,52 @@ def _wrap_per_lane_ops_with_for_lane(
             # Recurse: inner body may contain per-lane ops that need
             # their own per-op for-lane wrapper.
             inner = _wrap_per_lane_ops_with_for_lane(
-                op.body or [], lane_var, lane_extent,
+                op.body or [],
+                lane_var,
+                lane_extent,
             )
-            out.append(_hlir.Op(
-                kind="for",
-                buffer_args=list(op.buffer_args),
-                scalar_args=list(op.scalar_args),
-                annotations=dict(op.annotations),
-                body=inner,
-            ))
+            out.append(
+                _hlir.Op(
+                    kind="for",
+                    buffer_args=list(op.buffer_args),
+                    scalar_args=list(op.scalar_args),
+                    annotations=dict(op.annotations),
+                    body=inner,
+                )
+            )
         elif _op_fires_once_across_lanes(op):
             out.append(op)
         else:
-            out.append(_hlir.make_for_op(
-                loop_var=lane_var, extent=lane_extent, body=[op],
-            ))
+            out.append(
+                _hlir.make_for_op(
+                    loop_var=lane_var,
+                    extent=lane_extent,
+                    body=[op],
+                )
+            )
     return out
 
 
-def _walk_stmts(stmts: list[Stmt],
-                buf_name_to_hlir: dict[str, _hlir.Buffer],
-                cluster_extent: int | None,
-                cluster_axis_name: str | None = None,
-                cluster_axis_var: VarRef | None = None,
-                ) -> list[_hlir.Op]:
+def _walk_stmts(
+    stmts: list[Stmt],
+    buf_name_to_hlir: dict[str, _hlir.Buffer],
+    cluster_extent: int | None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
+) -> list[_hlir.Op]:
     out: list[_hlir.Op] = []
     for s in stmts:
-        out.extend(_walk_stmt(s, buf_name_to_hlir, cluster_extent,
-                              cluster_axis_name, cluster_axis_var))
+        out.extend(_walk_stmt(s, buf_name_to_hlir, cluster_extent, cluster_axis_name, cluster_axis_var))
     return out
 
 
-def _walk_stmt(stmt: Stmt,
-               buf_name_to_hlir: dict[str, _hlir.Buffer],
-               cluster_extent: int | None,
-               cluster_axis_name: str | None = None,
-               cluster_axis_var: VarRef | None = None,
-               ) -> list[_hlir.Op]:
+def _walk_stmt(
+    stmt: Stmt,
+    buf_name_to_hlir: dict[str, _hlir.Buffer],
+    cluster_extent: int | None,
+    cluster_axis_name: str | None = None,
+    cluster_axis_var: VarRef | None = None,
+) -> list[_hlir.Op]:
     if isinstance(stmt, ParallelAxis):
         if stmt.kind == ParallelKind.CLUSTER:
             # CLUSTER: each per-lane op gets its own ``for lane in
@@ -2462,40 +2494,41 @@ def _walk_stmt(stmt: Stmt,
             # natively. We recurse into structural ``for`` nodes so
             # per-lane ops nested inside (e.g. inside a kernel
             # ``for row``) still get a per-op for-lane wrapper.
-            body = _walk_stmts(stmt.body, buf_name_to_hlir, stmt.extent,
-                               stmt.axis_name, stmt.axis_var)
+            body = _walk_stmts(stmt.body, buf_name_to_hlir, stmt.extent, stmt.axis_name, stmt.axis_var)
             lane_var = _axis_loop_var(stmt)
             return _wrap_per_lane_ops_with_for_lane(
-                body, lane_var, stmt.extent,
+                body,
+                lane_var,
+                stmt.extent,
             )
         # threadIdx.* axes are a GPU abstraction: PLENA HW has no
         # thread-level dispatch, every instruction is implicitly
         # broadcast across the SIMD width. Unwrap them so the body
         # runs once, not threads-many times.
-        if (stmt.thread_tag is not None
-                and stmt.thread_tag.startswith("threadIdx.")):
-            return _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent,
-                               cluster_axis_name, cluster_axis_var)
+        if stmt.thread_tag is not None and stmt.thread_tag.startswith("threadIdx."):
+            return _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent, cluster_axis_name, cluster_axis_var)
         # BLOCK_IDX or LOGICAL_GRID → flatten to a serial for.
-        body = _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent,
-                           cluster_axis_name, cluster_axis_var)
-        return [_hlir.make_for_op(
-            loop_var=_axis_loop_var(stmt),
-            extent=stmt.extent, body=body,
-        )]
+        body = _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent, cluster_axis_name, cluster_axis_var)
+        return [
+            _hlir.make_for_op(
+                loop_var=_axis_loop_var(stmt),
+                extent=stmt.extent,
+                body=body,
+            )
+        ]
     if isinstance(stmt, For):
-        body = _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent,
-                           cluster_axis_name, cluster_axis_var)
+        body = _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent, cluster_axis_name, cluster_axis_var)
         for_op = _hlir.make_for_op(
-            _for_loop_var(stmt), stmt.extent, body=body,
+            _for_loop_var(stmt),
+            stmt.extent,
+            body=body,
         )
         for_op.annotations["loop_kind"] = stmt.kind
         return [for_op]
     if isinstance(stmt, Async):
         # By pass_5 every Async should be MultiLaneOp; if it lingers,
         # walk through.
-        return _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent,
-                           cluster_axis_name, cluster_axis_var)
+        return _walk_stmts(stmt.body, buf_name_to_hlir, cluster_extent, cluster_axis_name, cluster_axis_var)
     if isinstance(stmt, MultiLaneOp):
         # The actual cluster extent comes from the enclosing CLUSTER
         # ParallelAxis (forwarded as ``cluster_extent``). Pass it down
@@ -2512,31 +2545,43 @@ def _walk_stmt(stmt: Stmt,
         if stmt.kind == "btmm":
             # Shouldn't be bare; treat as single-lane btmm.
             return [_lower_multi_lane_btmm(stmt, 1, buf_name_to_hlir)]
-        return [_lower_bare_per_head_gemm(
-            stmt, cluster_extent, cluster_axis_name,
-            cluster_axis_var=cluster_axis_var,
-            buf_name_to_hlir=buf_name_to_hlir, lane_modes=_LANE_MODES,
-        )]
+        return [
+            _lower_bare_per_head_gemm(
+                stmt,
+                cluster_extent,
+                cluster_axis_name,
+                cluster_axis_var=cluster_axis_var,
+                buf_name_to_hlir=buf_name_to_hlir,
+                lane_modes=_LANE_MODES,
+            )
+        ]
     if isinstance(stmt, Reduce):
-        return [_lower_bare_reduce(stmt, cluster_extent, cluster_axis_name,
-                                   cluster_axis_var=cluster_axis_var)]
+        return [_lower_bare_reduce(stmt, cluster_extent, cluster_axis_name, cluster_axis_var=cluster_axis_var)]
     if isinstance(stmt, Elementwise):
         has_broadcast = any(isinstance(s, Broadcast) for s in stmt.srcs)
         if has_broadcast:
-            return [_lower_bare_broadcast_elementwise(
-                stmt, cluster_extent, cluster_axis_name,
-                cluster_axis_var=cluster_axis_var,
-            )]
+            return [
+                _lower_bare_broadcast_elementwise(
+                    stmt,
+                    cluster_extent,
+                    cluster_axis_name,
+                    cluster_axis_var=cluster_axis_var,
+                )
+            ]
         dst_scope = buf_name_to_hlir[stmt.dst.buffer.name].scope
         if dst_scope == _scope.FPRAM:
             # Per-lane FPRAM scalar update (M_OLD[row] = M_INIT[row]
             # etc.). Lower to a ``for lane: fp_<op>_at`` loop — the
             # ``row`` loop is the enclosing mid_ir For (already a HLIR
             # for op by now).
-            return [_lower_bare_fp_scalar_elementwise(
-                stmt, cluster_extent, cluster_axis_name,
-                cluster_axis_var=cluster_axis_var,
-            )]
+            return [
+                _lower_bare_fp_scalar_elementwise(
+                    stmt,
+                    cluster_extent,
+                    cluster_axis_name,
+                    cluster_axis_var=cluster_axis_var,
+                )
+            ]
         # Pure elementwise that wasn't wrapped (shouldn't happen if
         # pass_4 ran). Treat as single-lane multi_lane.
         return [_lower_multi_lane_elementwise(stmt, cluster_extent or 1, buf_name_to_hlir)]
@@ -2554,9 +2599,7 @@ def _walk_stmt(stmt: Stmt,
 # ---------------------------------------------------------------------------
 
 
-def run(func: MidFunc,
-        build_dir: Path | None = None,
-        mlen: int = 64) -> _hlir.HLIRModule:
+def run(func: MidFunc, build_dir: Path | None = None, mlen: int = 64) -> _hlir.HLIRModule:
     """Lower a MidFunc to HLIRModule.
 
     ``mlen`` is the hardware vector lane width (V_*_V row width). It is
@@ -2643,7 +2686,8 @@ def run(func: MidFunc,
     buf_name_to_hlir: dict[str, _hlir.Buffer] = {}
     pad_inserts: dict[str, tuple[int, ...]] = {}
     cluster_modes_for_refs: dict[
-        str, tuple[str, int | None, tuple[int, ...]],
+        str,
+        tuple[str, int | None, tuple[int, ...]],
     ] = {}
     # Reset module-global mid_ir-axes ↔ hlir-axes alignment tables so a
     # fresh compile doesn't see stale entries from a previous one.
@@ -2677,14 +2721,16 @@ def run(func: MidFunc,
             # tracked through view/burn_view); the new 4D shape is
             # needed to recover the lane extent under sync-wrap.
             mode = lane_modes.get(buf.name)
-            if (mode is not None
-                    and mode != _MODE_FP_LANE
-                    and not _is_global_scope(buf.scope)):
+            if mode is not None and mode != _MODE_FP_LANE and not _is_global_scope(buf.scope):
                 cluster_modes_for_refs[buf.name] = (
-                    mode, buf.cluster_dim, tuple(hlir_buf.shape),
+                    mode,
+                    buf.cluster_dim,
+                    tuple(hlir_buf.shape),
                 )
                 _CLUSTER_MODES[buf.name] = (
-                    mode, buf.cluster_dim, tuple(hlir_buf.shape),
+                    mode,
+                    buf.cluster_dim,
+                    tuple(hlir_buf.shape),
                 )
 
     # Copy hoisted-constant values onto the matching HLIR buffers so
@@ -2761,12 +2807,18 @@ def _rewrite_refs_to_4d(
                     a = ctor(
                         parent=a.parent,
                         starts=_rewrite_ref_for_cluster_mode(
-                            tuple(a.starts), mode, old_cluster_dim,
-                            new_shape, is_extent=False,
+                            tuple(a.starts),
+                            mode,
+                            old_cluster_dim,
+                            new_shape,
+                            is_extent=False,
                         ),
                         extents=_rewrite_ref_for_cluster_mode(
-                            tuple(a.extents), mode, old_cluster_dim,
-                            new_shape, is_extent=True,
+                            tuple(a.extents),
+                            mode,
+                            old_cluster_dim,
+                            new_shape,
+                            is_extent=True,
                         ),
                     )
             new_bargs.append(a)

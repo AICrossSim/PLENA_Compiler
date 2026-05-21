@@ -83,9 +83,7 @@ def test_constant_fold_add():
     mat, _ = _new_materializer()
     expr = tir.Add(tir.IntImm("int32", 64), tir.IntImm("int32", 16))
     m = mat.materialize(expr)
-    assert ", 80" in m.isa and "S_ADD_INT" not in m.isa, (
-        f"expected folded literal 80, got: {m.isa!r}"
-    )
+    assert ", 80" in m.isa and "S_ADD_INT" not in m.isa, f"expected folded literal 80, got: {m.isa!r}"
     print("[ok] constant fold: 64+16=80 in single S_ADDI_INT")
 
 
@@ -157,8 +155,7 @@ def test_compound_release_frees_all():
     # During emission, intermediates were freed eagerly -- only the final
     # output reg should remain checked out.
     assert len(ra._gp_free) == free_before - 1, (
-        f"expected only output reg held, got pool delta "
-        f"{free_before - len(ra._gp_free)}"
+        f"expected only output reg held, got pool delta {free_before - len(ra._gp_free)}"
     )
     m.release()
     assert len(ra._gp_free) == free_before

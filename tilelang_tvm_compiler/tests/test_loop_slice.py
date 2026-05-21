@@ -70,9 +70,7 @@ def test_isa_uses_register_sourced_offset_in_dma():
     off_reg = m.group(1)
     # And the emitter must do a register copy: `S_ADDI_INT gpX, gp{off_reg}, 0`.
     copy_pat = re.compile(rf"S_ADDI_INT gp\d+, gp{off_reg}, 0\b")
-    assert copy_pat.search(asm), (
-        f"expected register copy from gp{off_reg} (dynamic offset) into emitter scratch"
-    )
+    assert copy_pat.search(asm), f"expected register copy from gp{off_reg} (dynamic offset) into emitter scratch"
     print(f"[ok] DMA reads dynamic offset from gp{off_reg} via S_ADDI_INT mov")
 
 
@@ -81,9 +79,9 @@ def test_isa_scale_is_parent_full_size_not_slice():
     ck = compile_kernel(loop_slice_dma, target=PlenaTarget(), name="loop_slice")
     asm = ck.isa_text
     parent_scale = SEQ_TOTAL * GROUP_HEADS * HLEN  # B=1 so just S*H*D = 16384
-    assert re.search(
-        rf"S_ADDI_INT gp\d+, gp0, {parent_scale}\s*\n\s*C_SET_SCALE_REG", asm
-    ), f"expected SCALE_REG = parent_full_size = {parent_scale}"
+    assert re.search(rf"S_ADDI_INT gp\d+, gp0, {parent_scale}\s*\n\s*C_SET_SCALE_REG", asm), (
+        f"expected SCALE_REG = parent_full_size = {parent_scale}"
+    )
     print(f"[ok] SCALE_REG <- parent full size {parent_scale}")
 
 
@@ -93,9 +91,7 @@ def test_isa_loop_increment_present():
     asm = ck.isa_text
     m = re.search(r"-- hw counter gp(\d+), idx gp(\d+)", asm)
     hw_reg, idx_reg = m.group(1), m.group(2)
-    inc_then_end = re.compile(
-        rf"S_ADDI_INT gp{idx_reg}, gp{idx_reg}, 1\s*\n\s*C_LOOP_END gp{hw_reg}"
-    )
+    inc_then_end = re.compile(rf"S_ADDI_INT gp{idx_reg}, gp{idx_reg}, 1\s*\n\s*C_LOOP_END gp{hw_reg}")
     assert inc_then_end.search(asm)
     print(f"[ok] loop tail: gp{idx_reg} += 1 then C_LOOP_END gp{hw_reg}")
 

@@ -14,6 +14,7 @@ Usage:
         layer_idx=0,
     )
 """
+
 import re
 import struct
 import numpy as np
@@ -29,7 +30,7 @@ _HW_MAX_K_TILES = 4
 def _read_bf16_matrix(vram_path, addr, rows, cols, mlen=64):
     """Read a (rows, cols) matrix from VRAM dump in column-tile layout."""
     out = np.zeros((rows, cols), dtype=np.float32)
-    with open(vram_path, 'rb') as f:
+    with open(vram_path, "rb") as f:
         for tile in range(cols // mlen):
             for r in range(rows):
                 f.seek((addr + tile * rows * mlen + r * mlen) * 2)
@@ -37,7 +38,7 @@ def _read_bf16_matrix(vram_path, addr, rows, cols, mlen=64):
                 for c in range(mlen):
                     u16 = int(raw[c * 2]) | (int(raw[c * 2 + 1]) << 8)
                     u32 = u16 << 16
-                    out[r, tile * mlen + c] = struct.unpack('f', struct.pack('I', u32))[0]
+                    out[r, tile * mlen + c] = struct.unpack("f", struct.pack("I", u32))[0]
     return torch.tensor(out)
 
 
@@ -68,9 +69,20 @@ def _read_alloc_addr(asm: str, name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def compare_stages(vram_path, build_dir, hidden, inter, num_heads, num_kv_heads,
-                   seq_len=64, mlen=64, head_dim=64, eps=1e-5, verbose=True,
-                   layer_idx=None):
+def compare_stages(
+    vram_path,
+    build_dir,
+    hidden,
+    inter,
+    num_heads,
+    num_kv_heads,
+    seq_len=64,
+    mlen=64,
+    head_dim=64,
+    eps=1e-5,
+    verbose=True,
+    layer_idx=None,
+):
     """Compare each pipeline stage using emulator's own VRAM intermediates.
 
     Args:
@@ -92,6 +104,7 @@ def compare_stages(vram_path, build_dir, hidden, inter, num_heads, num_kv_heads,
 
     # Read final output address from comparison_params
     import json
+
     params = json.load(open(build / "comparison_params.json"))
     final_addr = params["start_row_idx"] * mlen
 
@@ -184,6 +197,7 @@ def compare_stages(vram_path, build_dir, hidden, inter, num_heads, num_kv_heads,
 
 if __name__ == "__main__":
     import sys
+
     vram = sys.argv[1] if len(sys.argv) > 1 else "transactional_emulator/vram_dump.bin"
     build = sys.argv[2] if len(sys.argv) > 2 else "/tmp/smolvlm2_1layer_f32regs"
     layer_idx = int(sys.argv[3]) if len(sys.argv) > 3 else None
@@ -192,7 +206,10 @@ if __name__ == "__main__":
     results = compare_stages(
         vram_path=vram,
         build_dir=build,
-        hidden=576, inter=1536, num_heads=9, num_kv_heads=3,
+        hidden=576,
+        inter=1536,
+        num_heads=9,
+        num_kv_heads=3,
         layer_idx=layer_idx,
     )
     print(f"\nOverall: {'PASS' if results.get('norm+FFN+norm', 0) >= 99.0 else 'FAIL'}")

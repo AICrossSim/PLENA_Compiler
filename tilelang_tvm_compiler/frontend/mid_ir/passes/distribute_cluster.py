@@ -74,9 +74,13 @@ from __future__ import annotations
 
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
-    For, Async, MultiLaneOp,
-    ParallelAxis, ParallelKind,
-    MidFunc, Stmt,
+    For,
+    Async,
+    MultiLaneOp,
+    ParallelAxis,
+    ParallelKind,
+    MidFunc,
+    Stmt,
 )
 
 
@@ -88,8 +92,7 @@ def _is_unroll_for(s: Stmt) -> bool:
     return isinstance(s, For) and s.kind == "unroll"
 
 
-def _clone_cluster_with_body(template: ParallelAxis,
-                             body: list[Stmt]) -> ParallelAxis:
+def _clone_cluster_with_body(template: ParallelAxis, body: list[Stmt]) -> ParallelAxis:
     """Make a fresh CLUSTER axis with the same axis_name / extent /
     parent_grid_axis_name as ``template`` but a different body."""
     return ParallelAxis(
@@ -97,7 +100,7 @@ def _clone_cluster_with_body(template: ParallelAxis,
         extent=template.extent,
         body=body,
         kind=ParallelKind.CLUSTER,
-        thread_tag=template.thread_tag,         # always None for CLUSTER, but copy anyway
+        thread_tag=template.thread_tag,  # always None for CLUSTER, but copy anyway
         parent_grid_axis_name=template.parent_grid_axis_name,
         original_axis_name=template.original_axis_name,
         axis_var=template.axis_var,
@@ -118,7 +121,7 @@ def _distribute_one_cluster(cluster: ParallelAxis) -> list[Stmt]:
     See module docstring for the rewrite rule.
     """
     out: list[Stmt] = []
-    pending: list[Stmt] = []   # ops accumulated since last unroll-for boundary
+    pending: list[Stmt] = []  # ops accumulated since last unroll-for boundary
 
     def flush_pending() -> None:
         nonlocal pending
@@ -159,15 +162,15 @@ def _walk_stmt(stmt: Stmt) -> Stmt:
             # cluster… no, better: surface a SeqStmt-like via the
             # parent. Easiest path: parent walker collects stmt lists,
             # not single stmts. See _walk_stmts below.
-            if (len(distributed) == 1
-                    and isinstance(distributed[0], ParallelAxis)
-                    and distributed[0] is not stmt):
+            if len(distributed) == 1 and isinstance(distributed[0], ParallelAxis) and distributed[0] is not stmt:
                 return distributed[0]
             # Single-stmt no-change case
-            if (len(distributed) == 1
-                    and isinstance(distributed[0], ParallelAxis)
-                    and distributed[0].axis_name == stmt.axis_name
-                    and distributed[0].body == stmt.body):
+            if (
+                len(distributed) == 1
+                and isinstance(distributed[0], ParallelAxis)
+                and distributed[0].axis_name == stmt.axis_name
+                and distributed[0].body == stmt.body
+            ):
                 return stmt
             # Multi-stmt distribution — caller has to flatten via _walk_stmts.
             # Mark by returning a "marker" sentinel? We avoid that by
@@ -214,9 +217,7 @@ def _walk_stmts(stmts: list[Stmt]) -> list[Stmt]:
     rewrite cleanly)."""
     out: list[Stmt] = []
     for s in stmts:
-        if (isinstance(s, ParallelAxis)
-                and s.kind == ParallelKind.CLUSTER
-                and any(_is_unroll_for(c) for c in s.body)):
+        if isinstance(s, ParallelAxis) and s.kind == ParallelKind.CLUSTER and any(_is_unroll_for(c) for c in s.body):
             # Recurse into the cluster body's children first so any
             # nested clusters / fors are handled, then distribute.
             child = ParallelAxis(

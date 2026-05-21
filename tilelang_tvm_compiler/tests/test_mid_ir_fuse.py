@@ -71,8 +71,11 @@ _LANE = _lane_vars()
 
 def _cluster(body, axis_name="by_phase", parent="by_number"):
     return ir.ParallelAxis(
-        axis_name=axis_name, extent=LANE, body=body,
-        kind=ir.ParallelKind.CLUSTER, thread_tag=None,
+        axis_name=axis_name,
+        extent=LANE,
+        body=body,
+        kind=ir.ParallelKind.CLUSTER,
+        thread_tag=None,
         parent_grid_axis_name=parent,
         original_axis_name="by",
         axis_var=_LANE["phase"],
@@ -82,8 +85,11 @@ def _cluster(body, axis_name="by_phase", parent="by_number"):
 
 def _grid(body, axis_name="by_number", tag="blockIdx.y"):
     return ir.ParallelAxis(
-        axis_name=axis_name, extent=1, body=body,
-        kind=ir.ParallelKind.BLOCK_IDX, thread_tag=tag,
+        axis_name=axis_name,
+        extent=1,
+        body=body,
+        kind=ir.ParallelKind.BLOCK_IDX,
+        thread_tag=tag,
         original_axis_name="by",
         axis_var=_LANE["number"],
         original_axis_var=_LANE["original"],
@@ -92,7 +98,10 @@ def _grid(body, axis_name="by_number", tag="blockIdx.y"):
 
 def _wrap(body, allocs=()):
     return ir.MidFunc(
-        name="t", params=[], allocs=list(allocs), body=list(body),
+        name="t",
+        params=[],
+        allocs=list(allocs),
+        body=list(body),
         lane_axes=["by"],
     )
 
@@ -106,26 +115,39 @@ def test_async_dma_collapses_to_multi_lane() -> int:
     print("test_async_dma_collapses_to_multi_lane")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16], scope="shared")
-    fn = _wrap([_grid([_cluster([
-        ir.Async(body=[
-            ir.Dma(
-                src=_ref(Q_hbm, [0, ir.Slice(), _LANE["original"], ir.Slice()]),
-                dst=_slice_ref(Q_sh, 3),
-                marker=ir.Marker.DMA, can_async=True,
-            ),
-        ], scope_id=0),
-    ])])], allocs=[Q_sh])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Async(
+                                body=[
+                                    ir.Dma(
+                                        src=_ref(Q_hbm, [0, ir.Slice(), _LANE["original"], ir.Slice()]),
+                                        dst=_slice_ref(Q_sh, 3),
+                                        marker=ir.Marker.DMA,
+                                        can_async=True,
+                                    ),
+                                ],
+                                scope_id=0,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[Q_sh],
+    )
     out = fuse_run(fn)
     cluster = out.body[0].body[0]
     failures = 0
     failures += _check("body length", len(cluster.body), 1)
-    failures += _check("body[0] is MultiLaneOp",
-                       type(cluster.body[0]).__name__, "MultiLaneOp")
+    failures += _check("body[0] is MultiLaneOp", type(cluster.body[0]).__name__, "MultiLaneOp")
     if isinstance(cluster.body[0], ir.MultiLaneOp):
         mlo = cluster.body[0]
         failures += _check("inner is Dma", type(mlo.inner).__name__, "Dma")
-        failures += _check("cluster_axis_names", mlo.cluster_axis_names,
-                           ["by_phase"])
+        failures += _check("cluster_axis_names", mlo.cluster_axis_names, ["by_phase"])
         # Q_hbm is global → not in dim_map; Q_sh is non-global → [0]
         failures += _check("dim_map keys", set(mlo.dim_map.keys()), {"Q_sh"})
         failures += _check("dim_map['Q_sh']", mlo.dim_map["Q_sh"], [0])
@@ -138,21 +160,38 @@ def test_async_btmm_collapses() -> int:
     Q = _mk_buf("Q", [LANE, 64, 16], scope="shared")
     K = _mk_buf("K", [LANE, 64, 16], scope="shared")
     S = _mk_buf("S", [LANE, 64, 64], scope="fragment")
-    fn = _wrap([_grid([_cluster([
-        ir.Async(body=[
-            ir.Gemm(
-                a=_slice_ref(Q, 3), b=_slice_ref(K, 3), c=_slice_ref(S, 3),
-                kind="btmm", transpose_b=True,
-                marker=ir.Marker.BTMM, can_async=True,
-            ),
-        ], scope_id=0),
-    ])])], allocs=[Q, K, S])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Async(
+                                body=[
+                                    ir.Gemm(
+                                        a=_slice_ref(Q, 3),
+                                        b=_slice_ref(K, 3),
+                                        c=_slice_ref(S, 3),
+                                        kind="btmm",
+                                        transpose_b=True,
+                                        marker=ir.Marker.BTMM,
+                                        can_async=True,
+                                    ),
+                                ],
+                                scope_id=0,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[Q, K, S],
+    )
     out = fuse_run(fn)
     mlo = out.body[0].body[0].body[0]
     failures = 0
     failures += _check("type", type(mlo).__name__, "MultiLaneOp")
-    failures += _check("dim_map keys",
-                       set(mlo.dim_map.keys()), {"Q", "K", "S"})
+    failures += _check("dim_map keys", set(mlo.dim_map.keys()), {"Q", "K", "S"})
     for n in ("Q", "K", "S"):
         failures += _check(f"dim_map[{n}]", mlo.dim_map[n], [0])
     return failures
@@ -164,11 +203,27 @@ def test_reduce_stays_bare() -> int:
     print("test_reduce_stays_bare")
     S = _mk_buf("S", [LANE, 64, 16], scope="fragment")
     M = _mk_buf("M", [LANE, 64], scope="fragment")
-    fn = _wrap([_grid([_cluster([
-        ir.Reduce(dst=_slice_ref(M, 2), src=_slice_ref(S, 3),
-                  op=ir.ReduceOp.MAX, axis=2,
-                  marker=ir.Marker.LANE_OP, can_async=False),
-    ])])], allocs=[S, M])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Reduce(
+                                dst=_slice_ref(M, 2),
+                                src=_slice_ref(S, 3),
+                                op=ir.ReduceOp.MAX,
+                                axis=2,
+                                marker=ir.Marker.LANE_OP,
+                                can_async=False,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[S, M],
+    )
     out = fuse_run(fn)
     inner = out.body[0].body[0].body[0]
     return _check("body[0] still Reduce", type(inner).__name__, "Reduce")
@@ -180,19 +235,43 @@ def test_mixed_async_and_bare() -> int:
     A = _mk_buf("A", [LANE, 64, 16])
     S = _mk_buf("S", [LANE, 64, 16], scope="fragment")
     M = _mk_buf("M", [LANE, 64], scope="fragment")
-    fn = _wrap([_grid([_cluster([
-        ir.Async(body=[
-            ir.Dma(src=_slice_ref(A, 3), dst=_slice_ref(A, 3),
-                   marker=ir.Marker.DMA, can_async=True),
-        ], scope_id=0),
-        ir.Reduce(dst=_slice_ref(M, 2), src=_slice_ref(S, 3),
-                  op=ir.ReduceOp.MAX, axis=2,
-                  marker=ir.Marker.LANE_OP, can_async=False),
-        ir.Async(body=[
-            ir.Dma(src=_slice_ref(A, 3), dst=_slice_ref(A, 3),
-                   marker=ir.Marker.DMA, can_async=True),
-        ], scope_id=1),
-    ])])], allocs=[A, S, M])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Async(
+                                body=[
+                                    ir.Dma(
+                                        src=_slice_ref(A, 3), dst=_slice_ref(A, 3), marker=ir.Marker.DMA, can_async=True
+                                    ),
+                                ],
+                                scope_id=0,
+                            ),
+                            ir.Reduce(
+                                dst=_slice_ref(M, 2),
+                                src=_slice_ref(S, 3),
+                                op=ir.ReduceOp.MAX,
+                                axis=2,
+                                marker=ir.Marker.LANE_OP,
+                                can_async=False,
+                            ),
+                            ir.Async(
+                                body=[
+                                    ir.Dma(
+                                        src=_slice_ref(A, 3), dst=_slice_ref(A, 3), marker=ir.Marker.DMA, can_async=True
+                                    ),
+                                ],
+                                scope_id=1,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[A, S, M],
+    )
     out = fuse_run(fn)
     body = out.body[0].body[0].body
     failures = 0
@@ -207,16 +286,33 @@ def test_global_buffer_not_in_dim_map() -> int:
     print("test_global_buffer_not_in_dim_map")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16], scope="shared")
-    fn = _wrap([_grid([_cluster([
-        ir.Async(body=[
-            ir.Dma(src=_slice_ref(Q_hbm, 4), dst=_slice_ref(Q_sh, 3),
-                   marker=ir.Marker.DMA, can_async=True),
-        ], scope_id=0),
-    ])])], allocs=[Q_sh])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Async(
+                                body=[
+                                    ir.Dma(
+                                        src=_slice_ref(Q_hbm, 4),
+                                        dst=_slice_ref(Q_sh, 3),
+                                        marker=ir.Marker.DMA,
+                                        can_async=True,
+                                    ),
+                                ],
+                                scope_id=0,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[Q_sh],
+    )
     out = fuse_run(fn)
     mlo = out.body[0].body[0].body[0]
-    return _check("Q_hbm not in dim_map",
-                  "Q_hbm" in mlo.dim_map, False)
+    return _check("Q_hbm not in dim_map", "Q_hbm" in mlo.dim_map, False)
 
 
 def test_async_outside_cluster_raises() -> int:
@@ -224,12 +320,17 @@ def test_async_outside_cluster_raises() -> int:
     FuseError."""
     print("test_async_outside_cluster_raises")
     A = _mk_buf("A", [LANE, 64, 16])
-    fn = _wrap([
-        ir.Async(body=[
-            ir.Dma(src=_slice_ref(A, 3), dst=_slice_ref(A, 3),
-                   can_async=True),
-        ], scope_id=0),
-    ], allocs=[A])
+    fn = _wrap(
+        [
+            ir.Async(
+                body=[
+                    ir.Dma(src=_slice_ref(A, 3), dst=_slice_ref(A, 3), can_async=True),
+                ],
+                scope_id=0,
+            ),
+        ],
+        allocs=[A],
+    )
     try:
         fuse_run(fn)
     except FuseError as e:
@@ -242,7 +343,9 @@ def test_skip_no_lane_axes() -> int:
     print("test_skip_no_lane_axes")
     A = _mk_buf("A", [LANE, 64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[A],
+        name="t",
+        params=[],
+        allocs=[A],
         body=[ir.Dma(src=_slice_ref(A, 3), dst=_slice_ref(A, 3))],
         lane_axes=[],
     )
@@ -265,48 +368,72 @@ def test_index_var_identity_not_name() -> int:
 
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16], scope="shared")
-    fn = _wrap([_grid([_cluster([
-        ir.Async(body=[
-            ir.Dma(
-                src=_ref(Q_hbm, [0, ir.Slice(), unrelated_ref, ir.Slice()]),
-                dst=_slice_ref(Q_sh, 3),
-                marker=ir.Marker.DMA, can_async=True,
-            ),
-        ], scope_id=0),
-    ])])], allocs=[Q_sh])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Async(
+                                body=[
+                                    ir.Dma(
+                                        src=_ref(Q_hbm, [0, ir.Slice(), unrelated_ref, ir.Slice()]),
+                                        dst=_slice_ref(Q_sh, 3),
+                                        marker=ir.Marker.DMA,
+                                        can_async=True,
+                                    ),
+                                ],
+                                scope_id=0,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[Q_sh],
+    )
     out = fuse_run(fn)
     mlo = out.body[0].body[0].body[0]
     failures = 0
     if not isinstance(mlo, ir.MultiLaneOp):
-        failures += _check("inner is MultiLaneOp",
-                           type(mlo).__name__, "MultiLaneOp")
+        failures += _check("inner is MultiLaneOp", type(mlo).__name__, "MultiLaneOp")
         return failures
     # The unrelated ``by`` at index slot 2 must stay a bare VarRef
     # (NOT be collapsed to a ranged_slice). The pre-VarRef code would
     # have name-matched ``"by"`` and replaced it.
     src_indices = mlo.inner.src.indices
-    failures += _check("unrelated by preserved as VarRef",
-                       isinstance(src_indices[2], ir.VarRef), True)
+    failures += _check("unrelated by preserved as VarRef", isinstance(src_indices[2], ir.VarRef), True)
     if isinstance(src_indices[2], ir.VarRef):
         # Must be the exact unrelated var, not the lane's original.
-        failures += _check("identity preserved",
-                           src_indices[2].var is unrelated_by, True)
+        failures += _check("identity preserved", src_indices[2].var is unrelated_by, True)
     return failures
 
 
 def test_skip_d_ge_mlen() -> int:
     print("test_skip_d_ge_mlen")
     A = _mk_buf("A", [4, 64], scope="shared")  # D=64=MLEN → skip
-    fn = _wrap([_grid([_cluster([
-        ir.Async(body=[
-            ir.Dma(src=_slice_ref(A, 2), dst=_slice_ref(A, 2),
-                   can_async=True),
-        ], scope_id=0),
-    ])])], allocs=[A])
+    fn = _wrap(
+        [
+            _grid(
+                [
+                    _cluster(
+                        [
+                            ir.Async(
+                                body=[
+                                    ir.Dma(src=_slice_ref(A, 2), dst=_slice_ref(A, 2), can_async=True),
+                                ],
+                                scope_id=0,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ],
+        allocs=[A],
+    )
     out = fuse_run(fn)
     # Should be a no-op: Async still there.
-    return _check("Async preserved (skipped)",
-                  type(out.body[0].body[0].body[0]).__name__, "Async")
+    return _check("Async preserved (skipped)", type(out.body[0].body[0].body[0]).__name__, "Async")
 
 
 # ---------------------------------------------------------------------------

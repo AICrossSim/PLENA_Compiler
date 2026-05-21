@@ -49,9 +49,7 @@ class LayerWeights:
             (f"W_q_{layer_idx}", self.w_q),
             (f"W_o_{layer_idx}", self.w_o),
         ]
-        for kv_h, (w_k, w_v) in enumerate(
-            zip(self.w_k_heads, self.w_v_heads, strict=True)
-        ):
+        for kv_h, (w_k, w_v) in enumerate(zip(self.w_k_heads, self.w_v_heads, strict=True)):
             entries.extend(
                 [
                     (f"W_k_{layer_idx}_h{kv_h}", w_k),
@@ -84,9 +82,7 @@ def find_model_root(model: Any) -> Any:
             if hasattr(candidate, "layers"):
                 return candidate
             # LLaDA-style: transformer.blocks instead of layers
-            if hasattr(candidate, "transformer") and hasattr(
-                candidate.transformer, "blocks"
-            ):
+            if hasattr(candidate, "transformer") and hasattr(candidate.transformer, "blocks"):
                 # Create a wrapper that exposes .layers for compatibility
                 class LayersWrapper:
                     def __init__(self, obj):
@@ -126,7 +122,7 @@ def extract_model_config(model: Any) -> ModelConfig:
 
 def extract_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
     """Extract one decoder layer in PLENA's (in, out) convention.
-    
+
     Supports both standard Llama layers (with self_attn and mlp) and
     LLaDA-style layers (with direct projections).
     """
@@ -161,7 +157,7 @@ def _extract_llama_layer_weights(layer: Any, config: ModelConfig) -> LayerWeight
 
 def _extract_llada_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
     """Extract LLaDA-style layer weights.
-    
+
     LLaDA uses ff_proj and up_proj both mapping to intermediate dimension,
     with ff_out as the down projection. We treat ff_proj as gate and up_proj
     as the traditional up projection for compatibility with PLENA's FFN ops.
@@ -191,10 +187,5 @@ def _linear_weight(module: Any, rows: int, cols: int) -> torch.Tensor:
     return module.weight.detach().T.contiguous()[:rows, :cols]
 
 
-def _split_heads(
-    weight: torch.Tensor, head_dim: int, num_heads: int
-) -> list[torch.Tensor]:
-    return [
-        weight[:, h * head_dim : (h + 1) * head_dim].contiguous()
-        for h in range(num_heads)
-    ]
+def _split_heads(weight: torch.Tensor, head_dim: int, num_heads: int) -> list[torch.Tensor]:
+    return [weight[:, h * head_dim : (h + 1) * head_dim].contiguous() for h in range(num_heads)]

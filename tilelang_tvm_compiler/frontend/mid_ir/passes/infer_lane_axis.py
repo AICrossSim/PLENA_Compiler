@@ -57,8 +57,7 @@ class InferLaneAxisError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _collect_block_idx_bindings(func: tir.PrimFunc
-                                ) -> list[tuple[str, int]]:
+def _collect_block_idx_bindings(func: tir.PrimFunc) -> list[tuple[str, int]]:
     """Walk the body, collect ``(var_name, extent)`` for every
     ``thread_extent`` AttrStmt whose IterVar is bound to ``blockIdx.*``
     and has a static integer extent."""
@@ -68,11 +67,13 @@ def _collect_block_idx_bindings(func: tir.PrimFunc
         if stmt is None:
             return
         if isinstance(stmt, tir.AttrStmt):
-            if (stmt.attr_key == "thread_extent"
-                    and isinstance(stmt.node, tir.IterVar)
-                    and stmt.node.thread_tag is not None
-                    and stmt.node.thread_tag.startswith("blockIdx")
-                    and isinstance(stmt.value, tir.IntImm)):
+            if (
+                stmt.attr_key == "thread_extent"
+                and isinstance(stmt.node, tir.IterVar)
+                and stmt.node.thread_tag is not None
+                and stmt.node.thread_tag.startswith("blockIdx")
+                and isinstance(stmt.value, tir.IntImm)
+            ):
                 out.append((stmt.node.var.name, int(stmt.value.value)))
             visit(stmt.body)
             return
@@ -161,10 +162,7 @@ def run(func: tir.PrimFunc, lane: int = _DEFAULT_LANE) -> tir.PrimFunc:
     grid_bindings = _collect_block_idx_bindings(func)
     bare_names = _collect_bare_index_var_names(func)
 
-    candidates = [
-        (name, ext) for (name, ext) in grid_bindings
-        if ext % lane == 0 and name in bare_names
-    ]
+    candidates = [(name, ext) for (name, ext) in grid_bindings if ext % lane == 0 and name in bare_names]
 
     if not candidates:
         return func

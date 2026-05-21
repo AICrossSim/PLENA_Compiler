@@ -15,6 +15,5 @@ mid_ir pipeline (``tilelang_tvm_compiler.pipeline.compile_kernel``).
 
 def compile_func(*_args, **_kwargs):
     raise RuntimeError(
-        "frontend.pipeline.compile_func has been removed. Use "
-        "tilelang_tvm_compiler.pipeline.compile_kernel instead."
+        "frontend.pipeline.compile_func has been removed. Use tilelang_tvm_compiler.pipeline.compile_kernel instead."
     )

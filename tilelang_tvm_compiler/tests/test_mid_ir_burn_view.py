@@ -49,7 +49,10 @@ def _check(label, actual, expected) -> int:
 
 def _wrap(body, allocs=()):
     return ir.MidFunc(
-        name="t", params=[], allocs=list(allocs), body=list(body),
+        name="t",
+        params=[],
+        allocs=list(allocs),
+        body=list(body),
         lane_axes=["by"],
     )
 
@@ -65,14 +68,15 @@ def test_bshd_bake_permutes_shape_and_indices() -> int:
     [:, 'by_phase', :]."""
     print("test_bshd_bake_permutes_shape_and_indices")
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16])
-    fn = _wrap([
-        ir.Dma(
-            src=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[1, 0, 2]),
-            dst=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[1, 0, 2]),
-        ),
-    ], allocs=[Q_sh])
+    fn = _wrap(
+        [
+            ir.Dma(
+                src=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
+                dst=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
+            ),
+        ],
+        allocs=[Q_sh],
+    )
     out = burn_run(fn)
     failures = 0
     # Buffer shape permuted
@@ -80,10 +84,8 @@ def test_bshd_bake_permutes_shape_and_indices() -> int:
     failures += _check("Buffer shape", new_buf.shape, [64, LANE, 16])
     # Ref indices permuted
     dma = out.body[0]
-    failures += _check("src indices", dma.src.indices,
-                       [ir.Slice(), "by_phase", ir.Slice()])
-    failures += _check("dst indices", dma.dst.indices,
-                       [ir.Slice(), "by_phase", ir.Slice()])
+    failures += _check("src indices", dma.src.indices, [ir.Slice(), "by_phase", ir.Slice()])
+    failures += _check("dst indices", dma.dst.indices, [ir.Slice(), "by_phase", ir.Slice()])
     failures += _check("src view_perm cleared", dma.src.view_perm, None)
     failures += _check("dst view_perm cleared", dma.dst.view_perm, None)
     return failures
@@ -97,23 +99,24 @@ def test_bhsd_identity_unchanged_shape_indices() -> int:
     """
     print("test_bhsd_identity_unchanged_shape_indices")
     S = _mk_buf("S", [LANE, 64, 16], scope="fragment")
-    fn = _wrap([
-        ir.Reduce(
-            dst=_ref(S, ["by_phase", 0, 0], view_perm=[0, 1, 2]),
-            src=_ref(S, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[0, 1, 2]),
-            op=ir.ReduceOp.MAX, axis=2,
-        ),
-    ], allocs=[S])
+    fn = _wrap(
+        [
+            ir.Reduce(
+                dst=_ref(S, ["by_phase", 0, 0], view_perm=[0, 1, 2]),
+                src=_ref(S, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[0, 1, 2]),
+                op=ir.ReduceOp.MAX,
+                axis=2,
+            ),
+        ],
+        allocs=[S],
+    )
     out = burn_run(fn)
     failures = 0
     new_buf = out.allocs[0]
     failures += _check("shape unchanged", new_buf.shape, [LANE, 64, 16])
     red = out.body[0]
-    failures += _check("dst indices unchanged",
-                       red.dst.indices, ["by_phase", 0, 0])
-    failures += _check("src indices unchanged",
-                       red.src.indices, ["by_phase", ir.Slice(), ir.Slice()])
+    failures += _check("dst indices unchanged", red.dst.indices, ["by_phase", 0, 0])
+    failures += _check("src indices unchanged", red.src.indices, ["by_phase", ir.Slice(), ir.Slice()])
     failures += _check("dst view_perm cleared", red.dst.view_perm, None)
     failures += _check("src view_perm cleared", red.src.view_perm, None)
     return failures
@@ -122,27 +125,27 @@ def test_bhsd_identity_unchanged_shape_indices() -> int:
 def test_mixed_buffers_baked_independently() -> int:
     """Q_sh BSHD, S_loc BHSD, in same kernel — each baked own way."""
     print("test_mixed_buffers_baked_independently")
-    Q_sh = _mk_buf("Q_sh", [LANE, 64, 16])               # → BSHD permute
+    Q_sh = _mk_buf("Q_sh", [LANE, 64, 16])  # → BSHD permute
     S_loc = _mk_buf("S_loc", [LANE, 64, 64], scope="fragment")  # BHSD identity
-    fn = _wrap([
-        ir.Dma(
-            src=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[1, 0, 2]),
-            dst=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[1, 0, 2]),
-        ),
-        ir.Reduce(
-            dst=_ref(S_loc, ["by_phase", 0, 0], view_perm=[0, 1, 2]),
-            src=_ref(S_loc, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[0, 1, 2]),
-            op=ir.ReduceOp.MAX, axis=2,
-        ),
-    ], allocs=[Q_sh, S_loc])
+    fn = _wrap(
+        [
+            ir.Dma(
+                src=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
+                dst=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
+            ),
+            ir.Reduce(
+                dst=_ref(S_loc, ["by_phase", 0, 0], view_perm=[0, 1, 2]),
+                src=_ref(S_loc, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[0, 1, 2]),
+                op=ir.ReduceOp.MAX,
+                axis=2,
+            ),
+        ],
+        allocs=[Q_sh, S_loc],
+    )
     out = burn_run(fn)
     failures = 0
     failures += _check("Q_sh shape", out.allocs[0].shape, [64, LANE, 16])
-    failures += _check("S_loc shape unchanged", out.allocs[1].shape,
-                       [LANE, 64, 64])
+    failures += _check("S_loc shape unchanged", out.allocs[1].shape, [LANE, 64, 64])
     return failures
 
 
@@ -151,19 +154,21 @@ def test_buffer_pointer_swap() -> int:
     (not the old one)."""
     print("test_buffer_pointer_swap")
     Q_sh = _mk_buf("Q_sh", [LANE, 64, 16])
-    fn = _wrap([
-        ir.Dma(
-            src=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[1, 0, 2]),
-            dst=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()],
-                    view_perm=[1, 0, 2]),
-        ),
-    ], allocs=[Q_sh])
+    fn = _wrap(
+        [
+            ir.Dma(
+                src=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
+                dst=_ref(Q_sh, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
+            ),
+        ],
+        allocs=[Q_sh],
+    )
     out = burn_run(fn)
     new_buf = out.allocs[0]
     dma = out.body[0]
-    return (_check("src.buffer is new def", dma.src.buffer is new_buf, True)
-            + _check("dst.buffer is new def", dma.dst.buffer is new_buf, True))
+    return _check("src.buffer is new def", dma.src.buffer is new_buf, True) + _check(
+        "dst.buffer is new def", dma.dst.buffer is new_buf, True
+    )
 
 
 def test_inconsistent_perms_raise() -> int:
@@ -171,12 +176,15 @@ def test_inconsistent_perms_raise() -> int:
     have caught it). burn_view re-verifies as defense in depth."""
     print("test_inconsistent_perms_raise")
     Q = _mk_buf("Q", [LANE, 64, 16])
-    fn = _wrap([
-        ir.Dma(
-            src=_ref(Q, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
-            dst=_ref(Q, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[0, 1, 2]),
-        ),
-    ], allocs=[Q])
+    fn = _wrap(
+        [
+            ir.Dma(
+                src=_ref(Q, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[1, 0, 2]),
+                dst=_ref(Q, ["by_phase", ir.Slice(), ir.Slice()], view_perm=[0, 1, 2]),
+            ),
+        ],
+        allocs=[Q],
+    )
     try:
         burn_run(fn)
     except BurnViewError as e:
@@ -189,9 +197,10 @@ def test_skip_no_lane_axes() -> int:
     print("test_skip_no_lane_axes")
     Q = _mk_buf("Q", [LANE, 64, 16])
     fn = ir.MidFunc(
-        name="t", params=[], allocs=[Q],
-        body=[ir.Dma(src=_ref(Q, [ir.Slice()] * 3),
-                     dst=_ref(Q, [ir.Slice()] * 3))],
+        name="t",
+        params=[],
+        allocs=[Q],
+        body=[ir.Dma(src=_ref(Q, [ir.Slice()] * 3), dst=_ref(Q, [ir.Slice()] * 3))],
         lane_axes=[],
     )
     out = burn_run(fn)
@@ -202,10 +211,12 @@ def test_no_views_set_no_op() -> int:
     """No ref carries view_perm — nothing to bake, returns input."""
     print("test_no_views_set_no_op")
     Q = _mk_buf("Q", [LANE, 64, 16])
-    fn = _wrap([
-        ir.Dma(src=_ref(Q, [ir.Slice()] * 3),
-               dst=_ref(Q, [ir.Slice()] * 3)),
-    ], allocs=[Q])
+    fn = _wrap(
+        [
+            ir.Dma(src=_ref(Q, [ir.Slice()] * 3), dst=_ref(Q, [ir.Slice()] * 3)),
+        ],
+        allocs=[Q],
+    )
     out = burn_run(fn)
     return _check("shape unchanged", out.allocs[0].shape, [LANE, 64, 16])
 

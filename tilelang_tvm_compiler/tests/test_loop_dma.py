@@ -26,13 +26,10 @@ def test_loop_dma_emits_c_loop_pair():
     # Outer hardware loop: C_LOOP_START gp_X, ITERS  + matching C_LOOP_END.
     starts = re.findall(rf"C_LOOP_START gp(\d+), {ITERS}\b", asm)
     assert len(starts) == 1, (
-        f"expected exactly one outer C_LOOP_START with extent={ITERS}, "
-        f"got {len(starts)}: {starts!r}"
+        f"expected exactly one outer C_LOOP_START with extent={ITERS}, got {len(starts)}: {starts!r}"
     )
     outer_reg = starts[0]
-    assert f"C_LOOP_END gp{outer_reg}" in asm, (
-        f"missing matching C_LOOP_END gp{outer_reg}"
-    )
+    assert f"C_LOOP_END gp{outer_reg}" in asm, f"missing matching C_LOOP_END gp{outer_reg}"
     print(f"[ok] outer loop: C_LOOP_START gp{outer_reg}, {ITERS} ... C_LOOP_END gp{outer_reg}")
 
 
@@ -45,12 +42,9 @@ def test_loop_dma_initialises_index_register_at_zero():
     assert m is not None, "missing for-loop comment marker"
     hw_reg, idx_reg = m.group(1), m.group(2)
     # Init idx to 0 immediately before C_LOOP_START.
-    init_pattern = re.compile(
-        rf"S_ADDI_INT gp{idx_reg}, gp0, 0\s*\n\s*C_LOOP_START gp{hw_reg},"
-    )
+    init_pattern = re.compile(rf"S_ADDI_INT gp{idx_reg}, gp0, 0\s*\n\s*C_LOOP_START gp{hw_reg},")
     assert init_pattern.search(asm), (
-        f"expected `S_ADDI_INT gp{idx_reg}, gp0, 0` followed by "
-        f"`C_LOOP_START gp{hw_reg}, ...`"
+        f"expected `S_ADDI_INT gp{idx_reg}, gp0, 0` followed by `C_LOOP_START gp{hw_reg}, ...`"
     )
     print(f"[ok] idx init: gp{idx_reg} = 0 then C_LOOP_START gp{hw_reg}")
 
@@ -62,12 +56,8 @@ def test_loop_dma_increments_index_at_loop_tail():
     m = re.search(r"-- hw counter gp(\d+), idx gp(\d+)", asm)
     hw_reg, idx_reg = m.group(1), m.group(2)
     # Last lines of body should have:  inc idx; C_LOOP_END gp_outer
-    inc_then_end = re.compile(
-        rf"S_ADDI_INT gp{idx_reg}, gp{idx_reg}, 1\s*\n\s*C_LOOP_END gp{hw_reg}"
-    )
-    assert inc_then_end.search(asm), (
-        "expected idx increment immediately before C_LOOP_END"
-    )
+    inc_then_end = re.compile(rf"S_ADDI_INT gp{idx_reg}, gp{idx_reg}, 1\s*\n\s*C_LOOP_END gp{hw_reg}")
+    assert inc_then_end.search(asm), "expected idx increment immediately before C_LOOP_END"
     print(f"[ok] tail increment: gp{idx_reg} += 1 then C_LOOP_END gp{hw_reg}")
 
 
@@ -102,9 +92,7 @@ def test_loop_dma_no_register_conflict():
         for r in forbidden:
             bad = re.search(rf"^\s*S_ADDI_INT gp{r}, gp0, ", line)
             if bad:
-                raise AssertionError(
-                    f"body clobbers loop register gp{r}: {line.strip()!r}"
-                )
+                raise AssertionError(f"body clobbers loop register gp{r}: {line.strip()!r}")
     print(f"[ok] no clobber: gp{hw_reg} (hw) and gp{idx_reg} (idx) untouched by body")
 
 

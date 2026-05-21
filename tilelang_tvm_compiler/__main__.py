@@ -45,9 +45,7 @@ def _parse_kernel_kwargs(spec: str | None) -> dict:
         if not pair.strip():
             continue
         if "=" not in pair:
-            raise SystemExit(
-                f"--kernel-kwargs entry must be key=value, got {pair!r}"
-            )
+            raise SystemExit(f"--kernel-kwargs entry must be key=value, got {pair!r}")
         k, v = pair.split("=", 1)
         k = k.strip()
         v = v.strip()
@@ -67,10 +65,9 @@ def _resolve_kernel(spec: str, kwargs: dict | None = None):
         PrimFunc or a `(PrimFunc, ...)` tuple as the return value
     """
     from tvm import tir
+
     if ":" not in spec:
-        raise SystemExit(
-            f"--kernel must be of the form module:funcname, got {spec!r}"
-        )
+        raise SystemExit(f"--kernel must be of the form module:funcname, got {spec!r}")
     mod_path, func_name = spec.split(":", 1)
     mod = importlib.import_module(mod_path)
     print(f"[kernel] {mod_path} -> {mod.__file__}", file=sys.stderr)
@@ -79,9 +76,7 @@ def _resolve_kernel(spec: str, kwargs: dict | None = None):
     obj = getattr(mod, func_name)
     if isinstance(obj, tir.PrimFunc):
         if kwargs:
-            raise SystemExit(
-                f"{func_name!r} is already a PrimFunc; --kernel-kwargs not allowed"
-            )
+            raise SystemExit(f"{func_name!r} is already a PrimFunc; --kernel-kwargs not allowed")
         return obj
     if callable(obj):
         result = obj(**(kwargs or {}))
@@ -89,14 +84,9 @@ def _resolve_kernel(spec: str, kwargs: dict | None = None):
             # Factories like make_tiled_btmm return (PrimFunc, constants).
             result = result[0]
         if not isinstance(result, tir.PrimFunc):
-            raise SystemExit(
-                f"factory {func_name!r} returned {type(result).__name__}, "
-                f"expected tir.PrimFunc"
-            )
+            raise SystemExit(f"factory {func_name!r} returned {type(result).__name__}, expected tir.PrimFunc")
         return result
-    raise SystemExit(
-        f"{func_name!r} is neither PrimFunc nor callable: {type(obj).__name__}"
-    )
+    raise SystemExit(f"{func_name!r} is neither PrimFunc nor callable: {type(obj).__name__}")
 
 
 def _emit_output_staging(
@@ -123,10 +113,7 @@ def _emit_output_staging(
 
     buf = compiled.hlir.get_buffer(out_buffer_name)
     if buf.scope != _scope.HBM:
-        raise SystemExit(
-            f"--stage-output buffer {out_buffer_name!r} must be in HBM, "
-            f"got {buf.scope!r}"
-        )
+        raise SystemExit(f"--stage-output buffer {out_buffer_name!r} must be in HBM, got {buf.scope!r}")
     rows, cols = _logical_2d(buf.shape, buf.layout)
     mlen = target.mlen
     tile_elems = mlen * mlen
@@ -156,8 +143,10 @@ def _emit_output_staging(
     # NCHW's channel-major HBM layout.
     if len(buf.shape) == 4:
         layout = make_tile_layout(
-            shape=tuple(int(x) for x in buf.shape), layout=buf.layout,
-            mlen=mlen, hlen=target.btmm_hlen,
+            shape=tuple(int(x) for x in buf.shape),
+            layout=buf.layout,
+            mlen=mlen,
+            hlen=target.btmm_hlen,
         )
     else:
         layout = None
@@ -169,7 +158,8 @@ def _emit_output_staging(
 
     if layout is not None:
         hbm_b, hbm_s, hbm_h, _hbm_d = hbm_strides_for_layout(
-            buf.shape, buf.layout,
+            buf.shape,
+            buf.layout,
         )
         shim.compiler.generated_code += (
             f"; tile_layout: d_tiles={layout.d_tiles} s_tiles={layout.s_tiles} "
@@ -188,12 +178,7 @@ def _emit_output_staging(
             for h_grp in range(layout.h_groups):
                 for s_tile in range(layout.s_tiles):
                     for b in range(layout.logical_b):
-                        hbm_off = (
-                            b * hbm_b
-                            + s_tile * mlen * hbm_s
-                            + h_grp * layout.lane_count * hbm_h
-                            + d_tile * mlen
-                        )
+                        hbm_off = b * hbm_b + s_tile * mlen * hbm_s + h_grp * layout.lane_count * hbm_h + d_tile * mlen
                         shim.compiler.generated_code += (
                             f"; stage tile (d={d_tile}, h={h_grp}, "
                             f"s={s_tile}, b={b}) hbm_off={hbm_off}  "
@@ -218,10 +203,7 @@ def _emit_output_staging(
     # multi-head BSHD shapes that genuinely need the 7D physical
     # layout to stage correctly).
     if rows % mlen or cols % mlen:
-        raise SystemExit(
-            f"staging only supports mlen-aligned shapes for now, got "
-            f"rows={rows} cols={cols} mlen={mlen}"
-        )
+        raise SystemExit(f"staging only supports mlen-aligned shapes for now, got rows={rows} cols={cols} mlen={mlen}")
     row_blocks = rows // mlen
     col_blocks = cols // mlen
     shim.compiler.generated_code += (
@@ -234,8 +216,7 @@ def _emit_output_staging(
         for i in range(row_blocks):
             hbm_offset_elems = i * mlen * cols + j * mlen
             shim.compiler.generated_code += (
-                f"; stage tile [{i},{j}]  hbm_offset(elems)={hbm_offset_elems}  "
-                f"-> vram[{vram_addr}]\n"
+                f"; stage tile [{i},{j}]  hbm_offset(elems)={hbm_offset_elems}  -> vram[{vram_addr}]\n"
             )
             emitter.emit_load_tile_from_hbm(
                 hbm_addr=buf.address,
@@ -254,6 +235,7 @@ def _logical_2d(shape, layout: str = "BSHD") -> tuple[int, int]:
     helper so __main__'s stage-output staging picks the same axes as
     address_alloc / isa_pass."""
     from tilelang_tvm_compiler.hlir import logical_2d_extents
+
     return logical_2d_extents(shape, layout)
 
 
@@ -268,13 +250,17 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     )
     midir_dump_dir = Path(args.dump_hlir).parent if args.dump_hlir else None
     compiled = compile_kernel(
-        func, target=target, name=args.asm_name,
+        func,
+        target=target,
+        name=args.asm_name,
         midir_dump_dir=midir_dump_dir,
     )
     isa_text = compiled.isa_text
     if args.stage_output:
         isa_text = isa_text.rstrip() + _emit_output_staging(
-            compiled, target, args.stage_output,
+            compiled,
+            target,
+            args.stage_output,
         )
 
     if args.dump_hlir:
@@ -286,13 +272,19 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     # written into the same dir as ``--dump-hlir`` so step kernels'
     # traces stay next to their ASM.
     if args.dump_hlir and compiled.gp_trace:
-        trace_path = Path(args.dump_hlir).with_name(
-            f"{args.asm_name}.gp_trace.tsv"
-        )
+        trace_path = Path(args.dump_hlir).with_name(f"{args.asm_name}.gp_trace.tsv")
         cols = [
-            "asm_line", "event", "site",
-            "regs", "n", "slot", "addr", "spilled",
-            "free", "in_use", "pinned",
+            "asm_line",
+            "event",
+            "site",
+            "regs",
+            "n",
+            "slot",
+            "addr",
+            "spilled",
+            "free",
+            "in_use",
+            "pinned",
         ]
         lines = ["\t".join(cols)]
         for row in compiled.gp_trace:
@@ -321,13 +313,8 @@ def _cmd_compile(args: argparse.Namespace) -> int:
                 entry["value"] = float(buf.constant_value)
             return entry
 
-        addr_table = {
-            buf.name: _buf_entry(buf)
-            for buf in compiled.hlir.buffers.values()
-        }
-        Path(args.dump_buffer_addrs).write_text(
-            json.dumps(addr_table, indent=2)
-        )
+        addr_table = {buf.name: _buf_entry(buf) for buf in compiled.hlir.buffers.values()}
+        Path(args.dump_buffer_addrs).write_text(json.dumps(addr_table, indent=2))
 
     if args.output:
         Path(args.output).write_text(isa_text)
@@ -348,18 +335,17 @@ def main(argv: list[str] | None = None) -> int:
         "--kernel",
         required=True,
         help='Kernel spec, e.g. "tilelang_tvm_compiler.kernels.minimal_btmm:minimal_btmm"; '
-             'may also point at a factory function used together with --kernel-kwargs',
+        "may also point at a factory function used together with --kernel-kwargs",
     )
     p_compile.add_argument(
         "--kernel-kwargs",
         default=None,
         help="Comma-separated k=v pairs to pass when --kernel resolves to a "
-             "factory (e.g. `seq_q=128,seq_k=128`). Values are coerced to int "
-             "when possible.",
+        "factory (e.g. `seq_q=128,seq_k=128`). Values are coerced to int "
+        "when possible.",
     )
     p_compile.add_argument("--asm-name", default="kernel")
-    p_compile.add_argument("--output", default=None,
-                           help="If given, write ISA to this path; else stdout.")
+    p_compile.add_argument("--output", default=None, help="If given, write ISA to this path; else stdout.")
     p_compile.add_argument("--mlen", type=int, default=64)
     p_compile.add_argument("--blen", type=int, default=4)
     p_compile.add_argument("--btmm-lane-count", type=int, default=4)
@@ -368,21 +354,21 @@ def main(argv: list[str] | None = None) -> int:
         "--stage-output",
         default=None,
         help="If given, append per-tile DMA HBM->VRAM[0..] for this output "
-             "buffer so view_mem.py can compare against golden.",
+        "buffer so view_mem.py can compare against golden.",
     )
     p_compile.add_argument(
         "--dump-hlir",
         default=None,
         help="If given, write a human-readable HLIR dump to this path "
-             "(after address allocation; final form fed into ISA emit).",
+        "(after address allocation; final form fed into ISA emit).",
     )
     p_compile.add_argument(
         "--dump-buffer-addrs",
         default=None,
         help="If given, write a JSON dict {buffer_name: {scope, address, "
-             "shape, dtype}} so testbenches can read the *actual* allocated "
-             "addresses instead of mirroring them by hand. Single source of "
-             "truth for FPRAM / VRAM / MRAM / HBM offsets.",
+        "shape, dtype}} so testbenches can read the *actual* allocated "
+        "addresses instead of mirroring them by hand. Single source of "
+        "truth for FPRAM / VRAM / MRAM / HBM offsets.",
     )
     p_compile.set_defaults(func=_cmd_compile)
 
