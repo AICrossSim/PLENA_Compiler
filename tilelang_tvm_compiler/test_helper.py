@@ -273,7 +273,7 @@ def run(spec: TvmTestbenchSpec) -> int:
     # Lazy imports — these need the testbench's venv site-packages to be
     # on sys.path, which the testbench itself sets up before importing us.
     from compiler.sim_env_utils import create_mem_for_sim
-    from transactional_emulator.tools.create_sim_env import create_sim_env
+    from verification.create_sim_env import create_sim_env
 
     artifact_prefix = spec.artifact_prefix or spec.asm_name
 
