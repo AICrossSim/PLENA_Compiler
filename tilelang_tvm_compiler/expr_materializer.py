@@ -142,7 +142,26 @@ class ExprMaterializer:
     # public API
     # ------------------------------------------------------------------
     def materialize(self, expr) -> MaterializedExpr:
-        """Top-level entry. Always returns a MaterializedExpr."""
+        """Top-level entry. Always returns a MaterializedExpr.
+
+        Before dispatch we apply a single peephole optimisation on the
+        incoming PrimExpr: if every ``tir.Var`` referenced inside ``expr``
+        has an ``IntImm`` binding in ``symbol_table`` (the canonical case
+        for fully-unrolled loop iterations), we substitute the Vars to
+        their IntImm values and run ``arith.Analyzer().simplify`` over
+        the result. This collapses expressions like
+        ``Add(IntImm(base), Mul(IntImm(iter), IntImm(stride)))`` to a
+        single ``IntImm(base + iter * stride)`` so ``_materialize`` emits
+        a single ``S_ADDI_INT`` instead of a 3-instruction chain.
+
+        The optimisation is a no-op when:
+          * ``expr`` is not a tir.PrimExpr (int / etc.) — bypassed
+          * any referenced Var has a non-IntImm binding (e.g. ``("ram",
+            addr)`` for serial-loop idx vars) — falling through preserves
+            the legacy materialise path for those.
+        """
+        if isinstance(expr, tir.PrimExpr):
+            expr = self._peephole_const_fold(expr)
         if self._lowir_log is not None:
             # Record the symbolic expression BEFORE register lowering —
             # tir.Var loop indices (head_phase, row, ...) survive in the
@@ -150,6 +169,57 @@ class ExprMaterializer:
             # lowir report wants. str() of a tir node is side-effect free.
             self._lowir_log.append((self._lowir_op_idx, str(expr)))
         return self._materialize(expr)
+
+    def _peephole_const_fold(self, expr):
+        """Substitute every ``tir.Var`` in ``expr`` that has an
+        ``IntImm`` binding in ``self.symbol_table``, then run
+        ``arith.Analyzer().simplify`` over the result.
+
+        If any referenced Var has a non-IntImm binding (or no binding),
+        the original ``expr`` is returned unchanged — the legacy
+        materialise path then handles it (loading from IntRAM / using a
+        live GP / emitting an ADD chain).
+        """
+        # Lazy imports — arith / stmt_functor are heavy and not always
+        # needed (the legacy callers without symbol_table go through
+        # the unchanged path).
+        from tvm import arith
+        from tvm.tir import stmt_functor
+
+        # Collect every free Var. If any isn't an IntImm-bound entry in
+        # symbol_table, don't try to substitute (the materialise path
+        # is the safe fallback).
+        free_vars: List[tir.Var] = []
+
+        def _collect(node):
+            if isinstance(node, tir.Var):
+                if node not in free_vars:
+                    free_vars.append(node)
+
+        stmt_functor.post_order_visit(expr, _collect)
+        if not free_vars:
+            # Pure-literal expr — substitution would do nothing; just
+            # simplify in case there's still arithmetic to fold.
+            try:
+                return arith.Analyzer().simplify(expr)
+            except Exception:
+                return expr
+
+        var_map: Dict[tir.Var, tir.PrimExpr] = {}
+        for v in free_vars:
+            binding = self.symbol_table.get(v)
+            if isinstance(binding, tir.IntImm):
+                var_map[v] = binding
+            else:
+                # Any Var without an IntImm binding — bail. The
+                # materialiser handles "live GP" / "ram-backed idx"
+                # bindings natively.
+                return expr
+        substituted = stmt_functor.substitute(expr, var_map)
+        try:
+            return arith.Analyzer().simplify(substituted)
+        except Exception:
+            return substituted
 
     # ------------------------------------------------------------------
     # core dispatch

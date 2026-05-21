@@ -138,6 +138,13 @@ class TvmTestbenchSpec:
     """Buffer name to re-stage from HBM -> VRAM at the end of the
     kernel for view_mem comparison (passed via ``--stage-output``)."""
 
+    use_v2: bool = False
+    """Route compilation through the PreIsaPassV2 → MIR → ISA path
+    (passed via ``--use-v2``) instead of the legacy single-pass
+    IsaEmitterPass. Same HW op stream; v2 also runs the MIR opt
+    passes (LICM / reassoc / spill). Enable to validate the v2
+    backend end-to-end against the simulator golden."""
+
     artifact_prefix: Optional[str] = None
     """Prefix for ancillary build artefacts. Defaults to ``asm_name``."""
 
@@ -222,6 +229,8 @@ def _compile_via_subprocess(
         cmd += ["--btmm-hlen", str(spec.btmm_hlen)]
     if spec.stage_output is not None:
         cmd += ["--stage-output", spec.stage_output]
+    if spec.use_v2:
+        cmd += ["--use-v2"]
     cmd += ["--dump-hlir", str(hlir_path)]
     if addrs_path is not None:
         cmd += ["--dump-buffer-addrs", str(addrs_path)]

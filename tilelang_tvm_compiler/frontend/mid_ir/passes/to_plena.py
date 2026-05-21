@@ -2489,7 +2489,17 @@ def _walk_stmt(stmt: Stmt,
         for_op = _hlir.make_for_op(
             _for_loop_var(stmt), stmt.extent, body=body,
         )
-        for_op.annotations["loop_kind"] = stmt.kind
+        # ``parallel`` mid-IR kind = user wrote T.Parallel but the
+        # body didn't fold into a vector op. Treat it downstream
+        # like a serial loop (HW C_LOOP_START/END) but mark
+        # ``order_independent`` so the backend can skip the per-iter
+        # idx-slot read/write and run the hw counter as the lvar
+        # directly. See mir_to_isa._emit_loop_serial.
+        if stmt.kind == "parallel":
+            for_op.annotations["loop_kind"] = "serial"
+            for_op.annotations["order_independent"] = True
+        else:
+            for_op.annotations["loop_kind"] = stmt.kind
         return [for_op]
     if isinstance(stmt, Async):
         # By pass_5 every Async should be MultiLaneOp; if it lingers,

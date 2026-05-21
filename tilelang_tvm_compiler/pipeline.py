@@ -103,6 +103,7 @@ def compile_kernel(
     name: str = "kernel",
     midir_dump_dir: Optional[Path] = None,
     addr_config_override: Optional[AddressAllocConfig] = None,
+    use_v2: bool = False,
 ) -> CompiledKernel:
     """Lower a raw TIR PrimFunc through the mid_ir pipeline + downstream
     address-alloc + ISA-emit passes.
@@ -114,7 +115,26 @@ def compile_kernel(
     verbatim for the address-alloc pass instead of building a default
     one from ``target``. Used by multi-kernel drivers that stitch
     several kernels into one continuous ASM run and need to control
-    the FPRAM / HBM bases per kernel (e.g. tvm_single_stream_block_test).
+    the FPRAM / HBM bases per kernel.
+
+    ``use_v2`` (default False): when True, route the post-address HLIR
+    through the PreIsaPassV2 → MIR → ISA pipeline instead of the legacy
+    single-pass ``IsaEmitterPass``. The v2 path is fully op-coverage-
+    complete (all 38 HLIR op kinds) and produces structurally
+    identical HW-op streams (same M_MM/M_BTMM/H_PREFETCH_V/etc.
+    count and order); GP numbers can differ. Set this when you want
+    the v2 path's tighter register allocation (~9 GPs on full matmul
+    vs 14+ in legacy) and the MIR-level dump for debugging.
+
+    Unroll loops in v2: the MIR is kept compact (no physical
+    expansion); ``mir_to_isa._emit_loop_unroll`` clones each iter's
+    body into a throwaway scratch block, substitutes the loop_var
+    to a plain int, runs scratch-local constant folding, then emits
+    the folded result. This collapses per-iter address arithmetic
+    without inflating the MIR, and is consistently shorter ISA than
+    the previous "physically unroll then re-fold" strategy because
+    LICM's hoisted invariants survive (they aren't duplicated per
+    unroll iter).
     """
     # ---------- 0. stmt prep ----------
     func = _stmt_inline_let.run(prim_func)
@@ -200,6 +220,39 @@ def compile_kernel(
         v_writeback_amount=_plena_settings.v_writeback_amount(),
         register_allocator=allocator,
     )
+    if use_v2:
+        # v2 path: HLIR → PreIsaIR v2 → MIR → opt pipeline → ISA.
+        # PreIsaPassV2 still delegates layout/offset helpers to a
+        # legacy IsaEmitterPass instance, but the *visible* ISA
+        # output here comes from the v2 MIR emit.
+        from .pre_isa_pass_v2 import PreIsaPassV2
+        from . import pre_isa_to_mir as _p2m
+        from . import mir as _mir
+        from . import mir_to_isa as _m2i
+        from . import mir_passes as _mp
+        pre = PreIsaPassV2(shim).run(mod)
+        mir_fn = _p2m.convert(pre, shim)
+        _mir.verify(mir_fn)
+        # Per-pass MIR dump (debugging): one .mir file per pass under
+        # ``<midir_dump_dir>/mir_passes/`` so each address-PrimExpr fold
+        # is visible step by step.
+        _mir_dump_dir = (
+            (midir_dump_dir / "mir_passes") if midir_dump_dir else None
+        )
+        # DLE + const-fold + DCE + CSE to a fixed point. Reduces
+        # GP pressure (peels extent-1 loops, folds static
+        # address arithmetic, deduplicates repeated bases).
+        _mp.run_default_pipeline(
+            mir_fn, enable_licm=True, dump_dir=_mir_dump_dir,
+        )
+        _mir.verify(mir_fn)
+        isa_text = _m2i.emit(mir_fn, shim)
+        return CompiledKernel(
+            name=name, hlir=mod, isa_text=isa_text,
+            gp_trace=allocator.trace_rows(),
+            lowir_log=[],
+        )
+
     isa_pass = IsaEmitterPass(shim)
     # Record symbolic address expressions for the lowir report. Enabled
     # before run() so the recorder captures the real emit pass — no

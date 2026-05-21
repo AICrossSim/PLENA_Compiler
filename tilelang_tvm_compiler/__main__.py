@@ -276,6 +276,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     compiled = compile_kernel(
         func, target=target, name=args.asm_name,
         midir_dump_dir=midir_dump_dir,
+        use_v2=bool(getattr(args, "use_v2", False)),
     )
     isa_text = compiled.isa_text
     if args.stage_output:
@@ -403,6 +404,14 @@ def main(argv: list[str] | None = None) -> int:
              "shape, dtype}} so testbenches can read the *actual* allocated "
              "addresses instead of mirroring them by hand. Single source of "
              "truth for FPRAM / VRAM / MRAM / HBM offsets.",
+    )
+    p_compile.add_argument(
+        "--use-v2",
+        action="store_true",
+        help="Route through the PreIsaPassV2 → MIR → ISA pipeline "
+             "instead of the legacy IsaEmitterPass single-pass. Same "
+             "HW op stream; tighter register allocation; MIR dump "
+             "available for debugging.",
     )
     p_compile.set_defaults(func=_cmd_compile)
 

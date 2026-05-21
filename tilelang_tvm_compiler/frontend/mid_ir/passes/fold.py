@@ -1047,10 +1047,24 @@ def _tir_for_kind_name(stmt: tir.For) -> str:
 
 def _mid_for_kind(name: str) -> str:
     """Map a tilelang for-kind name to the mid-IR For.kind string.
-    For.kind is one of ``"serial"`` or ``"unroll"``; other tilelang
-    kinds shouldn't reach For (T.Parallel becomes ParallelAxis(CLUSTER))."""
+
+    Values:
+      * ``"unroll"`` — fully unrolled at codegen
+      * ``"parallel"`` — ``T.Parallel`` that didn't fold into a vector
+        op and isn't lifted to a ParallelAxis; preserved here as a
+        hint that the body is order-independent (no cross-iter
+        dependency). Downstream passes treat this exactly like
+        ``"serial"`` except the HLIR for-op carries an
+        ``annotations["order_independent"] = True`` flag, which the
+        v2 backend uses to drop the IntRAM idx slot + per-iter
+        LD/ADDI/ST overhead in favor of running the hw counter as
+        the loop var directly.
+      * ``"serial"`` — default, strict-order loop
+    """
     if name == "unrolled" or name == "unroll":
         return "unroll"
+    if name == "parallel":
+        return "parallel"
     return "serial"
 
 
