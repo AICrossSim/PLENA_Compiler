@@ -558,8 +558,10 @@ class _LinearScanAllocator:
             return gp
         slot = self.reserve_intram_slot()
         self.value_to_slot[vid] = slot
+        _nm = self._vid_to_value.get(vid)
+        _nm = f"%{_nm.name}" if _nm is not None else f"id{vid}"
         self._isa_lines.append(
-            f"; SPILL value@{vid} -> intram[{slot}] (freeing gp{gp})"
+            f"; SPILL {_nm} (value@{vid}) -> intram[{slot}] (freeing gp{gp})"
         )
         self._isa_lines.append(f"S_ST_INT gp{gp}, gp0, {slot}")
         # Return the GP to the free pool so the caller (assign_i32 /
@@ -604,7 +606,8 @@ class _LinearScanAllocator:
             gp = self._take_gp()
             self.value_to_gp[id(v)] = gp
             self._isa_lines.append(
-                f"; RELOAD value@{id(v)} from intram[{slot}] -> gp{gp}"
+                f"; RELOAD %{v.name} (value@{id(v)}) from intram[{slot}] "
+                f"-> gp{gp}"
             )
             self._isa_lines.append(f"S_LD_INT gp{gp}, gp0, {slot}")
             self.reload_count += 1
@@ -720,6 +723,245 @@ class _LinearScanAllocator:
                 del self.value_to_gp[vid]
                 self._free_gp(gp)
 
+    def store_result(self) -> None:
+        """No-op for the linear-scan allocator (results live in GPs and
+        are spilled lazily on pressure). The stable allocator overrides
+        this to write each result back to its fixed slot. Present here so
+        ``_emit_instr`` can call it unconditionally for both allocators."""
+        return
+
+
+# ---------------------------------------------------------------------
+# Stable allocator — correctness-first, NO reuse optimisation.
+# ---------------------------------------------------------------------
+#
+# The linear-scan allocator above mixes 4 mechanisms (end-interval
+# release, carried-spill protection, scope-entry spill, pin) whose
+# interaction has缝 — bugs that only show up across loop re-entries
+# (NQ=2) and are nearly impossible to debug. This allocator trades ALL
+# optimisation for absolute robustness + trivial debuggability:
+#
+#   ONE rule: every i32 SSA value lives in its OWN permanent IntRAM slot
+#   (never reused). GPs are pure intra-instruction scratch.
+#     * define a value : compute into a scratch GP, then S_ST_INT it to
+#                        the value's fixed slot. The GP is then free.
+#     * use a value    : S_LD_INT its fixed slot into a fresh scratch GP.
+#     * NOTHING survives an instruction in a GP (except the serial-loop
+#       counter, which the hardware itself owns, and gp0=const-zero).
+#
+# Because no GP state crosses an instruction boundary, a loop body that
+# is emitted once but runs N times is correct for every N: each
+# instruction is self-contained (reload → compute → store). There is no
+# spill decision, no carried set, no live interval, no cross-iteration
+# state — therefore no缝 to leak through. It is slow (a load per use, a
+# store per def) but provably correct and dead-simple to read: the slot
+# number IS the value's identity.
+#
+# Hardware-forced exceptions (the only non-uniform parts):
+#   * gp0 — hardware const-zero, never allocated.
+#   * serial-loop counter — C_LOOP_START/END read/decrement it; it must
+#     occupy a fixed GP for the loop's lifetime (``pin``).
+#   * loop_var index — already IntRAM-backed (idx slot); fits the model.
+class _StableAllocator:
+    """Every value -> a permanent IntRAM slot; GPs are intra-instr scratch.
+
+    Same public interface as ``_LinearScanAllocator`` so ``MirToIsa`` /
+    ``_emit_instr`` use it unchanged, plus ``store_result`` (emit calls it
+    after the instruction line to write the result GP back to its slot).
+    Switch via ``MirToIsa(... )`` constructing this instead of the
+    linear-scan one (see USE_STABLE_ALLOC)."""
+
+    def __init__(self, fn: "mir.MirFunction") -> None:
+        self.fn = fn
+        self.emit_order = compute_emit_order(fn)
+        _check_no_iter_args(fn)
+        # Permanent slot per value-id. Allocated on first sight (define or
+        # use), never reused. Counters/lvars also get pinned GPs.
+        self.value_to_slot: Dict[int, int] = {}
+        self._intram_next_slot: int = 0
+        # Scratch GP pool. gp0 reserved (const-zero). The rest are handed
+        # out per-instruction and reclaimed at every release_dead_at.
+        self._all_scratch = list(range(GP_USER_FIRST, GP_USER_LAST + 1))
+        self.free_gp: List[int] = list(self._all_scratch)
+        # gp currently holding each value THIS instruction (transient).
+        self.value_to_gp: Dict[int, int] = {}
+        # Pinned values (serial-loop counter + lvar) hold a GP for the
+        # whole loop; never reclaimed by release_dead_at.
+        self._pinned: set = set()
+        self._pin_gp: Dict[int, int] = {}
+        # The value whose result-GP must be stored back after this instr.
+        self._pending_store: Optional[Tuple[int, int]] = None  # (vid, gp)
+        self._vid_to_value: Dict[int, "mir.MirValue"] = {}
+        # addr-reg file (same as linear-scan).
+        self.value_to_areg: Dict[int, int] = {}
+        self._next_areg: int = 0
+        self._isa_lines: Optional[List[str]] = None
+        self._get_cur_idx = None
+        self.spill_count = 0
+        self.reload_count = 0
+        # Unused-but-interface-compatible bits:
+        self.loop_last_idx: Dict[int, int] = {}
+        self.carried_by_loop: Dict[int, set] = {}
+        self.end: Dict[int, int] = {}
+
+    # ---- emit hookups ----
+    def bind_emit(self, isa_lines, get_cur_idx) -> None:
+        self._isa_lines = isa_lines
+        self._get_cur_idx = get_cur_idx
+
+    def reserve_intram_slot(self) -> int:
+        slot = self._intram_next_slot
+        self._intram_next_slot += 1
+        return slot
+
+    def _slot_of(self, v: "mir.MirValue") -> int:
+        """Permanent slot for value ``v`` (allocate on first sight)."""
+        if id(v) not in self.value_to_slot:
+            self.value_to_slot[id(v)] = self.reserve_intram_slot()
+        return self.value_to_slot[id(v)]
+
+    def _take_scratch(self) -> int:
+        if not self.free_gp:
+            raise MirToIsaError(
+                "stable alloc: out of scratch GPs in a single instruction "
+                f"(have {len(self._all_scratch)} usable, all in use). A "
+                "single MIR instr referenced more distinct i32 values than "
+                "the GP file holds — should not happen for PLENA opcodes."
+            )
+        return self.free_gp.pop(0)
+
+    def _free_scratch(self, gp: int) -> None:
+        if gp == 0:
+            return
+        if gp not in self.free_gp:
+            self.free_gp.insert(0, gp)
+
+    # ---- value access ----
+    def assign_i32(self, v: "mir.MirValue") -> int:
+        """Define ``v``: hand out a scratch GP for the result and schedule
+        a store-back to v's permanent slot after the instruction line."""
+        self._vid_to_value[id(v)] = v
+        if v.is_function_const:
+            return 0
+        if id(v) in self._pinned:               # counter/lvar: fixed GP
+            return self._pin_gp[id(v)]
+        gp = self._take_scratch()
+        self.value_to_gp[id(v)] = gp
+        # ensure the slot exists; schedule store-back.
+        slot = self._slot_of(v)
+        self._pending_store = (id(v), gp, slot)
+        return gp
+
+    def ensure_in_gp(self, v: "mir.MirValue") -> int:
+        """Use ``v``: reload its permanent slot into a fresh scratch GP."""
+        self._vid_to_value[id(v)] = v
+        if v.is_function_const:
+            return 0
+        if id(v) in self._pinned:               # counter/lvar: fixed GP
+            return self._pin_gp[id(v)]
+        if id(v) in self.value_to_gp:           # already loaded this instr
+            return self.value_to_gp[id(v)]
+        if id(v) not in self.value_to_slot:
+            raise MirToIsaError(
+                f"stable alloc: use of value@{id(v)} (%{v.name}) before "
+                f"any definition (no slot). live-range / emit-order bug."
+            )
+        slot = self.value_to_slot[id(v)]
+        gp = self._take_scratch()
+        self.value_to_gp[id(v)] = gp
+        self._isa_lines.append(
+            f"; LD %{v.name} (slot {slot}) -> gp{gp}"
+        )
+        self._isa_lines.append(f"S_LD_INT gp{gp}, gp0, {slot}")
+        self.reload_count += 1
+        return gp
+
+    def store_result(self) -> None:
+        """Emit the store-back for the value defined this instruction
+        (called by emit right AFTER the instruction line)."""
+        if self._pending_store is None:
+            return
+        vid, gp, slot = self._pending_store
+        self._pending_store = None
+        val = self._vid_to_value.get(vid)
+        nm = f"%{val.name}" if val is not None else f"id{vid}"
+        self._isa_lines.append(f"; ST {nm} gp{gp} -> slot {slot}")
+        self._isa_lines.append(f"S_ST_INT gp{gp}, gp0, {slot}")
+        self.spill_count += 1
+
+    def assign_addr_reg(self, v: "mir.MirValue") -> int:
+        if id(v) in self.value_to_areg:
+            return self.value_to_areg[id(v)]
+        areg = self._next_areg
+        self._next_areg += 1
+        self.value_to_areg[id(v)] = areg
+        return areg
+
+    def release_dead_at(self, cur_idx: int) -> None:
+        """Reclaim ALL scratch GPs (nothing crosses an instruction).
+        Pinned counter/lvar GPs are kept."""
+        for vid in list(self.value_to_gp.keys()):
+            if vid in self._pinned:
+                continue
+            gp = self.value_to_gp.pop(vid)
+            self._free_scratch(gp)
+
+    # ---- pins (counter / lvar) ----
+    def pin(self, v: "mir.MirValue") -> None:
+        # Give the pinned value its own dedicated GP for the loop.
+        # ``_emit_loop_serial`` calls ``assign_i32(v)`` immediately before
+        # ``pin(v)`` to mint the GP the prologue text already references —
+        # so ADOPT that GP rather than taking a fresh one (otherwise the
+        # prologue and body would disagree on which GP holds the counter/
+        # lvar). Also drop any store-back scheduled by that assign_i32:
+        # the counter/lvar live in a dedicated GP (and the lvar in its idx
+        # slot), NOT in a data slot — a stray S_ST_INT would clobber a
+        # data slot on the next instruction's store_result.
+        if id(v) not in self._pin_gp:
+            if id(v) in self.value_to_gp:
+                gp = self.value_to_gp[id(v)]
+            else:
+                gp = self._take_scratch()
+                self.value_to_gp[id(v)] = gp
+            self._pin_gp[id(v)] = gp
+        if self._pending_store is not None and self._pending_store[0] == id(v):
+            self._pending_store = None
+        self._pinned.add(id(v))
+
+    def unpin(self, v: "mir.MirValue") -> None:
+        self._pinned.discard(id(v))
+        gp = self._pin_gp.pop(id(v), None)
+        if gp is not None:
+            self.value_to_gp.pop(id(v), None)
+            self._free_scratch(gp)
+
+    # ---- no-op / trivial interface compatibility ----
+    def set_end(self, v, end_idx) -> None:
+        pass
+
+    def enter_loop(self, lp) -> None:
+        pass
+
+    def exit_loop(self, lp) -> None:
+        pass
+
+    def spill_carried_at_entry(self, lp) -> None:
+        pass
+
+    def lock_operands(self, vids) -> None:
+        pass
+
+    def clear_operand_lock(self) -> None:
+        pass
+
+    def assign_i32_pin_gp(self, v):  # helper for pin GP lookup
+        return self._pin_gp.get(id(v))
+
+
+# Switch: True = robust stable allocator (every value -> fixed IntRAM
+# slot, GPs intra-instruction only). False = linear-scan optimiser above.
+USE_STABLE_ALLOC = True
+
 
 # ---------------------------------------------------------------------
 # Emit
@@ -731,7 +973,10 @@ class MirToIsa:
     def __init__(self, fn: mir.MirFunction, shim) -> None:
         self.fn = fn
         self.shim = shim
-        self.alloc = _LinearScanAllocator(fn)
+        self.alloc = (
+            _StableAllocator(fn) if USE_STABLE_ALLOC
+            else _LinearScanAllocator(fn)
+        )
         self.lines: List[str] = []
         # For serial loops we need to claim an IntRAM idx slot and a
         # GP-loop counter; pin/release like legacy ``_emit_for``.
@@ -1001,9 +1246,24 @@ class MirToIsa:
                 arg_list = ", ".join([result_tok] + tokens)
             else:
                 arg_list = ", ".join(tokens)
-            self.lines.append(f"{spec.isa_mnemonic} {arg_list}")
+            # Inline MIR-trace tag: map this ISA line back to its MIR
+            # SSA value(s), so a reader can follow which %N each GP holds.
+            def _opname(o):
+                if isinstance(o, mir.MirValue):
+                    return f"%{o.name}"
+                return str(o)
+            res_nm = f"%{instr.result.name}=" if instr.result is not None else ""
+            ops_nm = ",".join(_opname(o) for o in instr.operands)
+            self.lines.append(
+                f"{spec.isa_mnemonic} {arg_list}"
+                f"   ; {res_nm}{op}({ops_nm})"
+            )
         finally:
             self.alloc.clear_operand_lock()
+        # Store-back the result to its permanent slot (stable allocator).
+        # Must run while the result GP is still owned (before the release
+        # below frees it). No-op for the linear-scan allocator.
+        self.alloc.store_result()
         # Post-emit: release any value whose interval END == cur. These
         # are operands whose final use was this very instruction. They
         # can't be released before assign_i32 above (their GP was needed

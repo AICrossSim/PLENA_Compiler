@@ -123,7 +123,7 @@ def make_gelu_min(
             for row in T.serial(rows):
                 T.copy(X_sh[row, 0], X_FP)
 
-                for i in T.unroll(hlen):
+                for i in T.parallel(hlen):
                     # u = sqrt(2/pi) * (x + 0.044715 * x^3)
                     x3[i]        = X_FP[i] * X_FP[i] * X_FP[i]
                     cx3[i]       = T.float16(0.044715) * x3[i]

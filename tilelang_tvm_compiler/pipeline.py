@@ -103,7 +103,7 @@ def compile_kernel(
     name: str = "kernel",
     midir_dump_dir: Optional[Path] = None,
     addr_config_override: Optional[AddressAllocConfig] = None,
-    use_v2: bool = False,
+    use_v2: bool = True,
 ) -> CompiledKernel:
     """Lower a raw TIR PrimFunc through the mid_ir pipeline + downstream
     address-alloc + ISA-emit passes.
@@ -117,9 +117,10 @@ def compile_kernel(
     several kernels into one continuous ASM run and need to control
     the FPRAM / HBM bases per kernel.
 
-    ``use_v2`` (default False): when True, route the post-address HLIR
+    ``use_v2`` (default True): when True, route the post-address HLIR
     through the PreIsaPassV2 → MIR → ISA pipeline instead of the legacy
-    single-pass ``IsaEmitterPass``. The v2 path is fully op-coverage-
+    single-pass ``IsaEmitterPass``. midir is now the default compile
+    path; pass ``use_v2=False`` to fall back to the legacy emitter. The v2 path is fully op-coverage-
     complete (all 38 HLIR op kinds) and produces structurally
     identical HW-op streams (same M_MM/M_BTMM/H_PREFETCH_V/etc.
     count and order); GP numbers can differ. Set this when you want

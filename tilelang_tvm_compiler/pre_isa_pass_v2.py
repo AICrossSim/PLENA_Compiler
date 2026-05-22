@@ -43,6 +43,56 @@ def _addr(base: int, offset) -> tir.PrimExpr:
     return tir.Add(base_imm, offset)
 
 
+def _try_const(expr) -> "int | None":
+    """Return ``int(expr)`` if it simplifies to a compile-time constant,
+    else None. Uses TVM's arithmetic so symbolic-but-cancelling diffs
+    (e.g. ``(b + c*MLEN) - (b + (c-1)*MLEN)``) fold to the literal step."""
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, tir.IntImm):
+        return int(expr.value)
+    import tvm
+    simp = tvm.arith.Analyzer().simplify(expr)
+    if isinstance(simp, tir.IntImm):
+        return int(simp.value)
+    return None
+
+
+def _const_stride_pair(src_chunks, dst_chunks):
+    """If both chunk-offset lists are constant arithmetic progressions,
+    return ``(src_base, src_stride, dst_base, dst_stride)`` (base = chunk
+    0's offset expr, stride = the constant int step). Else None — caller
+    must fall back to static expansion. A 1-element list has no stride to
+    infer, so it is treated as non-arithmetic (caller handles len==1
+    separately anyway)."""
+    def _stride_of(chunks):
+        if len(chunks) < 2:
+            return None
+        step = _try_const(tir.Sub(_as_expr(chunks[1]), _as_expr(chunks[0])))
+        if step is None:
+            return None
+        # Verify EVERY consecutive gap equals that same step.
+        for a, b in zip(chunks, chunks[1:]):
+            d = _try_const(tir.Sub(_as_expr(b), _as_expr(a)))
+            if d != step:
+                return None
+        return step
+
+    s_stride = _stride_of(src_chunks)
+    d_stride = _stride_of(dst_chunks)
+    if s_stride is None or d_stride is None:
+        return None
+    return src_chunks[0], s_stride, dst_chunks[0], d_stride
+
+
+def _stride_off(base, stride: int, iv: tir.Var) -> tir.PrimExpr:
+    """``base + iv*stride`` as a PrimExpr (the chunk offset for iteration
+    ``iv``). ``base`` is chunk 0's offset expr; for iv=0 this is exactly
+    ``base``, matching the static-expansion chunk-0 offset."""
+    term = tir.Mul(iv, tir.IntImm("int32", int(stride)))
+    return tir.Add(_as_expr(base), term)
+
+
 def _as_expr(v) -> tir.PrimExpr:
     """Coerce ``v`` (int / IntImm / PrimExpr) to a PrimExpr."""
     if isinstance(v, int):
@@ -452,17 +502,58 @@ class PreIsaPassV2:
             f"dst.parent={dst_region.parent} "
             f"extents={list(dst_region.extents)!r}"
         )
-        src_iter = self._legacy._vram_region_iter_chunks(src, src_region)
-        dst_iter = self._legacy._vram_region_iter_chunks(dst, dst_region)
-        for (s_off, _), (d_off, _) in zip(src_iter, dst_iter):
-            src_addr = _addr(int(src.address), s_off)
-            dst_addr = _addr(int(dst.address), d_off)
-            # V_ADD_VF dst, src, f0, 0  — adds the zero FP register
-            # to ``src`` and writes the result to ``dst`` (= copy).
+        src_chunks = [s_off for (s_off, _) in
+                      self._legacy._vram_region_iter_chunks(src, src_region)]
+        dst_chunks = [d_off for (d_off, _) in
+                      self._legacy._vram_region_iter_chunks(dst, dst_region)]
+        if len(src_chunks) != len(dst_chunks):
+            raise PreIsaPassV2Error(
+                f"copy_v_to_v: src has {len(src_chunks)} chunks but dst "
+                f"has {len(dst_chunks)}"
+            )
+
+        def _emit_one(src_off, dst_off):
             self._append(pi.PreIsaOp(
                 opcode="V_ADD_VF",
-                operands=[dst_addr, src_addr, "f0", 0],
+                operands=[
+                    _addr(int(dst.address), dst_off),
+                    _addr(int(src.address), src_off),
+                    "f0", 0,
+                ],
             ))
+
+        # A whole-buffer T.copy (e.g. C_loc -> C_sh, 1024 rows) has no
+        # source for-loop wrapping it, so the naive lowering emits ONE
+        # V_ADD_VF per chunk — at MLEN=1024 that is 1024 instructions
+        # with 1024 literal addresses, which LICM then hoists into a
+        # ~2000-line constant prologue. When the chunk offsets are a
+        # constant arithmetic stride (the common case — row-major-flat
+        # chunks step by exactly MLEN) we instead emit ONE serial loop
+        # whose body computes addr = base + i*stride from the loop_var,
+        # collapsing the 1024 instrs to a 1-instr C_LOOP body. Anything
+        # not detectably arithmetic falls back to static expansion so we
+        # never emit a wrong address.
+        strides = _const_stride_pair(src_chunks, dst_chunks)
+        if len(src_chunks) > 1 and strides is not None:
+            src_base, src_stride, dst_base, dst_stride = strides
+            iv = tir.Var(f"copy_row_{id(op) & 0xffff:x}", "int32")
+            loop = pi.LoopRegion(
+                loop_var=iv, init_imm=0, extent_imm=len(src_chunks),
+                loop_kind="serial", body=[],
+            )
+            self._append(loop)
+            self._push_scope(loop.body)
+            try:
+                _emit_one(
+                    _stride_off(src_base, src_stride, iv),
+                    _stride_off(dst_base, dst_stride, iv),
+                )
+            finally:
+                self._pop_scope()
+            return
+
+        for s_off, d_off in zip(src_chunks, dst_chunks):
+            _emit_one(s_off, d_off)
 
     def _emit_v_fp_transfer_slice(
         self, mod: _hlir.HLIRModule, op: _hlir.Op, *, direction: str,
