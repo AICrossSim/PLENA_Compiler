@@ -267,6 +267,24 @@ class ProgramMatrixOpsMixin:
         self.vram_add(input_var, pos_weight_var)
         return input_var
 
+    def vram_mul(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        dst_row_offset: int = 0,
+        src_row_offset: int = 0,
+        num_rows: int | None = None,
+    ):
+        """VRAM matrix multiply: dst[row_offset:] *= src."""
+        super().vram_matrix_mul(
+            dst_matrix=dst.name,
+            src_matrix=src.name,
+            dst_row_offset=dst_row_offset,
+            src_row_offset=src_row_offset,
+            num_rows=num_rows,
+        )
+        return dst
+
     def vram_block_add_to(
         self,
         src1: TensorVar,

@@ -672,6 +672,69 @@ class IsaMatrixMixin:
         isa_code = "\n".join(lines) + "\n"
         return self._emit(isa_code)
 
+    def vram_matrix_mul(
+        self,
+        dst_matrix: str,
+        src_matrix: str,
+        dst_row_offset: int = 0,
+        src_row_offset: int = 0,
+        num_rows: int | None = None,
+    ) -> str:
+        """General VRAM Matrix Multiplication: dst[row_offset:] *= src."""
+        dst_info = self[dst_matrix]
+        src_info = self[src_matrix]
+
+        self._ensure_vram_matrix_layout(dst_matrix)
+        self._ensure_vram_matrix_layout(src_matrix)
+
+        dst_addr = dst_info.vram_addr
+        src_addr = src_info.vram_addr
+
+        dst_rows, dst_cols = dst_info.shape
+        src_rows, src_cols = src_info.shape
+        dst_physical_rows, dst_physical_cols = dst_info.physical_shape
+        src_physical_rows, src_physical_cols = src_info.physical_shape
+
+        if num_rows is None:
+            num_rows = src_rows
+
+        assert dst_cols == src_cols, f"Column mismatch: dst={dst_cols}, src={src_cols}"
+        assert dst_row_offset + num_rows <= dst_rows, (
+            f"dst row range out of bounds: offset={dst_row_offset}, num_rows={num_rows}, dst_rows={dst_rows}"
+        )
+        assert src_row_offset + num_rows <= src_rows, (
+            f"src row range out of bounds: offset={src_row_offset}, num_rows={num_rows}, src_rows={src_rows}"
+        )
+
+        lines = [
+            f"; === VRAM Matrix Mul: "
+            f"{dst_matrix}[{dst_row_offset}:{dst_row_offset + num_rows}] *= "
+            f"{src_matrix}[{src_row_offset}:{src_row_offset + num_rows}] ===",
+            f"; dst shape: {dst_info.shape}, src shape: {src_info.shape}",
+        ]
+
+        gp_regs = self.register_allocator.allocate_gp(2)
+        gp_dst = gp_regs[0]
+        gp_src = gp_regs[1]
+        num_col_blocks = dst_physical_cols // self.mlen
+        lines.append(f"; row-wise path: num_rows={num_rows}, num_col_blocks={num_col_blocks}")
+
+        for row in range(num_rows):
+            dst_actual_row = dst_row_offset + row
+            src_actual_row = src_row_offset + row
+
+            for col_block in range(num_col_blocks):
+                dst_block_addr = dst_addr + col_block * dst_physical_rows * self.mlen + dst_actual_row * self.mlen
+                src_block_addr = src_addr + col_block * src_physical_rows * self.mlen + src_actual_row * self.mlen
+
+                lines.extend(load_large_int(gp_dst, dst_block_addr))
+                lines.extend(load_large_int(gp_src, src_block_addr))
+                lines.append(f"V_MUL_VV gp{gp_dst}, gp{gp_dst}, gp{gp_src}, 0")
+        self.register_allocator.free_gp(gp_regs)
+
+        isa_code = "\n".join(lines) + "\n"
+        return self._emit(isa_code)
+
     def _target_tile_addr(self, target_matrix: str, target_row_idx: int, target_col_idx: int) -> tuple[int, int, int]:
         if target_matrix not in self:
             raise KeyError(f"Target matrix '{target_matrix}' not found. Use allocate_vram_matrix first.")

@@ -13,6 +13,51 @@ class ProgramAttentionMixin:
     # Flash Attention Operations
     # ========================================================================
 
+    def _needs_explicit_valid_col_mask(self, valid_cols: int | None) -> bool:
+        """Return true when softmax must ignore padded K columns.
+
+        The vector mask path is not sufficient for reductions on current
+        behavioral hardware: padded score lanes can still affect the softmax
+        denominator.  Materialize a VRAM score mask for every partial K block
+        so padded columns are explicitly set to -inf before online softmax.
+        """
+        if valid_cols is None or valid_cols >= self.mlen:
+            return False
+        return True
+
+    def _build_valid_col_mask(self, name: str, valid_cols: int) -> VRAMMatrixVar:
+        """Materialize an MLEN x MLEN score mask with -inf in padded columns."""
+        if valid_cols < 0 or valid_cols > self.mlen:
+            raise ValueError(f"valid_cols must be in [0, {self.mlen}], got {valid_cols}")
+
+        mask = self.alloc(name, self.mlen, self.mlen)
+        mask_addr = self.get_vram_addr(mask.name)
+        fp_scratch_base = self._ONLINE_SOFTMAX_FPSRAM_BASE
+        gp_mask, gp_fp, gp_loop = self.register_allocator.allocate_gp(3)
+
+        lines = [
+            f"; === Build valid-column score mask: valid_cols={valid_cols}, MLEN={self.mlen} ===",
+            f"S_ADDI_INT gp{gp_fp}, gp0, {fp_scratch_base}",
+            "S_LD_FP f7, gp0, 2",
+        ]
+        for col in range(valid_cols):
+            lines.append(f"S_ST_FP f0, gp{gp_fp}, {col}")
+        for col in range(valid_cols, self.mlen):
+            lines.append(f"S_ST_FP f7, gp{gp_fp}, {col}")
+        lines.extend(load_large_int(gp_mask, mask_addr))
+        lines.extend(
+            [
+                f"C_LOOP_START gp{gp_loop}, {self.mlen}",
+                f"S_MAP_V_FP gp{gp_mask}, gp{gp_fp}, 0",
+                f"S_ADDI_INT gp{gp_mask}, gp{gp_mask}, {self.mlen}",
+                f"C_LOOP_END gp{gp_loop}",
+            ]
+        )
+
+        self.register_allocator.free_gp([gp_mask, gp_fp, gp_loop])
+        self.emit("\n".join(lines) + "\n")
+        return mask
+
     def flash_attention(
         self,
         Q,
@@ -123,6 +168,13 @@ class ProgramAttentionMixin:
         num_q_blocks = math.ceil(seq_len / mlen)
         num_k_blocks = math.ceil(kv_seq_len / mlen)
         k_row_blocks_per_batch = max(1, math.ceil(k_rows_per_batch / mlen))
+        valid_col_masks: dict[int, VRAMMatrixVar] = {}
+        for k_idx in range(num_k_blocks):
+            block_cols = min(mlen, kv_seq_len - k_idx * mlen)
+            if self._needs_explicit_valid_col_mask(block_cols):
+                valid_col_masks[block_cols] = self._build_valid_col_mask(
+                    f"_mha_valid_col_mask_{block_cols}", block_cols
+                )
 
         S_block = self.alloc("S", mlen, mlen)
         pv_rows = min(mlen, seq_len)
@@ -177,14 +229,21 @@ class ProgramAttentionMixin:
                         target_row_idx=0,
                         target_col_idx=0,
                     )
+                    valid_col_mask = valid_col_masks.get(block_cols)
+                    if valid_col_mask is not None:
+                        self.vram_add(S_block, valid_col_mask, num_rows=block_rows)
                     if causal_mask is not None:
                         self.vram_add(S_block, causal_mask)
-                    self.online_softmax_block(S_block, scale, rows=block_rows, valid_cols=block_cols)
+                    softmax_valid_cols = None if valid_col_mask is not None else block_cols
+                    self.online_softmax_block(S_block, scale, rows=block_rows, valid_cols=softmax_valid_cols)
                     self.compute_pv(S_block, V, physical_k_idx, PV, head_dim, rows=block_rows)
                     self.scale_o_row(O_batch, q_idx, rows=block_rows)
                     self.vram_add(O_batch, PV, dst_row_offset=q_idx * mlen, num_rows=block_rows)
 
                 self.final_scale_o(q_idx, O_batch, rows=block_rows)
+
+        for mask in valid_col_masks.values():
+            self.free_tensor(mask)
 
         return O
 
@@ -575,6 +634,12 @@ class ProgramAttentionMixin:
             s_base_address=scratch_base_address,
         )
 
+        active_cols = valid_cols or seq_len
+        valid_col_mask = (
+            self._build_valid_col_mask(f"_packed_valid_col_mask_{active_cols}", active_cols)
+            if self._needs_explicit_valid_col_mask(active_cols)
+            else None
+        )
         for head, s_head in enumerate(s_views):
             o_head = self.alloc(
                 f"_packed_O_head{head}",
@@ -584,15 +649,17 @@ class ProgramAttentionMixin:
                 physical_shape=(mlen, mlen),
             )
             self.init_online_softmax(0, o_head, rows=rows)
+            if valid_col_mask is not None:
+                self.vram_add(s_head, valid_col_mask, num_rows=rows)
             if isinstance(causal_mask, VRAMMatrixVar):
                 self.vram_add(s_head, causal_mask, num_rows=rows)
             elif causal_mask is True:
                 self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
-            # A materialized causal mask already makes inactive/future columns
-            # negligible for the active rows. Passing valid_cols here selects
-            # the vector-mask reduce path, whose semantics differ from a pure
-            # active-lane reduction in the emulator.
-            softmax_valid_cols = None if isinstance(causal_mask, VRAMMatrixVar) else (valid_cols or seq_len)
+            softmax_valid_cols = (
+                None
+                if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar)
+                else active_cols
+            )
             self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
             self.compute_pv(s_head, V, k_idx, pv, head_slot_dim, rows=rows)
             self.scale_o_row(o_head, 0, rows=rows)
@@ -613,6 +680,8 @@ class ProgramAttentionMixin:
             )
             self.free_tensor(o_head)
 
+        if valid_col_mask is not None:
+            self.free_tensor(valid_col_mask)
         self.free_tensor(pv)
         self.free_tensor(pack_scratch)
 
@@ -699,6 +768,11 @@ class ProgramAttentionMixin:
         pv = self.alloc("_packed_loop_PV", rows, head_slot_dim, strict=False, physical_shape=(mlen, mlen))
         pack_scratch = self.alloc("_packed_loop_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen))
         pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
+        valid_col_mask = (
+            self._build_valid_col_mask(f"_packed_loop_valid_col_mask_{seq_len}", seq_len)
+            if self._needs_explicit_valid_col_mask(seq_len)
+            else None
+        )
 
         gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop = self.register_allocator.allocate_gp(6)
         k_addr_reg, v_addr_reg = self.register_allocator.allocate_addr(2)
@@ -732,11 +806,17 @@ class ProgramAttentionMixin:
                     physical_shape=(mlen, mlen),
                 )
                 self.init_online_softmax(0, o_head, rows=rows)
+                if valid_col_mask is not None:
+                    self.vram_add(s_head, valid_col_mask, num_rows=rows)
                 if isinstance(causal_mask, VRAMMatrixVar):
                     self.vram_add(s_head, causal_mask, num_rows=rows)
                 elif causal_mask is True:
                     self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
-                softmax_valid_cols = None if isinstance(causal_mask, VRAMMatrixVar) else seq_len
+                softmax_valid_cols = (
+                    None
+                    if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar)
+                    else seq_len
+                )
                 self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
                 self.emit(
                     self._pv_multiply_asm(
@@ -774,6 +854,8 @@ class ProgramAttentionMixin:
             self.register_allocator.free_addr([k_addr_reg, v_addr_reg])
             self.register_allocator.free_gp([gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop])
             self.free_tensor(pv)
+            if valid_col_mask is not None:
+                self.free_tensor(valid_col_mask)
             self.free_tensor(pack_scratch)
 
     def flash_attention_packed_group(
