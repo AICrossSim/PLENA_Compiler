@@ -167,14 +167,17 @@ class VisionConnectorWeights:
 def find_model_root(model: Any) -> Any:
     """Find the transformer backbone (model.model or model.model.text_model).
 
-    Handles standard CausalLM models, VLMs like SmolVLM2, and diffusion models like LLaDA.
-    For LLaDA-style models, wraps transformer.blocks under a .layers attribute for compatibility.
+    Handles standard CausalLM models, VLMs like SmolVLM2, diffusion models like LLaDA,
+    and direct-wrapper models like Fast_dLLM_QwenModel.
     """
-    for candidate in [
+    # Check the model itself first, then common nested attributes
+    candidates = [
+        model,  # Direct wrapper models (e.g., Fast_dLLM_QwenModel)
         getattr(model, "model", None),
         getattr(getattr(model, "model", None), "text_model", None),
         getattr(model, "language_model", getattr(model, "text_model", None)),
-    ]:
+    ]
+    for candidate in candidates:
         if candidate is not None:
             # Standard case: .layers attribute
             if hasattr(candidate, "layers"):
@@ -226,7 +229,16 @@ def find_vision_connector(model: Any) -> Any | None:
 
 def extract_model_config(model: Any) -> ModelConfig:
     """Extract decoder dimensions, resolving text_config for VLM wrappers."""
-    config = getattr(model.config, "text_config", model.config)
+    # Robust config lookup for custom wrappers
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        cfg = getattr(getattr(model, "model", None), "config", None)
+    if cfg is None:
+        raise ValueError(
+            f"Cannot find .config on {type(model).__name__} or its submodules"
+        )
+
+    config = getattr(cfg, "text_config", cfg)
     hidden = config.hidden_size
     num_heads = config.num_attention_heads
     inter_dim = getattr(config, "intermediate_size", None)
@@ -277,28 +289,34 @@ def extract_vision_config(model: Any) -> VisionConfig:
 
 def extract_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
     """Extract one decoder layer in PLENA's (in, out) convention.
-    
-    Supports both standard Llama layers (with self_attn and mlp) and
+
+    Supports both standard Llama/Qwen layers (with self_attn and mlp) and
     LLaDA-style layers (with direct projections).
     """
     # Detect layer type
     is_llada = hasattr(layer, "q_proj") and not hasattr(layer, "self_attn")
-    
+
     if is_llada:
         return _extract_llada_layer_weights(layer, config)
     else:
         return _extract_llama_layer_weights(layer, config)
 
 
-def extract_vision_patch_weights(vision_model: Any, config: VisionConfig) -> VisionPatchWeights:
+def extract_vision_patch_weights(
+    vision_model: Any, config: VisionConfig
+) -> VisionPatchWeights:
     """Extract Conv2d patch embedding as im2col weight + bias."""
     patch = vision_model.embeddings.patch_embedding
-    weight = patch.weight.detach().float().reshape(config.hidden_size, -1).T.contiguous()
+    weight = (
+        patch.weight.detach().float().reshape(config.hidden_size, -1).T.contiguous()
+    )
     bias = _linear_bias(patch, config.hidden_size)
     return VisionPatchWeights(weight_2d=weight, bias=bias)
 
 
-def extract_vision_layer_weights(layer: Any, config: VisionConfig) -> VisionLayerWeights:
+def extract_vision_layer_weights(
+    layer: Any, config: VisionConfig
+) -> VisionLayerWeights:
     """Extract one SigLIP/ViT encoder layer."""
     hidden = config.hidden_size
     inter = config.inter_dim
@@ -325,7 +343,9 @@ def extract_vision_layer_weights(layer: Any, config: VisionConfig) -> VisionLaye
     )
 
 
-def extract_vision_post_norm_weights(vision_model: Any, config: VisionConfig) -> VisionPostNormWeights:
+def extract_vision_post_norm_weights(
+    vision_model: Any, config: VisionConfig
+) -> VisionPostNormWeights:
     norm = vision_model.post_layernorm
     hidden = config.hidden_size
     return VisionPostNormWeights(
@@ -335,7 +355,9 @@ def extract_vision_post_norm_weights(vision_model: Any, config: VisionConfig) ->
     )
 
 
-def extract_vision_connector_weights(model: Any, config: VisionConfig) -> VisionConnectorWeights | None:
+def extract_vision_connector_weights(
+    model: Any, config: VisionConfig
+) -> VisionConnectorWeights | None:
     connector = find_vision_connector(model)
     if connector is None:
         return None
@@ -344,10 +366,16 @@ def extract_vision_connector_weights(model: Any, config: VisionConfig) -> Vision
     if projection is None:
         projection = getattr(connector, "modality_projection", None)
     if projection is None or not hasattr(projection, "weight"):
-        raise ValueError(f"Unsupported vision connector on {type(model).__name__}: missing modality projection")
+        raise ValueError(
+            f"Unsupported vision connector on {type(model).__name__}: missing modality projection"
+        )
 
     scale_factor = int(getattr(connector, "scale_factor", 1))
-    input_dim = int(getattr(projection, "in_features", config.hidden_size * scale_factor * scale_factor))
+    input_dim = int(
+        getattr(
+            projection, "in_features", config.hidden_size * scale_factor * scale_factor
+        )
+    )
     output_dim = int(getattr(projection, "out_features", config.hidden_size))
     expected_input = config.hidden_size * scale_factor * scale_factor
     if input_dim != expected_input:
@@ -367,7 +395,7 @@ def extract_vision_connector_weights(model: Any, config: VisionConfig) -> Vision
 
 
 def _extract_llama_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
-    """Extract standard Llama layer weights."""
+    """Extract standard Llama/Qwen layer weights."""
     hidden = config.hidden_size
     total_kv_dim = config.num_kv_heads * config.head_dim
     w_k_full = _linear_weight(layer.self_attn.k_proj, hidden, total_kv_dim)
@@ -388,7 +416,7 @@ def _extract_llama_layer_weights(layer: Any, config: ModelConfig) -> LayerWeight
 
 def _extract_llada_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
     """Extract LLaDA-style layer weights.
-    
+
     LLaDA uses ff_proj and up_proj both mapping to intermediate dimension,
     with ff_out as the down projection. We treat ff_proj as gate and up_proj
     as the traditional up projection for compatibility with PLENA's FFN ops.
@@ -397,7 +425,7 @@ def _extract_llada_layer_weights(layer: Any, config: ModelConfig) -> LayerWeight
     total_kv_dim = config.num_kv_heads * config.head_dim
     w_k_full = _linear_weight(layer.k_proj, hidden, total_kv_dim)
     w_v_full = _linear_weight(layer.v_proj, hidden, total_kv_dim)
-    
+
     # Get epsilon from either attn_norm or ff_norm
     norm = getattr(layer, "attn_norm", getattr(layer, "ff_norm", None))
 
@@ -409,7 +437,11 @@ def _extract_llada_layer_weights(layer: Any, config: ModelConfig) -> LayerWeight
         w_gate=_linear_weight(layer.ff_proj, hidden, config.inter_dim),
         w_up=_linear_weight(layer.up_proj, hidden, config.inter_dim),
         w_down=_linear_weight(layer.ff_out, config.inter_dim, hidden),
-        eps=getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-5)) if norm else 1e-5,
+        eps=(
+            getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-5))
+            if norm
+            else 1e-5
+        ),
     )
 
 
