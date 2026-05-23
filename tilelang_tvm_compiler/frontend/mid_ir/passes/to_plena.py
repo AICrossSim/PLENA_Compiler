@@ -1528,6 +1528,10 @@ def _lower_multi_lane_elementwise(
 
 _UNARY_TO_ROW_INTRIN = {
     UnaryOp.EXP: "row_exp",
+    # row_footprint==1 reci (e.g. activation kernels fissioned to one
+    # store per for-row) lands here. The v2 emitter's _emit_row_scalar
+    # already maps row_op="reci" -> V_RECI_V, mirroring V_EXP_V.
+    UnaryOp.RECI: "row_reci",
 }
 
 

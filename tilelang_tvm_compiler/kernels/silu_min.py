@@ -1,16 +1,12 @@
-"""SiLU-min kernel — sigmoid linear unit on FP scalar pipeline.
+"""SiLU-min kernel (sigmoid linear unit) on the FP scalar pipeline.
 
-    SiLU(x)    = x * sigmoid(x)
-    sigmoid(x) = 1 / (1 + exp(-x))
+    SiLU(x) = x * sigmoid(x),  sigmoid(x) = 1 / (1 + exp(-x))
 
-PLENA has no sigmoid ISA; the kernel composes it from
-``exp / add / reci / mul``. Only two scalar constants are needed —
-``1.0`` (for the reci numerator and the denominator add) and ``-1.0``
-(to express ``exp(-x)`` as ``exp(NEG_ONE * x)``, since there is no
-unary negate in the FP scalar set). Both come from preloaded rank-1
-``local.fragment`` slots, mirroring gelu_min and flash_attention_min.
-
-Layout: HBM -> VRAM (shared) -> per-row FPRAM scratch -> VRAM -> HBM.
+No native sigmoid; composed from exp/add/reci/mul. ``exp(-x)`` is written as
+``exp(NEG_ONE * x)`` (no unary negate in the FP scalar set). The chain is
+inline; ``lower_compound_fp_stores`` decomposes the nested RHS and
+``hoist_float_constants`` preloads each ``T.float16(...)`` literal into a
+1-slot global.fpram buffer. The ``1.0 / x`` reci form is required.
 """
 
 import tilelang.language as T
@@ -26,13 +22,10 @@ def make_silu_min(
     num_s_blocks: int = 2,
     batch: int = 1,
 ):
-    # Hardware sizes default to plena_settings.toml's active mode.
     _hw = _load_sizes()
     MLEN = _hw.mlen
-    if hlen is None:
-        hlen = _hw.hlen
-    if rows is None:
-        rows = MLEN
+    hlen = hlen if hlen is not None else _hw.hlen
+    rows = rows if rows is not None else MLEN
     if rows != MLEN:
         raise ValueError(f"silu_min requires rows == MLEN ({MLEN}), got {rows}")
     if MLEN % hlen != 0:
@@ -57,55 +50,24 @@ def make_silu_min(
             X_sh = T.alloc_shared((rows, hlen), "float16")
             Y_sh = T.alloc_shared((rows, hlen), "float16")
 
-            X_FP = T.alloc_fragment((hlen,), "float16")
-            Y_FP = T.alloc_fragment((hlen,), "float16")
-
-            # 1.0 / -1.0 are inlined as T.float16(...) literals below.
-            # The hoist_float_constants pre-pass synthesises one 1-slot
-            # global.fpram buffer per unique value.
-
-            neg_x   = T.alloc_fragment((hlen,), "float16")   # -x
-            e_negx  = T.alloc_fragment((hlen,), "float16")   # exp(-x)
-            denom   = T.alloc_fragment((hlen,), "float16")   # 1 + exp(-x)
-            sig     = T.alloc_fragment((hlen,), "float16")   # sigmoid(x)
-
-            T.copy(
-                X_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
-                X_sh,
-            )
-
+            T.copy(X_hbm[0, s_block * rows:(s_block + 1) * rows, by, 0:hlen], X_sh)
             for row in T.serial(rows):
-                T.copy(X_sh[row, 0], X_FP)
-
                 for i in T.unroll(hlen):
-                    neg_x[i]  = T.float16(-1.0) * X_FP[i]
-                    e_negx[i] = T.exp(neg_x[i])
-                    denom[i]  = T.float16(1.0) + e_negx[i]
-                    # ``1.0 / x`` literal numerator — fold lowers this
-                    # to fp_reci_at. A BufferLoad/BufferLoad div would
-                    # not match the reci pattern.
-                    sig[i]    = T.float16(1.0) / denom[i]
-                    Y_FP[i]   = X_FP[i] * sig[i]
-
-                T.copy(Y_FP, Y_sh[row, 0])
-
+                    sig = T.float16(1.0) / (
+                        T.float16(1.0) + T.exp(T.float16(-1.0) * X_sh[row, i])
+                    )
+                    Y_sh[row, i] = X_sh[row, i] * sig
             T.copy(
                 Y_sh,
-                Y_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+                Y_hbm[0, s_block * rows:(s_block + 1) * rows, by, 0:hlen],
             )
 
-    lowered = silu_min
-
     constants = {
-        "ROWS": rows,
-        "MLEN": MLEN,
-        "HLEN": hlen,
-        "HEAD_COUNT": head_count,
-        "BATCH": batch,
-        "NUM_S_BLOCKS": num_s_blocks,
+        "ROWS": rows, "MLEN": MLEN, "HLEN": hlen, "HEAD_COUNT": head_count,
+        "BATCH": batch, "NUM_S_BLOCKS": num_s_blocks,
         "HARDWARE_LANE_COUNT": hardware_lane_count,
     }
-    return lowered, constants
+    return silu_min, constants
 
 
 __all__ = ["make_silu_min"]

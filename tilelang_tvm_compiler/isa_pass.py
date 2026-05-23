@@ -176,6 +176,7 @@ class IsaEmitterPass:
             "row_reduce_max_at": self._emit_row_reduce_max_at,
             "row_reduce_sum_at": self._emit_row_reduce_sum_at,
             "row_exp": self._emit_row_exp,
+            "row_reci": self._emit_row_reci,
             "row_sub_fp": self._emit_row_sub_fp,
             "row_mul_fp": self._emit_row_mul_fp,
             "row_add_fp": self._emit_row_add_fp,
@@ -2711,6 +2712,9 @@ class IsaEmitterPass:
     # instruction. Multi-row callers wrap in outer ``for row``.
     def _emit_row_exp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_row_scalar_op_at(mod, op, row_op="exp", masked=True)
+
+    def _emit_row_reci(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        self._emit_row_scalar_op_at(mod, op, row_op="reci", masked=True)
 
     def _emit_row_sub_fp(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
         self._emit_row_scalar_op_at(mod, op, row_op="sub", masked=True, has_fp=True)

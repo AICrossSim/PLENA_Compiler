@@ -100,6 +100,10 @@ class PreIsaPass:
                 lambda m, o: self._emit_row_scalar_op_at(
                     m, o, row_op="exp", masked=True,
                 ),
+            "row_reci":
+                lambda m, o: self._emit_row_scalar_op_at(
+                    m, o, row_op="reci", masked=True,
+                ),
             "row_sub_fp":
                 lambda m, o: self._emit_row_scalar_op_at(
                     m, o, row_op="sub", masked=True, has_fp=True,

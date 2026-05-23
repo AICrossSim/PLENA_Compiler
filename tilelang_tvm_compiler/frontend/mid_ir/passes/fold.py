@@ -1104,6 +1104,27 @@ def _index_expr_uses_varref(idx, target: VarRef) -> bool:
     return False
 
 
+def _op_keeps_row(ew) -> bool:
+    """True if this Elementwise will be lowered via a PER-ROW path that
+    keeps the ``row`` index in the buffer address (needing an enclosing
+    ``for row``), so the outer loop must NOT be absorbed.
+
+    Mirrors to_plena's per-row routing (the only two cases that keep row):
+      * unary EXP / RECI with a single-row footprint  → row_exp / row_reci
+        (to_plena _lower_multi_lane_elementwise ~1398). Our fissioned ops
+        always have a concrete row index here, so footprint is 1.
+      * any op with a Broadcast src (incl. rank-0 hoisted scalar consts:
+        ``CONST * tmp``)               → row_mul_fp / row_add_fp / row_sub_fp
+        (to_plena _lower_bare_broadcast_elementwise).
+
+    COPY and two-buffer binops without a Broadcast go whole-tile (v_*,
+    rebuilt as ``for row1``, row remapped) and ARE safe to absorb.
+    Supersedes the narrower ``_elementwise_refs_var`` row-only check."""
+    if any(isinstance(src, Broadcast) for src in ew.srcs):
+        return True
+    return ew.op in (UnaryOp.EXP, UnaryOp.RECI) and len(ew.srcs) == 1
+
+
 def _elementwise_refs_var(ew, target: VarRef) -> bool:
     """True if any ``Broadcast`` src of ``ew`` references ``target``
     (by identity) in its indices.
@@ -1220,18 +1241,27 @@ def _walk_stmt(stmt,
                         and _outer_loop_matches_buffer_axis(
                             inner_ew.dst, stmt.loop_var, int(stmt.extent.value),
                         )
-                        # Don't absorb if any Broadcast src still uses
-                        # the outer loop var — e.g. ``dst[row,col] =
-                        # a[row,col] * b[row]`` folds the parallel ``col``
-                        # away but the ``b[row]`` Broadcast still needs
-                        # ``row`` bound by an enclosing for. Absorbing it
-                        # would leave ``row`` referenced but unbound,
-                        # crashing ExprMaterializer later. Pass through
-                        # as a regular For instead so the outer loop
-                        # keeps its scope.
-                        and not _elementwise_refs_var(
-                            inner_ew, _vref(stmt.loop_var),
-                        )):
+                        # Don't absorb if the op has ANY Broadcast src.
+                        # A Broadcast src makes mark set can_async=False, so
+                        # the op lowers via the per-row path (row_*_fp etc.),
+                        # which needs ``row`` bound by an enclosing for.
+                        #
+                        # Two flavours both require the outer for to stay:
+                        #   * rank>=1 Broadcast (``a[row,col] * b[row]``):
+                        #     the src indices reference ``row`` literally.
+                        #   * rank-0 Broadcast (``dst[row,col] = CONST *
+                        #     src[row,col]`` with a hoisted scalar const):
+                        #     the const's indices are empty so
+                        #     _elementwise_refs_var misses it, but the
+                        #     per-row lowering still needs ``row`` for the
+                        #     dst/other-src indices. (Only activation
+                        #     kernels writing a scalar-const mul straight to
+                        #     2D VRAM hit this — FPRAM-scalar dsts take the
+                        #     _is_serial_for branch above, and rank-2 *
+                        #     rank-2 muls have no Broadcast at all.)
+                        # Pass through as a regular For so the loop keeps
+                        # its scope.
+                        and not _op_keeps_row(inner_ew)):
                     return [inner_ew]
         # Pass through as a regular For. Body is recursively walked;
         # any nested BufferStore that doesn't fold becomes a RawStore.

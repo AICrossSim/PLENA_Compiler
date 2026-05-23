@@ -34,6 +34,7 @@ from . import plena_settings as _plena_settings
 # __init__ (which imports compile_func → frontend/pipeline.py →
 # ..pipeline.PlenaTarget, a circular import once we land here).
 from .frontend.passes import inline_let_stmts as _stmt_inline_let
+from .frontend.passes import fission_vector_chains as _stmt_fission_vec
 from .frontend.passes import lower_compound_fp_stores as _stmt_lower_compound
 from .frontend.passes import hoist_float_constants as _stmt_hoist_consts
 from .frontend.mid_ir.passes import infer_lane_axis as _mid_infer_lane_axis
@@ -139,6 +140,16 @@ def compile_kernel(
     """
     # ---------- 0. stmt prep ----------
     func = _stmt_inline_let.run(prim_func)
+    # Fission compound vector (VRAM) chains into one-op-per-loop form
+    # before anything else looks at the IR. Activation kernels compute
+    # directly on 2D shared buffers; this rewrite is what makes their
+    # nested RHS legal for the single-op mid_ir fold. No-op for the
+    # rank-1 FPRAM path that lower_compound_fp_stores handles next.
+    func = _stmt_fission_vec.run(func)
+    # DEBUG: dump the TIR right after fission (one-op-per-loop form) so we
+    # can inspect the pre-mid_ir loop structure.
+    if midir_dump_dir is not None:
+        (midir_dump_dir / "post_fission.tir.txt").write_text(str(func))
     func = _stmt_lower_compound.run(func)
     # Hoist FP literals (T.float16(c) etc.) into auto-synthesised
     # ``global.fpram`` 1-slot buffers so the kernel author doesn't have

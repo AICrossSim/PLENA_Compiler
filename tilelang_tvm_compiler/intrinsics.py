@@ -284,6 +284,13 @@ register(IntrinsicSpec(
 ))
 
 register(IntrinsicSpec(
+    name="plena.row_reci_at",
+    # vram_src, vram_dst, row, head (no FP operand) — mirrors row_exp_at
+    operand_scopes=(_scope.VRAM, _scope.VRAM, None, None),
+    emit=lambda a: f"ROW_RECI_AT src={a[0]} dst={a[1]} row={a[2]} head={a[3]}",
+))
+
+register(IntrinsicSpec(
     name="plena.row_sub_fp_at",
     # vram_src, fp_addr, vram_dst, row, head
     operand_scopes=(_scope.VRAM, None, _scope.VRAM, None, None),
