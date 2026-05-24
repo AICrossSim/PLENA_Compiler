@@ -36,8 +36,10 @@ from . import scope as _scope
 
 def _parse_kernel_kwargs(spec: str | None) -> dict:
     """Parse a comma-separated `k=v,k=v` string into a kwargs dict.
-    Values are coerced to int if possible (the only case we currently
-    need for shape parameters)."""
+    Values are coerced to int, then float, else kept as a string. The float
+    fallback matters for params like ``eps=1e-06`` — without it the kernel
+    receives the string "1e-06" and ``T.float16(eps)`` fails with a handle
+    cast error."""
     if not spec:
         return {}
     out: dict = {}
@@ -54,7 +56,10 @@ def _parse_kernel_kwargs(spec: str | None) -> dict:
         try:
             out[k] = int(v)
         except ValueError:
-            out[k] = v
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
     return out
 
 
