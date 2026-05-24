@@ -149,31 +149,42 @@ class PlenaCompiler(
         return name
 
     def _allocate_hbm(self, hbm_size: int) -> int:
-        """Allocate HBM range, preferring previously freed blocks."""
+        """Allocate HBM range, preferring previously freed blocks.
+
+        All addresses returned are aligned to mlen*mlen, which the Rust
+        emulator's continous_write_delayed requires (src/main.rs:155).
+        """
+        m = self.mlen
+        tile_bytes = m * m
         best_idx = None
         best_waste = None
         for i, (addr, size) in enumerate(self._hbm_free_blocks):
-            if size >= hbm_size:
-                waste = size - hbm_size
+            aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+            aligned_waste = aligned_addr - addr
+            effective_size = size - aligned_waste
+            if effective_size >= hbm_size:
+                waste = effective_size - hbm_size
                 if best_waste is None or waste < best_waste:
                     best_idx = i
                     best_waste = waste
 
         if best_idx is not None:
             addr, block_size = self._hbm_free_blocks.pop(best_idx)
-            # Return excess fragment to free list
-            excess = block_size - hbm_size
+            aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+            # Return any pre-alignment gap as a free fragment
+            if aligned_addr > addr:
+                self._hbm_free_blocks.append((addr, aligned_addr - addr))
+            excess = block_size - (aligned_addr - addr) - hbm_size
             if excess > 0:
-                self._hbm_free_blocks.append((addr + hbm_size, excess))
-            return addr
+                self._hbm_free_blocks.append((aligned_addr + hbm_size, excess))
+            return aligned_addr
 
         addr = self._next_hbm_addr
-        m = self.mlen
+        # Ensure the start address is tile-aligned (first alloc starts at 0;
+        # recycled blocks could have left us misaligned).
+        addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
         self._next_hbm_addr = ((addr + hbm_size + m - 1) // m) * m
-        # Rust emulator's continous_write_delayed requires HBM addresses
-        # aligned to mlen*mlen (65536 at MLEN=256). Pad the allocation end
-        # to this alignment so the next address is compatible.
-        self._next_hbm_addr = ((self._next_hbm_addr + m * m - 1) // (m * m)) * (m * m)
+        self._next_hbm_addr = ((self._next_hbm_addr + tile_bytes - 1) // tile_bytes) * tile_bytes
         return addr
 
     def _recycle_hbm(self, hbm_addr: int, hbm_size: int):
