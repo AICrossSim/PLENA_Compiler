@@ -3210,11 +3210,13 @@ def compile_native_hf_decoder(
     COS = prog.load_batch(cos_input, name="COS")
     SIN = prog.load_batch(sin_input, name="SIN")
 
-    # Causal mask: (mlen, mlen) with 0 on/below diagonal, -inf above
+    # Causal mask: (mlen, mlen) with 0 on/below diagonal, -inf above.
+    # Bidirectional models (e.g. LLaDA) use an all-zero mask.
     causal_mask_data = torch.zeros(mlen, mlen)
-    causal_mask_data.masked_fill_(
-        torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
-    )
+    if model_cfg.model_type != "llada":
+        causal_mask_data.masked_fill_(
+            torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
+        )
     causal_mask_input = prog.input("causal_mask", shape=(mlen, mlen))
     CAUSAL_MASK = prog.load_batch(causal_mask_input, name="CAUSAL_MASK")
 
