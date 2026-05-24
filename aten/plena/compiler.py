@@ -170,6 +170,10 @@ class PlenaCompiler(
         addr = self._next_hbm_addr
         m = self.mlen
         self._next_hbm_addr = ((addr + hbm_size + m - 1) // m) * m
+        # Rust emulator's continous_write_delayed requires HBM addresses
+        # aligned to mlen*mlen (65536 at MLEN=256). Pad the allocation end
+        # to this alignment so the next address is compatible.
+        self._next_hbm_addr = ((self._next_hbm_addr + m * m - 1) // (m * m)) * (m * m)
         return addr
 
     def _recycle_hbm(self, hbm_addr: int, hbm_size: int):
