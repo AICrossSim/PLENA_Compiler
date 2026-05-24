@@ -263,6 +263,20 @@ def _logical_2d(shape, layout: str = "BSHD") -> tuple[int, int]:
     return logical_2d_extents(shape, layout)
 
 
+def _load_addr_overrides(path):
+    """Load a name -> address map from a JSON file.
+
+    Returns {} when ``path`` is None. The JSON is a flat object mapping buffer
+    name to integer address.
+    """
+    if not path:
+        return {}
+    raw = json.loads(Path(path).read_text())
+    if not isinstance(raw, dict):
+        raise SystemExit(f"--*-address-overrides {path}: expected a JSON object")
+    return {str(k): int(v) for k, v in raw.items()}
+
+
 def _cmd_compile(args: argparse.Namespace) -> int:
     kernel_kwargs = _parse_kernel_kwargs(args.kernel_kwargs)
     func = _resolve_kernel(args.kernel, kernel_kwargs)
@@ -273,9 +287,29 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         btmm_hlen=args.btmm_hlen,
     )
     midir_dump_dir = Path(args.dump_hlir).parent if args.dump_hlir else None
+
+    # Address overrides (manager / multi-kernel drivers). When either is set
+    # we build a full AddressAllocConfig from the same geometry the pipeline
+    # default uses, then attach the pinned addresses. Geometry MUST come from
+    # the CLI args (which the manager derives from plena_settings.toml), never
+    # hardcoded — the HW geometry is a moving target.
+    addr_config_override = None
+    hbm_ov = _load_addr_overrides(args.hbm_address_overrides)
+    fpram_ov = _load_addr_overrides(args.fpram_address_overrides)
+    if hbm_ov or fpram_ov:
+        from .address_alloc import AddressAllocConfig
+        addr_config_override = AddressAllocConfig(
+            mlen=args.mlen,
+            blen=args.blen,
+            hlen=args.btmm_hlen,
+            hbm_address_overrides=hbm_ov or {},
+            fpram_address_overrides=fpram_ov or {},
+        )
+
     compiled = compile_kernel(
         func, target=target, name=args.asm_name,
         midir_dump_dir=midir_dump_dir,
+        addr_config_override=addr_config_override,
         use_v2=bool(getattr(args, "use_v2", True)),
     )
     isa_text = compiled.isa_text
@@ -414,6 +448,22 @@ def main(argv: list[str] | None = None) -> int:
              "On by default; pass --no-use-v2 for the legacy emitter. "
              "Same HW op stream; tighter register allocation; MIR dump "
              "available for debugging.",
+    )
+    p_compile.add_argument(
+        "--hbm-address-overrides",
+        default=None,
+        help="Path to a JSON file mapping buffer name -> HBM byte address. "
+             "Used by the manager / multi-kernel drivers to pin each tensor "
+             "to a pre-planned address (producer.out == consumer.in). Names "
+             "not in the map fall back to the bump allocator. Pinned "
+             "addresses do NOT advance the bump cursor.",
+    )
+    p_compile.add_argument(
+        "--fpram-address-overrides",
+        default=None,
+        help="Path to a JSON file mapping buffer name -> FPRAM slot address. "
+             "Used by the manager's global constant pool to place each "
+             "kernel's hoisted FP constants at pre-allocated slots.",
     )
     p_compile.set_defaults(func=_cmd_compile)
 
