@@ -54,6 +54,7 @@ Bias (optional):
 
 import tilelang.language as T
 
+from ..frontend.gemm_macros import KIND, BTMM_MM
 from ..plena_settings import load_sizes as _load_sizes
 
 
@@ -129,15 +130,12 @@ def make_linear_min(
                 BIAS_sh = T.alloc_shared((MLEN, MLEN), "float16")
                 C_sh    = T.alloc_shared((MLEN, MLEN), "float16")
 
-                C_loc   = T.alloc_fragment((MLEN, MLEN), "float16")
-                SCR_loc = T.alloc_fragment((MLEN, MLEN), "float16")
+                C_loc = T.alloc_fragment((MLEN, MLEN), "float16")
 
-                # Zero C_loc so the first K iteration's add behaves as
-                # clear+write.
-                for row in T.serial(MLEN):
-                    for col in T.Parallel(MLEN):
-                        C_loc[row, col] = T.float16(0)
-
+                # btmm_mm: M_BTMM per k_block accumulates in hm_accum; the
+                # deferred M_BMM_WO drain (before C_loc's first read — here
+                # the BIAS add below) writes the result into C_loc. No
+                # software K-add, no zero-seed.
                 for k_block in T.serial(k_blocks):
                     T.copy(
                         A_hbm[0,
@@ -147,11 +145,9 @@ def make_linear_min(
                         A_sh,
                     )
                     # B is (N, K) row-major — same convention as
-                    # nn.Linear.weight. The lowering issues M_TMM when
-                    # transpose_B is set, which transposes the (mlen,
-                    # mlen) MRAM tile on the fly inside the systolic
-                    # array. The slice walks N along the seq axis and K
-                    # along the hlen axis.
+                    # nn.Linear.weight. transpose_B transposes the (mlen,
+                    # mlen) MRAM tile inside the systolic array. The slice
+                    # walks N along seq and K along hlen.
                     T.copy(
                         B_hbm[0,
                               bx * MLEN : (bx + 1) * MLEN,
@@ -160,11 +156,8 @@ def make_linear_min(
                         B_sh,
                     )
 
-                    T.gemm(A_sh, B_sh, SCR_loc, transpose_B=True)
-
-                    for row in T.serial(MLEN):
-                        for col in T.Parallel(MLEN):
-                            C_loc[row, col] = C_loc[row, col] + SCR_loc[row, col]
+                    with T.attr(0, KIND, BTMM_MM):
+                        T.gemm(A_sh, B_sh, C_loc, transpose_B=True)
 
                 T.copy(
                     BIAS_hbm[0,
@@ -200,13 +193,14 @@ def make_linear_min(
                 B_sh = T.alloc_shared((MLEN, MLEN), "float16")
                 C_sh = T.alloc_shared((MLEN, MLEN), "float16")
 
-                C_loc   = T.alloc_fragment((MLEN, MLEN), "float16")
-                SCR_loc = T.alloc_fragment((MLEN, MLEN), "float16")
+                C_loc = T.alloc_fragment((MLEN, MLEN), "float16")
 
-                for row in T.serial(MLEN):
-                    for col in T.Parallel(MLEN):
-                        C_loc[row, col] = T.float16(0)
-
+                # btmm_mm: each k_block issues one M_BTMM that ACCUMULATES
+                # into the hardware accumulator (hm_accum +=). No software
+                # K-add and no zero-seed — the deferred M_BMM_WO drain
+                # (auto-inserted by split_btmm_materialize before C_loc is
+                # first read) writes the accumulated result into C_loc and
+                # zeroes the accumulator for the next tile.
                 for k_block in T.serial(k_blocks):
                     T.copy(
                         A_hbm[0,
@@ -223,11 +217,8 @@ def make_linear_min(
                         B_sh,
                     )
 
-                    T.gemm(A_sh, B_sh, SCR_loc, transpose_B=True)
-
-                    for row in T.serial(MLEN):
-                        for col in T.Parallel(MLEN):
-                            C_loc[row, col] = C_loc[row, col] + SCR_loc[row, col]
+                    with T.attr(0, KIND, BTMM_MM):
+                        T.gemm(A_sh, B_sh, C_loc, transpose_B=True)
 
                 T.copy(C_loc, C_sh)
                 # Write into a column-slice of the (possibly wider)

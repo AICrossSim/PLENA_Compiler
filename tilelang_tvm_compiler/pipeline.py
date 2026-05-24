@@ -35,6 +35,7 @@ from . import plena_settings as _plena_settings
 # ..pipeline.PlenaTarget, a circular import once we land here).
 from .frontend.passes import inline_let_stmts as _stmt_inline_let
 from .frontend.passes import fission_vector_chains as _stmt_fission_vec
+from .frontend.passes import split_btmm_materialize as _stmt_split_btmm
 from .frontend.passes import lower_compound_fp_stores as _stmt_lower_compound
 from .frontend.passes import hoist_float_constants as _stmt_hoist_consts
 from .frontend.mid_ir.passes import infer_lane_axis as _mid_infer_lane_axis
@@ -146,6 +147,11 @@ def compile_kernel(
     # nested RHS legal for the single-op mid_ir fold. No-op for the
     # rank-1 FPRAM path that lower_compound_fp_stores handles next.
     func = _stmt_fission_vec.run(func)
+    # Split btmm_mm GEMMs: insert a deferred M_BMM_WO drain after the
+    # K-loop (hardware accumulates each k_block's M_BTMM; one drain
+    # writes the result out). No-op when no btmm_mm gemm is present.
+    func = _stmt_split_btmm.run(
+        func, mlen=target.mlen, lane_count=target.btmm_lane_count)
     # DEBUG: dump the TIR right after fission (one-op-per-loop form) so we
     # can inspect the pre-mid_ir loop structure.
     if midir_dump_dir is not None:

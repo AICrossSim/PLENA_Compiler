@@ -77,7 +77,7 @@ from tvm import tir as _tir
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
     BufferDef, BufferRef, Slice, VarRef,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
+    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore, BmmWo,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
     MidFunc, Stmt,
@@ -233,6 +233,18 @@ def _walk_stmt(stmt: Stmt, ctx: _Ctx) -> Stmt:
         return RawStore(
             dst=_swap_ref(stmt.dst, ctx),
             value=stmt.value,
+        )
+    if isinstance(stmt, BmmWo):
+        # scratch + dst are lane-aware buffers (cluster dim prepended like
+        # any on-chip buffer); rewrite both refs.
+        return BmmWo(
+            scratch=_swap_ref(stmt.scratch, ctx),
+            dst=_swap_ref(stmt.dst, ctx),
+            lane_count=stmt.lane_count,
+            scratch_axes=list(stmt.scratch_axes),
+            dst_axes=list(stmt.dst_axes),
+            marker=stmt.marker,
+            can_async=stmt.can_async,
         )
     if isinstance(stmt, ParallelAxis):
         return _split_or_walk_parallel(stmt, ctx)

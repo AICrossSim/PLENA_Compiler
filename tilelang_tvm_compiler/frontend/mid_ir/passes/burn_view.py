@@ -53,7 +53,7 @@ from ..cluster_guard import should_skip_cluster
 from ..ir import (
     AxisRole, AxisInfo,
     BufferDef, BufferRef, Slice,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
+    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore, BmmWo,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
     MidFunc, Stmt,
@@ -298,6 +298,16 @@ def _rewrite_op(op, new_defs):
         return RawStore(
             dst=_rewrite_ref(op.dst, new_defs),
             value=op.value,
+        )
+    if isinstance(op, BmmWo):
+        return BmmWo(
+            scratch=_rewrite_ref(op.scratch, new_defs),
+            dst=_rewrite_ref(op.dst, new_defs),
+            lane_count=op.lane_count,
+            scratch_axes=_permute_axes(op.scratch_axes, op.scratch),
+            dst_axes=_permute_axes(op.dst_axes, op.dst),
+            marker=op.marker,
+            can_async=op.can_async,
         )
     raise BurnViewError(f"unhandled op type {type(op).__name__}")
 

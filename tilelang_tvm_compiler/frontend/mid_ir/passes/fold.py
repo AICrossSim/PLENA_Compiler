@@ -69,13 +69,14 @@ from ..ir import (
     AxisRole, AxisInfo,
     BufferDef, BufferRef, Slice, VarRef,
     Elementwise, Broadcast, Reduce,
-    Gemm, Dma, RawStore, For, MidFunc,
+    Gemm, Dma, RawStore, BmmWo, For, MidFunc,
     ParallelAxis, ParallelKind,
 )
 
 
 _TILEOP_COPY = "tl.tileop.copy"
 _TILEOP_GEMM = "tl.tileop.gemm_py"
+_BMM_WO = "plena.bmm_wo_at"
 _TILEOP_REDUCE = "tl.tileop.reduce"
 _TILEOP_REGION = "tl.tileop.region"
 _KIND_KEY = "plena.gemm_kind"
@@ -877,6 +878,36 @@ def _try_fold_store(store: tir.BufferStore,
 # ---------------------------------------------------------------------------
 
 
+def _fold_bmm_wo(call: tir.Call,
+                 buf_table: Dict[str, BufferDef]) -> BmmWo:
+    """``plena.bmm_wo_at(scratch.data, dst.data, lane_count)`` → BmmWo.
+
+    Both buffers are passed as ``.data`` Vars (name == buffer name);
+    build whole-buffer BufferRefs from buf_table."""
+    args = _call_args(call)
+    if len(args) < 3:
+        raise FoldError(
+            f"plena.bmm_wo_at: expected (scratch, dst, lane_count); "
+            f"got {len(args)} args"
+        )
+
+    def _ref(var) -> BufferRef:
+        name = getattr(var, "name", None) or getattr(var, "name_hint", None)
+        if name is None:
+            raise FoldError(f"plena.bmm_wo_at arg is not a named var: {var!r}")
+        bd = buf_table.get(name)
+        if bd is None:
+            raise FoldError(
+                f"plena.bmm_wo_at buffer {name!r} not in buf_table"
+            )
+        return BufferRef(buffer=bd, indices=[Slice() for _ in bd.shape])
+
+    scratch_ref = _ref(args[0])
+    dst_ref = _ref(args[1])
+    lane_count = int(args[2].value) if isinstance(args[2], tir.IntImm) else 1
+    return BmmWo(scratch=scratch_ref, dst=dst_ref, lane_count=lane_count)
+
+
 _REDUCE_OPS_BY_NAME = {
     "max": ReduceOp.MAX,
     "sum": ReduceOp.SUM,
@@ -1331,6 +1362,8 @@ def _walk_stmt(stmt,
                                buf_table=buf_table)]
         if kind == _TILEOP_REDUCE:
             return [_fold_reduce(val, buf_table)]
+        if kind == _BMM_WO:
+            return [_fold_bmm_wo(val, buf_table)]
         # Unknown extern: drop with a deliberate marker. Production
         # could accumulate these into a side list for diagnostics.
         return []

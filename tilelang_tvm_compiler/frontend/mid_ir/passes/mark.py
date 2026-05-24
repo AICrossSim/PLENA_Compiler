@@ -63,7 +63,7 @@ from __future__ import annotations
 from typing import List
 
 from ..ir import (
-    Dma, Gemm, Elementwise, Reduce, RawStore, For, Async, MultiLaneOp,
+    Dma, Gemm, Elementwise, Reduce, RawStore, BmmWo, For, Async, MultiLaneOp,
     Broadcast, Marker, MidFunc, Stmt,
     ParallelAxis,
 )
@@ -89,9 +89,17 @@ def _mark_dma(op: Dma) -> Dma:
 
 def _mark_gemm(op: Gemm) -> Gemm:
     # btmm: one multi-lane M_BTMM instruction → async.
+    # btmm_mm: non-fused MLEN×MLEN matmul via M_BTMM; one per k_block,
+    #   accumulates in hm_accum, drained later. NOT async (program order,
+    #   no multilane fuse), so it doesn't get wrapped in Async.
     # overwrite (per-head): one matmul per lane, runs inside the lane
-    # loop → not async.
-    is_btmm = op.kind == "btmm"
+    #   loop → not async.
+    if op.kind == "btmm":
+        marker, can_async = Marker.BTMM, True
+    elif op.kind == "btmm_mm":
+        marker, can_async = Marker.BTMM_MM, False
+    else:
+        marker, can_async = None, False
     return Gemm(
         a=op.a, b=op.b, c=op.c,
         transpose_a=op.transpose_a, transpose_b=op.transpose_b,
@@ -99,8 +107,8 @@ def _mark_gemm(op: Gemm) -> Gemm:
         a_axes=list(op.a_axes),
         b_axes=list(op.b_axes),
         c_axes=list(op.c_axes),
-        marker=Marker.BTMM if is_btmm else None,
-        can_async=is_btmm,
+        marker=marker,
+        can_async=can_async,
     )
 
 
@@ -169,6 +177,8 @@ def _walk(stmt: Stmt) -> Stmt:
         return _mark_reduce(stmt)
     if isinstance(stmt, RawStore):
         return stmt  # pass-through; never gets a marker
+    if isinstance(stmt, BmmWo):
+        return stmt  # drain — non-async, no marker; lowered in to_plena
     if isinstance(stmt, For):
         return For(
             loop_var=stmt.loop_var,

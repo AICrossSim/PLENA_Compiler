@@ -70,7 +70,8 @@ class Marker(Enum):
     """Tag attached to op sites by pass_2_mark. Drives async/cluster handling
     downstream. Untagged ops stay sequential, never get lane-fused."""
     DMA = "dma"        # HBM ↔ on-chip transfer
-    BTMM = "btmm"      # head-fused matmul
+    BTMM = "btmm"      # head-fused matmul (async, multilane-fused)
+    BTMM_MM = "btmm_mm"  # non-fused MLEN×MLEN matmul via M_BTMM (not async)
     LANE_OP = "lane_op"  # an elementwise/reduce that lives inside the cluster
 
 
@@ -420,6 +421,34 @@ class RawStore:
     """
     dst: BufferRef
     value: object   # tir.PrimExpr or similar — opaque to mid_ir passes
+
+
+@dataclass
+class BmmWo:
+    """Drain ("materialize") of the systolic BTMM accumulator (hm_accum)
+    plus the lane-tile accumulation into the real dst.
+
+    Emitted by ``split_btmm_materialize`` after a ``btmm_mm`` K-loop. The
+    preceding btmm_mm Gemm(s) accumulated into hm_accum (hardware ``+=``).
+    BTMM splits K into ``lane_count`` partial products, so hm_accum holds
+    lane_count (mlen,mlen) tiles whose SUM is the full result.
+
+    Lowering (backend) does two things:
+      1. ``M_BMM_WO`` drains hm_accum's lane_count tiles into ``scratch``
+         (a (lane_count*mlen, mlen) buffer, tiles stacked along rows).
+      2. a V_ADD loop sums the lane_count tiles of ``scratch`` into
+         ``dst`` (mlen,mlen).
+
+    Opaque/structural like RawStore: downstream passes only do standard
+    cluster-dim handling on the refs.
+    """
+    scratch: BufferRef
+    dst: BufferRef
+    lane_count: int
+    scratch_axes: List[AxisInfo] = field(default_factory=list)
+    dst_axes: List[AxisInfo] = field(default_factory=list)
+    marker: Optional[Marker] = None
+    can_async: bool = False
 
 
 # ---------------------------------------------------------------------------

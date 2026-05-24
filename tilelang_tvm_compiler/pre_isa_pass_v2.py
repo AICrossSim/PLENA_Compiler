@@ -178,6 +178,8 @@ class PreIsaPassV2:
                 m, o, row_op="add", masked=True, has_fp=True,
             ),
             "btmm": self._emit_btmm,
+            "btmm_mm": self._emit_btmm_mm,
+            "bmm_wo": self._emit_bmm_wo,
             "btmv": self._emit_btmv,
             "mv": self._emit_mv,
             "mm": self._emit_mm,
@@ -974,6 +976,114 @@ class PreIsaPassV2:
             op_mnemonic="M_BTMV", wo_mnemonic="M_BMV_WO",
             task_default="btmv",
         )
+
+    def _emit_btmm_mm(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Non-fused MLEN×MLEN matmul: COMPUTE ONLY (one M_BTMM into the
+        hm_accum). No write-back — a separate ``bmm_wo`` op drains the
+        accumulator after the K-loop, so multiple k_blocks accumulate in
+        hardware before a single drain."""
+        if len(op.buffer_args) != 3:
+            raise PreIsaPassV2Error(
+                f"btmm_mm expects 3 buffer_args (a/b/c regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        a_reg, b_reg, c_reg = op.buffer_args
+        if not isinstance(a_reg, _hlir.VramRegion):
+            raise PreIsaPassV2Error("btmm_mm a: expected VramRegion")
+        if not isinstance(b_reg, _hlir.MramRegion):
+            raise PreIsaPassV2Error("btmm_mm b: expected MramRegion")
+        lhs = mod.get_buffer(a_reg.parent)
+        rhs = mod.get_buffer(b_reg.parent)
+        task_id = op.annotations.get("intrinsic", "btmm_mm")
+        rhs_addr = tir.IntImm("int32", int(rhs.address))
+        lhs_addr = tir.IntImm("int32", int(lhs.address))
+        self._comment(
+            f"btmm_mm compute {task_id} "
+            f"lhs_packed=vram[{int(lhs.address)}] rhs_mram={int(rhs.address)} "
+            f"(accumulate into hm_accum; drained by bmm_wo)"
+        )
+        self._append(pi.PreIsaOp(
+            opcode="M_BTMM",
+            operands=["gp0", rhs_addr, lhs_addr],
+        ))
+
+    def _emit_bmm_wo(self, mod: _hlir.HLIRModule, op: _hlir.Op) -> None:
+        """Drain ("materialize") + accumulate. BTMM split K into
+        ``lane_count`` partial products, so hm_accum holds lane_count
+        (mlen,mlen) tiles whose SUM is the full result.
+
+        1. ``M_BMM_WO scratch`` writes the lane_count tiles into the
+           scratch buffer ((lane_count*mlen, mlen): tile ``lane`` occupies
+           rows [lane*mlen:(lane+1)*mlen]).
+        2. A V_ADD_VV loop sums the lane_count tiles into ``dst``
+           (mlen,mlen), one mlen-wide chunk (row) at a time:
+               dst[i]  = scratch[0*mlen + i]              (lane 0, copy)
+               dst[i] += scratch[lane*mlen + i]           (lane > 0)
+        """
+        if len(op.buffer_args) != 2:
+            raise PreIsaPassV2Error(
+                f"bmm_wo expects 2 buffer_args (scratch, dst regions); "
+                f"got {len(op.buffer_args)}"
+            )
+        scratch_reg, dst_reg = op.buffer_args
+        if not isinstance(scratch_reg, _hlir.VramRegion):
+            raise PreIsaPassV2Error("bmm_wo scratch: expected VramRegion")
+        if not isinstance(dst_reg, _hlir.VramRegion):
+            raise PreIsaPassV2Error("bmm_wo dst: expected VramRegion")
+        scratch = mod.get_buffer(scratch_reg.parent)
+        dst = mod.get_buffer(dst_reg.parent)
+        lane_count = int(op.scalar_args[0]) if op.scalar_args else 1
+        mlen = self.shim.mlen
+
+        # 1. drain hm_accum -> scratch
+        self._comment(
+            f"bmm_wo drain out=vram[{int(scratch.address)}] "
+            f"tiles={lane_count}"
+        )
+        self._append(pi.PreIsaOp(
+            opcode="M_BMM_WO",
+            operands=[tir.IntImm("int32", int(scratch.address)), 0],
+        ))
+
+        # 2. accumulate lane_count tiles of scratch into dst, one mlen-wide
+        #    row per iteration of a hardware C_LOOP (loop var = row i).
+        #    Row i address offset = i*mlen; scratch tile `lane` row i =
+        #    (lane*mlen + i)*mlen = lane*mlen*mlen + i*mlen. Only the row
+        #    axis is a runtime loop; the few lanes stay statically unrolled
+        #    inside the body (each has a distinct constant tile base).
+        self._comment(
+            f"bmm_wo accumulate {lane_count} tiles "
+            f"scratch[{int(scratch.address)}] -> dst[{int(dst.address)}] "
+            f"(C_LOOP over {mlen} rows)"
+        )
+        i_var = tir.Var(f"bmm_wo_row_{id(op) & 0xffff:x}", "int32")
+        row_off = tir.Mul(i_var, tir.IntImm("int32", mlen))  # i*mlen
+        loop = pi.LoopRegion(
+            loop_var=i_var, init_imm=0, extent_imm=mlen,
+            loop_kind="serial", body=[],
+        )
+        loop.annotations["order_independent"] = True
+        self._append(loop)
+        self._push_scope(loop.body)
+        try:
+            dst_addr = _addr(int(dst.address), row_off)
+            # lane 0: dst[i] = scratch[0*tile + i*mlen] + 0  (copy)
+            lane0_addr = _addr(int(scratch.address), row_off)
+            self._append(pi.PreIsaOp(
+                opcode="V_ADD_VF",
+                operands=[dst_addr, lane0_addr, "f0", 0],
+            ))
+            # lanes 1..: dst[i] += scratch[lane*mlen*mlen + i*mlen]
+            for lane in range(1, lane_count):
+                tile_base = lane * mlen * mlen
+                src_off = tir.Add(tir.IntImm("int32", tile_base), row_off)
+                src_addr = _addr(int(scratch.address), src_off)
+                self._append(pi.PreIsaOp(
+                    opcode="V_ADD_VV",
+                    operands=[dst_addr, dst_addr, src_addr, 0],
+                ))
+        finally:
+            self._pop_scope()
 
     # ------------------------------------------------------------------
     # mm — single-tile (mlen*mlen) matmul. Walks (oc, orow) grid;

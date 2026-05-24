@@ -89,9 +89,15 @@ KIND = "plena.gemm_kind"
 OVERWRITE = "overwrite"
 BTMM = "btmm"
 ADD = "add"
+# Non-fused (non-async) BTMM for plain MLEN×MLEN GEMM (e.g. linear). Unlike
+# BTMM (head-fused Q@K^T, async/multilane), btmm_mm runs one M_BTMM per
+# k_block accumulating in the hardware accumulator (hm_accum +=), and a
+# single deferred M_BMM_WO drain (inserted by split_btmm_materialize) writes
+# the result out after the K-loop. NOT async, NOT multilane-fused.
+BTMM_MM = "btmm_mm"
 
 
-VALID_KINDS = (OVERWRITE, BTMM, ADD)
+VALID_KINDS = (OVERWRITE, BTMM, ADD, BTMM_MM)
 
 
 # AttrStmt key the kernel author would use to attach a scratch buffer
@@ -101,4 +107,5 @@ VALID_KINDS = (OVERWRITE, BTMM, ADD)
 GEMM_SCRATCH_KEY = "plena.gemm_scratch"
 
 
-__all__ = ["KIND", "OVERWRITE", "BTMM", "ADD", "VALID_KINDS", "GEMM_SCRATCH_KEY"]
+__all__ = ["KIND", "OVERWRITE", "BTMM", "ADD", "BTMM_MM", "VALID_KINDS",
+           "GEMM_SCRATCH_KEY"]

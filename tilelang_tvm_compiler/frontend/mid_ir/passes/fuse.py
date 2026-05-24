@@ -39,7 +39,7 @@ from typing import Dict, List, Optional
 from ..cluster_guard import should_skip_cluster
 from ..ir import (
     BufferRef, Broadcast, VarRef,
-    Dma, Gemm, Elementwise, Reduce, RawStore,
+    Dma, Gemm, Elementwise, Reduce, RawStore, BmmWo,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
     MidFunc, Stmt,
@@ -107,6 +107,8 @@ def _collect_op_refs(op) -> List[BufferRef]:
         refs.extend([op.dst, op.src])
     elif isinstance(op, RawStore):
         refs.append(op.dst)
+    elif isinstance(op, BmmWo):
+        refs.extend([op.scratch, op.dst])
     return refs
 
 

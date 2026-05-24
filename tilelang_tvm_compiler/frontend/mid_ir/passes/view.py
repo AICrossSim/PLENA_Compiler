@@ -55,7 +55,7 @@ from ..cluster_guard import should_skip_cluster, MLEN
 from ..ir import (
     AxisRole, AxisInfo,
     BufferDef, BufferRef, Slice, VarRef,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
+    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore, BmmWo,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
     MidFunc, Stmt,
@@ -440,6 +440,20 @@ def _rewrite_op(op, ctx: _ClusterCtx, bhsd_buffers: set):
         # RawStore is opaque; don't rewrite. (And it shouldn't appear
         # inside a cluster anyway; pass_4 doesn't wrap it.)
         return op
+    if isinstance(op, BmmWo):
+        # scratch + dst follow the BTMM-output anchor (BHSD if anchored,
+        # else BSHD).
+        sv = "BHSD" if op.scratch.buffer.name in bhsd_buffers else "BSHD"
+        dv = "BHSD" if op.dst.buffer.name in bhsd_buffers else "BSHD"
+        new_scratch, new_scratch_axes = _rewrite_ref_with_axes(
+            op.scratch, op.scratch_axes, ctx, sv)
+        new_dst, new_dst_axes = _rewrite_ref_with_axes(
+            op.dst, op.dst_axes, ctx, dv)
+        return BmmWo(
+            scratch=new_scratch, dst=new_dst, lane_count=op.lane_count,
+            scratch_axes=new_scratch_axes, dst_axes=new_dst_axes,
+            marker=op.marker, can_async=op.can_async,
+        )
     raise ViewError(f"unhandled op type {type(op).__name__}")
 
 

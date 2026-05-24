@@ -70,7 +70,7 @@ from ..ir import (
     BinOp, UnaryOp, ReduceOp,
     AxisRole, AxisInfo,
     BufferDef, BufferRef, Slice, VarRef,
-    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore,
+    Dma, Gemm, Elementwise, Broadcast, Reduce, RawStore, BmmWo,
     For, Async, MultiLaneOp,
     ParallelAxis, ParallelKind,
     MidFunc, Stmt, format_func,
@@ -1302,6 +1302,58 @@ def _lower_multi_lane_btmm(op: Gemm, lane_count: int,
     )
 
 
+def _lower_btmm_mm_compute(op: Gemm, lane_count: int,
+                           buf_name_to_hlir: Optional[Dict[str, _hlir.Buffer]] = None,
+                           ) -> _hlir.Op:
+    """Bare (non-fused, non-async) ``Gemm(kind="btmm_mm")`` → HLIR
+    ``btmm_mm`` COMPUTE-ONLY op (one M_BTMM, accumulates into hm_accum, no
+    writeback). The drain is a separate HLIR ``bmm_wo`` from BmmWo.
+
+    Region schema mirrors _lower_multi_lane_btmm (a VRAM, b MRAM, c VRAM
+    full regions), but the emitter for ``btmm_mm`` emits M_BTMM only."""
+    if buf_name_to_hlir is None:
+        raise ToPlenaError(
+            "Gemm[btmm_mm]: buf_name_to_hlir is required for region lowering"
+        )
+    a_buf = buf_name_to_hlir[op.a.buffer.name]
+    b_buf = buf_name_to_hlir[op.b.buffer.name]
+    c_buf = buf_name_to_hlir[op.c.buffer.name]
+    a_region = _gemm_full_region(op.a, a_buf, lane_axis_name=None)
+    b_region = _gemm_full_region(op.b, b_buf, lane_axis_name=None)
+    c_region = _gemm_full_region(op.c, c_buf, lane_axis_name=None)
+    a_roles = _align_dim_roles_to_4d(op.a.buffer.name, op.a_axes)
+    b_roles = _align_dim_roles_to_4d(op.b.buffer.name, op.b_axes)
+    c_roles = _align_dim_roles_to_4d(op.c.buffer.name, op.c_axes)
+    return _hlir.Op(
+        kind="btmm_mm",
+        buffer_args=[a_region, b_region, c_region],
+        scalar_args=[a_roles, b_roles, c_roles],
+        annotations={"source": "Gemm[btmm_mm] compute"},
+    )
+
+
+def _lower_bmm_wo(op: BmmWo,
+                  buf_name_to_hlir: Optional[Dict[str, _hlir.Buffer]] = None,
+                  ) -> _hlir.Op:
+    """``BmmWo`` → HLIR ``bmm_wo`` op. Carries the scratch region (M_BMM_WO
+    drain target, (lane_count*mlen, mlen)) and the dst region (final
+    accumulate target, (mlen, mlen)); the backend emits M_BMM_WO into
+    scratch then a V_ADD loop summing the lane_count tiles into dst."""
+    if buf_name_to_hlir is None:
+        raise ToPlenaError("BmmWo: buf_name_to_hlir is required")
+    scratch_buf = buf_name_to_hlir[op.scratch.buffer.name]
+    dst_buf = buf_name_to_hlir[op.dst.buffer.name]
+    scratch_region = _gemm_full_region(op.scratch, scratch_buf,
+                                       lane_axis_name=None)
+    dst_region = _gemm_full_region(op.dst, dst_buf, lane_axis_name=None)
+    return _hlir.Op(
+        kind="bmm_wo",
+        buffer_args=[scratch_region, dst_region],
+        scalar_args=[int(op.lane_count)],
+        annotations={"source": "BmmWo drain+accumulate"},
+    )
+
+
 def _find_role(axes: List[AxisInfo], role: AxisRole
                 ) -> Tuple[Optional[int], Optional[AxisInfo]]:
     """Return ``(dim_index, AxisInfo)`` of the first entry tagged
@@ -2526,11 +2578,18 @@ def _walk_stmt(stmt: Stmt,
         if stmt.kind == "btmm":
             # Shouldn't be bare; treat as single-lane btmm.
             return [_lower_multi_lane_btmm(stmt, 1, buf_name_to_hlir)]
+        if stmt.kind == "btmm_mm":
+            # Non-fused MLEN×MLEN matmul via M_BTMM: compute-only (no
+            # writeback). The accumulator is drained by a later BmmWo.
+            return [_lower_btmm_mm_compute(
+                stmt, cluster_extent or 1, buf_name_to_hlir)]
         return [_lower_bare_per_head_gemm(
             stmt, cluster_extent, cluster_axis_name,
             cluster_axis_var=cluster_axis_var,
             buf_name_to_hlir=buf_name_to_hlir, lane_modes=_LANE_MODES,
         )]
+    if isinstance(stmt, BmmWo):
+        return [_lower_bmm_wo(stmt, buf_name_to_hlir)]
     if isinstance(stmt, Reduce):
         return [_lower_bare_reduce(stmt, cluster_extent, cluster_axis_name,
                                    cluster_axis_var=cluster_axis_var)]

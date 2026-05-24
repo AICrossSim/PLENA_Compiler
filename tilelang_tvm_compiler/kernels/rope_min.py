@@ -1,38 +1,35 @@
-"""RoPE-min kernel — written in tilelang style.
+"""RoPE-min kernel — shuffle-matrix matmul form (no FPRAM pair-swap).
 
-Multi-S × multi-head RoPE with branchless pair-swap and FPRAM-scalar
-lowering. The pair-swap (output element d depends on input elements
-d and d^1) is expressed as loop fission over half_dim — no
-``T.if_then_else``, no per-element predicate. Each iteration writes both
-the even (``2*i``) and odd (``2*i+1``) output slots in straight-line
-code.
+RoPE's pair-swap (OUT[d] depends on X[d] and its pair partner X[d^1]) used
+to be done by mapping each VRAM row into FPRAM and doing per-element scalar
+FMA — a V↔FPRAM MAP + scalar chain per row that dominated latency (~53 ms
+at 1024×1024). This rewrite expresses the whole thing as whole-tile vector
++ BTMM ops:
 
-Lowering path:
-  * ``T.copy`` for HBM↔VRAM tile transfer (existing).
-  * Per-row inner: ``T.copy(shared_2d[row, 0], frag_1d)`` lowers to a
-    contiguous DMA from VRAM into an FPRAM-resident 1D fragment (v2f).
-    Same fragments are reused across rows — one FPRAM region per slot,
-    bound once by ``allocate_group_memory``.
-  * FPRAM-only scalar FMA over half_dim pairs. ``X_FP[e]`` and
-    ``X_FP[o]`` are different elements of the same fragment addressed
-    as scalars; no cross-element hardware shuffle needed.
-  * ``T.copy(frag_1d, shared_2d[row, 0])`` lowers to f2v symmetrically.
+    OUT = X ⊙ COS  +  shuffle(X) ⊙ SGN_SIN
+    shuffle(X) = X @ P
 
-What this kernel needs from the compiler that isn't already in place:
-  * ``T.copy(shared, fragment)`` and ``T.copy(fragment, shared)`` lowered
-    to ``plena.dma_v2f`` / ``plena.dma_f2v`` (length=hlen, contiguous,
-    dynamic row index).
-  * Scalar FPRAM lvalue stores (``OUT_FP[e] = ...``) where ``e`` is an
-    affine expression of an enclosing loop var. flash_attention_min
-    already lvalue-stores into a 1D fragment with a loop-var index
-    (``M_RES[row] = ...``); this just reuses that with ``e = 2*i``.
+where:
+  * P is the (H*D × H*D) **pair-swap permutation matrix** (block-diagonal
+    2×2 swaps [[0,1],[1,0]]); X @ P swaps every adjacent (even,odd) pair.
+  * SGN_SIN[d] = -sin at even d, +sin at odd d (host pre-combines the old
+    NEG_SIN/SIN split into one tensor).
+  * ⊙ is whole-tile elementwise (V_MUL / V_ADD); X @ P runs over the BTMM
+    ``btmm_mm`` path (M_BTMM + deferred bmm_wo drain + accumulate), exactly
+    like linear_min.
 
-K-side RoPE has identical structure (XK→K, SIN↔NEG_SIN role swap).
-Kept out of this minimal kernel.
+Layout: BSHD is collapsed to ``(1, SEQ, 1, H*D)`` so head+dim form one big
+linear-style axis (H*D = head_count*hlen). The shuffle is then a plain
+(SEQ × H*D) @ (H*D × H*D) GEMM. Head boundaries are multiples of hlen
+(even), so no 2×2 pair straddles a head — the global pair-swap equals the
+per-head pair-swap.
+
+K-side RoPE is identical with SGN_SIN's sign convention flipped.
 """
 
 import tilelang.language as T
 
+from ..frontend.gemm_macros import KIND, BTMM_MM
 from ..plena_settings import load_sizes as _load_sizes
 
 
@@ -41,16 +38,10 @@ def make_rope_min(
     rows: int | None = None,
     hlen: int | None = None,
     head_count: int = 8,
-    half_dim: int = 8,
+    half_dim: int | None = None,
     num_s_blocks: int = 2,
     batch: int = 1,
 ):
-    full_dim = half_dim * 2
-    if full_dim != hlen:
-        raise ValueError(
-            f"full_dim (= 2*half_dim = {full_dim}) must equal hlen ({hlen})"
-        )
-    # Hardware sizes default to plena_settings.toml's active mode.
     _hw = _load_sizes()
     MLEN = _hw.mlen
     if hlen is None:
@@ -58,84 +49,94 @@ def make_rope_min(
     if rows is None:
         rows = MLEN
     if rows != MLEN:
-        raise ValueError(
-            f"rope_min requires rows == MLEN ({MLEN}), got {rows}"
-        )
+        raise ValueError(f"rope_min requires rows == MLEN ({MLEN}), got {rows}")
     if MLEN % hlen != 0:
         raise ValueError(f"hlen must divide MLEN ({MLEN}); got hlen={hlen}")
-    hardware_lane_count = MLEN // hlen
-    if head_count % hardware_lane_count != 0:
-        raise ValueError(
-            f"head_count must be a multiple of MLEN/hlen={hardware_lane_count}; "
-            f"got {head_count}"
-        )
+    if hlen % 2 != 0:
+        raise ValueError(f"hlen must be even for RoPE pair-swap; got {hlen}")
     if num_s_blocks < 1:
         raise ValueError(f"num_s_blocks must be >= 1, got {num_s_blocks}")
+    # half_dim kept for signature compat with the chain / testbench; the
+    # vector form doesn't need it (pair-swap is the permutation matrix).
+    if half_dim is not None and half_dim * 2 != hlen:
+        raise ValueError(
+            f"half_dim*2 ({half_dim * 2}) must equal hlen ({hlen})"
+        )
 
     seq_len = num_s_blocks * rows
+    HD = head_count * hlen          # collapsed head*dim axis
+    if HD % MLEN != 0:
+        raise ValueError(
+            f"H*D (head_count*hlen = {HD}) must be a multiple of MLEN "
+            f"({MLEN})"
+        )
+    m_blocks = seq_len // MLEN
+    n_blocks = HD // MLEN           # output spans H*D in MLEN-wide blocks
+    if seq_len % MLEN != 0:
+        raise ValueError(f"seq_len ({seq_len}) must be a multiple of MLEN")
 
     @T.prim_func
     def rope_min(
-        XQ_hbm:      T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        COS_hbm:     T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        SIN_hbm:     T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        NEG_SIN_hbm: T.Tensor((batch, seq_len, head_count, hlen), "float16"),
-        Q_OUT_hbm:   T.Tensor((batch, seq_len, head_count, hlen), "float16"),
+        XQ_hbm:      T.Tensor((1, seq_len, 1, HD), "float16"),
+        COS_hbm:     T.Tensor((1, seq_len, 1, HD), "float16"),
+        SGN_SIN_hbm: T.Tensor((1, seq_len, 1, HD), "float16"),
+        P_hbm:       T.Tensor((1, MLEN, 1, MLEN), "float16"),
+        Q_OUT_hbm:   T.Tensor((1, seq_len, 1, HD), "float16"),
     ):
-        with T.Kernel(num_s_blocks, head_count, threads=128) as (s_block, by):
-            XQ_sh      = T.alloc_shared((rows, hlen), "float16")
-            COS_sh     = T.alloc_shared((rows, hlen), "float16")
-            SIN_sh     = T.alloc_shared((rows, hlen), "float16")
-            NEG_SIN_sh = T.alloc_shared((rows, hlen), "float16")
-            Q_OUT_sh   = T.alloc_shared((rows, hlen), "float16")
+        # Grid: one program per (n_block, m_block) output tile, same axis
+        # order as linear_min (bx along N=H*D, by along M=SEQ).
+        with T.Kernel(n_blocks, m_blocks, threads=128) as (bx, by):
+            X_sh   = T.alloc_shared((MLEN, MLEN), "float16")  # X[by, bx]
+            P_sh   = T.alloc_shared((MLEN, MLEN), "float16")  # shared pair-swap P (→ MRAM)
+            COS_sh = T.alloc_shared((MLEN, MLEN), "float16")
+            SGN_sh = T.alloc_shared((MLEN, MLEN), "float16")
+            OUT_sh = T.alloc_shared((MLEN, MLEN), "float16")
 
-            # FPRAM scratch — one (hlen,) fragment per source.
-            # Allocated at kernel scope; same FPRAM offsets are reused
-            # across every row of every (s_block, head) tile.
-            X_FP   = T.alloc_fragment((hlen,), "float16")
-            C_FP   = T.alloc_fragment((hlen,), "float16")
-            S_FP   = T.alloc_fragment((hlen,), "float16")
-            NS_FP  = T.alloc_fragment((hlen,), "float16")
-            OUT_FP = T.alloc_fragment((hlen,), "float16")
+            XS_loc = T.alloc_fragment((MLEN, MLEN), "float16")  # shuffle(X) tile
 
+            # shuffle: XS = X[by, bx] @ P. P is the (MLEN×MLEN) pair-swap
+            # permutation — block-diagonal, so the pair-swap never crosses a
+            # MLEN boundary and EACH output column block bx only needs X's
+            # OWN block bx times the single shared diagonal P block. No K
+            # accumulation (single btmm_mm). transpose_B is harmless (P
+            # symmetric). The deferred bmm_wo drain (before XS_loc's first
+            # read below) writes the result into XS_loc.
             T.copy(
-                XQ_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
-                XQ_sh,
+                XQ_hbm[0, by * MLEN:(by + 1) * MLEN, 0,
+                       bx * MLEN:(bx + 1) * MLEN],
+                X_sh,
             )
+            T.copy(P_hbm[0, 0:MLEN, 0, 0:MLEN], P_sh)
+            with T.attr(0, KIND, BTMM_MM):
+                T.gemm(X_sh, P_sh, XS_loc, transpose_B=True)
+
+            # Elementwise term operands at the same (by, bx) block.
             T.copy(
-                COS_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+                COS_hbm[0, by * MLEN:(by + 1) * MLEN, 0,
+                        bx * MLEN:(bx + 1) * MLEN],
                 COS_sh,
             )
             T.copy(
-                SIN_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
-                SIN_sh,
-            )
-            T.copy(
-                NEG_SIN_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
-                NEG_SIN_sh,
+                SGN_SIN_hbm[0, by * MLEN:(by + 1) * MLEN, 0,
+                            bx * MLEN:(bx + 1) * MLEN],
+                SGN_sh,
             )
 
-            for row in T.serial(rows):
-                T.copy(XQ_sh     [row, 0], X_FP)
-                T.copy(COS_sh    [row, 0], C_FP)
-                T.copy(SIN_sh    [row, 0], S_FP)
-                T.copy(NEG_SIN_sh[row, 0], NS_FP)
-
-                for i in T.unroll(half_dim):
-                    e = 2 * i
-                    o = 2 * i + 1
-                    OUT_FP[e] = X_FP[e] * C_FP[e] + X_FP[o] * NS_FP[e]
-                    OUT_FP[o] = X_FP[o] * C_FP[o] + X_FP[e] * S_FP[o]
-
-                T.copy(OUT_FP, Q_OUT_sh[row, 0])
+            # OUT = X ⊙ COS + shuffle(X) ⊙ SGN_SIN  (whole-tile vector).
+            # X_sh still holds X[by, bx] (gemm wrote XS_loc, not X_sh).
+            for row in T.serial(MLEN):
+                for col in T.Parallel(MLEN):
+                    OUT_sh[row, col] = (
+                        X_sh[row, col] * COS_sh[row, col]
+                        + XS_loc[row, col] * SGN_sh[row, col]
+                    )
 
             T.copy(
-                Q_OUT_sh,
-                Q_OUT_hbm[0, s_block * rows : (s_block + 1) * rows, by, 0:hlen],
+                OUT_sh,
+                Q_OUT_hbm[0, by * MLEN:(by + 1) * MLEN, 0,
+                          bx * MLEN:(bx + 1) * MLEN],
             )
 
-    # Return the raw PrimFunc — ``compile_kernel`` runs stmt prep + the
-    # mid_ir pipeline itself, so factories don't pre-lower anymore.
     lowered = rope_min
 
     constants = {
@@ -143,10 +144,13 @@ def make_rope_min(
         "MLEN": MLEN,
         "HLEN": hlen,
         "HEAD_COUNT": head_count,
-        "HALF_DIM": half_dim,
-        "FULL_DIM": full_dim,
+        "HD": HD,
         "BATCH": batch,
         "NUM_S_BLOCKS": num_s_blocks,
-        "HARDWARE_LANE_COUNT": hardware_lane_count,
+        "M_BLOCKS": m_blocks,
+        "N_BLOCKS": n_blocks,
     }
     return lowered, constants
+
+
+__all__ = ["make_rope_min"]
