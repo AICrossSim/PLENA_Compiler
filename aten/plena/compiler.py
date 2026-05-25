@@ -151,15 +151,22 @@ class PlenaCompiler(
     def _allocate_hbm(self, hbm_size: int) -> int:
         """Allocate HBM range, preferring previously freed blocks.
 
-        All addresses returned are aligned to mlen*mlen, which the Rust
-        emulator's continous_write_delayed requires (src/main.rs:155).
+        Large allocations (>= mlen*mlen) are aligned to mlen*mlen because the
+        Rust emulator's continous_write_delayed requires it (src/main.rs:155).
+        Small allocations only need mlen alignment, preserving sliced-test layout.
         """
         m = self.mlen
         tile_bytes = m * m
+        # Only pad to mlen*mlen at large tile sizes where the Rust emulator's
+        # continous_write_delayed (main.rs:155) requires tile-index alignment.
+        # At MLEN=64/128 the HBM layout must match create_mem_for_sim's
+        # sequential write order, which does not insert gaps.
+        needs_tile_align = m >= 256
+
         best_idx = None
         best_waste = None
         for i, (addr, size) in enumerate(self._hbm_free_blocks):
-            aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+            aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes if needs_tile_align else addr
             aligned_waste = aligned_addr - addr
             effective_size = size - aligned_waste
             if effective_size >= hbm_size:
@@ -170,21 +177,23 @@ class PlenaCompiler(
 
         if best_idx is not None:
             addr, block_size = self._hbm_free_blocks.pop(best_idx)
-            aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
-            # Return any pre-alignment gap as a free fragment
-            if aligned_addr > addr:
-                self._hbm_free_blocks.append((addr, aligned_addr - addr))
+            if needs_tile_align:
+                aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+                if aligned_addr > addr:
+                    self._hbm_free_blocks.append((addr, aligned_addr - addr))
+            else:
+                aligned_addr = addr
             excess = block_size - (aligned_addr - addr) - hbm_size
             if excess > 0:
                 self._hbm_free_blocks.append((aligned_addr + hbm_size, excess))
             return aligned_addr
 
         addr = self._next_hbm_addr
-        # Ensure the start address is tile-aligned (first alloc starts at 0;
-        # recycled blocks could have left us misaligned).
-        addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+        if needs_tile_align:
+            addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
         self._next_hbm_addr = ((addr + hbm_size + m - 1) // m) * m
-        self._next_hbm_addr = ((self._next_hbm_addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+        if needs_tile_align:
+            self._next_hbm_addr = ((self._next_hbm_addr + tile_bytes - 1) // tile_bytes) * tile_bytes
         return addr
 
     def _recycle_hbm(self, hbm_addr: int, hbm_size: int):
