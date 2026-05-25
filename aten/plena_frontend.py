@@ -3448,6 +3448,11 @@ def compile_native_hf_decoder(
 
     print(f"\nCompilation complete: {info['isa_lines']} ISA lines, "
           f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
+    hbm_addrs = {}
+    for name, inp in prog._inputs.items():
+        if hasattr(inp, "hbm_addr"):
+            hbm_addrs[name] = inp.hbm_addr
+
     return {
         "isa": isa_code,
         "golden_output": golden_out,
@@ -3460,6 +3465,7 @@ def compile_native_hf_decoder(
         "comparison_params": comparison_params,
         "info": info,
         "stage_checkpoints": stage_checkpoint_metadata,
+        "hbm_addrs": hbm_addrs,
         "sim_golden_result": {
             "original_output": padded_golden_output,
             "tensor_layouts": tensor_layouts,
