@@ -91,13 +91,18 @@ def _build_text_graph_and_scheduler(seq_len: int = 32):
     graph = parser.create_symbolic_graph(batch_size=1, seq_len=seq_len)
     hw = hardware_parser(paths["hw_config"], paths["precision"])
     dims = parser.extract_critical_dimensions()
+    attn = dims["attention"]
     model_config = {
         "hidden_size": dims["hidden_size"],
         "num_layers": dims["num_hidden_layers"],
         "seq_len": seq_len,
+        "context_length": dims["max_position_embeddings"],
         "batch_size": 1,
         "vocab_size": dims["vocab_size"],
         "intermediate_size": dims["ffn"]["intermediate_size"],
+        "num_key_value_heads": attn["num_key_value_heads"],
+        "num_attention_heads": attn["num_attention_heads"],
+        "head_dim": attn["head_dim"],
         "batch": 1,
     }
     sched = gen_scheduler(hw, model_config, paths["mem_layout"], paths["reg_assign"])
@@ -117,13 +122,18 @@ def _build_vision_graph_and_scheduler():
     vgraph = parser.create_vision_symbolic_graph(batch_size=1)
     hw = hardware_parser(paths["hw_config"], paths["precision"])
     dims = parser.extract_critical_dimensions()
+    vision_dims = dims["vision"]
     model_config = {
-        "hidden_size": dims["vision"]["hidden_size"],
-        "num_layers": dims["vision"]["num_hidden_layers"],
+        "hidden_size": vision_dims["hidden_size"],
+        "num_layers": vision_dims["num_hidden_layers"],
         "seq_len": 4,
+        "context_length": 4,
         "batch_size": 1,
         "vocab_size": 49280,
-        "intermediate_size": dims["vision"]["intermediate_size"],
+        "intermediate_size": vision_dims["intermediate_size"],
+        "num_key_value_heads": vision_dims["num_attention_heads"],
+        "num_attention_heads": vision_dims["num_attention_heads"],
+        "head_dim": vision_dims["head_dim"],
         "batch": 1,
     }
     sched = gen_scheduler(hw, model_config, paths["mem_layout"], paths["reg_assign"])
