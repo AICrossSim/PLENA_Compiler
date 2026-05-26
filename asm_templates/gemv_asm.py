@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from ._imm import addi_large_int as _addi_large_int_list
 from ._imm import load_large_int as _load_large_int_list
 

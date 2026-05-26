@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Main Flash Attention assembly code generation - orchestrates all components."""
 
 from ..reset_reg_asm import reset_fpreg_asm, reset_reg_asm, reset_vmask_asm
@@ -29,6 +31,12 @@ def flash_attn_asm(
     attn_scale_fp_address: int = 5,
     inf_fp_address: int = 0,
     causal_mask: bool = True,
+    broadcast_amount: int | None = None,
+    q_group_stride: int | None = None,
+    o_group_stride: int | None = None,
+    scratch_base_address: int | None = None,
+    output_base_address: int | None = None,
+    packed_group_layout: bool = False,
 ) -> str:
     """
     Args:
@@ -54,16 +62,20 @@ def flash_attn_asm(
     q_seq_iteration_number = (q_len + mlen - 1) // mlen
     k_seq_iteration_number = (kv_len + mlen - 1) // mlen
     q_index_2_kv_index_ratio = hq // hkv
+    broadcast_amount = blen if broadcast_amount is None else broadcast_amount
 
     stage = "decode" if q_len == 1 else "prefill"
     br = min(mlen, q_len)
     bc = min(mlen, kv_len)
 
-    # Batched path (M_BTMM) when ratio == blen — maximum throughput.
-    # Per-head path (M_TMM) for all other ratios — avoids M_BTMM over-read
-    # panic when ratio < blen (the extra blen-ratio "dummy" heads would read
-    # Q past the kv-group allocation).
-    use_batched = q_index_2_kv_index_ratio == blen
+    # Batched path (M_BTMM) when the Q heads for one KV group occupy hardware
+    # lanes inside one MLEN row. Legacy callers used BLEN as the broadcast
+    # amount; packed ATen callers pass the simulator BROADCAST_AMOUNT/HW HLEN
+    # explicitly and may have ratio < broadcast_amount.
+    if packed_group_layout:
+        use_batched = q_index_2_kv_index_ratio <= broadcast_amount
+    else:
+        use_batched = q_index_2_kv_index_ratio == blen
 
     # Memory Layout:
     # -- FP SRAM --
@@ -87,14 +99,25 @@ def flash_attn_asm(
     # Batched path: M_BMM_WO writes blen tiles; allocate blen tiles even though
     # only ratio are consumed by softmax/PV (harmless dead writes).
     # Per-head path: only 1 S tile needed at a time (reused per head).
-    s_tile_count = blen if use_batched else 1
-    s_base_address = q_base_address + q_len * hq * d  # Q size = seq_len * num_q_heads * head_dim
+    s_tile_count = broadcast_amount if use_batched else 1
+    # Q size = seq_len * num_q_heads * head_dim for legacy row-packed layout.
+    # Packed group layout stores each KV group as a separate MLEN-wide column
+    # block, so the caller passes an explicit scratch base.
+    s_base_address = (
+        scratch_base_address
+        if scratch_base_address is not None
+        else q_base_address + q_len * hq * d
+    )
     print(f"S Base Address: {s_base_address}")
     # PV (q_index_2_kv_index_ratio, mlen, mlen)
     pv_base_address = s_base_address + mlen * mlen * s_tile_count
     print(f"PV Base Address: {pv_base_address}")
     # O_Old (q_len, HEAD_DIM * Hq * batch)
-    o_old_base_address = pv_base_address + mlen * mlen * q_index_2_kv_index_ratio
+    o_old_base_address = (
+        output_base_address
+        if output_base_address is not None
+        else pv_base_address + mlen * mlen * q_index_2_kv_index_ratio
+    )
     print(f"O_Old Base Address: {o_old_base_address}")
 
     generated_code = "; Flash Attention Generation \n"
@@ -109,6 +132,13 @@ def flash_attn_asm(
 
     # loop over kv heads
     for kv_head_index in range(hkv):
+        group_q_base_address = q_base_address + kv_head_index * (
+            q_group_stride if q_group_stride is not None else q_index_2_kv_index_ratio * d
+        )
+        group_o_base_address = o_old_base_address + kv_head_index * (
+            o_group_stride if o_group_stride is not None else 0
+        )
+
         # loop over per kv head kv_len // MLEN
         for _ in range(k_seq_iteration_number):
             print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in GQA mode")
@@ -144,15 +174,27 @@ def flash_attn_asm(
                 use_zero_reg=True,
             )
 
-            # Reset O_old with zeros
-            generated_code += reset_vssram_code(
-                reset_start_address=o_old_base_address,
-                vect_dim=vlen,
-                per_stride_dim=d,
-                reset_stride=q_index_2_kv_index_ratio * br,
-                reset_amount=q_index_2_kv_index_ratio,
-                alive_registers_int=alive_registers_int[0:3],
-            )
+            # Reset O_old with zeros. Packed group layout stores one KV group's
+            # active Q heads in HLEN-sized lanes of an MLEN-wide row, so zero
+            # the valid rows once instead of using the legacy head-stride reset.
+            if packed_group_layout:
+                generated_code += reset_vssram_code(
+                    reset_start_address=group_o_base_address,
+                    vect_dim=vlen,
+                    per_stride_dim=br,
+                    reset_stride=br,
+                    reset_amount=1,
+                    alive_registers_int=alive_registers_int[0:3],
+                )
+            else:
+                generated_code += reset_vssram_code(
+                    reset_start_address=o_old_base_address,
+                    vect_dim=vlen,
+                    per_stride_dim=d,
+                    reset_stride=q_index_2_kv_index_ratio * br,
+                    reset_amount=q_index_2_kv_index_ratio,
+                    alive_registers_int=alive_registers_int[0:3],
+                )
 
             # # loop over per q_index_2_kv_index_ratio q heads (q_len // MLEN), compute q_index_2_kv_index_ratio heads in parallel.
             for _ in range(q_seq_iteration_number):
@@ -166,9 +208,9 @@ def flash_attn_asm(
                         mlen=mlen,
                         stage=stage,
                         alive_registers=alive_registers_int[0:2],
-                        q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                        q_base_address=group_q_base_address,
                         k_base_hbm_offset_reg=k_base_hbm_offset_reg,
-                        q_head_index=kv_head_index * q_index_2_kv_index_ratio,
+                        q_head_index=0 if packed_group_layout else kv_head_index * q_index_2_kv_index_ratio,
                         k_head_index=kv_head_index,
                         s_base_address=s_base_address,
                         s_head_offset=0,
@@ -189,9 +231,9 @@ def flash_attn_asm(
                             mlen=mlen,
                             stage=stage,
                             alive_registers=alive_registers_int[0:9],
-                            q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                            q_base_address=group_q_base_address,
                             k_base_hbm_offset_reg=k_base_hbm_offset_reg,
-                            q_head_index=abs_q_head,
+                            q_head_index=inner_q_head_index if packed_group_layout else abs_q_head,
                             k_head_index=kv_head_index,
                             s_base_address=s_base_address,
                             s_head_offset=0,  # single S tile, always at offset 0
@@ -205,9 +247,11 @@ def flash_attn_asm(
                     # ``scheduler["memory_layout"]["fp_sram"]["attn_scale"]``
                     # so this template no longer hardcodes the QK-scale slot.
                     #
-                    # For batched path: S tiles are at s_base + head * br * bc.
+                    # For batched path M_BMM_WO writes each broadcast result
+                    # as a full physical MLEN x MLEN tile, even when the
+                    # logical br/bc for a short sequence is smaller.
                     # For per-head path: S tile is always at s_base (offset 0).
-                    s_softmax_addr = s_base_address + (inner_q_head_index * br * bc if use_batched else 0)
+                    s_softmax_addr = s_base_address + (inner_q_head_index * mlen * mlen if use_batched else 0)
                     generated_code += online_softmax_code(
                         mlen=mlen,
                         stage=stage,
@@ -217,6 +261,7 @@ def flash_attn_asm(
                         m_start_address=m_fp_sram_start_address,
                         qk_scale_address=attn_scale_fp_address,
                         causal_mask=causal_mask,
+                        rows=br,
                     )
                     # P is stored in s_base_address (per-head) or
                     # s_base_address + inner_q_head_index * mlen * mlen (batched)
@@ -240,6 +285,7 @@ def flash_attn_asm(
                         v_head_index=kv_head_index,
                         output_base_address=pv_base_address,
                         head_offset=inner_q_head_index,  # This head's position within the row
+                        rows=br,
                     )
 
                     generated_code += reset_reg_asm(alive_registers_int[0:6])
@@ -252,9 +298,10 @@ def flash_attn_asm(
                         alive_registers_fp=alive_registers_fp[0:1],
                         m_res_base_address=stored_m_fp_res_address,
                         pv_base_address=pv_base_address,
-                        o_old_base_address=o_old_base_address,
+                        o_old_base_address=group_o_base_address if packed_group_layout else o_old_base_address,
                         head_dim=d,
-                        q_head_num=hq,
+                        q_head_num=(broadcast_amount if packed_group_layout else hq),
+                        rows=br,
                     )
                     stored_m_fp_res_address += 3 * br
 
@@ -278,9 +325,10 @@ def flash_attn_asm(
                         stage=stage,
                         alive_registers_int=alive_registers_int[0:3],
                         alive_registers_fp=alive_registers_fp[0:1],
-                        o_old_base_address=o_old_base_address,
+                        o_old_base_address=group_o_base_address if packed_group_layout else o_old_base_address,
                         l_old_base_address=l_old_base_address,
-                        o_row_stride=hq * d,  # Row stride is total width of all heads
+                        o_row_stride=(mlen if packed_group_layout else hq * d),
                         use_mask=True,
+                        rows=br,
                     )
     return generated_code

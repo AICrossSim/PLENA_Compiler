@@ -10,6 +10,7 @@ helper used inside ffn_asm is exercised indirectly via ffn_asm().
 import unittest
 from typing import ClassVar
 
+from asm_templates._imm import add_large_int as _add_large_int
 from asm_templates._imm import load_large_int as _load_large_int
 from asm_templates.projection_asm import projection_asm, projection_T_asm
 
@@ -79,6 +80,23 @@ class TestLoadLargeInt(unittest.TestCase):
         # 4096 < 2^18, so single S_ADDI_INT from gp0 (no LUI needed)
         self.assertIn("S_ADDI_INT gp1, gp0, 4096", asm)
         self.assertNotIn("S_LUI_INT", asm)
+
+    def test_large_add_with_temp(self):
+        """Relative large adds can use caller-provided temp registers."""
+        result = _add_large_int(5, 3, 300000, temp_reg=7)
+        asm = "\n".join(result)
+        self.assertIn("S_LUI_INT gp7, 73", asm)
+        self.assertIn("S_ADDI_INT gp7, gp7, 992", asm)
+        self.assertIn("S_ADD_INT gp5, gp3, gp7", asm)
+
+    def test_large_add_without_temp_chunks(self):
+        """Compiler-wide fallback must not need a scratch register."""
+        result = _add_large_int(5, 3, 300000, temp_reg=None)
+        asm = "\n".join(result)
+        self.assertIn("S_ADDI_INT gp5, gp3, 262143", asm)
+        self.assertIn("S_ADDI_INT gp5, gp5, 37857", asm)
+        self.assertNotIn("S_ADDI_INT gp5, gp3, 300000", asm)
+        _check_all_addi_immediates(self, asm, "add_large_int(no temp)")
 
 
 class TestProjectionAsmLargeMatrix(unittest.TestCase):
@@ -267,6 +285,29 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         args["alive_registers"] = list(range(10))
         asm = ffn_asm(hidden_size=128, intermediate_size=256, use_loop_instructions=True, **args)
         _check_all_addi_immediates(self, asm, "ffn_asm(loop,128,256)")
+
+    def test_workspace_base_offsets_loop_path(self):
+        """Production loop path must place FFN temps at the explicit workspace base."""
+        ffn_asm = self._import_ffn_asm()
+        args = dict(self.BASE_ARGS)
+        args["alive_registers"] = list(range(10))
+        workspace_base = 1_000_000
+        rows = args["batch"] * args["seq_len"]
+        gate_base = workspace_base + rows * 256
+
+        asm = ffn_asm(
+            hidden_size=128,
+            intermediate_size=256,
+            use_loop_instructions=True,
+            workspace_base_address=workspace_base,
+            **args,
+        )
+
+        self.assertIn(f"S_LUI_INT gp3, {workspace_base >> 12}", asm)
+        self.assertIn(f"S_ADDI_INT gp3, gp3, {workspace_base & 0xFFF}", asm)
+        self.assertIn(f"S_LUI_INT gp5, {gate_base >> 12}", asm)
+        self.assertIn(f"S_ADDI_INT gp5, gp5, {gate_base & 0xFFF}", asm)
+        _check_all_addi_immediates(self, asm, "ffn_asm(loop,workspace)")
 
 
 def _check_all_addi_immediates(test_case, asm: str, label: str) -> None:

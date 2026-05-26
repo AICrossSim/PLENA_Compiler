@@ -1,5 +1,7 @@
 """Reset/initialization assembly code generation for Flash Attention."""
 
+from .._imm import load_large_int_str as _load_large_int
+
 IMM2_BOUND = 2**18 - 1
 
 
@@ -28,11 +30,9 @@ def reset_fpsram_code(
     addr_register = alive_registers_int[0]
     outer_loop_register = alive_registers_int[1]
     inner_loop_register = alive_registers_int[2]
-    offset_register = alive_registers_int[3]
     fp_val_register = alive_registers_fp[0]
 
-    generated_code += f"S_ADDI_INT gp{addr_register}, gp0, {reset_start_address} \n"
-    generated_code += f"S_ADDI_INT gp{offset_register}, gp0, {reset_start_address + stride_dist} \n"
+    generated_code += _load_large_int(addr_register, reset_start_address)
     if use_zero_reg:
         fp_val_register = 0  # f0 = hardware zero
     else:
@@ -49,9 +49,9 @@ def reset_fpsram_code(
         else:
             generated_code += f"S_ST_FP f{fp_val_register}, gp{addr_register}, 0 \n"
             generated_code += f"S_ADDI_INT gp{addr_register}, gp{addr_register}, 1 \n"
-
-        generated_code += f"S_ADDI_INT gp{offset_register}, gp{offset_register}, {stride_dist} \n"
-        generated_code += f"S_ADD_INT gp{addr_register}, gp0, gp{offset_register} \n"
+        stride_advance = stride_dist - per_stride_dim
+        if stride_advance != 0:
+            generated_code += f"S_ADDI_INT gp{addr_register}, gp{addr_register}, {stride_advance} \n"
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
     else:
         if per_stride_dim > 1:
@@ -88,7 +88,7 @@ def reset_vssram_code(
     outer_loop_register = alive_registers_int[1]
     inner_loop_register = alive_registers_int[2]
 
-    generated_code += f"S_ADDI_INT gp{addr_register}, gp0, {reset_start_address} \n"
+    generated_code += _load_large_int(addr_register, reset_start_address)
 
     total_iterations = reset_amount * per_stride_dim
     if total_iterations > 0:
@@ -111,17 +111,15 @@ def reset_kv_prefetch(
     alive_registers_int: list[int],
 ) -> str:
     generated_code = "; Reset KV Prefetch Code \n"
-    assert hkv * d * kv_len * batch < IMM2_BOUND, f"hkv * d * kv_len * batch must be less than {IMM2_BOUND}"
-    assert hkv * d * kv_len * batch < IMM2_BOUND, f"hkv * d * kv_len * batch must be less than {IMM2_BOUND}"
 
     if hkv * d < mlen:
-        generated_code += f"S_ADDI_INT gp{alive_registers_int[0]}, gp0, {mlen * kv_len * batch} \n"
+        generated_code += _load_large_int(alive_registers_int[0], mlen * kv_len * batch)
         generated_code += f"C_SET_SCALE_REG gp{alive_registers_int[0]} \n"
-        generated_code += f"S_ADDI_INT gp{alive_registers_int[0]}, gp0, {mlen} \n"
+        generated_code += _load_large_int(alive_registers_int[0], mlen)
         generated_code += f"C_SET_STRIDE_REG gp{alive_registers_int[0]} \n"
     else:
-        generated_code += f"S_ADDI_INT gp{alive_registers_int[0]}, gp0, {hkv * d * kv_len * batch} \n"
+        generated_code += _load_large_int(alive_registers_int[0], hkv * d * kv_len * batch)
         generated_code += f"C_SET_SCALE_REG gp{alive_registers_int[0]} \n"
-        generated_code += f"S_ADDI_INT gp{alive_registers_int[0]}, gp0, {hkv * d * batch} \n"
+        generated_code += _load_large_int(alive_registers_int[0], hkv * d * batch)
         generated_code += f"C_SET_STRIDE_REG gp{alive_registers_int[0]} \n"
     return generated_code

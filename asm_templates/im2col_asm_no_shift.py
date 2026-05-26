@@ -9,6 +9,8 @@ Algorithm per output row m:
 Requires: f0=0.0 (hw const), fp_preload[fp_one_reg]=1.0.
 """
 
+from __future__ import annotations
+
 from ._imm import load_large_int as _load_large_int_list
 
 PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows
@@ -30,6 +32,7 @@ def im2col_asm_no_shift(
     scratch_vram_addr: int,
     temp_vram_addr: int,
     output_vram_base: int,
+    output_physical_rows: int | None = None,
     W_padded: int | None = None,
     fp_one_reg: int = 1,  # FP register holding 1.0 (must be pre-loaded via fp_preload)
     fp_ex_reg: int = 2,  # FP register used as V_RED_SUM accumulator
@@ -66,6 +69,9 @@ def im2col_asm_no_shift(
             VRAM addr of temp mul-result row (vlen elements).
         output_vram_base:
             VRAM base for M im2col output rows.
+        output_physical_rows:
+            Physical row stride for column-block-major output storage.  Defaults
+            to M for legacy direct callers.
         W_padded:
             Input row width in HBM (padded for 64-element alignment). Default=W.
         fp_one_reg:
@@ -102,6 +108,10 @@ def im2col_asm_no_shift(
     )
     assert K <= vlen, f"K={K} > vlen={vlen}; basis-vector extraction requires K <= vlen"
     num_tiles = (K_col + vlen - 1) // vlen
+    output_row_stride = M if output_physical_rows is None else output_physical_rows
+    assert output_row_stride >= M, (
+        f"output_physical_rows={output_row_stride} cannot be smaller than logical M={M}"
+    )
 
     if W_padded is None:
         W_padded = W
@@ -126,7 +136,10 @@ def im2col_asm_no_shift(
     lines.append("; im2col (no-shift): NCHW input in HBM -> im2col matrix in VRAM")
     lines.append(f";   input  : (1,{C_in},{H},{W})  W_padded={W_padded}")
     lines.append(f";   kernel : {K}x{K}  OH={OH}  OW={OW}")
-    lines.append(f";   output : ({M},{K_col}) @ VRAM base {output_vram_base}")
+    lines.append(
+        f";   output : ({M},{K_col}) @ VRAM base {output_vram_base} "
+        f"(physical_rows={output_row_stride})"
+    )
     lines.append("; ISA: H_PREFETCH_V V_MUL_VV V_RED_SUM S_ST_FP S_MAP_V_FP")
     lines.append("; Requires: f0=0.0 (hw const), fp_preload[1]=1.0")
     lines.append("; ============================================================")
@@ -191,7 +204,7 @@ def im2col_asm_no_shift(
     lines.append(f"C_SET_SCALE_REG gp{basis_reg}")
 
     # Main loop: tiles × output positions. VRAM is column-block-major:
-    #   vram_addr(m, t) = output_vram_base + t*M*vlen + m*vlen
+    #   vram_addr(m, t) = output_vram_base + t*physical_rows*vlen + m*vlen
     for tile_t in range(num_tiles):
         tile_start = tile_t * vlen
         tile_end = min(tile_start + vlen, K_col)
@@ -204,7 +217,7 @@ def im2col_asm_no_shift(
             oh = m // OW
             ow = m % OW
 
-            out_vram_addr = output_vram_base + tile_t * M * vlen + m * vlen
+            out_vram_addr = output_vram_base + tile_t * output_row_stride * vlen + m * vlen
 
             lines.append("")
             lines.append(f"; ==== tile={tile_t} output row m={m}  oh={oh}  ow={ow}  vram={out_vram_addr} ====")

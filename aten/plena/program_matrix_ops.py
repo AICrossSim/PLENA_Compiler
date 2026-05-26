@@ -6,13 +6,13 @@ import math
 
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
-MAX_K_TILES = 4  # MRAM capacity: 4 x mlen^2 elements
 
-
-def _iter_k_chunks(num_k_tiles: int):
+def _iter_k_chunks(num_k_tiles: int, max_k_tiles: int):
+    if max_k_tiles <= 0:
+        raise ValueError(f"max_k_tiles must be > 0, got {max_k_tiles}")
     k_start = 0
     while k_start < num_k_tiles:
-        k_end = min(k_start + MAX_K_TILES, num_k_tiles)
+        k_end = min(k_start + max_k_tiles, num_k_tiles)
         yield k_start, k_end - k_start
         k_start = k_end
 
@@ -36,6 +36,7 @@ class ProgramMatrixOpsMixin:
             name=input_var.name,
             hbm_addr=input_var.hbm_addr,
             shape=(h, w),
+            physical_shape=input_var.physical_shape,
             real_data_ratio=self.real_data_ratio,
         )
         self._registered_hbm_sub_matrices[input_var.name] = True
@@ -47,6 +48,7 @@ class ProgramMatrixOpsMixin:
         super().ensure_vram_matrix_layout(
             name=matrix_var.name,
             shape=matrix_var.shape,
+            physical_shape=matrix_var.physical_shape,
         )
         self._registered_vram_sub_matrices[matrix_var.name] = True
 
@@ -122,21 +124,43 @@ class ProgramMatrixOpsMixin:
             target_col_idx=target_col_idx,
         )
 
-    def linear_projection(self, input_var: VRAMMatrixVar, weight_var: InputVar, name: str = "linear_out"):
+    def linear_projection(
+        self,
+        input_var: VRAMMatrixVar,
+        weight_var: InputVar,
+        name: str = "linear_out",
+        physical_shape: tuple[int, int] | None = None,
+    ):
         """Emit tiled PLENA linear projection, including K-split accumulation."""
         mlen = self.mlen
 
         rows, k_total = input_var.shape
         _, out_features = weight_var.shape
-        num_row_blocks = math.ceil(rows / mlen)
-        if out_features % mlen != 0:
-            raise ValueError(f"out_features ({out_features}) must be a multiple of mlen ({mlen})")
-        num_col_blocks = out_features // mlen
-        num_k_tiles = math.ceil(k_total / mlen)
+        if physical_shape is None:
+            physical_rows = max(input_var.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
+            physical_out_features = weight_var.physical_shape[1]
+        else:
+            physical_rows, physical_out_features = physical_shape
+            if physical_rows < rows or physical_out_features < out_features:
+                raise ValueError(
+                    f"physical_shape {physical_shape} cannot be smaller than "
+                    f"logical output {(rows, out_features)}"
+                )
+        physical_k = max(input_var.physical_shape[1], weight_var.physical_shape[0])
+        num_row_blocks = math.ceil(physical_rows / mlen)
+        num_col_blocks = math.ceil(physical_out_features / mlen)
+        num_k_tiles = math.ceil(physical_k / mlen)
+        max_k_tiles = self.mram_tile_capacity
 
         # When rows is not a multiple of mlen the hardware still operates on
         # full tiles; only the first `rows` rows contain valid output.
-        output = self.alloc(name, rows, out_features, strict=rows % mlen == 0)
+        output = self.alloc(
+            name,
+            rows,
+            out_features,
+            strict=False,
+            physical_shape=(physical_rows, physical_out_features),
+        )
 
         def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split):
             self.vram_sub_projection_to(
@@ -150,7 +174,7 @@ class ProgramMatrixOpsMixin:
                 **k_split,
             )
 
-        if num_k_tiles <= MAX_K_TILES:
+        if num_k_tiles <= max_k_tiles:
             for col_idx in range(num_col_blocks):
                 for row_idx in range(num_row_blocks):
                     emit_projection(row_idx, col_idx, output, row_idx, col_idx)
@@ -159,7 +183,7 @@ class ProgramMatrixOpsMixin:
         # Temp buffer for one partial-sum tile. Allocating the full output shape
         # here can overlap with the real output for wide projections.
         temp = self.alloc(f"{name}_temp", mlen, mlen)
-        for k_chunk_idx, (k_block_start, k_block_count) in enumerate(_iter_k_chunks(num_k_tiles)):
+        for k_chunk_idx, (k_block_start, k_block_count) in enumerate(_iter_k_chunks(num_k_tiles, max_k_tiles)):
             k_split = {
                 "k_block_start": k_block_start,
                 "k_block_count": k_block_count,
@@ -184,9 +208,14 @@ class ProgramMatrixOpsMixin:
         self.free_tensor(temp)
         return output
 
-    def linear(self, input_var: VRAMMatrixVar, weight_var: InputVar):
+    def linear(
+        self,
+        input_var: VRAMMatrixVar,
+        weight_var: InputVar,
+        physical_shape: tuple[int, int] | None = None,
+    ):
         """Default linear op compatibility surface."""
-        return self.linear_projection(input_var, weight_var)
+        return self.linear_projection(input_var, weight_var, physical_shape=physical_shape)
 
     # ========================================================================
     # RoPE (1D Positional Encoding)
@@ -237,6 +266,24 @@ class ProgramMatrixOpsMixin:
         """Add learned/positional embedding weights to input in-place."""
         self.vram_add(input_var, pos_weight_var)
         return input_var
+
+    def vram_mul(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        dst_row_offset: int = 0,
+        src_row_offset: int = 0,
+        num_rows: int | None = None,
+    ):
+        """VRAM matrix multiply: dst[row_offset:] *= src."""
+        super().vram_matrix_mul(
+            dst_matrix=dst.name,
+            src_matrix=src.name,
+            dst_row_offset=dst_row_offset,
+            src_row_offset=src_row_offset,
+            num_rows=num_rows,
+        )
+        return dst
 
     def vram_block_add_to(
         self,

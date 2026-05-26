@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 """Output computation assembly code generation for Flash Attention."""
+
+from .._imm import load_large_int_str as _load_large_int
 
 IMM2_BOUND = 2**18 - 1
 
@@ -13,6 +17,7 @@ def computing_o_code(
     o_old_base_address: int,
     head_dim: int,
     q_head_num: int,
+    rows: int | None = None,
 ) -> str:
     """
     Args:
@@ -39,20 +44,18 @@ def computing_o_code(
     # break diag(MLEN) * (MLEN * Head_dim) into diag(MLEN) * [(MLEN * MLEN) ... (MLEN * MLEN)]
 
     # load o_old base address
-    assert o_old_base_address < IMM2_BOUND, f"o_old_base_address must be less than {IMM2_BOUND}"
-    generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp0, {o_old_base_address} \n"
+    generated_code += _load_large_int(o_old_vector_address_register, o_old_base_address)
 
     # reload m_res base address
-    assert m_res_base_address < IMM2_BOUND, f"m_res_base_address must be less than {IMM2_BOUND}"
-    generated_code += f"S_ADDI_INT gp{m_res_vector_address_register}, gp0, {m_res_base_address} \n"
+    generated_code += _load_large_int(m_res_vector_address_register, m_res_base_address)
 
     # load pv base address
-    assert pv_base_address < IMM2_BOUND, f"pv_base_address must be less than {IMM2_BOUND}"
-    generated_code += f"S_ADDI_INT gp{pv_vector_address_register}, gp0, {pv_base_address} \n"
+    generated_code += _load_large_int(pv_vector_address_register, pv_base_address)
 
     if stage == "prefill":
         # loop over different row of m_res using hardware loop
-        generated_code += f"C_LOOP_START gp{loop_register}, {mlen} \n"
+        loop_rows = mlen if rows is None else rows
+        generated_code += f"C_LOOP_START gp{loop_register}, {loop_rows} \n"
         # load m_res (using indirect addressing)
         generated_code += f"S_LD_FP f{m_res_fp_register}, gp{m_res_vector_address_register}, 0 \n"
         # boardcast m_res to multiply with a row of a block of O_old and write to o_old
@@ -90,6 +93,7 @@ def computing_row_wise_scaling_code(
     l_old_base_address: int,
     o_row_stride: int,
     use_mask: bool = True,
+    rows: int | None = None,
 ) -> str:
     """
     line 12 in flash attention algorithm
@@ -110,13 +114,14 @@ def computing_row_wise_scaling_code(
 
     generated_code = "; Row-wise Scaling Code (1/l normalization) \n"
     # load l_old base address
-    generated_code += f"S_ADDI_INT gp{l_old_vector_address_register}, gp0, {l_old_base_address} \n"
+    generated_code += _load_large_int(l_old_vector_address_register, l_old_base_address)
     # load o_old base address
-    generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp0, {o_old_base_address} \n"
+    generated_code += _load_large_int(o_old_vector_address_register, o_old_base_address)
 
     if stage == "prefill":
         # loop over different row of Br using hardware loop
-        generated_code += f"C_LOOP_START gp{loop_register}, {mlen} \n"
+        loop_rows = mlen if rows is None else rows
+        generated_code += f"C_LOOP_START gp{loop_register}, {loop_rows} \n"
         # load l_old (using indirect addressing through l_old_vector_address_register)
         generated_code += f"S_LD_FP f{l_old_fp_register}, gp{l_old_vector_address_register}, 0 \n"
         # compute the inverse of l_old

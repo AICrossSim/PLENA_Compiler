@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 """Online softmax assembly code generation for Flash Attention."""
+
+from .._imm import load_large_int_str as _load_large_int
 
 IMM2_BOUND = 2**18 - 1
 
@@ -19,6 +23,9 @@ def online_softmax_code(
     m_start_address: int,
     qk_scale_address: int = 5,
     causal_mask: bool = True,
+    rows: int | None = None,
+    valid_cols: int | None = None,
+    mask_unit: int | None = None,
 ) -> str:
     """
     Args:
@@ -54,20 +61,29 @@ def online_softmax_code(
     if stage == "prefill":
         # Presettings
         # Load the starting address of S, which is the QKT result of the current head, in shape of (MLEN, MLEN)
-        assert m_start_address < IMM2_BOUND, f"m_start_address must be less than {IMM2_BOUND}"
-        generated_code += f"S_ADDI_INT gp{s_address_register}, gp0, {s_address} \n"
-        generated_code += f"S_ADDI_INT gp{m_last_address_register}, gp0, {m_start_address} \n"
+        generated_code += _load_large_int(s_address_register, s_address)
+        generated_code += _load_large_int(m_last_address_register, m_start_address)
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {mlen} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {mlen} \n"
 
         # Load qk_scale from FP SRAM (preloaded at FP SRAM address 5)
         generated_code += f"S_LD_FP f{qk_scale_register}, gp0, {qk_scale_address} \n"
 
-        # Hardware loop over mlen rows
-        generated_code += f"C_LOOP_START gp{loop_register}, {mlen} \n"
+        mask_en = 0
+        if valid_cols is not None and valid_cols < mlen:
+            lane_width = mask_unit or mlen
+            valid_lanes = max(1, (valid_cols + lane_width - 1) // lane_width)
+            mask_bits = (1 << valid_lanes) - 1
+            generated_code += f"S_ADDI_INT gp{loop_register}, gp0, {mask_bits} \n"
+            generated_code += f"C_SET_V_MASK_REG gp{loop_register} \n"
+            mask_en = 1
+
+        # Hardware loop over the valid query rows in this tile.
+        loop_rows = mlen if rows is None else rows
+        generated_code += f"C_LOOP_START gp{loop_register}, {loop_rows} \n"
 
         # Scale S row by qk_scale: S = S * qk_scale
-        generated_code += f"V_MUL_VF gp{s_address_register}, gp{s_address_register}, f{qk_scale_register}, 0 \n"
+        generated_code += f"V_MUL_VF gp{s_address_register}, gp{s_address_register}, f{qk_scale_register}, {mask_en} \n"
 
         # load m_last (using indirect addressing with offset 0)
         # Note: m_last is already in scaled space from previous tiles (or -inf for first tile)
@@ -77,7 +93,7 @@ def online_softmax_code(
 
         # m_curr = max(S_scaled[row], m_last) and store at m_curr
         m_curr_register = m_last_register
-        generated_code += f"V_RED_MAX f{m_curr_register}, gp{s_address_register}, 0 \n"
+        generated_code += f"V_RED_MAX f{m_curr_register}, gp{s_address_register}, {mask_en} \n"
 
         # m_res = m_last - m_curr
         m_res_register = tmp_fp_register
@@ -93,17 +109,17 @@ def online_softmax_code(
         generated_code += f"S_ST_FP f{m_curr_register}, gp{m_last_address_register}, 0 \n"
 
         # # S' = S - m_curr
-        generated_code += f"V_SUB_VF gp{s_address_register}, gp{s_address_register}, f{m_curr_register}, 0, 0 \n"
+        generated_code += f"V_SUB_VF gp{s_address_register}, gp{s_address_register}, f{m_curr_register}, {mask_en}, 0 \n"
 
         # P = exp(S')
-        generated_code += f"V_EXP_V gp{s_address_register}, gp{s_address_register}, 0 \n"
+        generated_code += f"V_EXP_V gp{s_address_register}, gp{s_address_register}, {mask_en} \n"
 
         # load l_old (using indirect addressing with offset 0)
         generated_code += f"S_LD_FP f{l_old_register}, gp{l_old_address_register}, 0 \n"
 
         # P = sum(P)
         generated_code += f"S_ADD_FP  f{sum_p_register}, f0, f0 \n"
-        generated_code += f"V_RED_SUM f{sum_p_register}, gp{s_address_register} \n"
+        generated_code += f"V_RED_SUM f{sum_p_register}, gp{s_address_register}, {mask_en} \n"
 
         # l_s = l_old * exp(m_res)
         generated_code += f"S_MUL_FP f{l_old_register}, f{l_old_register}, f{tmp_fp_register} \n"
@@ -126,9 +142,8 @@ def online_softmax_code(
     else:
         # Presettings
         # Load the starting address of S, which is the QKT result of the current head, in shape of (MLEN, MLEN)
-        assert m_start_address < IMM2_BOUND, f"m_start_address must be less than {IMM2_BOUND}"
-        generated_code += f"S_ADDI_INT gp{s_address_register}, gp0, {s_address} \n"
-        generated_code += f"S_ADDI_INT gp{m_last_address_register}, gp0, {m_start_address} \n"
+        generated_code += _load_large_int(s_address_register, s_address)
+        generated_code += _load_large_int(m_last_address_register, m_start_address)
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {1} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {1} \n"
 

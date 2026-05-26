@@ -36,9 +36,21 @@ class IsaCompiler(
 
     _ONLINE_SOFTMAX_FPSRAM_BASE = 10
 
-    def __init__(self, mlen: int = 64, blen: int = 4, real_data_ratio: float = 1.125, unroll_loops: bool = False):
+    def __init__(
+        self,
+        mlen: int = 64,
+        blen: int = 4,
+        real_data_ratio: float = 1.125,
+        unroll_loops: bool = False,
+        mram_tile_capacity: int = 4,
+    ):
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
-        super().__init__(mlen=mlen, blen=blen, unroll_loops=unroll_loops)
+        super().__init__(
+            mlen=mlen,
+            blen=blen,
+            unroll_loops=unroll_loops,
+            mram_tile_capacity=mram_tile_capacity,
+        )
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
         self.generated_code = ""
@@ -49,7 +61,7 @@ class IsaCompiler(
         hbm_object_name: str,
         vram_object_name: str,
         vlen: int = 64,
-        preload_len: int = 4,
+        preload_len: int | None = None,
     ) -> str:
         """
         Load a Batch tensor from HBM to VRAM.
@@ -60,14 +72,19 @@ class IsaCompiler(
 
         Order (matters): allocate VRAM → register in symbol table → emit ISA.
         """
+        if preload_len is None:
+            preload_len = getattr(self, "hbm_v_prefetch_amount", 4)
+
         hbm_layout = self.get_hbm_layout(hbm_object_name)
-        h, w = hbm_layout.full_shape
+        logical_h, logical_w = hbm_layout.full_shape
+        h, w = hbm_layout.physical_shape or hbm_layout.full_shape
         hbm_addr = hbm_layout.hbm_base_addr
         size = h * w
         vram_base = self.vram_allocator.allocate(size, name=vram_object_name)
         self.add_vram_object(
             name=vram_object_name,
-            shape=(h, w),
+            shape=(logical_h, logical_w),
+            physical_shape=(h, w),
             vram_addr=vram_base,
             dtype="fp16",
             kind="Batch",
@@ -114,7 +131,7 @@ class IsaCompiler(
         hbm_addr_reg: int | None = None,
         vlen: int = 64,
         precision: int = 0,  # 0 = Activation, 1 = KeyValue
-        store_amount: int = 4,  # HBM_V_Writeback_Amount
+        store_amount: int | None = None,  # HBM_V_Writeback_Amount
     ) -> str:
         """
         Write tensor from VRAM back to HBM.
@@ -123,6 +140,9 @@ class IsaCompiler(
         downstream ops (e.g., QK^T) can read them from HBM. Emits
         ``store_act_asm`` for tensors of any supported size.
         """
+        if store_amount is None:
+            store_amount = getattr(self, "hbm_v_writeback_amount", 4)
+
         if tensor_name not in self:
             raise KeyError(f"Tensor '{tensor_name}' not found in symbol table")
 
@@ -143,8 +163,8 @@ class IsaCompiler(
             else:
                 raise ValueError(f"Tensor '{tensor_name}' has no HBM address. Please specify hbm_addr.")
 
-        batch_size = tensor_info.shape[0]
-        hidden_size = tensor_info.shape[1]
+        batch_size = tensor_info.physical_shape[0] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[0]
+        hidden_size = tensor_info.physical_shape[1] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[1]
 
         isa_code = f"; Store {tensor_name} from VRAM to HBM\n"
         isa_code += f"; VRAM[{tensor_info.vram_addr}] -> HBM[{hbm_addr}], shape=({batch_size}, {hidden_size})\n"
@@ -191,7 +211,8 @@ class IsaCompiler(
             self.add_hbm_object(
                 name=hbm_object_name,
                 hbm_addr=hbm_addr,
-                shape=(batch_size, hidden_size),
+                shape=tensor_info.shape,
+                physical_shape=(batch_size, hidden_size),
             )
 
         return self._emit(isa_code)
@@ -227,7 +248,10 @@ class IsaCompiler(
         if tensor_info.vram_addr is None:
             raise ValueError(f"Tensor '{tensor_name}' has no VRAM address")
 
-        batch_size, hidden_dim = tensor_info.shape
+        logical_batch_size, logical_hidden_dim = tensor_info.shape
+        physical_batch_size, physical_hidden_dim = tensor_info.physical_shape
+        batch_size = physical_batch_size or logical_batch_size
+        hidden_dim = physical_hidden_dim or logical_hidden_dim
         if vlen is None:
             vlen = self.mlen
         if hidden_dim % vlen != 0:
@@ -245,7 +269,11 @@ class IsaCompiler(
             scratchpad_vram_addr = self.vram_allocator.allocate(vlen, name=temp_scratchpad_name)
 
         try:
-            isa_code = f"; Normalize ({mode}) {tensor_name}, shape=({batch_size}, {hidden_dim})\n"
+            isa_code = (
+                f"; Normalize ({mode}) {tensor_name}, "
+                f"logical=({logical_batch_size}, {logical_hidden_dim}) "
+                f"physical=({batch_size}, {hidden_dim})\n"
+            )
             if mode == "rms":
                 isa_code += rms_norm_asm(
                     _eps_offset=eps_offset,
@@ -296,8 +324,10 @@ class IsaCompiler(
         if x_info.vram_addr is None:
             raise ValueError(f"Tensor '{x_name}' has no VRAM address")
 
-        seq_len, head_dim = x_info.shape
+        seq_len, logical_head_dim = x_info.shape
         vlen = self.mlen
+        physical_head_dim = x_info.physical_shape[1] if x_info.physical_shape != (0, 0) else logical_head_dim
+        head_dim = physical_head_dim if physical_head_dim >= logical_head_dim else logical_head_dim
 
         if head_dim % vlen != 0:
             raise ValueError(f"head_dim ({head_dim}) must be divisible by vlen ({vlen}) for rope")
@@ -344,6 +374,7 @@ class IsaCompiler(
         name: str,
         hbm_addr: int,
         shape: tuple[int, int],
+        physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
     ):
         """Register an HBM object and build its HBM layout.
@@ -356,6 +387,7 @@ class IsaCompiler(
             self,
             name=name,
             shape=shape,
+            physical_shape=physical_shape,
             hbm_addr=hbm_addr,
             real_data_ratio=real_data_ratio,
         )
@@ -394,6 +426,7 @@ class IsaCompiler(
         name: str,
         hbm_addr: int,
         shape: tuple[int, int],
+        physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
     ):
         """Ensure HBM matrix layout exists."""
@@ -403,10 +436,16 @@ class IsaCompiler(
             name=name,
             hbm_addr=hbm_addr,
             shape=shape,
+            physical_shape=physical_shape,
             real_data_ratio=real_data_ratio,
         )
 
-    def ensure_vram_matrix_layout(self, name: str, shape: tuple[int, int]):
+    def ensure_vram_matrix_layout(
+        self,
+        name: str,
+        shape: tuple[int, int],
+        physical_shape: tuple[int, int] | None = None,
+    ):
         """Ensure VRAM matrix layout exists for an already allocated VRAM object."""
         if name in self.vram_matrices:
             return
@@ -414,6 +453,7 @@ class IsaCompiler(
         self.add_vram_object(
             name=name,
             shape=shape,
+            physical_shape=physical_shape,
             vram_addr=vram_addr,
             allocate_if_none=False,
         )

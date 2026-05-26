@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 
 from ._imm import load_large_int_str as _load_large_int
@@ -33,6 +35,11 @@ def store_act_asm(
     generated_code += _load_large_int(vram_reg, act_vram_offset)
     # Initialize HBM offset to 0
     generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp0, 0\n"
+    # HBM MX formats store scale bytes after the element payload.  H_STORE_V
+    # uses C_SET_SCALE_REG as the scale-section base offset; do not inherit a
+    # stale value from a previous HBM load/store.
+    generated_code += _load_large_int(set_stride_register, batch * hidden_size)
+    generated_code += f"C_SET_SCALE_REG gp{set_stride_register}\n"
 
     if batch == 1:
         # Simple case: no stride needed, store sequentially
