@@ -53,6 +53,9 @@ jobs:
       - name: Run embedding codegen test
         run: |
           PYTHONPATH=. python3 generator/tests/test_embedding_code_gen.py
+      - name: Run generator contract tests
+        run: |
+          PYTHONPATH=. python3 generator/tests/test_codegen_contracts.py
       - name: Run VLM codegen tests
         run: |
           PYTHONPATH=. python3 generator/tests/test_vlm_code_gen.py

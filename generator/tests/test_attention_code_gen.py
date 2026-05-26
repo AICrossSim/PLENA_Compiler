@@ -14,15 +14,16 @@ from passes.code_gen import _generate_attention_code
 def test_attention_code_generation():
     """Test the attention code generation function"""
 
-    # Test node with LLaMA-3.1 8B parameters
+    # Keep this as a small in-bound smoke shape. Full-size model shapes are
+    # covered by higher-level codegen/e2e paths with proper scheduler layouts.
     test_node = {
         "name": "attention_layer_0",
         "operation_type": "attention",
-        "dimensions": {"hidden_size": 4096, "num_attention_heads": 32, "head_dim": 128, "num_key_value_heads": 8},
+        "dimensions": {"hidden_size": 64, "num_attention_heads": 1, "head_dim": 64, "num_key_value_heads": 1},
     }
 
     # Generate the assembly code
-    model_info = {"batch": 1}
+    model_info = {"batch_size": 1}
     hardware_config = {"MLEN": 64, "BLEN": 4}
     scheduler = {
         "register_assignment": {

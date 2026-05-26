@@ -3,12 +3,12 @@ import json
 
 def try_eval(expr, vars_):
     try:
-        return eval(expr, {}, vars_)
+        return eval(expr, {"__builtins__": {}}, vars_)
     except Exception as e:
-        return f"Error: {e}"
+        raise ValueError(f"Failed to evaluate scheduler expression {expr!r}: {e}") from e
 
 
-def generate_mem_layout(hardware_config: dict, model_config: dict, mem_layout_lib: str = "mem_layout_lib.json") -> None:
+def generate_mem_layout(hardware_config: dict, model_config: dict, mem_layout_lib: str = "mem_layout_lib.json") -> dict:
     """
     Generate memory layout based on hardware and model configurations.
 

@@ -5,7 +5,7 @@ PLENA generator runner -- symbolic codegen and utilization analysis.
 Modes:
   codegen      -- Pipeline 2 (Generator): HF config -> symbolic graph ->
                   code_gen_pass -> ASM. Valid ISA for analysis/profiling;
-                  numerically incomplete (HBM address registers not set).
+                  numerically incomplete.
   utilization  -- PE utilization analysis report (no ISA emitted).
 
 Examples:
@@ -30,6 +30,7 @@ def _run_codegen(args) -> int:
     model_path = args.model_path
     output_file = args.output_file
     seq_len = args.seq_len
+    batch_size = args.batch_size
     num_layers_override = args.num_layers
 
     if output_file is None:
@@ -62,13 +63,13 @@ def _run_codegen(args) -> int:
     parser.print_summary()
 
     # Create symbolic graph
-    symbolic_graph = parser.create_symbolic_graph(seq_len=seq_len)
+    symbolic_graph = parser.create_symbolic_graph(batch_size=batch_size, seq_len=seq_len)
 
     dimensions = parser.extract_critical_dimensions()
 
     # For multimodal models, prepend the vision encoder graph so the emitted ASM
     # actually exercises the SigLIP / ViT layers + connector before the text decoder.
-    vision_graph = parser.create_vision_symbolic_graph(batch_size=1)
+    vision_graph = parser.create_vision_symbolic_graph(batch_size=batch_size)
     if vision_graph is not None:
         vision_nodes = vision_graph["nodes"]
         vision_order = vision_graph["execution_order"]
@@ -88,7 +89,7 @@ def _run_codegen(args) -> int:
     model_info = {
         "model_name": model_path,
         "architecture": getattr(parser.config, "architectures", ["Unknown"])[0] if parser.config else "Unknown",
-        "batch_size": 4,
+        "batch_size": batch_size,
         "context_length": dimensions.get("max_position_embeddings", "Unknown"),
         "vocab_size": dimensions.get("vocab_size", "Unknown"),
         "hidden_size": dimensions.get("hidden_size", "Unknown"),
@@ -132,6 +133,7 @@ def _run_codegen(args) -> int:
         f.write(generated_asm)
 
     print(f"Generated assembly code saved to: {output_file}")
+    print(f"batch_size used: {batch_size}")
     print(f"seq_len used: {seq_len}")
 
     # Print a preview of the generated code
@@ -165,6 +167,12 @@ def run():
         help="Output .asm file (required for codegen; pass a dummy path for utilization)",
     )
     parser.add_argument("--seq-len", type=int, default=512, help="Sequence length (default: 512)")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size used for symbolic graph and codegen (default: 1)",
+    )
     parser.add_argument("--num-layers", type=int, default=None, help="Override num_hidden_layers in model config")
 
     args = parser.parse_args()

@@ -32,6 +32,19 @@ from asm_templates import (
 )
 
 
+def _batch_size(model_info: dict[str, Any]) -> int:
+    """Return the generator batch size, with legacy ``batch`` fallback."""
+    return model_info.get("batch_size", model_info.get("batch", 1))
+
+
+def _vector_sram_addr(scheduler: dict[str, Any]) -> dict[str, Any]:
+    """Return scheduler vector SRAM addresses from the canonical layout path."""
+    try:
+        return scheduler["memory_layout"]["vector_sram_addr"]
+    except KeyError as exc:
+        raise KeyError("scheduler must include memory_layout.vector_sram_addr") from exc
+
+
 def _load_template(template_name: str) -> str:
     """Load assembly template from file."""
     templates_dir = Path(__file__).parent.parent / "asm_templates"
@@ -79,7 +92,7 @@ def _generate_embedding_code(
     elem_bytes = act_block_width // (block_dim * 8)
     voc_table_row_bytes = hidden_size * elem_bytes
 
-    batch_size = model_info.get("batch_size", 1)
+    batch_size = _batch_size(model_info)
     seq_len = model_info.get("seq_len", 1)
     # Embedding must produce ``batch * seq_len * hidden`` elements in VRAM — one
     # row per token.  Generate placeholder ids covering the full sequence; the
@@ -137,7 +150,7 @@ def _generate_attention_code(
 """
     mlen = hardware_config.get("MLEN", 64)
     blen = hardware_config.get("BLEN", 4)
-    batch = model_info.get("batch", 1)
+    batch = _batch_size(model_info)
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
     vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
 
@@ -297,7 +310,7 @@ def _generate_ffn_code(
         code += projection_asm(
             mlen=mlen,
             blen=blen,
-            batch=model_info.get("batch", 1),
+            batch=_batch_size(model_info),
             hidden_size=hidden_size,
             alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
             w_base_hbm_offset_reg=hbm_addr_reg.get("ffn_up_offset", 0),
@@ -331,7 +344,7 @@ def _generate_ffn_code(
                 activation_base_address=vsram.get("block5", vsram.get("block2", 0)),
                 scratchpad_base_address=_gelu_scratch,
                 vlen=_vit_vlen,
-                batch_size=model_info.get("batch", 1),
+                batch_size=_batch_size(model_info),
                 hidden_dim=intermediate_size,
             )
         else:
@@ -340,7 +353,7 @@ def _generate_ffn_code(
         code += projection_asm(
             mlen=mlen,
             blen=blen,
-            batch=model_info.get("batch", 1),
+            batch=_batch_size(model_info),
             hidden_size=intermediate_size,
             alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
             w_base_hbm_offset_reg=hbm_addr_reg.get("ffn_down_offset", 0),
@@ -366,7 +379,7 @@ def _generate_ffn_code(
         mlen=mlen,
         vlen=hardware_config.get("VLEN", 64),
         blen=blen,
-        batch=model_info.get("batch", 1),
+        batch=_batch_size(model_info),
         seq_len=model_info.get("seq_len", 1),
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -399,9 +412,10 @@ def _generate_normalization_code(
     eps_offset = _fp_sram.get("eps", 1)
     reci_hid_offset = _fp_sram.get("hid_reciprocal", 2)
     vlen = hardware_config.get("VLEN", 64)
-    batch_size = model_info.get("batch_size", 1)
-    activation_base = scheduler.get("vector_sram_addr", {}).get("block1", 0)
-    scratchpad_base = scheduler.get("vector_sram_addr", {}).get("block2", 0)
+    batch_size = _batch_size(model_info)
+    vsram = _vector_sram_addr(scheduler)
+    activation_base = vsram.get("block1", 0)
+    scratchpad_base = vsram.get("block2", 0)
 
     if norm_type == "layer_norm":
         code = f"""
@@ -544,7 +558,7 @@ def _generate_conv2d_code(
     code += projection_asm(
         mlen=mlen,
         blen=blen,
-        batch=model_info.get("batch_size", 1),
+        batch=_batch_size(model_info),
         hidden_size=K_col,
         alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
         w_base_hbm_offset_reg=w_base_hbm_offset_reg,
@@ -589,7 +603,7 @@ def _generate_vision_projection_code(
     code += projection_asm(
         mlen=mlen,
         blen=blen,
-        batch=model_info.get("batch_size", 1),
+        batch=_batch_size(model_info),
         hidden_size=in_features,
         alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
         w_base_hbm_offset_reg=w_base_hbm_offset_reg,
@@ -615,10 +629,10 @@ def _generate_elementwise_add_code(
     code += elementwise_add_asm(
         vlen=hardware_config.get("VLEN", 64),
         hidden_size=model_info["hidden_size"],
-        batch=model_info.get("batch", 1),
+        batch=_batch_size(model_info),
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3]),
-        stored_activation_base_address=scheduler.get("vector_sram_addr", {}).get("block1", 0),
-        previous_activation_base_address=scheduler.get("vector_sram_addr", {}).get("block2", 0),
+        stored_activation_base_address=_vector_sram_addr(scheduler).get("block1", 0),
+        previous_activation_base_address=_vector_sram_addr(scheduler).get("block2", 0),
         previous_act_on_chip_addr_reg_index=scheduler["register_assignment"]
         .get("hbm_addr_reg", {})
         .get("previous_activation_offset", 0),
@@ -641,15 +655,15 @@ def _generate_lm_head_code(
     code += lm_head_asm(
         mlen=hardware_config.get("MLEN", 64),
         blen=hardware_config.get("BLEN", 4),
-        batch=model_info.get("batch_size", 1),
+        batch=_batch_size(model_info),
         hidden_size=hidden_size,
         vocab_size=vocab_size,
         alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
         lm_head_weight_hbm_offset_reg=scheduler["register_assignment"]
         .get("hbm_addr_reg", {})
         .get("lm_head_weight_offset", 0),
-        activation_base_address=scheduler.get("vector_sram_addr", {}).get("block1", 0),
-        result_base_address=scheduler.get("vector_sram_addr", {}).get("block2", 0),
+        activation_base_address=_vector_sram_addr(scheduler).get("block1", 0),
+        result_base_address=_vector_sram_addr(scheduler).get("block2", 0),
     )
     return code.strip()
 
