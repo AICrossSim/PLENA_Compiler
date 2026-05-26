@@ -171,10 +171,7 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
 
     // Extensions
     V_SHIFT_V              = 6'h31,
-    C_BREAK                = 6'h32,
-    V_PS_V                 = 6'h33,
-    V_SHFT_V               = 6'h34,
-    C_HADAMARD_TRANSFORM   = 6'h35
+    C_BREAK                = 6'h32
 } CUSTOM_ISA_OPCODE;
 
 
