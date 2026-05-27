@@ -156,6 +156,29 @@ def projection_asm(
     MAX_K_TILES = max(1, matrix_sram_size // mlen)
     num_k_tiles = in_features // mlen
 
+    if num_k_tiles > MAX_K_TILES:
+        output_elements = out_features * batch
+        activation_elements = in_features * batch
+
+        if scratch_base_address == 0:
+            raise ValueError(
+                "projection_asm requires a non-zero scratch_base_address when K-split is active"
+            )
+
+        def _ranges_overlap(start_a: int, size_a: int, start_b: int, size_b: int) -> bool:
+            end_a = start_a + size_a
+            end_b = start_b + size_b
+            return start_a < end_b and start_b < end_a
+
+        if _ranges_overlap(scratch_base_address, output_elements, result_base_address, output_elements):
+            raise ValueError(
+                "projection_asm scratch_base_address overlaps result_base_address during K-split"
+            )
+        if _ranges_overlap(scratch_base_address, output_elements, activation_base_address, activation_elements):
+            raise ValueError(
+                "projection_asm scratch_base_address overlaps activation_base_address during K-split"
+            )
+
     # Unpack registers (same layout as before)
     w_actual_register = alive_registers[0]
     w_temp_register = alive_registers[1]

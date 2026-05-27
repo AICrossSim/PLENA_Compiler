@@ -1,6 +1,6 @@
 """Output computation assembly code generation for Flash Attention."""
 
-IMM2_BOUND = 2**18 - 1
+from .._imm import load_large_int_str as _load_large_int
 
 
 def computing_o_code(
@@ -13,6 +13,8 @@ def computing_o_code(
     o_old_base_address: int,
     head_dim: int,
     q_head_num: int,
+    use_mask: bool = True,
+    o_row_stride: int | None = None,
 ) -> str:
     """
     Args:
@@ -38,17 +40,17 @@ def computing_o_code(
     assert head_dim <= mlen, "head_dim must be less than or equal to mlen"
     # break diag(MLEN) * (MLEN * Head_dim) into diag(MLEN) * [(MLEN * MLEN) ... (MLEN * MLEN)]
 
-    # load o_old base address
-    assert o_old_base_address < IMM2_BOUND, f"o_old_base_address must be less than {IMM2_BOUND}"
-    generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp0, {o_old_base_address} \n"
+    # load o_old base address (may exceed immediate bound)
+    assert o_old_base_address >= 0, "o_old_base_address must be non-negative"
+    generated_code += _load_large_int(o_old_vector_address_register, o_old_base_address)
 
-    # reload m_res base address
-    assert m_res_base_address < IMM2_BOUND, f"m_res_base_address must be less than {IMM2_BOUND}"
-    generated_code += f"S_ADDI_INT gp{m_res_vector_address_register}, gp0, {m_res_base_address} \n"
+    # reload m_res base address (may exceed immediate bound)
+    assert m_res_base_address >= 0, "m_res_base_address must be non-negative"
+    generated_code += _load_large_int(m_res_vector_address_register, m_res_base_address)
 
-    # load pv base address
-    assert pv_base_address < IMM2_BOUND, f"pv_base_address must be less than {IMM2_BOUND}"
-    generated_code += f"S_ADDI_INT gp{pv_vector_address_register}, gp0, {pv_base_address} \n"
+    # load pv base address (may exceed immediate bound)
+    assert pv_base_address >= 0, "pv_base_address must be non-negative"
+    generated_code += _load_large_int(pv_vector_address_register, pv_base_address)
 
     if stage == "prefill":
         # loop over different row of m_res using hardware loop
@@ -56,13 +58,15 @@ def computing_o_code(
         # load m_res (using indirect addressing)
         generated_code += f"S_LD_FP f{m_res_fp_register}, gp{m_res_vector_address_register}, 0 \n"
         # boardcast m_res to multiply with a row of a block of O_old and write to o_old
+        mask_en = 1 if use_mask else 0
         generated_code += (
-            f"V_MUL_VF gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, f{m_res_fp_register}, 1 \n"
+            f"V_MUL_VF gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, f{m_res_fp_register}, {mask_en} \n"
         )
         # # add pv row to o_old
-        generated_code += f"V_ADD_VV gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, gp{pv_vector_address_register}, 1 \n"
+        generated_code += f"V_ADD_VV gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, gp{pv_vector_address_register}, {mask_en} \n"
         # # update o_old base address
-        generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, {q_head_num * head_dim} \n"
+        _o_row_stride = o_row_stride if o_row_stride is not None else (q_head_num * head_dim)
+        generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp{o_old_vector_address_register}, {_o_row_stride} \n"
         # # update pv base address
         generated_code += f"S_ADDI_INT gp{pv_vector_address_register}, gp{pv_vector_address_register}, {mlen} \n"
         # # update m_res address
@@ -109,10 +113,11 @@ def computing_row_wise_scaling_code(
     mask_en = 1 if use_mask else 0
 
     generated_code = "; Row-wise Scaling Code (1/l normalization) \n"
-    # load l_old base address
-    generated_code += f"S_ADDI_INT gp{l_old_vector_address_register}, gp0, {l_old_base_address} \n"
-    # load o_old base address
-    generated_code += f"S_ADDI_INT gp{o_old_vector_address_register}, gp0, {o_old_base_address} \n"
+    # load l_old and o_old base addresses (may exceed immediate bound)
+    assert l_old_base_address >= 0, "l_old_base_address must be non-negative"
+    assert o_old_base_address >= 0, "o_old_base_address must be non-negative"
+    generated_code += _load_large_int(l_old_vector_address_register, l_old_base_address)
+    generated_code += _load_large_int(o_old_vector_address_register, o_old_base_address)
 
     if stage == "prefill":
         # loop over different row of Br using hardware loop

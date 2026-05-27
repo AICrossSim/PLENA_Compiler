@@ -1,5 +1,7 @@
 """Online softmax assembly code generation for Flash Attention."""
 
+from .._imm import load_large_int_str as _load_large_int
+
 IMM2_BOUND = 2**18 - 1
 
 """
@@ -54,9 +56,8 @@ def online_softmax_code(
     if stage == "prefill":
         # Presettings
         # Load the starting address of S, which is the QKT result of the current head, in shape of (MLEN, MLEN)
-        assert m_start_address < IMM2_BOUND, f"m_start_address must be less than {IMM2_BOUND}"
-        generated_code += f"S_ADDI_INT gp{s_address_register}, gp0, {s_address} \n"
-        generated_code += f"S_ADDI_INT gp{m_last_address_register}, gp0, {m_start_address} \n"
+        generated_code += _load_large_int(s_address_register, s_address)
+        generated_code += _load_large_int(m_last_address_register, m_start_address)
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {mlen} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {mlen} \n"
 
@@ -126,9 +127,8 @@ def online_softmax_code(
     else:
         # Presettings
         # Load the starting address of S, which is the QKT result of the current head, in shape of (MLEN, MLEN)
-        assert m_start_address < IMM2_BOUND, f"m_start_address must be less than {IMM2_BOUND}"
-        generated_code += f"S_ADDI_INT gp{s_address_register}, gp0, {s_address} \n"
-        generated_code += f"S_ADDI_INT gp{m_last_address_register}, gp0, {m_start_address} \n"
+        generated_code += _load_large_int(s_address_register, s_address)
+        generated_code += _load_large_int(m_last_address_register, m_start_address)
         generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {1} \n"
         generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {1} \n"
 

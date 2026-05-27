@@ -18,6 +18,8 @@ def qkt_multiply(
     s_head_offset: int = 0,
     use_batched: bool = True,
     blen: int = 4,
+    q_len: int = 0,
+    k_hbm_head_stride: int | None = None,
 ) -> str:
     """
     Args:
@@ -56,9 +58,25 @@ def qkt_multiply(
     s_base_register = q_base_register
     generated_code = "; QKT Per KV Head Multiplication \n"
 
+    # Q VRAM address:
+    #   - Batched / legacy path: q_base_address + q_head_index * d  (seq-major)
+    #   - Per-head path with q_len > 0: q_base_address is already the per-head
+    #     base (head-major layout, caller pre-computed q_base + head * q_len * d).
+    #     q_head_index is ignored in this case.
+    if q_len > 0 and not use_batched:
+        q_vram_offset = q_base_address  # head offset already baked in
+    else:
+        q_vram_offset = q_base_address + q_head_index * d
+
+    # K HBM element offset:
+    #   - If k_hbm_head_stride is provided: k_head_index * k_hbm_head_stride
+    #     (e.g. head-major HBM: k_head_index * kv_tile_size * d_padded)
+    #   - Else legacy: k_head_index * d
+    k_hbm_offset = k_head_index * (k_hbm_head_stride if k_hbm_head_stride is not None else d)
+
     # Prefetch K from HBM (shared by both batched and per-head paths)
-    generated_code += f"S_ADDI_INT gp{q_base_register}, gp0, {q_base_address + q_head_index * d} \n"
-    generated_code += f"S_ADDI_INT gp{k_base_register}, gp0, {k_head_index * d} \n"
+    generated_code += "\n".join(_load_large_int(q_base_register, q_vram_offset)) + "\n"
+    generated_code += "\n".join(_load_large_int(k_base_register, k_hbm_offset)) + "\n"
 
     # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
     # When stride < 64 elements, strided access causes unaligned HBM reads
@@ -71,13 +89,11 @@ def qkt_multiply(
         # q_head_index is absolute and used only for Q VRAM read addressing above.
         if stage == "prefill":
             generated_code += f"M_BTMM 0, gp{q_base_register}, gp0 \n"
-            assert s_base_address + s_head_offset * mlen * mlen < IMM2_BOUND, "S base address is too large"
-            generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen * mlen} \n"
+            generated_code += "\n".join(_load_large_int(s_base_register, s_base_address + s_head_offset * mlen * mlen)) + "\n"
             generated_code += f"M_BMM_WO gp{s_base_register}, 0 \n"
         else:
             generated_code += f"M_BTMV 0, gp{q_base_register}, gp0 \n"
-            assert s_base_address + s_head_offset * mlen < IMM2_BOUND, "S base address is too large"
-            generated_code += f"S_ADDI_INT gp{s_base_register}, gp0, {s_base_address + s_head_offset * mlen} \n"
+            generated_code += "\n".join(_load_large_int(s_base_register, s_base_address + s_head_offset * mlen)) + "\n"
             generated_code += f"M_BMV_WO gp{s_base_register}, 0 \n"
     else:
         # --- Per-head path: M_TMM / M_TMV for a single Q-head ---
@@ -92,7 +108,7 @@ def qkt_multiply(
         #   inner  – K-dim accumulate (d // blen)
 
         s_addr = s_base_address + s_head_offset * (mlen * mlen if stage == "prefill" else mlen)
-        q_addr = q_base_address + q_head_index * d
+        q_addr = q_vram_offset  # already computed above (per-head base)
 
         if stage == "prefill":
             generated_code += _qkt_per_head_prefill(

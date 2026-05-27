@@ -78,6 +78,8 @@ def layer_norm_asm(
     vlen: int,
     batch_size: int,
     hidden_dim: int,
+    affine_weight_base_address: int | None = None,
+    affine_bias_base_address: int | None = None,
 ) -> str:
     """
     Generate assembly code for layer normalization.
@@ -94,6 +96,10 @@ def layer_norm_asm(
     generated_code += "S_ADD_FP f2, f0, f0 \n"  # sum(x) accumulator
     generated_code += "S_ADD_FP f3, f0, f0 \n"  # sum(x^2) accumulator
     generated_code += f"S_LD_FP f4, gp0, {reci_hid_offset} \n"  # 1/hidden_dim
+
+    use_affine = affine_weight_base_address is not None and affine_bias_base_address is not None
+    if (affine_weight_base_address is None) != (affine_bias_base_address is None):
+        raise ValueError("layer_norm_asm requires both affine_weight_base_address and affine_bias_base_address")
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch
@@ -148,5 +154,18 @@ def layer_norm_asm(
         # Reset accumulators for next batch
         generated_code += "S_ADD_FP f2, f0, f0 \n"
         generated_code += "S_ADD_FP f3, f0, f0 \n"
+
+        if use_affine:
+            # Rewind to the batch start and apply learned gamma / beta.
+            generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
+            generated_code += _load_large_int(scratchpad_addr, affine_weight_base_address + vlen * batch)
+            generated_code += _load_large_int(stats_addr, affine_bias_base_address + vlen * batch)
+
+            for i in range(hidden_dim // vlen):
+                generated_code += f"V_MUL_VV gp{act_addr}, gp{act_addr}, gp{scratchpad_addr}, 0 \n"
+                generated_code += f"V_ADD_VV gp{act_addr}, gp{act_addr}, gp{stats_addr}, 0 \n"
+                generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
+                generated_code += f"S_ADDI_INT gp{scratchpad_addr}, gp{scratchpad_addr}, {vlen * batch_size} \n"
+                generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
 
     return generated_code
