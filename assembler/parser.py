@@ -126,9 +126,17 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
 
             # Split the opcode and operands
             parts = line.split()
-            if len(parts) < 2 or ";" in parts[0]:
+            if len(parts) < 1 or ";" in parts[0]:
                 continue  # Invalid line
             opcode = parts[0]
+
+            # Zero-operand instructions (e.g., C_BREAK)
+            if len(parts) == 1:
+                instructions.append(
+                    Instruction(opcode=opcode, rd=None, rs1=None, rs2=None, rstride=None, funct1=None, funct2=None)
+                )
+                continue
+
             operands = [part.strip() for part in " ".join(parts[1:]).split(",")]
             # print(f"Parsing instruction: {line}", "operand length:", len(operands), "operands:", operands)
 

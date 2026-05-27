@@ -21,14 +21,23 @@ def load_large_int(reg: int, value: int) -> list[str]:
     For values < 2^18, emits a single S_ADDI_INT from gp0.
     For values >= 2^18, emits S_LUI_INT (sets gp{reg} = imm << 12) followed
     by an S_ADDI_INT for the low 12 bits when non-zero.
+
+    Always produces at least 3 instructions so the GP register write completes
+    before any downstream consumer (C_SET_ADDR, H_PREFETCH, H_STORE) reads it.
+    Shorter sequences are padded with S_ADDI_INT gp0, gp0, 0 (NOP).
     """
     if value < IMM2_BOUND:
-        return [f"S_ADDI_INT gp{reg}, gp0, {value}"]
-    upper = value >> 12
-    lower = value & 0xFFF
-    lines = [f"S_LUI_INT gp{reg}, {upper}"]
-    if lower:
-        lines.append(f"S_ADDI_INT gp{reg}, gp{reg}, {lower}")
+        lines = [f"S_ADDI_INT gp{reg}, gp0, {value}"]
+    else:
+        upper = value >> 12
+        lower = value & 0xFFF
+        lines = [f"S_LUI_INT gp{reg}, {upper}"]
+        if lower:
+            lines.append(f"S_ADDI_INT gp{reg}, gp{reg}, {lower}")
+
+    # Pad to at least 3 instructions so GP write settles before consumer reads
+    while len(lines) < 3:
+        lines.append("S_ADDI_INT gp0, gp0, 0")
     return lines
 
 

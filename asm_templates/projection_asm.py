@@ -61,18 +61,26 @@ def _emit_projection_chunk(
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
             for _ in range(k_tile_count):
                 lines.append(
-                    f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
+                    f"H_PREFETCH_M a{w_base_hbm_offset_reg}, gp{w_actual_register}, gp{w_hbm_offset_register}, 1, 0 "
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
                 lines.extend(
                     _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register)
                 )
+                # NOP padding: data_flow_control reads gp_reg1/gp_reg2 at reg_rd for addr_1/addr_2;
+                # ALU writeback takes 3 cycles — 2 NOPs close the gap before next H_PREFETCH_M.
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
-            lines.append(
-                f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
-            )
+            vsram_subtile_offset = (weight_row % (mlen // blen)) * blen * mlen
+            if vsram_subtile_offset >= (1 << 18):
+                lines.extend(_addi_large_int(intermediate_register, result_reg, vsram_subtile_offset, w_temp_register))
+            else:
+                lines.append(
+                    f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {vsram_subtile_offset} "
+                )
         for act_col in range(batch // blen):
             addr = activation_base_address + act_col * mlen * blen + chunk_act_base
             if addr >= (1 << 18):
@@ -80,10 +88,16 @@ def _emit_projection_chunk(
             else:
                 lines.append(f"S_ADDI_INT gp{act_reg}, gp0, {addr} ")
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
+            # NOP padding: S_ADDI_INT writeback takes 3 cycles; M_MM reads gp{reg}
+            # at reg_rd (1 cycle after decode). 2 NOPs close the gap.
+            lines.append("S_ADDI_INT gp0, gp0, 0 ")
+            lines.append("S_ADDI_INT gp0, gp0, 0 ")
             for _ in range(k_tile_count):
                 lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                 lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")
         if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_features // blen - 1:
@@ -193,7 +207,7 @@ def projection_asm(
                 lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
                 for weight_col in range(hidden_size // mlen):
                     lines.append(
-                        f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
+                        f"H_PREFETCH_M a{w_base_hbm_offset_reg}, gp{w_actual_register}, gp{w_hbm_offset_register}, 1, 0 "
                     )
                     lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
                     lines.extend(
@@ -201,19 +215,29 @@ def projection_asm(
                             w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register
                         )
                     )
+                    lines.append("S_ADDI_INT gp0, gp0, 0 ")
+                    lines.append("S_ADDI_INT gp0, gp0, 0 ")
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
             else:
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
-                lines.append(
-                    f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
-                )
+                vsram_subtile_offset = (weight_row % (mlen // blen)) * blen * mlen
+                if vsram_subtile_offset >= (1 << 18):
+                    lines.extend(_addi_large_int(intermediate_register, result_reg, vsram_subtile_offset, w_temp_register))
+                else:
+                    lines.append(
+                        f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {vsram_subtile_offset} "
+                    )
             for act_col in range(batch // blen):
                 lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
                 for inner_loop_index in range(hidden_size // mlen):
                     lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
                     lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                     lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
+                    lines.append("S_ADDI_INT gp0, gp0, 0 ")
+                    lines.append("S_ADDI_INT gp0, gp0, 0 ")
                 lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
                 lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")
             if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_features // blen - 1:
@@ -332,11 +356,13 @@ def projection_T_asm(
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, 0 ")
             for weight_col in range(hidden_size // mlen):
                 lines.append(
-                    f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{w_base_hbm_offset_reg}, 1, 0 "
+                    f"H_PREFETCH_M a{w_base_hbm_offset_reg}, gp{w_actual_register}, gp{w_hbm_offset_register}, 1, 0 "
                 )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
                 # Move to next mlen-wide column block within this row group
                 lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen} ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % tiles_per_mlen) * blen} ")
@@ -346,10 +372,14 @@ def projection_T_asm(
         for act_col in range(batch // blen):
             lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
+            lines.append("S_ADDI_INT gp0, gp0, 0 ")
+            lines.append("S_ADDI_INT gp0, gp0, 0 ")
             for inner_loop_index in range(hidden_size // mlen):
                 lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                 lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
+                lines.append("S_ADDI_INT gp0, gp0, 0 ")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")
         if (weight_row + 1) % tiles_per_mlen == 0 and weight_row != out_features // blen - 1:

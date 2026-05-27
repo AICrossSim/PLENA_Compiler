@@ -54,23 +54,41 @@ def store_act_asm(
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register}\n"
         hbm_base_reg = set_stride_register  # reuse after stride is set
 
-        # Outer loop: iterate over column blocks (hidden_size / vlen)
-        generated_code += f"C_LOOP_START gp{outer_loop_register}, {store_amount_per_hidden}\n"
-        generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_offset_reg}, 0\n"
+        # Delay for V controller to be ready for writes after preload reads
+        for _ in range(10):
+            generated_code += "S_ADDI_INT gp0, gp0, 0\n"
 
+        # Unrolled: C_LOOP_START/C_LOOP_END not implemented in RTL.
+        # Correct operand order: H_STORE_V gp(vram), gp(hbm_offset), a(addr_reg), stride, flags.
+        # 20 NOPs between H_STORE_V for V controller timing.
         if batch > store_amount:
-            # Inner loop: iterate over batch blocks
-            generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / store_amount)}\n"
-
-        generated_code += f"H_STORE_V gp{vram_reg}, gp{hbm_base_reg}, a{hbm_addr_reg}, 1, 0\n"
-        generated_code += f"S_ADDI_INT gp{vram_reg}, gp{vram_reg}, {vlen * store_amount}\n"
-
-        if batch > store_amount:
-            generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_base_reg}, {hidden_size * store_amount}\n"
-            generated_code += f"C_LOOP_END gp{inner_loop_register}\n"
-
-        # Move to next column block in HBM
-        generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {vlen}\n"
-        generated_code += f"C_LOOP_END gp{outer_loop_register}\n"
+            inner_iters = math.ceil(batch / store_amount)
+            for _outer_i in range(store_amount_per_hidden):
+                generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_offset_reg}, 0\n"
+                for _ in range(10):
+                    generated_code += "S_ADDI_INT gp0, gp0, 0\n"
+                for _inner_i in range(inner_iters):
+                    generated_code += f"H_STORE_V a{hbm_addr_reg}, gp{vram_reg}, gp{hbm_base_reg}, 1, 0\n"
+                    # 2 NOPs: delay gp3 increment so late_rdata1_d1 captures pre-increment value
+                    # when H_STORE_V reaches mem_stage (regfile write at exe overlaps late read).
+                    generated_code += "S_ADDI_INT gp0, gp0, 0\n"
+                    generated_code += "S_ADDI_INT gp0, gp0, 0\n"
+                    generated_code += f"S_ADDI_INT gp{vram_reg}, gp{vram_reg}, {vlen * store_amount}\n"
+                    # 3 NOPs: delay S_ADDI on hbm_base_reg so H_STORE_V passes mem_stage before
+                    # gp2 changes.
+                    for _ in range(3):
+                        generated_code += "S_ADDI_INT gp0, gp0, 0\n"
+                    generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_base_reg}, {hidden_size * store_amount}\n"
+                    for _ in range(15):
+                        generated_code += "S_ADDI_INT gp0, gp0, 0\n"
+                generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {vlen}\n"
+        else:
+            for _outer_i in range(store_amount_per_hidden):
+                generated_code += f"S_ADDI_INT gp{hbm_base_reg}, gp{hbm_offset_reg}, 0\n"
+                generated_code += f"H_STORE_V a{hbm_addr_reg}, gp{vram_reg}, gp{hbm_base_reg}, 1, 0\n"
+                generated_code += f"S_ADDI_INT gp{vram_reg}, gp{vram_reg}, {vlen * store_amount}\n"
+                generated_code += f"S_ADDI_INT gp{hbm_offset_reg}, gp{hbm_offset_reg}, {vlen}\n"
+                for _ in range(20):
+                    generated_code += "S_ADDI_INT gp0, gp0, 0\n"
 
     return generated_code
