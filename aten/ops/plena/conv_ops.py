@@ -80,6 +80,47 @@ def conv2d_plena(
     elif os.environ.get("CONV_USE_SHIFT") == "0":
         use_shift = False
 
+    # ------------------------------------------------------------------
+    # CONV_2D fast path — single-instruction replacement for the
+    # im2col + GEMM lowering, used for the SmolVLM2 patch-embed shape
+    # (stride == K, small C_in). Decoder-stub level in the RTL: the
+    # opcode emits but the engine is not yet wired to VRAM/MSRAM.
+    # Enable via `CONV_USE_CONV2D_INSTR=1` env var.
+    # See PLENA_RTL doc/CONV2D_AND_SYNTH_FYP.md.
+    # ------------------------------------------------------------------
+    if os.environ.get("CONV_USE_CONV2D_INSTR") == "1" and stride == K and C_in <= 4:
+        from compiler.asm_templates.conv2d_asm import conv2d_asm
+
+        # The output VRAM matrix still needs to be allocated so downstream
+        # ops can reference it. We allocate at the same size the im2col
+        # path would have produced.
+        out_mat_fast = prog.alloc("conv2d_out", M, prog.mlen, strict=False)
+        out_vram_reg = 4  # arbitrary GP reg for output VRAM base — wired stub
+
+        # Set up HBM input + weight addr registers (a0 = input, a1 = weight)
+        for addr_reg_idx, var, gp_setup_reg in (
+            (0, input_raw_var, 6),
+            (1, weight_2d_var, 7),
+        ):
+            hbm_base = var.hbm_addr
+            setup_lines = []
+            if hbm_base <= 262143:
+                setup_lines.append(f"S_ADDI_INT gp{gp_setup_reg}, gp0, {hbm_base}")
+            else:
+                setup_lines.append(f"S_LUI_INT gp{gp_setup_reg}, {hbm_base >> 12}")
+                setup_lines.append(
+                    f"S_ADDI_INT gp{gp_setup_reg}, gp{gp_setup_reg}, {hbm_base & 0xFFF}"
+                )
+            setup_lines.append(f"C_SET_ADDR_REG a{addr_reg_idx}, gp0, gp{gp_setup_reg}")
+            prog.emit("\n".join(setup_lines) + "\n")
+
+        prog.emit(conv2d_asm(hbm_in_addr_reg=0, hbm_wt_addr_reg=1, vram_out_reg=out_vram_reg))
+
+        # Return a placeholder VRAMMatrixVar with the right shape so the
+        # rest of the front-end can chain. Functional values are not
+        # produced — see RTL doc.
+        return out_mat_fast
+
     # Lazy imports to avoid circular dependencies at module load time
     if use_shift:
         from compiler.asm_templates.im2col_asm import im2col_asm, PREFETCH_V_AMOUNT
