@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from ._imm import addi_large_int_str as _addi_large_int
 from ._imm import load_large_int_str as _load_large_int
 from ._k_split import k_chunks as _k_chunks
@@ -381,7 +383,7 @@ def _emit_ffn_projection_unrolled(
     chunks = _k_chunks(num_k_tiles, max_k_tiles)
     # Total output region size (elements) for the VRAM accumulator pass.
     output_elements = out_size * batch * seq_len
-    per_vlen_adds = output_elements // vlen
+    per_vlen_adds = math.ceil(output_elements / vlen)
 
     for chunk_idx, (k_start, k_count) in enumerate(chunks):
         lines.append(
@@ -1328,7 +1330,12 @@ def _ffn_asm_with_loops(
         generated_code += (
             f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
         )
-        generated_code += _load_large_int(a_actual_register, mlen * hidden_size)
+        generated_code += _addi_large_int(
+            a_actual_register,
+            a_actual_register,
+            mlen * hidden_size,
+            w_temp_register,
+        )
 
     # Reset for compute phase
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
@@ -1689,7 +1696,12 @@ def _ffn_asm_fused_up_gate(
             generated_code += f"; Prefetch DOWN weight tile {prefetch_idx}\n"
             generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{down_weight_hbm_offset_reg}, 1, 0\n"
             generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-            generated_code += _load_large_int(a_actual_register, mlen * hidden_size)
+            generated_code += _addi_large_int(
+                a_actual_register,
+                a_actual_register,
+                mlen * hidden_size,
+                w_temp_register,
+            )
 
     # Downsize linear (first block already prefetched)
     generated_code += (
@@ -1767,7 +1779,12 @@ def _ffn_asm_fused_up_gate(
         for weight_col in range(num_down_weight_tiles):
             generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{down_weight_hbm_offset_reg}, 1, 0\n"
             generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
-            generated_code += _load_large_int(a_actual_register, mlen * hidden_size)
+            generated_code += _addi_large_int(
+                a_actual_register,
+                a_actual_register,
+                mlen * hidden_size,
+                w_temp_register,
+            )
 
         generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n"
         generated_code += (
