@@ -3371,7 +3371,15 @@ def compile_native_hf_decoder(
     #   slot 4 = 1/hidden    (rms_norm, offset=4)
     #   slot 5 = 1.0         (FFN SiLU)
     #   slots 6-9 = 0.0      (padding)
-    fp_preload = [0.0, scale, float("-inf"), eps, 1.0 / hidden, 1.0] + [0.0] * 4
+    # slot 2 must be a large NEGATIVE FINITE, not -inf: it is the padded-column score
+    # mask (program_attention._build_valid_col_mask loads f7 from FP_SRAM[2]) and the
+    # packed-attention col-mask buffer VRAM-aliases O_proj's tile-align padding rows.
+    # The RMSNorm runs over physical rows, so a -inf padding row does (-inf)*0 = NaN
+    # (sumsq overflows -> reci=0), poisoning the output. A finite value gives
+    # (x)*0 = 0. NOTE: fp_preload is cast to float16 in create_sim_env (max ~65504),
+    # so use a value WITHIN float16 range (not -1e30, which overflows to -inf).
+    # -6e4 still masks (exp(score - 6e4) = 0) and its square stays finite.
+    fp_preload = [0.0, scale, -6.0e4, eps, 1.0 / hidden, 1.0] + [0.0] * 4
 
     # Result is at current's VRAM location
     o_vram_addr = prog.get_vram_addr(current.name)
@@ -3379,13 +3387,21 @@ def compile_native_hf_decoder(
     out_features = padded_hidden
     comparison_rows = compile_seq_rows if batch_size > 1 else seq_len
 
+    # Output is column-block-major: each batch's `out_features` span ceil(out_features/mlen)
+    # column blocks, and consecutive col-blocks of a batch are `physical_rows` rows apart
+    # (NOT comparison_rows). With tile-align padding (physical_rows > comparison_rows, e.g.
+    # MLEN=256 seq_len=64) the reader must span all col-blocks at the physical stride, so
+    # num_rows = num_col_blocks * physical_rows. (When physical_rows == comparison_rows, this
+    # equals the old comparison_rows*out_features//mlen, so MLEN=64 is unchanged.)
+    _physical_rows = current.physical_shape[0]
+    _num_col_blocks = (out_features + mlen - 1) // mlen
     comparison_params = {
         "start_row_idx": o_vram_addr // mlen,
-        "num_rows": (comparison_rows * out_features) // mlen,
+        "num_rows": _num_col_blocks * _physical_rows if out_features > mlen else comparison_rows,
         "num_batches": comparison_rows,
         "elements_per_batch": out_features,
         "row_dim": mlen,
-        "physical_rows": current.physical_shape[0],
+        "physical_rows": _physical_rows,
         "use_stride_mode": out_features > mlen,
     }
 
