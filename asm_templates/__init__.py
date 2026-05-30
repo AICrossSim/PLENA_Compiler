@@ -23,7 +23,7 @@ from .elementwise_add_vram_asm import elementwise_add_vram_asm
 from .embedding_asm import embedding_asm
 from .ffn_asm import ffn_asm, ffn_intermediate_asm, ffn_up_silu_asm
 from .flash_attn_asm import flash_attn_asm
-from .gelu_asm import gelu_asm
+from .gelu_asm import gelu_asm, gelu_tanh_asm
 from .im2col_asm import im2col_asm
 from .im2col_asm_no_shift import im2col_asm_no_shift
 from .lm_head import lm_head_asm
@@ -50,6 +50,7 @@ __all__ = [
     "ffn_up_silu_asm",
     "flash_attn_asm",
     "gelu_asm",
+    "gelu_tanh_asm",
     "gemv_asm",
     "im2col_asm",
     "im2col_asm_no_shift",
