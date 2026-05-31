@@ -393,6 +393,12 @@ class ProgramTensorMixin:
         _, inter_dim = w_up.physical_shape
         mlen = self.mlen
         blen = self.blen
+        # rows//blen drives the inner activation-column loop; a non-multiple
+        # (esp. rows < blen) emits C_LOOP_START 0 and the emulator panics.
+        if batch_size <= 0 or batch_size % blen != 0:
+            raise ValueError(
+                f"FFN activation rows ({batch_size}) must be a positive multiple of BLEN ({blen})."
+            )
         activation_base_address = self.get_vram_addr(input_var.name)
         max_k_tiles = max(hidden_size // mlen, inter_dim // mlen)
         use_loop_instructions = max_k_tiles <= self.mram_tile_capacity
