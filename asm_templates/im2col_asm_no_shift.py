@@ -97,24 +97,53 @@ def im2col_asm_no_shift(
 
     K_col = C_in * K * K
 
-    # With stride > 1 the pixel column is ``ow * stride + kc``, which may
-    # exceed a single VLEN load.  The assertion below checks the per-ow
-    # maximum: intra_col + K - 1 < vlen, where intra_col = (ow*stride) % 64.
+    # The pixel column for (ow, kc) is ``ow*stride + kc``; relative to the
+    # 64-aligned HBM load base it is ``intra_col + kc`` where
+    # intra_col = (ow*stride) % 64.  The K kernel elements of a row must fit
+    # inside ONE 64-element HBM burst (the physical aligned load), NOT inside
+    # a single VLEN.  When VLEN < 64 a burst is delivered as ceil(64/VLEN)
+    # consecutive VLEN-wide sub-rows (loaded contiguously via the H_PREFETCH_V
+    # PREFETCH_V_AMOUNT window), and the element at absolute burst position
+    # ``abs_pos = intra_col + kc`` is read from sub-row ``abs_pos // VLEN`` at
+    # lane ``abs_pos % VLEN``.  The bound is therefore the 64-element burst,
+    # independent of VLEN.
+    HBM_BURST = 64
     max_intra_col = max((ow * stride) % 64 for ow in range(OW)) if OW > 0 else 0
-    assert max_intra_col + K <= vlen, (
+    assert max_intra_col + K <= HBM_BURST, (
         f"im2col_asm_no_shift: intra_col ({max_intra_col}) + K ({K}) = "
-        f"{max_intra_col + K} > VLEN ({vlen}); the K kernel elements must fit "
-        f"within one 64-aligned HBM load"
+        f"{max_intra_col + K} > HBM burst ({HBM_BURST}); the K kernel elements "
+        f"must fit within one 64-aligned HBM load"
     )
-    assert K <= vlen, f"K={K} > vlen={vlen}; basis-vector extraction requires K <= vlen"
+
+    # Number of contiguous VLEN-wide sub-rows that tile one 64-element burst.
+    # VLEN >= 64 -> 1 (existing behaviour, exactly preserved).
+    _sub_rows = (HBM_BURST + vlen - 1) // vlen
+    assert _sub_rows <= PREFETCH_V_AMOUNT, (
+        f"im2col_asm_no_shift: VLEN={vlen} needs {_sub_rows} burst sub-rows "
+        f"but H_PREFETCH_V only loads PREFETCH_V_AMOUNT={PREFETCH_V_AMOUNT}"
+    )
+    # When VLEN < 64 the burst is read with rstride=0 so the PREFETCH window
+    # delivers contiguous sub-rows; VLEN >= 64 keeps the original rstride=1.
+    _burst_rstride = 1 if vlen >= HBM_BURST else 0
+
+    if W_padded is None:
+        W_padded = W
+
+    # The over-read guard (below, VLEN >= 64 only) may shift a basis lane up
+    # by `delta` (a multiple of 64, at most vlen - W_padded).  The shifted
+    # lane must still fit inside the single VLEN-wide clamped load window.
+    if vlen >= HBM_BURST:
+        _max_intra_col_for_guard = max((ow * stride) % 64 for ow in range(OW)) if OW > 0 else 0
+        _max_guard_delta = max(0, vlen - W_padded)
+        assert _max_intra_col_for_guard + (K - 1) + _max_guard_delta < vlen, (
+            f"im2col_asm_no_shift: over-read-guard basis lane "
+            f"{_max_intra_col_for_guard + (K - 1) + _max_guard_delta} >= VLEN ({vlen})"
+        )
     num_tiles = (K_col + vlen - 1) // vlen
     output_row_stride = M if output_physical_rows is None else output_physical_rows
     assert output_row_stride >= M, (
         f"output_physical_rows={output_row_stride} cannot be smaller than logical M={M}"
     )
-
-    if W_padded is None:
-        W_padded = W
 
     # Compute save f_regs for precious fp_sram slots.
     # im2col zeroes fp_sram[0..K-1] during setup and writes fp_sram[0..K_col-1]
@@ -144,16 +173,67 @@ def im2col_asm_no_shift(
     lines.append("; Requires: f0=0.0 (hw const), fp_preload[1]=1.0")
     lines.append("; ============================================================")
 
-    # Build basis vectors e_pos in VRAM (e_pos[i] = 1.0 if i==pos else 0.0).
-    # With stride > 1, the basis position for (ow, kc) is
-    #   (ow * stride) % 64 + kc
-    # so we need basis vectors for every unique position index that appears.
-    # Collect the full set once, build only those that are needed.
+    # ------------------------------------------------------------------
+    # Over-read guard for VLEN > W_padded (e.g. MLEN=256, W_padded=128).
+    #
+    # H_PREFETCH_V always loads VLEN consecutive elements starting at the
+    # requested HBM offset.  When VLEN > W_padded a single load spans more
+    # than one physical pixel row.  For the last channel's bottom pixel
+    # rows the load window runs off the end of the V_PIXELS element region
+    # (C_in*H*W_padded elements) and over-reads into the appended E8M0
+    # scale-byte region.  Those scale bytes, decoded as activation FP8
+    # elements, are NaN/Inf (e.g. 0x7f -> E4M3 NaN); the basis-vector
+    # multiply zeroes those lanes but NaN*0 = NaN, which then poisons the
+    # V_RED_SUM and yields NaN im2col outputs.
+    #
+    # Fix: clamp the load base downward by `delta` so the VLEN window ends
+    # exactly at the element-region boundary (never reading the scale
+    # region).  The wanted element is unchanged in HBM; in the clamped load
+    # it simply lands `delta` lanes higher, so the basis-vector position is
+    # offset by the same `delta`.  This keeps the element addressing/stride
+    # and the C_SET_SCALE_REG math on the logical C_in*H*W_padded size, and
+    # is a no-op when VLEN <= W_padded (delta is always 0 there, since a
+    # single row already exceeds the load width).
+    input_tensor_elems = C_in * H * W_padded
+
+    def _load_delta(hbm_offset: int) -> int:
+        # Only meaningful for VLEN >= 64 (single-sub-row clamp).  Multiple of 64
+        # (vlen, W_padded and the element region are all 64-aligned), so the
+        # clamped base stays 64-aligned for H_PREFETCH_V.  Always 0 for VLEN < 64
+        # (a single VLEN row is narrower than W_padded, never crossing the end).
+        if vlen < HBM_BURST:
+            return 0
+        over = hbm_offset + vlen - input_tensor_elems
+        return over if over > 0 else 0
+
+    def _burst_index(intra_col: int, kc: int, delta: int) -> tuple[int, int]:
+        """Map a kernel element to (sub_row, lane) within the prefetched burst.
+
+        The wanted element's absolute position inside the 64-element burst is
+        ``intra_col + kc`` (plus the VLEN>=64 over-read clamp ``delta``).  With
+        contiguous sub-rows it lands in sub-row ``abs // vlen`` at lane
+        ``abs % vlen``.  For VLEN >= 64 the burst is one sub-row, so this is
+        simply (0, intra_col+kc+delta) — exactly the original behaviour.
+        """
+        abs_pos = intra_col + kc + delta
+        return abs_pos // vlen, abs_pos % vlen
+
+    # Build basis vectors e_lane in VRAM (e_lane[i] = 1.0 if i==lane else 0.0).
+    # The basis selects a single VLEN lane; the sub-row is chosen by addressing
+    # the right prefetched scratch sub-row.  Collect every lane that appears.
     _basis_positions: set[int] = set()
     for ow in range(OW):
         intra_col = (ow * stride) % 64
-        for kc in range(K):
-            _basis_positions.add(intra_col + kc)
+        for oh in range(OH):
+            for c in range(C_in):
+                for kr in range(K):
+                    pixel_row = oh * stride + kr
+                    aligned_col = ((ow * stride) // 64) * 64
+                    hbm_offset = (c * H + pixel_row) * W_padded + aligned_col
+                    delta = _load_delta(hbm_offset)
+                    for kc in range(K):
+                        _, lane = _burst_index(intra_col, kc, delta)
+                        _basis_positions.add(lane)
     _basis_positions_sorted = sorted(_basis_positions)
     _num_basis = len(_basis_positions_sorted)
     # Map position → VRAM address for quick lookup in the main loop.
@@ -199,7 +279,8 @@ def im2col_asm_no_shift(
     lines.append("; -- Setup: HBM stride and scale --")
     lines.extend(_load_large_int_list(basis_reg, W_padded))
     lines.append(f"C_SET_STRIDE_REG gp{basis_reg}")
-    input_tensor_elems = C_in * H * W_padded
+    # input_tensor_elems (= C_in*H*W_padded) is computed once above; the scale
+    # register stays on this LOGICAL element-region size.
     lines.extend(_load_large_int_list(basis_reg, input_tensor_elems))
     lines.append(f"C_SET_SCALE_REG gp{basis_reg}")
 
@@ -247,18 +328,48 @@ def im2col_asm_no_shift(
                     # HBM offset — 64-aligned; intra_col handled by basis vector.
                     hbm_offset = (c * H + pixel_row) * W_padded + aligned_col
 
-                    lines.append(f"; (c={c}, kr={kr})  hbm_off={hbm_offset}  intra_col={intra_col}")
-                    lines.extend(_load_large_int_list(off_reg, hbm_offset))
-                    lines.append(f"H_PREFETCH_V gp{scratch_reg}, gp{off_reg}, a{input_hbm_base_addr_reg}, 1, 0")
+                    # Over-read guard: when the VLEN load window would run off
+                    # the end of the V_PIXELS element region (into the appended
+                    # E8M0 scale region, which decodes to NaN as FP8 elements),
+                    # clamp the load base down by `delta` so the window ends at
+                    # the element-region boundary.  The wanted element then sits
+                    # `delta` lanes higher, so the basis position is shifted by
+                    # the same delta.  delta is 0 (no-op) whenever VLEN <= W_padded.
+                    delta = _load_delta(hbm_offset)
+                    load_offset = hbm_offset - delta
+
+                    lines.append(
+                        f"; (c={c}, kr={kr})  hbm_off={hbm_offset}  "
+                        f"load_off={load_offset}  delta={delta}  intra_col={intra_col}"
+                    )
+                    lines.extend(_load_large_int_list(off_reg, load_offset))
+                    # rstride=0 (VLEN<64) makes the PREFETCH_V_AMOUNT window
+                    # deliver contiguous VLEN-wide sub-rows that tile the 64-elem
+                    # burst; rstride=1 (VLEN>=64) keeps the original single-row
+                    # behaviour (only sub-row 0 is consumed).
+                    lines.append(
+                        f"H_PREFETCH_V gp{scratch_reg}, gp{off_reg}, "
+                        f"a{input_hbm_base_addr_reg}, {_burst_rstride}, 0"
+                    )
 
                     for kc in contributing_kcs:
                         local_pos = c * K * K + kr * K + kc - tile_start
-                        # Basis vector at (intra_col + kc) extracts the
-                        # correct element from the aligned load.
-                        basis_addr = _basis_pos_to_vram[intra_col + kc]
+                        # (sub_row, lane) of the wanted element within the burst.
+                        # VLEN>=64 -> sub_row 0, lane=intra_col+kc+delta (original).
+                        sub_row, lane = _burst_index(intra_col, kc, delta)
+                        basis_addr = _basis_pos_to_vram[lane]
+                        # Scratch sub-row holding this element.
+                        scratch_sub_addr = scratch_vram_addr + sub_row * vlen
 
                         lines.extend(_load_large_int_list(basis_reg, basis_addr))
-                        lines.append(f"V_MUL_VV gp{temp_reg}, gp{scratch_reg}, gp{basis_reg}, 0")
+                        if sub_row == 0:
+                            mul_src_reg = scratch_reg
+                        else:
+                            # off_reg is free after the prefetch; reuse it to point
+                            # at the scratch sub-row.
+                            lines.extend(_load_large_int_list(off_reg, scratch_sub_addr))
+                            mul_src_reg = off_reg
+                        lines.append(f"V_MUL_VV gp{temp_reg}, gp{mul_src_reg}, gp{basis_reg}, 0")
                         lines.append(f"S_ADD_FP f{fp_ex_reg}, f0, f0")
                         lines.append(f"V_RED_SUM f{fp_ex_reg}, gp{temp_reg}, 0, 0")
                         lines.append(f"S_ST_FP f{fp_ex_reg}, gp0, {local_pos}")

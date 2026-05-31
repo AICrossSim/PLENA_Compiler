@@ -1320,7 +1320,9 @@ def _emit_vision_attention_block(
     )
     prog.vram_fill_zero(O_full)
     o_full_addr = prog.get_vram_addr(O_full.name)
-    o_head_stride = O_full.physical_shape[0] * prog.mlen
+    # Each head spans padded_head_dim//mlen col-blocks; stride by the full
+    # per-head span, not one mlen tile (heads overlap at sub-64 head_dim>mlen).
+    o_head_stride = O_full.physical_shape[0] * padded_head_dim
 
     for h in range(num_heads):
         Q_h = _linear_projection(
@@ -2682,20 +2684,34 @@ def compile_native_hf_vision_encoder(
 
     tensor_layouts = _tensor_layout_metadata(prog, input_tensors)
     gelu_1702_fp_address = prog._ONLINE_SOFTMAX_FPSRAM_BASE + 3 * mlen
-    fp_preload = [0.0, scale, float("-inf"), eps, 1.0 / hidden, 1.0, 1.702] + [0.0] * 3
+    # slot 2 must be a large NEGATIVE FINITE, not -inf (see compile_native_hf_decoder):
+    # it is the attention softmax/padded-column score mask and the packed col-mask buffer
+    # VRAM-aliases tile-align padding rows. LayerNorm runs over physical rows, so a -inf
+    # padding row does (-inf)*0 = NaN, poisoning the output; a finite value gives x*0 = 0.
+    # fp_preload is cast to float16 in create_sim_env (max ~65504), so use -6e4 (within
+    # float16 range, unlike -1e30 which overflows to -inf); it still masks and stays finite.
+    fp_preload = [0.0, scale, -6.0e4, eps, 1.0 / hidden, 1.0, 1.702] + [0.0] * 3
     if len(fp_preload) <= gelu_1702_fp_address:
         fp_preload.extend([0.0] * (gelu_1702_fp_address + 1 - len(fp_preload)))
     fp_preload[gelu_1702_fp_address] = 1.702
 
     o_vram_addr = prog.get_vram_addr(current.name)
     comparison_rows = output_seq_len
+    # Output is column-block-major: each batch's `output_padded_hidden` span
+    # ceil(output_padded_hidden/mlen) column blocks, and consecutive col-blocks of a batch
+    # are `physical_rows` rows apart (NOT comparison_rows). With tile-align padding
+    # (physical_rows > comparison_rows) the reader must span all col-blocks at the physical
+    # stride, so num_rows = num_col_blocks * physical_rows. (When physical_rows ==
+    # comparison_rows, this equals the old comparison_rows*output_padded_hidden//mlen.)
+    _physical_rows = current.physical_shape[0]
+    _num_col_blocks = (output_padded_hidden + mlen - 1) // mlen
     comparison_params = {
         "start_row_idx": o_vram_addr // mlen,
-        "num_rows": (comparison_rows * output_padded_hidden) // mlen,
+        "num_rows": _num_col_blocks * _physical_rows if output_padded_hidden > mlen else comparison_rows,
         "num_batches": comparison_rows,
         "elements_per_batch": output_padded_hidden,
         "row_dim": mlen,
-        "physical_rows": current.physical_shape[0],
+        "physical_rows": _physical_rows,
         "use_stride_mode": output_padded_hidden > mlen,
     }
 
