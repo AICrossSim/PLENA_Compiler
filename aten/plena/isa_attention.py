@@ -219,6 +219,7 @@ class IsaAttentionMixin:
         v_hbm_offset: int,
         pv_address: int,
         rows: int | None = None,
+        pv_physical_rows: int | None = None,
     ) -> str:
         """
         Compute PV = P @ V via M_MM.
@@ -232,6 +233,14 @@ class IsaAttentionMixin:
         column blocks; the outer loop iterates blocks, middle loop iterates blen-wide
         V columns within a block, inner loop iterates blen-wide P rows.
         """
+        # PV is stored column-block-major with `pv_physical_rows` rows (= min(mlen,
+        # seq_len) for the decoder), so each head_dim col-block spans
+        # pv_physical_rows*mlen, not mlen*mlen. They coincide at seq>=mlen, but for
+        # seq<mlen using mlen*mlen writes col-blocks 1.. out of bounds, leaving
+        # head_dim cols mlen.. zero (PV shrinks by mlen/head_dim).
+        if pv_physical_rows is None:
+            pv_physical_rows = mlen
+
         if getattr(self, "unroll_attention", False):
             return self._pv_multiply_asm_unrolled(
                 mlen=mlen,
@@ -241,6 +250,7 @@ class IsaAttentionMixin:
                 v_hbm_offset_reg=v_hbm_offset_reg,
                 v_hbm_offset=v_hbm_offset,
                 pv_address=pv_address,
+                pv_physical_rows=pv_physical_rows,
             )
 
         gp_regs = self.register_allocator.allocate_gp(8)
@@ -283,7 +293,7 @@ class IsaAttentionMixin:
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
             lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
 
-            pv_col_block_base = pv_address + v_col_block * mlen * mlen
+            pv_col_block_base = pv_address + v_col_block * pv_physical_rows * mlen
             lines.extend(load_large_int(gp_pv_col_base, pv_col_block_base))
             lines.append(f"C_LOOP_START gp{gp_v_loop}, {tiles_per_mlen}")
             lines.extend(load_large_int(gp_p, p_address))
@@ -310,8 +320,11 @@ class IsaAttentionMixin:
         v_hbm_offset_reg: int,
         v_hbm_offset: int,
         pv_address: int,
+        pv_physical_rows: int | None = None,
     ) -> str:
         """Legacy Python-unrolled P @ V emission, kept for A/B comparisons."""
+        if pv_physical_rows is None:
+            pv_physical_rows = mlen
         gp_regs = self.register_allocator.allocate_gp(5)
         gp_p = gp_regs[0]
         gp_v = gp_regs[1]
@@ -348,7 +361,7 @@ class IsaAttentionMixin:
                     lines.extend(load_large_int(gp_p, p_row_addr))
                     lines.append(f"M_MM 0, gp{gp_v}, gp{gp_p}")
 
-                    pv_offset = v_col_block * mlen * mlen + p_row * blen * mlen + v_col * blen
+                    pv_offset = v_col_block * pv_physical_rows * mlen + p_row * blen * mlen + v_col * blen
                     lines.extend(load_large_int(gp_pv, pv_address + pv_offset))
                     lines.append(f"M_MM_WO gp{gp_pv}, gp{gp_stride}, 0")
 
@@ -797,6 +810,7 @@ class IsaAttentionMixin:
             v_hbm_offset=v_hbm_offset,
             pv_address=pv_address,
             rows=rows,
+            pv_physical_rows=pv_info.physical_shape[0],
         )
 
         self.register_allocator.free_gp(gp_regs)
