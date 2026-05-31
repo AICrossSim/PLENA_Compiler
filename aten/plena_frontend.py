@@ -1094,6 +1094,14 @@ def _emit_attention_block(
 
     O_full = prog.alloc(f"O_full_{layer_idx}", seq_len, total_q_dim, strict=False)
     o_full_addr = prog.get_vram_addr(O_full.name)
+    prog.vram_fill_zero(O_full)
+    # Each head occupies head_dim//mlen col-blocks of O_full, so the per-head span
+    # is physical_rows*head_dim. seq_len*mlen (= physical_rows*mlen) only spans one
+    # col-block, overlapping the heads so O_proj reads only the first ~2 correctly
+    # (the rest fall past the written range). Mirrors the vision o_head_stride;
+    # identical when head_dim==mlen, correct when head_dim>mlen.
+    physical_rows = O_full.physical_shape[0]
+    head_stride = physical_rows * head_dim
 
     kv_stored = _emit_kv_stores(
         prog,
@@ -1112,7 +1120,7 @@ def _emit_attention_block(
         kv_h = h // ratio
         K_stored, V_stored = kv_stored[kv_h]
 
-        q_h_addr = q_full_addr + h * seq_len * prog.mlen
+        q_h_addr = q_full_addr + h * head_stride
         Q_h = prog.alloc_at(f"Q_h{h}_{layer_idx}", seq_len, head_dim, q_h_addr)
         _apply_rope_projection(
             prog,
@@ -1130,9 +1138,12 @@ def _emit_attention_block(
             V_stored,
             scale,
             causal_mask=causal_mask,
+            batch_size=1,
+            seq_len=active_seq_len,
+            kv_seq_len=active_seq_len,
         )
 
-        o_h_dest_addr = o_full_addr + h * seq_len * prog.mlen
+        o_h_dest_addr = o_full_addr + h * head_stride
         _copy_into_vram_view(
             prog,
             O_h,
@@ -2866,9 +2877,19 @@ def compile_native_hf_decoder(
     # (BLEN), not a full MLEN block. Columns/K dimensions still use MLEN
     # until the vector, norm, RoPE, and FFN templates learn true tail masks.
     #
-    # Keep an opt-in compatibility path for reproducing older tile-scaling
-    # reports that padded sequence rows to MLEN.
-    seq_padding_multiple = mlen if os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1" else blen
+    # Exception: when seq_len < MLEN the flash-attention kernel still requires
+    # Q/K/V to occupy a full MLEN tile physically (it asserts physical rows per
+    # batch >= max(MLEN, seq_len)). A BLEN-padded sub-MLEN sequence leaves the
+    # per-head Q/O slices with only `padded_seq_len` physical rows, so pad the
+    # sequence up to MLEN in that case. The extra padding query rows are never
+    # compared (comparison uses the real seq_len), and the causal mask keeps the
+    # real query rows from attending to the padding KV rows, so this is just the
+    # proven seq_len==MLEN tile path with fewer logically-active rows.
+    #
+    # Also keep an opt-in compatibility path for reproducing older tile-scaling
+    # reports that padded every sequence (even seq_len >= MLEN) up to MLEN.
+    pad_seq_to_mlen = os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1" or seq_len < mlen
+    seq_padding_multiple = mlen if pad_seq_to_mlen else blen
     padded_seq_len = _ceil_to_multiple(seq_len, seq_padding_multiple)
     rows_per_batch = (
         padded_seq_len
