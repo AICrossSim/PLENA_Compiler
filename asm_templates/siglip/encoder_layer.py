@@ -101,61 +101,6 @@ def build_mlp_block(
     return asm
 
 
-def _pack_ln1_seq_to_head_major_q(
-    *,
-    s_q,
-    hq,
-    d_padded,
-    x_base,
-    q_base,
-):
-    """Pack LN1 output from seq-major [s_q, hq, d] to head-major [hq, s_q, d]."""
-    asm = "; Repack LN1 output to flash-attn Q (head-major)\n"
-
-    asm += reset_vssram_code(
-        reset_start_address=q_base,
-        vect_dim=d_padded,
-        per_stride_dim=s_q * hq,
-        reset_stride=d_padded,
-        reset_amount=1,
-        alive_registers_int=[10, 11, 12],
-    )
-
-    # Register map:
-    # - gp10/gp11: current dst/src vector pointers
-    # - gp12/gp13: head-base dst/src pointers for outer loop
-    # - gp14/gp15: outer/inner loop counters
-    # - gp9: temp register for large immediate adds
-    dst_reg = 10
-    src_reg = 11
-    dst_head_base_reg = 12
-    src_head_base_reg = 13
-    outer_loop_reg = 14
-    inner_loop_reg = 15
-    temp_reg = 9
-
-    asm += load_large_int_str(dst_head_base_reg, q_base)
-    asm += load_large_int_str(src_head_base_reg, x_base)
-
-    if hq > 0 and s_q > 0:
-        asm += f"C_LOOP_START gp{outer_loop_reg}, {hq}\n"
-        asm += f"S_ADDI_INT gp{dst_reg}, gp{dst_head_base_reg}, 0\n"
-        asm += f"S_ADDI_INT gp{src_reg}, gp{src_head_base_reg}, 0\n"
-
-        asm += f"C_LOOP_START gp{inner_loop_reg}, {s_q}\n"
-        asm += f"V_ADD_VV gp{dst_reg}, gp{dst_reg}, gp{src_reg}, 0\n"
-        asm += addi_large_int_str(dst_reg, dst_reg, d_padded, temp_reg)
-        asm += addi_large_int_str(src_reg, src_reg, hq * d_padded, temp_reg)
-        asm += f"C_LOOP_END gp{inner_loop_reg}\n"
-
-        asm += addi_large_int_str(dst_head_base_reg, dst_head_base_reg, s_q * d_padded, temp_reg)
-        asm += addi_large_int_str(src_head_base_reg, src_head_base_reg, d_padded, temp_reg)
-        asm += f"C_LOOP_END gp{outer_loop_reg}\n"
-
-    asm += reset_reg_asm(alive_registers=[9, 10, 11, 12, 13, 14, 15])
-    return asm
-
-
 def _pack_chunk_major_to_head_major_q(
     *,
     s_q,
@@ -409,48 +354,42 @@ def build_encoder_layer_asm(
     # - q_seq_base: chunk-major [NB, S, V]
     # - q_base: head-major [HQ, S, D]
     if q_base is not None:
-        if q_seq_base is not None and wq_hbm_offset is not None:
-            asm += projection_asm(
-                mlen=mlen,
-                blen=blen,
-                batch=s_q,
-                hidden_size=hidden_size,
+        if q_seq_base is None or wq_hbm_offset is None:
+            raise ValueError("Chunk-major LN1 output requires q_seq_base and wq_hbm_offset for Q construction")
+
+        asm += projection_asm(
+            mlen=mlen,
+            blen=blen,
+            batch=s_q,
+            hidden_size=hidden_size,
+            vlen=vlen,
+            alive_registers=[4, 5, 6, 7, 8, 9],
+            w_base_hbm_offset_reg=5,
+            activation_base_address=x_base,
+            result_base_address=q_seq_base,
+            out_features=hidden_size,
+            scratch_base_address=scratch_base,
+            rope_enabled=False,
+        )
+        asm += reset_reg_asm(alive_registers=[4, 5, 6, 7, 8, 9])
+
+        if q_bias_base is not None:
+            asm += elementwise_add_vram_asm(
                 vlen=vlen,
-                alive_registers=[4, 5, 6, 7, 8, 9],
-                w_base_hbm_offset_reg=5,
-                activation_base_address=x_base,
-                result_base_address=q_seq_base,
-                out_features=hidden_size,
-                scratch_base_address=scratch_base,
-                rope_enabled=False,
+                num_vectors=(s_q * hidden_size) // vlen,
+                alive_registers=[10, 11],
+                dst_base_address=q_seq_base,
+                src_base_address=q_bias_base,
             )
-            asm += reset_reg_asm(alive_registers=[4, 5, 6, 7, 8, 9])
+            asm += reset_reg_asm(alive_registers=[10, 11])
 
-            if q_bias_base is not None:
-                asm += elementwise_add_vram_asm(
-                    vlen=vlen,
-                    num_vectors=(s_q * hidden_size) // vlen,
-                    alive_registers=[10, 11],
-                    dst_base_address=q_seq_base,
-                    src_base_address=q_bias_base,
-                )
-                asm += reset_reg_asm(alive_registers=[10, 11])
-
-            asm += _pack_chunk_major_to_head_major_q(
-                s_q=s_q,
-                hq=hq,
-                d_padded=h_qkv,
-                x_base=q_seq_base,
-                q_base=q_base,
-            )
-        else:
-            asm += _pack_ln1_seq_to_head_major_q(
-                s_q=s_q,
-                hq=hq,
-                d_padded=h_qkv,
-                x_base=x_base,
-                q_base=q_base,
-            )
+        asm += _pack_chunk_major_to_head_major_q(
+            s_q=s_q,
+            hq=hq,
+            d_padded=h_qkv,
+            x_base=q_seq_base,
+            q_base=q_base,
+        )
 
     # Stage 3: Flash attention.
     # Shape after Stage 3 (attn_base/o_old_base): token-major [S, NB, V].
