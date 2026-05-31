@@ -321,18 +321,17 @@ def build_encoder_layer_asm(
     # - chunk-major: [NB, S, V]  (flat index: ((b * S) + t) * V + j)
     # - token-major: [S, NB, V]  (flat index: ((t * NB) + b) * V + j)
     # - head-major Q: [HQ, S, D] (flat index: ((h * S) + t) * D + j)
-    # Stage outputs in order:
-    # - Input X at x_base: chunk-major [NB, S, V]
-    # - Stage 0 residual snapshot at residual_base: token-major [S, NB, V]
+    # Stage outputs in execution order:
+    # - Stage 0 input residual snapshot at residual_base: chunk-major [NB, S, V]
     # - Stage 1 LN1 output at x_base: chunk-major [NB, S, V]
-    # - Stage 1.5 Q projection (if enabled): q_seq_base chunk-major [NB, S, V], q_base head-major [HQ, S, D]
-    # - Stage 2 flash-attn output at attn_base: token-major [S, NB, V]
-    # - Stage 3 x_res1 at attn_base: token-major [S, NB, V]
-    # - Stage 5 repack x_res1 to ln2_input_base/x_base: chunk-major [NB, S, V]
-    # - Stage 4 residual snapshot for final add at residual_base: chunk-major [NB, S, V]
-    # - Stage 5 LN2 output at x_base: chunk-major [NB, S, V]
-    # - Stage 6 MLP output at mlp_out_base: chunk-major [NB, S, V]
-    # - Stage 7 final output at mlp_out_base: chunk-major [NB, S, V]
+    # - Stage 2 Q build: q_seq_base chunk-major [NB, S, V], q_base head-major [HQ, S, D]
+    # - Stage 3 flash-attn output at attn_base: token-major [S, NB, V]
+    # - Stage 4 out projection workspace: repack attn_base -> x_base, project to q_seq_base
+    # - Stage 5 first residual add at q_seq_base: chunk-major [NB, S, V]
+    # - Stage 6 residual snapshot for final add at residual_base: chunk-major [NB, S, V]
+    # - Stage 7 LN2 output at q_seq_base: chunk-major [NB, S, V]
+    # - Stage 8 MLP output at mlp_out_base: chunk-major [NB, S, V]
+    # - Stage 9 final output at mlp_out_base: chunk-major [NB, S, V]
 
     if wq_hbm_offset is None:
         asm += preload_addr_reg_asm(
@@ -348,19 +347,25 @@ def build_encoder_layer_asm(
         )
     asm += reset_reg_asm(alive_registers=[1])
 
-    # Stage 0: Save X residual in token-major layout before LN1.
-    # Shape after Stage 0 (residual_base): token-major [S, NB, V].
+    # Stage 0: Save X residual in chunk-major layout before LN1.
+    # Shape after Stage 0 (residual_base): chunk-major [NB, S, V].
     # x_base holds X in chunk-major [hidden//vlen, s_q, vlen].
-    # Flash-attn writes its output at attn_base in token-major [s_q, hidden//vlen, vlen].
-    # We must save the residual in the same token-major layout so Stage 3
-    # (attn_out += residual) performs the flat element-wise add correctly.
-    asm += _pack_seq_major_to_block_major(
-        seq_len=hidden_size // vlen,
-        num_blocks=s_q,
-        block_size=vlen,
-        src_base=x_base,
-        dst_base=residual_base,
-        comment="Save X residual in token-major layout (chunk->token) for Stage 3 residual add",
+    # We keep this copy in the same chunk-major layout so the attention output
+    # can be added after out projection without a token-major roundtrip.
+    asm += reset_vssram_code(
+        reset_start_address=residual_base,
+        vect_dim=vlen,
+        per_stride_dim=hidden_size // vlen,
+        reset_stride=hidden_size,
+        reset_amount=s_q,
+        alive_registers_int=[10, 11, 12],
+    )
+    asm += elementwise_add_vram_asm(
+        vlen=vlen,
+        num_vectors=(s_q * hidden_size) // vlen,
+        alive_registers=[10, 11],
+        dst_base_address=residual_base,
+        src_base_address=x_base,
     )
 
     if debug_stage0_snapshot_base is not None:
@@ -397,10 +402,10 @@ def build_encoder_layer_asm(
     )
     asm += reset_reg_asm(alive_registers=[5, 6, 7])
 
-    # Stage 1.5: Build flash-attn Q on-chip from LN1 output.
-    # LN1 seq-major X at x_base -> projection_asm with WQ -> q_seq_base,
+    # Stage 2: Build flash-attn Q on-chip from LN1 output.
+    # LN1 chunk-major X at x_base -> projection_asm with WQ -> q_seq_base,
     # optional bias add from q_bias_base, then repack to head-major at q_base.
-    # Shape after Stage 1.5:
+    # Shape after Stage 2:
     # - q_seq_base: chunk-major [NB, S, V]
     # - q_base: head-major [HQ, S, D]
     if q_base is not None:
@@ -447,8 +452,8 @@ def build_encoder_layer_asm(
                 q_base=q_base,
             )
 
-    # Stage 2: Flash attention.
-    # Shape after Stage 2 (attn_base/o_old_base): token-major [S, NB, V].
+    # Stage 3: Flash attention.
+    # Shape after Stage 3 (attn_base/o_old_base): token-major [S, NB, V].
     asm += "; Flash attention block\n"
     alive_int = [1, 2, 3, 4, 5, 6, 7, 8, 9]
     alive_fp = [1, 2, 3, 4, 5, 6]
@@ -493,12 +498,12 @@ def build_encoder_layer_asm(
         )
         asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
-    # Stage 2.5: Out projection on attention output before residual add.
+    # Stage 4: Out projection on attention output before residual add.
     # flash-attn output at attn_base is token-major [S, NB, V].
     # projection_asm expects chunk-major [NB, S, V], so repack token->chunk,
-    # project to q_seq_base, then repack chunk->token back to attn_base.
+    # project to q_seq_base, then keep the result in chunk-major.
     if q_seq_base is None:
-        raise ValueError("build_encoder_layer_asm requires q_seq_base for Stage 2.5 out projection")
+        raise ValueError("build_encoder_layer_asm requires q_seq_base for Stage 4 out projection")
     asm += _pack_seq_major_to_block_major(
         seq_len=s_q,
         num_blocks=hidden_size // vlen,
@@ -536,14 +541,14 @@ def build_encoder_layer_asm(
             src_base_address=out_bias_base,
         )
         asm += reset_reg_asm(alive_registers=[10, 11])
-    asm += _pack_seq_major_to_block_major(
-        seq_len=hidden_size // vlen,
-        num_blocks=s_q,
-        block_size=vlen,
-        src_base=q_seq_base,
-        dst_base=attn_base,
-        comment="Repack out-proj output chunk-major -> token-major for residual add",
+    asm += elementwise_add_vram_asm(
+        vlen=vlen,
+        num_vectors=(s_q * hidden_size) // vlen,
+        alive_registers=[10, 11],
+        dst_base_address=q_seq_base,
+        src_base_address=residual_base,
     )
+    asm += reset_reg_asm(alive_registers=[10, 11])
 
     if debug_outproj_snapshot_base is not None:
         asm += reset_vssram_code(
@@ -559,38 +564,12 @@ def build_encoder_layer_asm(
             num_vectors=(s_q * hidden_size) // vlen,
             alive_registers=[10, 11],
             dst_base_address=debug_outproj_snapshot_base,
-            src_base_address=attn_base,
+            src_base_address=q_seq_base,
         )
         asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
-    # Stage 3: Residual 1, attn_out += residual.
-    # Shape after Stage 3 (attn_base): token-major [S, NB, V].
-    asm += elementwise_add_vram_asm(
-        vlen=vlen,
-        num_vectors=(s_q * hidden_size) // vlen,
-        alive_registers=[10, 11],
-        dst_base_address=attn_base,
-        src_base_address=residual_base,
-    )
-    asm += reset_reg_asm(alive_registers=[10, 11])
-
-    # Stage 5: Repack x_res1 (token-major at attn_base) -> chunk-major at x_base for LN2/MLP.
-    # Shape after repack (ln2_input_base/x_base): chunk-major [NB, S, V].
-    # Must run BEFORE Stage 4 so we save the chunk-major version as residual for Stage 7.
-    ln2_input_base = x_base
-    asm += _pack_seq_major_to_block_major(
-        seq_len=s_q,
-        num_blocks=hidden_size // vlen,
-        block_size=vlen,
-        src_base=attn_base,
-        dst_base=ln2_input_base,
-        comment="Repack x_res1 (token-major) -> chunk-major for LN2/MLP",
-    )
-
-    # Stage 4: Save chunk-major x_res1 (now at x_base/ln2_input_base) as residual for
-    # the final MLP residual add (Stage 7).  The token-major X saved at Stage 0 is no
-    # longer needed — it has been consumed by Stage 3.
-    # Shape after Stage 4 (residual_base): chunk-major [NB, S, V].
+    # Stage 5: Save the first residual output for the final MLP residual add.
+    # Shape after Stage 5 (residual_base): chunk-major [NB, S, V].
     asm += reset_vssram_code(
         reset_start_address=residual_base,
         vect_dim=vlen,
@@ -604,17 +583,17 @@ def build_encoder_layer_asm(
         num_vectors=(s_q * hidden_size) // vlen,
         alive_registers=[10, 11],
         dst_base_address=residual_base,
-        src_base_address=x_base,
+        src_base_address=q_seq_base,
     )
     asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
-    # Stage 5: LayerNorm2 in-place.
-    # Shape after Stage 5 (ln2_input_base/x_base): chunk-major [NB, S, V].
+    # Stage 6: LayerNorm2 in-place.
+    # Shape after Stage 6 (q_seq_base): chunk-major [NB, S, V].
     asm += layer_norm_asm(
         _eps_offset=ln_eps_fp_slot,
         reci_hid_offset=ln_reci_hid_fp_slot,
         alive_registers=[5, 6, 7],
-        activation_base_address=ln2_input_base,
+        activation_base_address=q_seq_base,
         scratchpad_base_address=scratch_base,
         vlen=vlen,
         batch_size=s_q,
@@ -624,8 +603,8 @@ def build_encoder_layer_asm(
     )
     asm += reset_reg_asm(alive_registers=[5, 6, 7])
 
-    # Stage 6: MLP block.
-    # Shape after Stage 6 (mlp_out_base): chunk-major [NB, S, V].
+    # Stage 7: MLP block.
+    # Shape after Stage 7 (mlp_out_base): chunk-major [NB, S, V].
     asm += build_mlp_block(
         mlen=mlen,
         blen=blen,
@@ -635,7 +614,7 @@ def build_encoder_layer_asm(
         inter_dim=inter_dim,
         w1_hbm_offset_reg=3,
         w2_hbm_offset_reg=4,
-        activation_base=ln2_input_base,
+        activation_base=q_seq_base,
         mlp_inter_base=mlp_inter_base,
         mlp_out_base=mlp_out_base,
         scratch_base=scratch_base,
@@ -647,8 +626,8 @@ def build_encoder_layer_asm(
     )
 
     if include_final_residual:
-        # Stage 7: Residual 2, mlp_out += residual.
-        # Shape after Stage 7 (mlp_out_base): chunk-major [NB, S, V].
+        # Stage 8: Residual 2, mlp_out += residual.
+        # Shape after Stage 8 (mlp_out_base): chunk-major [NB, S, V].
         asm += elementwise_add_vram_asm(
             vlen=vlen,
             num_vectors=(s_q * hidden_size) // vlen,
