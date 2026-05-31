@@ -1,6 +1,6 @@
 """Helpers for loading large integer immediates into GP registers.
 
-S_ADDI_INT only encodes 18-bit immediates (0..2^18-1). Anything larger needs
+S_ADDI_INT only encodes 16-bit immediates (0..2^16-1). Anything larger needs
 S_LUI_INT (which writes `imm << 12` into the destination) optionally followed
 by an S_ADDI_INT for the lower 12 bits.
 
@@ -11,7 +11,7 @@ the single source of truth.
 
 from __future__ import annotations
 
-IMM2_BOUND = 1 << 18  # S_ADDI_INT supports values 0..2^18-1
+IMM2_BOUND = 1 << 16  # S_ADDI_INT supports values 0..2^16-1
 
 
 def load_large_int(reg: int, value: int) -> list[str]:

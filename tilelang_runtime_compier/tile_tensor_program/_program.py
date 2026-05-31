@@ -1549,7 +1549,7 @@ class TileTensorProgram:
                 lines.append(line)
                 continue
 
-            if 0 <= imm_value <= 262143:
+            if 0 <= imm_value <= 65535:
                 lines.append(line)
                 continue
 

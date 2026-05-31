@@ -18,3 +18,10 @@ generated_*.mem
 !asm_templates/**/*.mem
 !**/tests/**/*.asm
 !**/tests/**/*.mem
+
+# Compiler debug/output dumps from manual runs (e.g. fa.isa, fa.mir*.txt) — artifacts, not source
+/fa.isa
+/fa.mir.txt
+/fa.mir.with_licm.txt
+/fa.no_opt.mir.txt
+/fa.only_licm.mir.txt

@@ -4,8 +4,8 @@ class RegisterAllocator:
     """Register Allocator: Manages address registers and GP registers"""
 
     def __init__(self, start_gp: int = 1, start_addr: int = 0, start_fp: int = 1):
-        # HW OPERAND_WIDTH = 4 bits → gp0-gp15; gp0 reserved as constant 0.
-        self.gp_registers = list(range(start_gp, 16))
+        # HW OPERAND_WIDTH = 5 bits → gp0-gp31; gp0 reserved as constant 0.
+        self.gp_registers = list(range(start_gp, 32))
         self.addr_registers = list(range(start_addr, 8))
         # f0 reserved as constant 0 (writing to f0 is a no-op for V_RED_MAX/V_RED_SUM).
         self.fp_registers = list(range(start_fp, 8))

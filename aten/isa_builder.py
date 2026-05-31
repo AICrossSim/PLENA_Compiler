@@ -69,7 +69,7 @@ class Comment:
 
 
 AsmItem = str | Instr | Comment
-IMM2_BOUND = 1 << 18
+IMM2_BOUND = 1 << 16
 
 
 @dataclass

@@ -35,11 +35,11 @@ class IsaEmissionError(RuntimeError):
 
 
 # Maximum unsigned literal that fits in the S_ADDI_INT three-operand
-# immediate slot. opcode(6) + 2*operand(4) = 14 bits taken by other
-# fields, leaving 32 - 14 = 18 bits for imm. Mirrors _S_ADDI_MAX in
+# immediate slot. opcode(6) + 2*operand(5) = 16 bits taken by other
+# fields, leaving 32 - 16 = 16 bits for imm. Mirrors _S_ADDI_MAX in
 # expr_materializer.py and _normalize_large_addi_immediates in
 # tilelang_runtime_compier/tile_tensor_program/_program.py.
-_S_ADDI_IMM_MAX = (1 << 18) - 1  # 262143
+_S_ADDI_IMM_MAX = (1 << 16) - 1  # 65535
 
 
 def _normalize_large_addi_immediates(asm_code: str) -> str:

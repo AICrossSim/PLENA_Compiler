@@ -412,7 +412,7 @@ def const_fold(fn: mir.MirFunction) -> bool:
             # already handled wide imms; if we hit one here it
             # came from a fold and we don't want to over-eagerly
             # rewrite).
-            if not (-(1 << 17) <= folded < (1 << 17)):
+            if not (-(1 << 16) <= folded < (1 << 16)):
                 continue
             # Detach old operands.
             for op in list(instr.operands):
@@ -958,7 +958,7 @@ def reassociate(fn: mir.MirFunction) -> bool:
                 tail.append(("S_SUB_INT", v))
             if pending_const != 0:
                 # Check range; out of range → don't fold here, drop.
-                if -(1 << 17) <= pending_const < (1 << 17):
+                if -(1 << 16) <= pending_const < (1 << 16):
                     tail.append(("S_ADDI_INT", int(pending_const)))
                 else:
                     # Wide const — leave the original instr alone.

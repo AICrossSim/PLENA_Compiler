@@ -441,8 +441,8 @@ class PreIsaToMir:
         if n == 0:
             return self.gp0_value
         dst = self.fn.mint_value("i32")
-        # Fits in S_ADDI_INT immediate? legacy bound 262143.
-        if 0 <= n <= 262143:
+        # Fits in S_ADDI_INT immediate? bound 65535 (imm16).
+        if 0 <= n <= 65535:
             self.cur_block.append(mir.MirInstr(
                 opcode="S_ADDI_INT",
                 operands=[self.gp0_value, n],
@@ -474,7 +474,7 @@ class PreIsaToMir:
         if _is_intlike(a) and _intval(a) == 0:
             return self._lower_primexpr(b)
         # Imm form: S_ADDI_INT %a, IMM  (fits in immediate).
-        if _is_intlike(b) and 0 <= _intval(b) <= 262143:
+        if _is_intlike(b) and 0 <= _intval(b) <= 65535:
             lhs = self._lower_primexpr(a)
             dst = self.fn.mint_value("i32")
             self.cur_block.append(mir.MirInstr(
@@ -483,7 +483,7 @@ class PreIsaToMir:
                 result=dst,
             ))
             return dst
-        if _is_intlike(a) and 0 <= _intval(a) <= 262143:
+        if _is_intlike(a) and 0 <= _intval(a) <= 65535:
             rhs = self._lower_primexpr(b)
             dst = self.fn.mint_value("i32")
             self.cur_block.append(mir.MirInstr(

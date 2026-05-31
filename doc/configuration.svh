@@ -39,15 +39,15 @@ package configuration_pkg;
 endpackage
 
 package instruction_pkg;
-    parameter INT_OPERAND_WIDTH     = 4;
+    parameter INT_OPERAND_WIDTH     = 5;
     parameter FP_OPERAND_WIDTH      = 3;
     parameter HBM_ADR_OPERAND_WIDTH = 3;
     parameter STRIDE_OPERAND_WIDTH  = 3;
-    parameter OPERAND_WIDTH         = 4;
+    parameter OPERAND_WIDTH         = 5;
     parameter FUNCT_WIDTH           = 4;
     parameter OPCODE_WIDTH          = 6;
-    parameter IMM_WIDTH             = 22;
-    parameter IMM_2_WIDTH           = 18;
+    parameter IMM_WIDTH             = 21;
+    parameter IMM_2_WIDTH           = 16;
     parameter INSTRUCTION_LENGTH    = 32;
 endpackage
 

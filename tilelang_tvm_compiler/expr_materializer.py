@@ -39,7 +39,7 @@ from .program_shim import ProgramShim
 
 # Maximum unsigned literal that fits in a single S_ADDI_INT immediate.
 # (preload_addr_reg.py uses the same bound.)
-_S_ADDI_MAX = 262143
+_S_ADDI_MAX = 65535
 
 
 class ExprMaterializeError(RuntimeError):

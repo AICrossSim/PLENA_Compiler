@@ -59,7 +59,7 @@ class LoopRegisterAllocError(RuntimeError):
 # stage still needs a workable pool for op temporaries after loop
 # registers are reserved — if a nest is so deep that too few GPs are
 # left, fail here with a clear message rather than crashing mid-emit.
-_GP_TOTAL = 16
+_GP_TOTAL = 32
 _GP0_RESERVED = 1                       # gp0
 _MIN_EMIT_POOL = 8                      # heaviest emit_* needs ~7 scratch
 

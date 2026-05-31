@@ -35,7 +35,7 @@ __all__ = [
     "quantize_to_mxfp",
 ]
 
-_IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
+_IMM2_BOUND = 1 << 16  # S_ADDI_INT max immediate
 
 
 def _fix_large_immediates(isa_code: str) -> str:
