@@ -1320,7 +1320,9 @@ def _emit_vision_attention_block(
     )
     prog.vram_fill_zero(O_full)
     o_full_addr = prog.get_vram_addr(O_full.name)
-    o_head_stride = O_full.physical_shape[0] * prog.mlen
+    # Each head spans padded_head_dim//mlen col-blocks; stride by the full
+    # per-head span, not one mlen tile (heads overlap at sub-64 head_dim>mlen).
+    o_head_stride = O_full.physical_shape[0] * padded_head_dim
 
     for h in range(num_heads):
         Q_h = _linear_projection(
