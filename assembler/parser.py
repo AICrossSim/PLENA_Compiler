@@ -92,6 +92,32 @@ class Instruction:
         return f"Instruction(opcode='{self.opcode}', rd='{self.rd}', rs1='{self.rs1}', rs2='{self.rs2}', rstride = '{self.rstride}', funct1={self.funct1}, funct2={self.funct2}, imm={self.imm}, rflag={self.rflag})"
 
 
+_REG_PREFIXES = ("gp", "f", "a")
+# Hoisted to module scope: these were previously re-created for every line of the
+# .asm (millions of times for large programs), which dominated sim_env re-parse time.
+vector_masked_unary_or_reduction_ops = frozenset({"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"})
+vector_masked_binary_ops = frozenset({"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF"})
+
+
+def _parse_operand(operand):
+    """Parse a register (gp/f/a prefix, decimal index) or integer operand; None if neither.
+
+    Operands are already whitespace-stripped by the caller (the line-132 split), so this
+    does no stripping. Hoisted out of the per-line loop, where it was redefined every line.
+    """
+    if operand.endswith(";"):
+        operand = operand[:-1]
+    if operand.startswith("gp"):
+        return int(operand[2:])  # decimal, not hex
+    elif operand.startswith(("f", "a")):
+        return int(operand[1:])  # decimal, not hex
+    else:
+        try:
+            return int(operand)
+        except ValueError:
+            return None
+
+
 def parse_asm_file(file_path: str) -> list[Instruction]:
     """
     Parse an ASM file into a list of Instruction objects.
@@ -109,28 +135,28 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
     """
     instructions = []
 
-    vector_masked_unary_or_reduction_ops = {"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"}
-    vector_masked_binary_ops = {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF"}
-
     with open(file_path) as file:
         for line in file:
-            # Remove comments and strip whitespace
-            # Handle both // and ; style comments
-            if line.startswith("//") or line.strip().startswith(";"):
-                continue
-            line = line.split("//")[0]  # Remove // comments
-            line = line.split(";")[0]  # Remove ; comments
+            # Strip once, then skip blanks and whole-line comments with cheap char checks
+            # (most lines are neither). Comments are // or ; style.
             line = line.strip()
-            if not line:
+            if not line or line[0] == ";" or line.startswith("//"):
                 continue
+            # Remove inline // and ; comments only when present.
+            c = line.find("//")
+            if c != -1:
+                line = line[:c]
+            c = line.find(";")
+            if c != -1:
+                line = line[:c]
 
-            # Split the opcode and operands
-            parts = line.split()
-            if len(parts) < 2 or ";" in parts[0]:
+            # Split opcode off the operand string on the first whitespace run; this avoids
+            # the old split()+" ".join() round-trip. Lines with no operands are skipped.
+            head = line.split(None, 1)
+            if len(head) < 2:
                 continue  # Invalid line
-            opcode = parts[0]
-            operands = [part.strip() for part in " ".join(parts[1:]).split(",")]
-            # print(f"Parsing instruction: {line}", "operand length:", len(operands), "operands:", operands)
+            opcode, rest = head
+            operands = [part.strip() for part in rest.split(",")]
 
             # Decode based on number of operands, case-structure by length
             rd = None
@@ -141,34 +167,17 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             funct2 = None
             imm = None
 
-            # Helper to parse a register or int operand
-            def parse_reg_or_int(operand):
-                operand = operand.strip()
-                if operand.endswith(";"):
-                    operand = operand[:-1]
-                if operand.startswith("gp"):
-                    return int(operand[2:])  # decimal, not hex
-                elif operand.startswith("f"):
-                    return int(operand[1:])  # decimal, not hex
-                elif operand.startswith("a"):
-                    return int(operand[1:])  # decimal, not hex
-                else:
-                    try:
-                        return int(operand)
-                    except ValueError:
-                        return None
-
             if len(operands) == 1:
                 operand_0 = operands[0]
-                rd = parse_reg_or_int(operand_0)
+                rd = _parse_operand(operand_0)
             elif len(operands) == 2:
                 operand_0 = operands[0]
                 operand_1 = operands[1]
-                rd = parse_reg_or_int(operand_0)
+                rd = _parse_operand(operand_0)
                 # rs1 is a register, imm is a number
                 # Heuristics: if it looks like a reg, it's rs1; else, it's imm
-                if operand_1.strip().startswith(("gp", "f", "a")):
-                    rs1 = parse_reg_or_int(operand_1)
+                if operand_1.startswith(("gp", "f", "a")):
+                    rs1 = _parse_operand(operand_1)
                 else:
                     try:
                         imm = int(operand_1)
@@ -176,18 +185,18 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                         imm = None
             elif len(operands) == 3:
                 operand_0, operand_1, operand_2 = operands
-                rd = parse_reg_or_int(operand_0)
+                rd = _parse_operand(operand_0)
                 # If looks like register, rs1; else, imm
-                if operand_1.strip().startswith(("gp", "f", "a")):
-                    rs1 = parse_reg_or_int(operand_1)
+                if operand_1.startswith(("gp", "f", "a")):
+                    rs1 = _parse_operand(operand_1)
                 else:
                     try:
                         imm = int(operand_1)
                     except ValueError:
                         imm = None
                 # If it looks like register, rs2; else, imm (overwrites imm if rs1 not present)
-                if operand_2.strip().startswith(("gp", "f", "a")):
-                    rs2 = parse_reg_or_int(operand_2)
+                if operand_2.startswith(("gp", "f", "a")):
+                    rs2 = _parse_operand(operand_2)
                 else:
                     try:
                         imm = int(operand_2)
@@ -201,16 +210,16 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                     rstride = 0
             elif len(operands) == 4:
                 operand_0, operand_1, operand_2, operand_3 = operands
-                rd = parse_reg_or_int(operand_0)
-                if operand_1.strip().startswith(("gp", "f", "a")):
-                    rs1 = parse_reg_or_int(operand_1)
+                rd = _parse_operand(operand_0)
+                if operand_1.startswith(("gp", "f", "a")):
+                    rs1 = _parse_operand(operand_1)
                 else:
                     try:
                         imm = int(operand_1)
                     except ValueError:
                         imm = None
-                if operand_2.strip().startswith(("gp", "f", "a")):
-                    rs2 = parse_reg_or_int(operand_2)
+                if operand_2.startswith(("gp", "f", "a")):
+                    rs2 = _parse_operand(operand_2)
                 else:
                     try:
                         imm = int(operand_2)
@@ -223,16 +232,16 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                     rstride = None
             elif len(operands) == 5:
                 operand_0, operand_1, operand_2, operand_3, operand_4 = operands
-                rd = parse_reg_or_int(operand_0)
-                if operand_1.strip().startswith(("gp", "f", "a")):
-                    rs1 = parse_reg_or_int(operand_1)
+                rd = _parse_operand(operand_0)
+                if operand_1.startswith(("gp", "f", "a")):
+                    rs1 = _parse_operand(operand_1)
                 else:
                     try:
                         imm = int(operand_1)
                     except ValueError:
                         imm = None
-                if operand_2.strip().startswith(("gp", "f", "a")):
-                    rs2 = parse_reg_or_int(operand_2)
+                if operand_2.startswith(("gp", "f", "a")):
+                    rs2 = _parse_operand(operand_2)
                 else:
                     try:
                         imm = int(operand_2)
@@ -251,16 +260,16 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                     funct1 = funct1_raw  # fallback, if not int, keep as string
             elif len(operands) == 6:
                 operand_0, operand_1, operand_2, operand_3, operand_4, operand_5 = operands
-                rd = parse_reg_or_int(operand_0)
-                if operand_1.strip().startswith(("gp", "f", "a")):
-                    rs1 = parse_reg_or_int(operand_1)
+                rd = _parse_operand(operand_0)
+                if operand_1.startswith(("gp", "f", "a")):
+                    rs1 = _parse_operand(operand_1)
                 else:
                     try:
                         imm = int(operand_1)
                     except ValueError:
                         imm = None
-                if operand_2.strip().startswith(("gp", "f", "a")):
-                    rs2 = parse_reg_or_int(operand_2)
+                if operand_2.startswith(("gp", "f", "a")):
+                    rs2 = _parse_operand(operand_2)
                 else:
                     try:
                         imm = int(operand_2)
