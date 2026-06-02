@@ -125,13 +125,12 @@ def im2col_asm(
     if W_padded is None:
         W_padded = W
 
-    # Validate HBM alignment: every pixel column offset must be 64-aligned.
-    for ow in range(OW):
-        pixel_col = ow * stride
-        assert pixel_col % 64 == 0, (
-            f"im2col_asm: ow={ow}, pixel_col={pixel_col} is not 64-aligned. "
-            f"Use im2col_asm_no_shift for stride={stride} with non-64-aligned columns."
-        )
+    # HBM alignment: each H_PREFETCH_V load starts at the exact pixel_col, so the K
+    # patch elements land at [0:K] of the loaded vector and the mask+right-shift below
+    # places them. The emulator's HBM gather walks the byte range one 64-byte block at a
+    # time, clamping each read to a block boundary (dma::transfer_mx_from_hbm), so a
+    # non-64-aligned pixel_col (e.g. stride-16 patch embedding) is loaded correctly
+    # without any realignment. (The old 64-aligned-only assertion predated that gather.)
 
     # Compute save f_regs for precious fp_sram slots (mirrors im2col_asm_no_shift).
     # Mask construction zeroes fp_sram[0..VLEN-1] then writes mask values, corrupting
