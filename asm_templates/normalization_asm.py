@@ -10,6 +10,7 @@ def rms_norm_asm(
     vlen: int,
     batch_size: int,
     hidden_dim: int,
+    unroll: bool = True,
 ) -> str:
     """
     Generate assembly code for RMS normalization.
@@ -17,6 +18,9 @@ def rms_norm_asm(
     act_addr = alive_registers[0]
     scratchpad_addr = alive_registers[1]
     stats_addr = alive_registers[2]
+    # Rolled path uses the spare 4th register (already allocated by normalize()) as the
+    # C_LOOP counter. Only accessed when rolled, so unrolled callers may pass 3 registers.
+    loop_addr = alive_registers[3] if not unroll else None
 
     generated_code = "; RMS Norm generation \n"
     generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
@@ -35,13 +39,20 @@ def rms_norm_asm(
         generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
 
         # First loop: compute sum of squares using stats_addr
-        for i in range(hidden_dim // vlen):
-            # Compute square of the activation vector and summation
+        if unroll:
+            for i in range(hidden_dim // vlen):
+                # Compute square of the activation vector and summation
+                generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+                generated_code += f"V_RED_SUM f2, gp{scratchpad_addr} \n"
+
+                # Move stats pointer to next vector
+                generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+        else:
+            generated_code += f"C_LOOP_START gp{loop_addr}, {hidden_dim // vlen} \n"
             generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
             generated_code += f"V_RED_SUM f2, gp{scratchpad_addr} \n"
-
-            # Move stats pointer to next vector
             generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+            generated_code += f"C_LOOP_END gp{loop_addr} \n"
 
         # Taking the avg
         generated_code += "S_MUL_FP f2, f2, f3 \n"
@@ -56,12 +67,18 @@ def rms_norm_asm(
         generated_code += "S_RECI_FP f2, f2 \n"
 
         # Second loop: normalize using act_addr
-        for i in range(hidden_dim // vlen):
-            # Normalize the activation vector
-            generated_code += f"V_MUL_VF gp{act_addr}, gp{act_addr}, f2, 0 \n"
+        if unroll:
+            for i in range(hidden_dim // vlen):
+                # Normalize the activation vector
+                generated_code += f"V_MUL_VF gp{act_addr}, gp{act_addr}, f2, 0 \n"
 
-            # Move to next vector
+                # Move to next vector
+                generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
+        else:
+            generated_code += f"C_LOOP_START gp{loop_addr}, {hidden_dim // vlen} \n"
+            generated_code += f"V_MUL_VF gp{act_addr}, gp{act_addr}, f2, 0 \n"
             generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
+            generated_code += f"C_LOOP_END gp{loop_addr} \n"
 
         # Reset accumulator for next batch
         generated_code += "S_ADD_FP f2, f0, f0 \n"
@@ -78,6 +95,7 @@ def layer_norm_asm(
     vlen: int,
     batch_size: int,
     hidden_dim: int,
+    unroll: bool = True,
 ) -> str:
     """
     Generate assembly code for layer normalization.
@@ -85,6 +103,9 @@ def layer_norm_asm(
     act_addr = alive_registers[0]
     scratchpad_addr = alive_registers[1]
     stats_addr = alive_registers[2]
+    # Rolled path uses the spare 4th register (already allocated by normalize()) as the
+    # C_LOOP counter. Only accessed when rolled, so unrolled callers may pass 3 registers.
+    loop_addr = alive_registers[3] if not unroll else None
 
     generated_code = "; Layer Norm generation \n"
     generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
@@ -102,16 +123,24 @@ def layer_norm_asm(
         generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
 
         # First loop: compute sum(x) and sum(x^2) using stats_addr
-        for i in range(hidden_dim // vlen):
-            # sum(x)
-            generated_code += f"V_RED_SUM f2, gp{stats_addr} \n"
+        if unroll:
+            for i in range(hidden_dim // vlen):
+                # sum(x)
+                generated_code += f"V_RED_SUM f2, gp{stats_addr} \n"
 
-            # sum(x^2)
+                # sum(x^2)
+                generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+                generated_code += f"V_RED_SUM f3, gp{scratchpad_addr} \n"
+
+                # Move stats pointer to next vector
+                generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+        else:
+            generated_code += f"C_LOOP_START gp{loop_addr}, {hidden_dim // vlen} \n"
+            generated_code += f"V_RED_SUM f2, gp{stats_addr} \n"
             generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
             generated_code += f"V_RED_SUM f3, gp{scratchpad_addr} \n"
-
-            # Move stats pointer to next vector
             generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+            generated_code += f"C_LOOP_END gp{loop_addr} \n"
 
         # f2 = sum(x) * (1/hidden_dim) = mean(x)
         generated_code += "S_MUL_FP f2, f2, f4 \n"
@@ -135,15 +164,22 @@ def layer_norm_asm(
         generated_code += "S_RECI_FP f5, f5 \n"
 
         # Second loop: normalize using act_addr (still at batch start)
-        for i in range(hidden_dim // vlen):
-            # normalized = (x - mean) * (1/std)
-            # Store (x - mean) in scratchpad first
-            generated_code += f"V_SUB_VF gp{scratchpad_addr}, gp{act_addr}, f2, 0, 0 \n"
-            # Then multiply by 1/std and write back to activation
-            generated_code += f"V_MUL_VF gp{act_addr}, gp{scratchpad_addr}, f5, 0 \n"
+        if unroll:
+            for i in range(hidden_dim // vlen):
+                # normalized = (x - mean) * (1/std)
+                # Store (x - mean) in scratchpad first
+                generated_code += f"V_SUB_VF gp{scratchpad_addr}, gp{act_addr}, f2, 0, 0 \n"
+                # Then multiply by 1/std and write back to activation
+                generated_code += f"V_MUL_VF gp{act_addr}, gp{scratchpad_addr}, f5, 0 \n"
 
-            # Move to next vector
+                # Move to next vector
+                generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
+        else:
+            generated_code += f"C_LOOP_START gp{loop_addr}, {hidden_dim // vlen} \n"
+            generated_code += f"V_SUB_VF gp{scratchpad_addr}, gp{act_addr}, f2, 0, 0 \n"
+            generated_code += f"V_MUL_VF gp{act_addr}, gp{scratchpad_addr}, f5, 0 \n"
             generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
+            generated_code += f"C_LOOP_END gp{loop_addr} \n"
 
         # Reset accumulators for next batch
         generated_code += "S_ADD_FP f2, f0, f0 \n"

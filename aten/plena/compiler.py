@@ -90,9 +90,9 @@ class PlenaCompiler(
                           PLENA_SETTINGS_TOML / plena_settings.toml.
             unroll_loops: If True, unroll sub-projection and attention helper loops
                           at ASM-gen time to eliminate C_LOOP_START/END overhead.
-                          Overridden by the ATEN_UNROLL env var ("1"=True, "0"=False).
+                          Overridden by the ATEN_OPS_UNROLL env var ("1"=True, "0"=False).
         """
-        _env_unroll = os.environ.get("ATEN_UNROLL", "")
+        _env_unroll = os.environ.get("ATEN_OPS_UNROLL", "")
         if _env_unroll == "1":
             unroll_loops = True
         elif _env_unroll == "0":

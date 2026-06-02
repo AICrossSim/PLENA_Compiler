@@ -11,6 +11,7 @@ def rope_asm(
     vlen: int,
     seq_len: int,
     head_dim: int,
+    unroll: bool = True,
 ) -> str:
     """
     Generate assembly for Rotary Position Embedding (RoPE) applied in-place:
@@ -22,7 +23,8 @@ def rope_asm(
         Chunk j, position i is at: base + j * seq_len * vlen + i * vlen
 
     Args:
-        alive_registers: 5 GP registers [x_addr, xrot_addr, cos_addr, sin_addr, scratch_addr]
+        alive_registers: GP registers [x_addr, xrot_addr, cos_addr, sin_addr, scratch_addr]
+            (5 for the unrolled path; a 6th [loop_addr] is required for the rolled path)
         x_base_address:        VRAM base of x (shape: seq_len × head_dim)
         x_rot_base_address:    VRAM base of rotate_half(x), preloaded from HBM
         cos_base_address:      VRAM base of cos values (seq_len × head_dim)
@@ -45,16 +47,35 @@ def rope_asm(
     lines = ["; RoPE: x = x * cos + rotate_half(x) * sin  (in-place)"]
     lines.extend(_load_large_int_list(scratch_addr, scratchpad_base_address))
 
-    for j in range(num_chunks):
-        chunk_base = j * seq_len * vlen
-        for i in range(seq_len):
-            addr = chunk_base + i * vlen
-            lines.extend(_load_large_int_list(x_addr, x_base_address + addr))
-            lines.extend(_load_large_int_list(xrot_addr, x_rot_base_address + addr))
-            lines.extend(_load_large_int_list(cos_addr, cos_base_address + addr))
-            lines.extend(_load_large_int_list(sin_addr, sin_base_address + addr))
-            lines.append(f"V_MUL_VV gp{scratch_addr}, gp{xrot_addr}, gp{sin_addr}, 0 ")
-            lines.append(f"V_MUL_VV gp{x_addr}, gp{x_addr}, gp{cos_addr}, 0 ")
-            lines.append(f"V_ADD_VV gp{x_addr}, gp{x_addr}, gp{scratch_addr}, 0 ")
+    if unroll:
+        for j in range(num_chunks):
+            chunk_base = j * seq_len * vlen
+            for i in range(seq_len):
+                addr = chunk_base + i * vlen
+                lines.extend(_load_large_int_list(x_addr, x_base_address + addr))
+                lines.extend(_load_large_int_list(xrot_addr, x_rot_base_address + addr))
+                lines.extend(_load_large_int_list(cos_addr, cos_base_address + addr))
+                lines.extend(_load_large_int_list(sin_addr, sin_base_address + addr))
+                lines.append(f"V_MUL_VV gp{scratch_addr}, gp{xrot_addr}, gp{sin_addr}, 0 ")
+                lines.append(f"V_MUL_VV gp{x_addr}, gp{x_addr}, gp{cos_addr}, 0 ")
+                lines.append(f"V_ADD_VV gp{x_addr}, gp{x_addr}, gp{scratch_addr}, 0 ")
+    else:
+        # Rolled: addr = (j*seq_len + i)*vlen is a single linear progression, so the
+        # whole double loop collapses to ONE hardware loop of count num_chunks*seq_len
+        # with a +vlen stride on each of the four operand pointers (scratch is fixed).
+        loop_addr = alive_registers[5]
+        lines.extend(_load_large_int_list(x_addr, x_base_address))
+        lines.extend(_load_large_int_list(xrot_addr, x_rot_base_address))
+        lines.extend(_load_large_int_list(cos_addr, cos_base_address))
+        lines.extend(_load_large_int_list(sin_addr, sin_base_address))
+        lines.append(f"C_LOOP_START gp{loop_addr}, {num_chunks * seq_len}")
+        lines.append(f"V_MUL_VV gp{scratch_addr}, gp{xrot_addr}, gp{sin_addr}, 0 ")
+        lines.append(f"V_MUL_VV gp{x_addr}, gp{x_addr}, gp{cos_addr}, 0 ")
+        lines.append(f"V_ADD_VV gp{x_addr}, gp{x_addr}, gp{scratch_addr}, 0 ")
+        lines.append(f"S_ADDI_INT gp{x_addr}, gp{x_addr}, {vlen} ")
+        lines.append(f"S_ADDI_INT gp{xrot_addr}, gp{xrot_addr}, {vlen} ")
+        lines.append(f"S_ADDI_INT gp{cos_addr}, gp{cos_addr}, {vlen} ")
+        lines.append(f"S_ADDI_INT gp{sin_addr}, gp{sin_addr}, {vlen} ")
+        lines.append(f"C_LOOP_END gp{loop_addr}")
 
     return "\n".join(lines) + "\n"
