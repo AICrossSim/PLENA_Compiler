@@ -1056,9 +1056,15 @@ def _emit_attention_block(
     checkpoint_recorder: StageCheckpointRecorder | None = None,
     active_seq_len: int | None = None,
     active_hidden: int | None = None,
+    batch_size: int = 1,
+    rows_per_batch: int | None = None,
+    active_seq_len_per_batch: int | None = None,
 ):
     active_seq_len = active_seq_len or seq_len
     active_hidden = active_hidden or current.shape[1]
+    active_seq_len_per_batch = active_seq_len_per_batch or seq_len
+    rows_per_batch = rows_per_batch or max(prog.mlen, seq_len)
+    total_physical_rows = batch_size * rows_per_batch if batch_size > 1 else max(prog.mlen, seq_len)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -1080,7 +1086,13 @@ def _emit_attention_block(
             semantic="attention RMS-normalized input",
         )
 
-    Q = _linear_projection(prog, current, layer_inputs.w_q, f"Q_{layer_idx}")
+    Q = _linear_projection(
+        prog,
+        current,
+        layer_inputs.w_q,
+        f"Q_{layer_idx}",
+        physical_shape=(total_physical_rows, total_q_dim) if batch_size > 1 else None,
+    )
     q_full_addr = prog.get_vram_addr(Q.name)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
@@ -1092,7 +1104,13 @@ def _emit_attention_block(
             semantic="Q projection before per-head RoPE",
         )
 
-    O_full = prog.alloc(f"O_full_{layer_idx}", seq_len, total_q_dim, strict=False)
+    O_full = prog.alloc(
+        f"O_full_{layer_idx}",
+        current.shape[0] if batch_size > 1 else seq_len,
+        total_q_dim,
+        strict=False,
+        physical_shape=(total_physical_rows, total_q_dim) if batch_size > 1 else None,
+    )
     o_full_addr = prog.get_vram_addr(O_full.name)
     prog.vram_fill_zero(O_full)
     # Each head occupies head_dim//mlen col-blocks of O_full, so the per-head span
@@ -1110,18 +1128,26 @@ def _emit_attention_block(
         rope_inputs,
         layer_idx,
         num_kv_heads,
+        physical_rows=total_physical_rows if batch_size > 1 else None,
         checkpoint_recorder=checkpoint_recorder,
         active_seq_len=active_seq_len,
         active_head_dim=head_dim,
     )
 
     rope_matrix, cos_var, sin_var = rope_inputs
+    q_h_phys = (total_physical_rows, head_dim) if batch_size > 1 else None
     for h in range(num_heads):
         kv_h = h // ratio
         K_stored, V_stored = kv_stored[kv_h]
 
         q_h_addr = q_full_addr + h * head_stride
-        Q_h = prog.alloc_at(f"Q_h{h}_{layer_idx}", seq_len, head_dim, q_h_addr)
+        Q_h = prog.alloc_at(
+            f"Q_h{h}_{layer_idx}",
+            current.shape[0] if batch_size > 1 else seq_len,
+            head_dim,
+            q_h_addr,
+            physical_shape=q_h_phys,
+        )
         _apply_rope_projection(
             prog,
             Q_h,
@@ -1131,6 +1157,8 @@ def _emit_attention_block(
             f"Q_rot_{layer_idx}_h{h}",
         )
 
+        # Delegate the per-batch loop to the kernel (proven for head_dim <= mlen;
+        # the kernel's own guard blocks head_dim > mlen until the kernel fix lands).
         O_h = ops.flash_attention(
             prog,
             Q_h,
@@ -1138,20 +1166,47 @@ def _emit_attention_block(
             V_stored,
             scale,
             causal_mask=causal_mask,
-            batch_size=1,
-            seq_len=active_seq_len,
-            kv_seq_len=active_seq_len,
+            batch_size=batch_size,
+            seq_len=active_seq_len_per_batch,
+            kv_seq_len=active_seq_len_per_batch,
         )
 
-        o_h_dest_addr = o_full_addr + h * head_stride
-        _copy_into_vram_view(
-            prog,
-            O_h,
-            f"O_dest_h{h}_{layer_idx}",
-            seq_len,
-            head_dim,
-            o_h_dest_addr,
-        )
+        if batch_size == 1:
+            o_h_dest_addr = o_full_addr + h * head_stride
+            _copy_into_vram_view(
+                prog,
+                O_h,
+                f"O_dest_h{h}_{layer_idx}",
+                seq_len,
+                head_dim,
+                o_h_dest_addr,
+            )
+        else:
+            # The kernel packs batches at active_seq stride; O_full needs them at the
+            # decoder's rows_per_batch stride (so O_proj feeds the rpb-strided
+            # residual). Remap each batch's active rows into its O_full slab.
+            o_h_addr = prog.get_vram_addr(O_h.name)
+            o_h_batch_stride = active_seq_len_per_batch * prog.mlen
+            o_full_batch_stride = rows_per_batch * prog.mlen
+            for b in range(batch_size):
+                O_hb = prog.alloc_at(
+                    f"O_src_h{h}_b{b}_{layer_idx}",
+                    active_seq_len_per_batch,
+                    head_dim,
+                    o_h_addr + b * o_h_batch_stride,
+                    physical_shape=O_h.physical_shape,
+                )
+                # O_full is already zero-filled, so add directly into batch b's slab.
+                # (Do NOT use _copy_into_vram_view: its vram_fill_zero uses the
+                # full-height physical_shape and would clobber adjacent heads/batches.)
+                O_dst = prog.alloc_at(
+                    f"O_dest_h{h}_b{b}_{layer_idx}",
+                    active_seq_len_per_batch,
+                    head_dim,
+                    o_full_addr + h * head_stride + b * o_full_batch_stride,
+                    physical_shape=(total_physical_rows, head_dim),
+                )
+                prog.vram_add(O_dst, O_hb)
         _free_named_tensors(prog, ("O", "S", "PV"))
 
     if checkpoint_recorder is not None:
@@ -3333,8 +3388,6 @@ def compile_native_hf_decoder(
                 active_seq_len_per_batch=seq_len,
             )
         else:
-            if batch_size != 1:
-                raise NotImplementedError("native non-packed MHA decoder lowering does not yet support batch_size > 1")
             current_after_attn = _emit_attention_block(
                 prog,
                 current,
@@ -3353,6 +3406,9 @@ def compile_native_hf_decoder(
                 checkpoints,
                 checkpoint_rows,
                 hidden,
+                batch_size=batch_size,
+                rows_per_batch=rows_per_batch,
+                active_seq_len_per_batch=seq_len,
             )
 
         current = _emit_ffn_block(
@@ -3423,6 +3479,12 @@ def compile_native_hf_decoder(
 
     out_features = padded_hidden
     comparison_rows = compile_seq_rows if batch_size > 1 else seq_len
+    # The compact golden holds only the active rows (batch_size*seq_len). For batch>1
+    # the active rows are rpb-strided (batch b lives at physical row b*rows_per_batch),
+    # so num_batches counts active rows and the reader extracts them via
+    # rows_per_batch/active_seq_per_batch instead of reading contiguous rows. For
+    # batch==1 this equals seq_len and the reader falls back to contiguous (unchanged).
+    active_comparison_rows = batch_size * seq_len
 
     # Output is column-block-major: each batch's `out_features` span ceil(out_features/mlen)
     # column blocks, and consecutive col-blocks of a batch are `physical_rows` rows apart
@@ -3435,11 +3497,13 @@ def compile_native_hf_decoder(
     comparison_params = {
         "start_row_idx": o_vram_addr // mlen,
         "num_rows": _num_col_blocks * _physical_rows if out_features > mlen else comparison_rows,
-        "num_batches": comparison_rows,
+        "num_batches": active_comparison_rows,
         "elements_per_batch": out_features,
         "row_dim": mlen,
         "physical_rows": _physical_rows,
         "use_stride_mode": out_features > mlen,
+        "rows_per_batch": rows_per_batch if batch_size > 1 else None,
+        "active_seq_per_batch": seq_len if batch_size > 1 else None,
     }
 
     info = {

@@ -159,8 +159,6 @@ class ProgramAttentionMixin:
             raise ValueError(f"K physical rows per batch {k_rows_per_batch} must be multiple of MLEN={mlen}")
         if batch_size > 1 and v_rows_per_batch % mlen != 0:
             raise ValueError(f"V physical rows per batch {v_rows_per_batch} must be multiple of MLEN={mlen}")
-        if head_dim > mlen and batch_size > 1:
-            raise NotImplementedError("Batched MHA currently supports head_dim <= MLEN.")
 
         if scale is None:
             scale = 1.0 / math.sqrt(head_dim)
@@ -189,7 +187,15 @@ class ProgramAttentionMixin:
 
         q_base = self.get_vram_addr(Q.name)
         o_base = self.get_vram_addr(O.name)
-        q_batch_stride = q_rows_per_batch * Q.physical_shape[1]
+        # Tensors are column-block-major: col-block cb of a tensor with physical height R
+        # starts at cb*R*mlen, and row r within a col-block is at r*mlen. So advancing one
+        # batch (q_rows_per_batch rows) within col-block 0 skips q_rows_per_batch*mlen flat
+        # elements — NOT q_rows_per_batch*physical_shape[1], which over-skips by head_dim/mlen
+        # col-blocks when head_dim > mlen. The two expressions coincide at head_dim == mlen
+        # (physical_shape[1] == mlen), so the head_dim <= mlen path is unchanged.
+        q_batch_stride = q_rows_per_batch * mlen
+        # O packs batches contiguously by seq_len rows (the decoder reads O_h batch b at
+        # b*seq_len*mlen), so its per-batch base offset is seq_len*mlen.
         o_batch_stride = seq_len * mlen
 
         for batch_idx in range(batch_size):
@@ -202,14 +208,20 @@ class ProgramAttentionMixin:
                     seq_len,
                     head_dim,
                     q_base + batch_idx * q_batch_stride,
-                    physical_shape=(q_rows_per_batch, Q.physical_shape[1]),
+                    # Preserve the full height so the col-block stride stays R*mlen; the
+                    # per-batch base offset then lands batch b correctly inside every
+                    # col-block. Truncating to q_rows_per_batch only works for a single
+                    # col-block (head_dim <= mlen) and mis-strides higher col-blocks.
+                    physical_shape=Q.physical_shape,
                 )
                 O_batch = self.alloc_at(
                     f"_mha_O_b{batch_idx}",
                     seq_len,
                     head_dim,
                     o_base + batch_idx * o_batch_stride,
-                    physical_shape=(max(mlen, seq_len), O.physical_shape[1]),
+                    # Same reasoning as Q_batch: keep O's full height so writes to higher
+                    # col-blocks (head_dim > mlen) land at R*mlen strides.
+                    physical_shape=O.physical_shape,
                 )
 
             batch_k_block_base = batch_idx * k_row_blocks_per_batch
