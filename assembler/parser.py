@@ -150,13 +150,19 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             if c != -1:
                 line = line[:c]
 
-            # Split opcode off the operand string on the first whitespace run; this avoids
-            # the old split()+" ".join() round-trip. Lines with no operands are skipped.
-            head = line.split(None, 1)
-            if len(head) < 2:
+            # Split the opcode and operands
+            parts = line.split()
+            if len(parts) < 1 or ";" in parts[0]:
                 continue  # Invalid line
-            opcode, rest = head
-            operands = [part.strip() for part in rest.split(",")]
+            opcode = parts[0]
+
+            # Handle instructions with no operands (e.g., C_BREAK)
+            if len(parts) == 1:
+                instructions.append(Instruction(opcode, None, None, None, None, None, None, None))
+                continue
+
+            operands = [part.strip() for part in " ".join(parts[1:]).split(",")]
+            # print(f"Parsing instruction: {line}", "operand length:", len(operands), "operands:", operands)
 
             # Decode based on number of operands, case-structure by length
             rd = None

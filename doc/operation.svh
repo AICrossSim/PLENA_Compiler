@@ -20,15 +20,16 @@ typedef struct {
 } MEM_WREQ_INFO;
 
 typedef enum logic [3:0] {
-    MV_IC           = 3'h1,
-    MV_BIC          = 3'h2,
-    MV_WO           = 3'h3,
-    BMV_WO          = 3'h4,
-    MM_IC           = 3'h5,
-    MM_BIC          = 3'h6,
-    MM_WO           = 3'h7,
-    BMM_WO          = 3'h8,
-    STALL_M         = 3'h0
+    MV_IC           = 4'h1,
+    MV_BIC          = 4'h2,
+    MV_WO           = 4'h3,
+    BMV_WO          = 4'h4,
+    MM_IC           = 4'h5,
+    MM_BIC          = 4'h6,
+    MM_WO           = 4'h7,
+    BMM_WO          = 4'h8,
+    MM_PS           = 4'h9,
+    STALL_M         = 4'h0
 } M_OP;
 
 typedef enum logic [3:0] {
@@ -78,17 +79,19 @@ typedef enum logic [3:0] {
     PASS_ADDR_2   = 4'h9, // addr_port_2: rd and addr_port_1: rs1 adress.
     COMP_ADDR     = 4'hA,
     COMP_ADDR_2   = 4'hB, // addr_port_2: rd and addr_port_1: rs1 + imm
+    LOOP_INIT     = 4'hC, // Write immediate to rd (loop counter initialization)
+    LOOP_DEC      = 4'hD, // Decrement rs1 and write back to rd (loop end)
     STALL_S_INT   = 4'h0
 } S_INT_OP;
 
 typedef enum logic [2:0] {
     STALL_C             = 3'h0,
     SET_ADDR_REG        = 3'h1,
-    SET_V_STRIDE_SIZE   = 3'h2,
-    SET_M_STRIDE_SIZE   = 3'h3,
-    SET_V_SCALE_REG     = 3'h4,
-    SET_M_SCALE_REG     = 3'h5,
-    BREAK               = 3'h6
+    SET_STRIDE_SIZE     = 3'h2,
+    SET_SCALE_REG       = 3'h3,
+    BREAK               = 3'h4,
+    LOOP_START          = 3'h5,
+    LOOP_END            = 3'h6
 } C_OP;
 
 typedef enum logic [2:0] {
@@ -170,10 +173,11 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     C_LOOP_END             = 6'h30,
 
     // Extensions
-    V_SHIFT_V              = 6'h31,
-    C_BREAK                = 6'h32
+    V_PS_V                 = 6'h31,
+    V_SHFT_V               = 6'h32,
+    C_HADAMARD_TRANSFORM   = 6'h33,
+    C_BREAK                = 6'h34
 } CUSTOM_ISA_OPCODE;
-
 
 typedef enum logic [2:0] {
     INVALID_TYPE = 3'h0,
