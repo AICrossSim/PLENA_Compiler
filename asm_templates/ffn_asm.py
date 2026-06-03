@@ -592,14 +592,24 @@ def _emit_ffn_projection_chunk(
                 )
 
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 \n")
-            for _ in range(k_tile_count):
-                lines.append(f"M_MM 0, gp{w_temp_register}, gp{a_actual_register} \n")
-                lines.append(
-                    f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} \n"
-                )
-                lines.append(
-                    f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n"
-                )
+            # Inner K-accumulation rolled into a hardware C_LOOP. The body is
+            # already loop-carried (w_temp += MLEN^2, a_actual += MLEN*B*S), and
+            # the weight HBM-offset register is dead here (only the per-MLEN-block
+            # prefetch above uses it, and it is reloaded each block), so it doubles
+            # as the trip counter. The systolic accumulator sums across all
+            # k_tile_count M_MMs before the M_MM_WO flush, identical to the
+            # unrolled form; this collapses 3*k_tile_count emitted lines to ~5.
+            if k_tile_count > 1:
+                lines.append(f"C_LOOP_START gp{w_hbm_offset_register}, {k_tile_count} \n")
+            lines.append(f"M_MM 0, gp{w_temp_register}, gp{a_actual_register} \n")
+            lines.append(
+                f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} \n"
+            )
+            lines.append(
+                f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n"
+            )
+            if k_tile_count > 1:
+                lines.append(f"C_LOOP_END gp{w_hbm_offset_register} \n")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 \n")
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} \n"
