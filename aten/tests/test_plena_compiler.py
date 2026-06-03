@@ -688,6 +688,51 @@ def test_mha_accepts_batch_slabs():
     print("  PASS test_mha_accepts_batch_slabs")
 
 
+def test_mha_causal_skips_future_tiles_and_masks_only_diagonal():
+    """Causal MHA across multiple seq tiles (seq_len > mlen).
+
+    Regression for the seq>mlen causal bug: the static (mlen, mlen) triangular
+    mask used to be added to *every* score tile, which leaked future keys on
+    above-diagonal tiles and dropped valid past keys on below-diagonal tiles
+    (correct only for the single-tile seq_len <= mlen case). The kernel must now
+    mask only the diagonal tile, skip strictly-future key tiles entirely, and
+    leave strictly-past tiles unmasked.
+    """
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=64, blen=4)
+    q_input = prog.input("Q", shape=(128, 64), physical_shape=(128, 64), prestaged_vram_addr=0)
+    k_input = prog.input("K", shape=(128, 64), physical_shape=(128, 64))
+    v_input = prog.input("V", shape=(128, 64), physical_shape=(128, 64))
+    q = prog.load_batch(q_input, name="Q")
+    mask_input = prog.input("causal_mask", shape=(64, 64))
+    mask = prog.load_batch(mask_input, name="CAUSAL_MASK")
+
+    o = prog.flash_attention(
+        q,
+        k_input,
+        v_input,
+        scale=1.0 / 8.0,
+        causal_mask=mask,
+        batch_size=1,
+        seq_len=128,
+        kv_seq_len=128,
+    )
+    asm = prog.compile()
+
+    assert o.shape == (128, 64)
+    # 2 query tiles x 2 key tiles. Causal keeps (q0,k0), (q1,k0), (q1,k1) and
+    # drops the strictly-future (q0,k1): key tile 0 is consumed by both query
+    # tiles, key tile 1 only by the second query tile.
+    assert asm.count("Compute PV = P @ V[k_idx=0]") == 2
+    assert asm.count("Compute PV = P @ V[k_idx=1]") == 1
+    # The triangular mask is added on the two diagonal tiles only, never on the
+    # below-diagonal fully-visible tile (pre-fix this was 4).
+    assert asm.count("+= CAUSAL_MASK") == 2
+
+    print("  PASS test_mha_causal_skips_future_tiles_and_masks_only_diagonal")
+
+
 def test_compile_native_hf_decoder_golden_vs_hf():
     """Golden (MXFP8+BF16) should closely match HF float32 at native dims."""
     from compiler.aten.plena_frontend import compile_native_hf_decoder

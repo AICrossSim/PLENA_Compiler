@@ -198,6 +198,12 @@ class ProgramAttentionMixin:
         # b*seq_len*mlen), so its per-batch base offset is seq_len*mlen.
         o_batch_stride = seq_len * mlen
 
+        # Position of the first query relative to the keys: queries are the LAST
+        # seq_len of the kv_seq_len key positions, so query row r of block q_idx is
+        # global position q_offset + q_idx*mlen + r. For prefill (kv_seq_len ==
+        # seq_len) this is 0.
+        q_offset = kv_seq_len - seq_len
+
         for batch_idx in range(batch_size):
             if batch_size == 1 and total_q_rows == seq_len:
                 Q_batch = Q
@@ -231,6 +237,32 @@ class ProgramAttentionMixin:
 
                 for k_idx in range(num_k_blocks):
                     block_cols = min(mlen, kv_seq_len - k_idx * mlen)
+                    needs_triangular_mask = False
+                    if causal_mask is not None:
+                        # Causal geometry across tiles. Query rows of block q_idx are
+                        # global positions q_offset + q_idx*mlen + [0, block_rows);
+                        # key cols of block k_idx are k_idx*mlen + [0, block_cols). A
+                        # key block entirely in the strict future of every query row
+                        # contributes nothing (exp(-inf)=0) and is skipped; one
+                        # entirely in the past is fully visible (no mask); only a
+                        # straddling block needs the triangular mask. The static
+                        # (mlen, mlen) mask encodes a zero-diagonal triangle, which is
+                        # exactly right when the straddle sits on the q_idx == k_idx
+                        # diagonal (q_offset == 0, i.e. prefill). seq_len <= mlen is
+                        # the single-block special case of this and is unchanged.
+                        key_first = k_idx * mlen
+                        query_first = q_offset + q_idx * mlen
+                        query_last = query_first + block_rows - 1
+                        if key_first > query_last:
+                            continue  # whole key block is in the strict future
+                        needs_triangular_mask = key_first + block_cols - 1 > query_first
+                        if needs_triangular_mask and query_first != key_first:
+                            raise NotImplementedError(
+                                "Causal mask across tiles with kv_seq_len != seq_len "
+                                "(non-zero query offset) is unsupported: the static "
+                                "(mlen, mlen) mask only encodes the zero diagonal "
+                                f"(q_offset={q_offset}, q_idx={q_idx}, k_idx={k_idx})."
+                            )
                     physical_k_idx = batch_k_block_base + k_idx
                     self.vram_sub_projection_T_to(
                         Q_batch,
@@ -244,7 +276,7 @@ class ProgramAttentionMixin:
                     valid_col_mask = valid_col_masks.get(block_cols)
                     if valid_col_mask is not None:
                         self.vram_add(S_block, valid_col_mask, num_rows=block_rows)
-                    if causal_mask is not None:
+                    if needs_triangular_mask:
                         self.vram_add(S_block, causal_mask)
                     softmax_valid_cols = None if valid_col_mask is not None else block_cols
                     self.online_softmax_block(S_block, scale, rows=block_rows, valid_cols=softmax_valid_cols)
