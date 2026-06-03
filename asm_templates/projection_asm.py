@@ -152,6 +152,11 @@ def projection_asm(
     if out_features is None:
         out_features = hidden_size  # Backward compatible: square matrix
 
+    if batch % blen != 0:
+        raise ValueError(
+            f"projection_asm requires batch ({batch}) to be divisible by BLEN ({blen})"
+        )
+
     assert in_features % mlen == 0, f"K ({in_features}) must be a multiple of MLEN ({mlen})"
     MAX_K_TILES = max(1, matrix_sram_size // mlen)
     num_k_tiles = in_features // mlen
@@ -322,6 +327,11 @@ def projection_T_asm(
     in_features = hidden_size
     if out_features is None:
         out_features = hidden_size
+
+    if batch % blen != 0:
+        raise ValueError(
+            f"projection_T_asm requires batch ({batch}) to be divisible by BLEN ({blen})"
+        )
 
     w_actual_register = alive_registers[0]
     w_temp_register = alive_registers[1]

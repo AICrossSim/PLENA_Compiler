@@ -31,8 +31,6 @@ def flash_attn_asm(
     inf_fp_address: int = 0,
     causal_mask: bool = True,
     kv_valid_len: int | None = None,
-    debug_tile_trace_base: int | None = None,
-    debug_trace_head_index: int = 0,
 ) -> str:
     """
     Args:
@@ -78,7 +76,6 @@ def flash_attn_asm(
     # kv_tile_size: number of KV tokens loaded per H_PREFETCH_M call.
     kv_tile_size = min(kv_len, mlen)
     mask_fp_sram_base = fp_sram_start_address + q_index_2_kv_index_ratio * 3 * br
-    trace_tile_stride = 2 * br + br * d_padded
 
     # Memory Layout:
     # -- FP SRAM --
@@ -135,7 +132,7 @@ def flash_attn_asm(
         # exactly one KV tile (kv_tile_size * d_padded = mlen*mlen elements).
         # kv_seq_tile_idx tracks the KV-sequence tile within this head.
         for kv_seq_tile_idx in range(k_seq_iteration_number):
-            print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in GQA mode")
+            print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in", "MHA" if hkv == hq else "GQA", "mode")
 
             # HBM element offset for K (and V) for this (head, tile):
             #   head-major: kv_head * kv_tile_size * d_padded + tile * kv_tile_size * d_padded
@@ -337,65 +334,6 @@ def flash_attn_asm(
                         o_row_stride=None if use_batched else hq * d_padded,
                     )
                     stored_m_fp_res_address += 3 * br
-
-                # Optional debug trace: dump per-tile m/l/O state for one selected head.
-                # Layout per KV tile at debug_tile_trace_base + tile_idx * trace_tile_stride:
-                #   [m_old(br), l_old(br), O_old(br * d_padded)]
-                if debug_tile_trace_base is not None and not use_batched:
-                    selected_kv_head = debug_trace_head_index // q_index_2_kv_index_ratio
-                    selected_rel_head = debug_trace_head_index % q_index_2_kv_index_ratio
-                    if kv_head_index == selected_kv_head and selected_rel_head == 0:
-                        trace_tile_base = debug_tile_trace_base + kv_seq_tile_idx * trace_tile_stride
-                        trace_o_base = trace_tile_base + 2 * br
-                        selected_o_base = o_old_base_address + debug_trace_head_index * d_padded
-                        selected_m_base = fp_sram_start_address + selected_rel_head * 3 * br
-                        selected_l_base = selected_m_base + 2 * br
-
-                        generated_code += reset_vssram_code(
-                            reset_start_address=trace_tile_base,
-                            vect_dim=br,
-                            per_stride_dim=2,
-                            reset_stride=br,
-                            reset_amount=1,
-                            alive_registers_int=alive_registers_int[0:3],
-                        )
-                        generated_code += reset_vssram_code(
-                            reset_start_address=trace_o_base,
-                            vect_dim=d_padded,
-                            per_stride_dim=br,
-                            reset_stride=d_padded,
-                            reset_amount=1,
-                            alive_registers_int=alive_registers_int[0:3],
-                        )
-
-                        # Copy m_old and l_old from FP SRAM into VRAM via S_MAP_V_FP.
-                        generated_code += _load_large_int(alive_registers_int[0], pv_base_address)
-                        generated_code += f"S_MAP_V_FP gp{alive_registers_int[0]}, gp0, {selected_m_base} \n"
-                        generated_code += _load_large_int(alive_registers_int[1], trace_tile_base)
-                        generated_code += (
-                            f"V_ADD_VV gp{alive_registers_int[1]}, gp{alive_registers_int[1]}, gp{alive_registers_int[0]}, 0 \n"
-                        )
-                        generated_code += f"S_MAP_V_FP gp{alive_registers_int[0]}, gp0, {selected_l_base} \n"
-                        generated_code += _load_large_int(alive_registers_int[1], trace_tile_base + br)
-                        generated_code += (
-                            f"V_ADD_VV gp{alive_registers_int[1]}, gp{alive_registers_int[1]}, gp{alive_registers_int[0]}, 0 \n"
-                        )
-
-                        # Copy O_old rows for selected head into contiguous debug region.
-                        generated_code += _load_large_int(alive_registers_int[0], selected_o_base)
-                        generated_code += _load_large_int(alive_registers_int[1], trace_o_base)
-                        generated_code += f"C_LOOP_START gp{alive_registers_int[2]}, {br} \n"
-                        generated_code += (
-                            f"V_ADD_VV gp{alive_registers_int[1]}, gp{alive_registers_int[1]}, gp{alive_registers_int[0]}, 0 \n"
-                        )
-                        generated_code += (
-                            f"S_ADDI_INT gp{alive_registers_int[0]}, gp{alive_registers_int[0]}, {hq * d_padded} \n"
-                        )
-                        generated_code += (
-                            f"S_ADDI_INT gp{alive_registers_int[1]}, gp{alive_registers_int[1]}, {d_padded} \n"
-                        )
-                        generated_code += f"C_LOOP_END gp{alive_registers_int[2]} \n"
-                        generated_code += reset_reg_asm(alive_registers_int[0:3])
 
                 # Apply final 1/l normalization only on the last KV tile.
                 # Intermediate tiles must keep O_old in accumulator form.

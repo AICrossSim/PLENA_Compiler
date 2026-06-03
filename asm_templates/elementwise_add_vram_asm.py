@@ -17,10 +17,14 @@ def elementwise_add_vram_asm(
 
     if len(alive_registers) < 2:
         raise ValueError("elementwise_add_vram_asm requires at least 2 GP registers")
+    if vlen <= 0:
+        raise ValueError("vlen must be positive")
     if num_vectors < 0:
         raise ValueError("num_vectors must be non-negative")
 
     step = vlen if vector_stride is None else vector_stride
+    if step <= 0:
+        raise ValueError("vector_stride must be positive")
     dst_reg = alive_registers[0]
     src_reg = alive_registers[1]
 
