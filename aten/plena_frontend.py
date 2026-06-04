@@ -2826,9 +2826,11 @@ def compile_native_hf_vision_encoder(
     print(f"\nVision compilation complete: {info['isa_lines']} ISA lines, "
           f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
     hbm_addrs = {}
+    hbm_sizes = {}
     for name, inp in prog._inputs.items():
         if hasattr(inp, "hbm_addr"):
             hbm_addrs[name] = inp.hbm_addr
+            hbm_sizes[name] = getattr(inp, "hbm_size", None)
     return {
         "isa": isa_code,
         "golden_output": golden_out,
@@ -2841,6 +2843,7 @@ def compile_native_hf_vision_encoder(
         "comparison_params": comparison_params,
         "info": info,
         "hbm_addrs": hbm_addrs,
+        "hbm_sizes": hbm_sizes,
         "sim_golden_result": {
             "original_output": padded_golden_output,
             "tensor_layouts": tensor_layouts,
@@ -3571,9 +3574,11 @@ def compile_native_hf_decoder(
     print(f"\nCompilation complete: {info['isa_lines']} ISA lines, "
           f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
     hbm_addrs = {}
+    hbm_sizes = {}
     for name, inp in prog._inputs.items():
         if hasattr(inp, "hbm_addr"):
             hbm_addrs[name] = inp.hbm_addr
+            hbm_sizes[name] = getattr(inp, "hbm_size", None)
 
     return {
         "isa": isa_code,
@@ -3588,6 +3593,7 @@ def compile_native_hf_decoder(
         "info": info,
         "stage_checkpoints": stage_checkpoint_metadata,
         "hbm_addrs": hbm_addrs,
+        "hbm_sizes": hbm_sizes,
         "sim_golden_result": {
             "original_output": padded_golden_output,
             "tensor_layouts": tensor_layouts,
