@@ -737,10 +737,17 @@ def _emit_kv_stores(
     checkpoint_recorder: StageCheckpointRecorder | None = None,
     active_seq_len: int | None = None,
     active_head_dim: int | None = None,
+    kv_physical_rows: int | None = None,
 ):
     rope_matrix, cos_var, sin_var = rope_inputs
     kv_stored = []
     active_seq_len = active_seq_len or current.shape[0]
+    # In decode (past_len > 0) the stored K/V regions must hold kv_seq_len = past_len +
+    # seq_len rows (rounded to whole MLEN tiles) so flash_attention reads all cached
+    # key/value row-blocks. The projection itself is still emitted at the natural row
+    # count (only the new tokens exist as input rows); the projected rows are then
+    # copied into the top of a kv_physical_rows-tall zero-filled region that is stored.
+    # Latency-only: the cached rows below the new tokens are left zero/uninitialised.
     for kv_h in range(num_kv_heads):
         kv_physical_shape = None
         if physical_rows is not None:
@@ -799,14 +806,43 @@ def _emit_kv_stores(
                 semantic=f"K projection for KV head {kv_h} after RoPE",
             )
 
-        K_stored = prog.store(K_h, name=f"K_stored_{layer_idx}_h{kv_h}")
-        V_stored = prog.store(V_h, name=f"V_stored_{layer_idx}_h{kv_h}")
-        kv_stored.append((K_stored, V_stored))
+        if kv_physical_rows is not None and kv_physical_rows > K_h.physical_shape[0]:
+            # Decode: widen the K/V regions to kv_seq_len rows so the stored HBM object
+            # (and thus flash_attention's per-tile reads) span all key/value row-blocks.
+            K_full = _grow_kv_region(prog, K_h, kv_physical_rows, f"K_full_{layer_idx}_h{kv_h}")
+            V_full = _grow_kv_region(prog, V_h, kv_physical_rows, f"V_full_{layer_idx}_h{kv_h}")
+            K_stored = prog.store(K_full, name=f"K_stored_{layer_idx}_h{kv_h}")
+            V_stored = prog.store(V_full, name=f"V_stored_{layer_idx}_h{kv_h}")
+            kv_stored.append((K_stored, V_stored))
+            prog.free_tensor(K_full)
+            prog.free_tensor(V_full)
+        else:
+            K_stored = prog.store(K_h, name=f"K_stored_{layer_idx}_h{kv_h}")
+            V_stored = prog.store(V_h, name=f"V_stored_{layer_idx}_h{kv_h}")
+            kv_stored.append((K_stored, V_stored))
 
         prog.free_tensor(K_h)
         prog.free_tensor(V_h)
 
     return kv_stored
+
+
+def _grow_kv_region(prog, source, target_rows: int, name: str):
+    """Copy a K/V projection into the top of a taller zero-filled region.
+
+    Used by the decode path to give the stored K/V kv_seq_len physical rows (whole
+    MLEN tiles) so flash_attention reads every cached row-block. The rows below the
+    new tokens stay zero (latency-only: their values do not matter)."""
+    grown = prog.alloc(
+        name,
+        target_rows,
+        source.shape[1],
+        strict=False,
+        physical_shape=(target_rows, source.physical_shape[1]),
+    )
+    prog.vram_fill_zero(grown)
+    prog.vram_add(grown, source, num_rows=source.shape[0])
+    return grown
 
 
 def _emit_packed_attention_block(
@@ -1059,12 +1095,27 @@ def _emit_attention_block(
     batch_size: int = 1,
     rows_per_batch: int | None = None,
     active_seq_len_per_batch: int | None = None,
+    past_len: int = 0,
 ):
     active_seq_len = active_seq_len or seq_len
     active_hidden = active_hidden or current.shape[1]
     active_seq_len_per_batch = active_seq_len_per_batch or seq_len
     rows_per_batch = rows_per_batch or max(prog.mlen, seq_len)
     total_physical_rows = batch_size * rows_per_batch if batch_size > 1 else max(prog.mlen, seq_len)
+    # Decode (past_len > 0): a single last-position query attends to all past_len
+    # cached keys plus the new token, so kv_seq_len = past_len + active_seq_len.
+    # The query attends to ALL cached keys (no triangular mask), so causal_mask is
+    # dropped, which also avoids the q_offset != 0 NotImplementedError in the
+    # kernel (program_attention.py). For latency we only require flash_attention to
+    # READ kv_seq_len rows, so the cached rows can be uninitialised.
+    is_decode = past_len > 0
+    kv_seq_len = past_len + active_seq_len_per_batch
+    # K/V regions need enough physical rows to hold kv_seq_len keys/values rounded
+    # up to whole MLEN tiles (the kernel reads ceil(kv_seq_len/mlen) blocks).
+    kv_physical_rows = (
+        _ceil_to_multiple(max(prog.mlen, kv_seq_len), prog.mlen) if is_decode else None
+    )
+    attn_causal_mask = None if is_decode else causal_mask
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -1132,6 +1183,7 @@ def _emit_attention_block(
         checkpoint_recorder=checkpoint_recorder,
         active_seq_len=active_seq_len,
         active_head_dim=head_dim,
+        kv_physical_rows=kv_physical_rows,
     )
 
     rope_matrix, cos_var, sin_var = rope_inputs
@@ -1165,10 +1217,10 @@ def _emit_attention_block(
             K_stored,
             V_stored,
             scale,
-            causal_mask=causal_mask,
+            causal_mask=attn_causal_mask,
             batch_size=batch_size,
             seq_len=active_seq_len_per_batch,
-            kv_seq_len=active_seq_len_per_batch,
+            kv_seq_len=kv_seq_len,
         )
 
         if batch_size == 1:
@@ -2880,8 +2932,16 @@ def compile_native_hf_decoder(
     component: str = "decoder",
     vision_stop_after: str | None = None,
     decoder_input_embeds: torch.Tensor | None = None,
+    past_len: int = 0,
 ) -> dict:
-    """Compile a HuggingFace decoder model at native dimensions to PLENA ISA metadata."""
+    """Compile a HuggingFace decoder model at native dimensions to PLENA ISA metadata.
+
+    past_len > 0 selects the single-token DECODE path: the new query attends to
+    past_len cached keys plus itself (kv_seq_len = past_len + seq_len), RoPE uses
+    absolute position past_len, and the causal mask is dropped (the last-position
+    query sees all keys). past_len == 0 is prefill and is byte-identical to before.
+    This path is latency-only: the cached KV rows are not materialised, only sized.
+    """
     component = component.lower()
     if component in {"vision", "vision_model", "vision_encoder"}:
         return compile_native_hf_vision_encoder(
@@ -2986,6 +3046,18 @@ def compile_native_hf_decoder(
         )
     else:
         head_packing = None
+    if past_len < 0:
+        raise ValueError(f"past_len must be non-negative, got {past_len}")
+    if past_len > 0 and batch_size > 1:
+        raise NotImplementedError("decode (past_len>0) supports batch_size=1 only")
+    if past_len > 0 and head_packing is not None:
+        # The packed-attention kernels (flash_attention_packed_group) take valid_cols
+        # but not kv_seq_len, so they cannot grow the key range for a decode step.
+        # Decode is only wired through the general _emit_attention_block path.
+        raise NotImplementedError(
+            "Decode (past_len > 0) is not supported with attention_head_packing; "
+            "run the decode path without head packing."
+        )
     padded_total_q_dim = head_packing.total_q_dim if head_packing is not None else num_heads * padded_head_dim
     padding_enabled = (
         padded_seq_len != seq_len
@@ -3143,7 +3215,7 @@ def compile_native_hf_decoder(
             )
     print(f"attn_scale: {scale:.6f}")
 
-    R_matrix, cos_table, sin_table = make_rope_inputs(seq_len, model_cfg)
+    R_matrix, cos_table, sin_table = make_rope_inputs(seq_len, model_cfg, position_offset=past_len)
     if head_packing is not None:
         compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = _pad_rope_inputs_for_head_slots(
             R_matrix,
@@ -3412,6 +3484,7 @@ def compile_native_hf_decoder(
                 batch_size=batch_size,
                 rows_per_batch=rows_per_batch,
                 active_seq_len_per_batch=seq_len,
+                past_len=past_len,
             )
 
         current = _emit_ffn_block(

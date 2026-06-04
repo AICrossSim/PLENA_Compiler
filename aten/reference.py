@@ -124,11 +124,16 @@ def quantize_to_mxfp(tensor: torch.Tensor) -> torch.Tensor:
     return bm_x.reshape(orig_shape)
 
 
-def _make_rope_tables(seq_len: int, head_dim: int, theta: float = 10000.0):
-    """Compute RoPE cos/sin tables, shape (seq_len, head_dim)."""
+def _make_rope_tables(seq_len: int, head_dim: int, theta: float = 10000.0, position_offset: int = 0):
+    """Compute RoPE cos/sin tables, shape (seq_len, head_dim).
+
+    position_offset shifts the absolute positions used for the angles, so a decode
+    token at absolute position past_len gets RoPE for that position. Default 0
+    keeps the prefill tables identical.
+    """
     half = head_dim // 2
     freqs = 1.0 / (theta ** (torch.arange(0, half).float() / half))
-    positions = torch.arange(seq_len).float()
+    positions = torch.arange(position_offset, position_offset + seq_len).float()
     angles = torch.outer(positions, freqs)
     cos_half = torch.cos(angles)
     sin_half = torch.sin(angles)
@@ -147,10 +152,18 @@ def _make_rotate_half_matrix(head_dim: int) -> torch.Tensor:
     return rotate
 
 
-def make_rope_inputs(seq_len: int, config: ModelConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the rotate_half matrix and RoPE tables used by CPU and PLENA paths."""
+def make_rope_inputs(
+    seq_len: int, config: ModelConfig, position_offset: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the rotate_half matrix and RoPE tables used by CPU and PLENA paths.
+
+    position_offset shifts the absolute positions (decode: pass past_len so the new
+    token gets RoPE for position past_len). Default 0 keeps prefill identical.
+    """
     rotate = _make_rotate_half_matrix(config.head_dim)
-    cos_table, sin_table = _make_rope_tables(seq_len, config.head_dim, config.rope_theta)
+    cos_table, sin_table = _make_rope_tables(
+        seq_len, config.head_dim, config.rope_theta, position_offset=position_offset
+    )
     return rotate, cos_table, sin_table
 
 
