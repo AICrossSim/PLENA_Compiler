@@ -20,6 +20,7 @@ def qkt_multiply(
     blen: int = 4,
     q_len: int = 0,
     k_hbm_head_stride: int | None = None,
+    k_hbm_offset: int | None = None,
 ) -> str:
     """
     Args:
@@ -68,15 +69,18 @@ def qkt_multiply(
     else:
         q_vram_offset = q_base_address + q_head_index * d
 
-    # K HBM element offset:
-    #   - If k_hbm_head_stride is provided: k_head_index * k_hbm_head_stride
-    #     (e.g. head-major HBM: k_head_index * kv_tile_size * d_padded)
-    #   - Else legacy: k_head_index * d
-    k_hbm_offset = k_head_index * (k_hbm_head_stride if k_hbm_head_stride is not None else d)
+    # K HBM element offset priority:
+    #   1) explicit absolute tile offset (k_hbm_offset)
+    #   2) head-stride based offset
+    #   3) legacy head-only offset
+    if k_hbm_offset is not None:
+        k_offset = k_hbm_offset
+    else:
+        k_offset = k_head_index * (k_hbm_head_stride if k_hbm_head_stride is not None else d)
 
     # Prefetch K from HBM (shared by both batched and per-head paths)
     generated_code += "\n".join(_load_large_int(q_base_register, q_vram_offset)) + "\n"
-    generated_code += "\n".join(_load_large_int(k_base_register, k_hbm_offset)) + "\n"
+    generated_code += "\n".join(_load_large_int(k_base_register, k_offset)) + "\n"
 
     # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
     # When stride < 64 elements, strided access causes unaligned HBM reads

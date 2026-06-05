@@ -188,7 +188,7 @@ def build_full_model_asm(
         probe_span = seq_len * hidden_padded
         layer0_probe_bases = {
             "input_chunk_major": int(persistent_end),
-            "attn_token_major": int(persistent_end + probe_span),
+            "attn_chunk_major": int(persistent_end + probe_span),
             "outproj_chunk_major": int(persistent_end + 2 * probe_span),
             "final_chunk_major": int(persistent_end + 3 * probe_span),
         }
@@ -273,7 +273,7 @@ def build_full_model_asm(
                 layer0_probe_bases.get("input_chunk_major") if layer_idx == 0 else None
             ),
             debug_attn_snapshot_base=(
-                layer0_probe_bases.get("attn_token_major") if layer_idx == 0 else None
+                layer0_probe_bases.get("attn_chunk_major") if layer_idx == 0 else None
             ),
             debug_outproj_snapshot_base=(
                 layer0_probe_bases.get("outproj_chunk_major") if layer_idx == 0 else None
@@ -304,6 +304,8 @@ def build_full_model_asm(
         final_output_base = int(vram_layout.get("final_output_base", final_input_base))
         final_ln_weight_base = vram_layout.get("final_ln_weight_base")
         final_ln_bias_base = vram_layout.get("final_ln_bias_base")
+        if final_ln_weight_base is None or final_ln_bias_base is None:
+            raise ValueError("apply_post_layernorm=True requires final_ln_weight_base/final_ln_bias_base in vram_layout")
         final_ln_scratch_base = _align_up(final_output_base + seq_len * hidden_padded, mlen)
 
         asm_code += "\n; --- FINAL: Post-Encoder LayerNorm ---\n"

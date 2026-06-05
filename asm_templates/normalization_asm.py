@@ -80,6 +80,7 @@ def layer_norm_asm(
     hidden_dim: int,
     affine_weight_base_address: int | None = None,
     affine_bias_base_address: int | None = None,
+    output_base_address: int | None = None,
 ) -> str:
     """
     Generate assembly code for layer normalization.
@@ -100,6 +101,8 @@ def layer_norm_asm(
     use_affine = affine_weight_base_address is not None and affine_bias_base_address is not None
     if (affine_weight_base_address is None) != (affine_bias_base_address is None):
         raise ValueError("layer_norm_asm requires both affine_weight_base_address and affine_bias_base_address")
+    if output_base_address is not None and int(output_base_address) != int(activation_base_address):
+        raise ValueError("layer_norm_asm currently supports only in-place output (output_base_address == activation_base_address)")
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch

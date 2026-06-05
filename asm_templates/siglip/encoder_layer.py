@@ -6,7 +6,7 @@ from compiler.asm_templates._imm import load_large_int_str
 from compiler.asm_templates._imm import addi_large_int_str
 from compiler.asm_templates.preload_addr_reg import preload_addr_reg_asm
 from compiler.asm_templates.reset_reg_asm import reset_reg_asm
-from compiler.asm_templates.flashattn.overall import flash_attn_asm
+from compiler.asm_templates.flashattn.encoder_mha import flash_attn_encoder_mha_asm
 from compiler.asm_templates.flashattn.reset import reset_vssram_code
 
 
@@ -256,8 +256,8 @@ def build_encoder_layer_asm(
     # - Stage 0 input residual snapshot at residual_base: chunk-major [NB, S, V]
     # - Stage 1 LN1 output at x_base: chunk-major [NB, S, V]
     # - Stage 2 Q build: q_base chunk-major [NB, S, V]
-    # - Stage 3 flash-attn output at attn_base: token-major [S, NB, V]
-    # - Stage 4 out projection workspace: repack attn_base -> x_base, project to q_base
+    # - Stage 3 flash-attn output at attn_base: chunk-major [NB, S, V]
+    # - Stage 4 out projection workspace: project attn_base -> q_base
     # - Stage 5 first residual add at q_base: chunk-major [NB, S, V]
     # - Stage 6 residual snapshot for final add at residual_base: chunk-major [NB, S, V]
     # - Stage 7 LN2 output at q_base: chunk-major [NB, S, V]
@@ -393,12 +393,12 @@ def build_encoder_layer_asm(
         )
         asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
-    # Stage 3: Flash attention.
-    # Shape after Stage 3 (attn_base/o_old_base): token-major [S, NB, V].
+    # Stage 3: Flash attention (encoder-focused MHA).
+    # Shape after Stage 3 (attn_base/o_old_base): chunk-major [NB, S, V].
     asm += "; Flash attention block\n"
     alive_int = [1, 2, 3, 4, 5, 6, 7, 8, 9]
     alive_fp = [1, 2, 3, 4, 5, 6]
-    asm += flash_attn_asm(
+    asm += flash_attn_encoder_mha_asm(
         mlen=mlen,
         vlen=vlen,
         blen=blen,
@@ -439,17 +439,8 @@ def build_encoder_layer_asm(
         asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
     # Stage 4: Out projection on attention output before residual add.
-    # flash-attn output at attn_base is token-major [S, NB, V].
-    # projection_asm expects chunk-major [NB, S, V], so repack token->chunk,
-    # project to q_base, then keep the result in chunk-major.
-    asm += _pack_seq_major_to_chunk_major(
-        seq_len=s_q,
-        num_chunks=hidden_size // vlen,
-        chunk_size=vlen,
-        src_base=attn_base,
-        dst_base=x_base,
-        comment="Repack attn output token-major -> chunk-major for out projection",
-    )
+    # flash-attn output is already chunk-major [NB, S, V], so projection can
+    # consume attn_base directly with no repack.
     asm += preload_addr_reg_asm(
         addr_reg_to_set=[2],
         available_registers=[2],
@@ -463,7 +454,7 @@ def build_encoder_layer_asm(
         vlen=vlen,
         alive_registers=[4, 5, 6, 7, 8, 9],
         w_base_hbm_offset_reg=2,
-        activation_base_address=x_base,
+        activation_base_address=attn_base,
         result_base_address=q_base,
         out_features=hidden_size,
         scratch_base_address=scratch_base,

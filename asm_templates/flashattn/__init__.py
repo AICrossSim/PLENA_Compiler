@@ -14,6 +14,7 @@ Modules:
 
 from .online_softmax import online_softmax_code
 from .output import computing_o_code, computing_row_wise_scaling_code
+from .encoder_mha import flash_attn_encoder_mha_asm
 from .overall import flash_attn_asm
 from .pv import computing_pv_code
 from .qkt import qkt_multiply
@@ -23,6 +24,7 @@ __all__ = [
     "computing_o_code",
     "computing_pv_code",
     "computing_row_wise_scaling_code",
+    "flash_attn_encoder_mha_asm",
     "flash_attn_asm",
     "online_softmax_code",
     "qkt_multiply",

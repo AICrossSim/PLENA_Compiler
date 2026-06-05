@@ -183,7 +183,7 @@ def build_full_model_streaming_asm(
         probe_span = seq_len * hidden_padded
         layer0_probe_bases = {
             "input_chunk_major": int(persistent_end),
-            "attn_token_major": int(persistent_end + probe_span),
+            "attn_chunk_major": int(persistent_end + probe_span),
             "outproj_chunk_major": int(persistent_end + 2 * probe_span),
             "final_chunk_major": int(persistent_end + 3 * probe_span),
         }
@@ -286,7 +286,7 @@ def build_full_model_streaming_asm(
                 layer0_probe_bases.get("input_chunk_major") if (enable_layer0_probes and layer_idx == 0) else None
             ),
             debug_attn_snapshot_base=(
-                layer0_probe_bases.get("attn_token_major") if (enable_layer0_probes and layer_idx == 0) else None
+                layer0_probe_bases.get("attn_chunk_major") if (enable_layer0_probes and layer_idx == 0) else None
             ),
             debug_outproj_snapshot_base=(
                 layer0_probe_bases.get("outproj_chunk_major") if (enable_layer0_probes and layer_idx == 0) else None

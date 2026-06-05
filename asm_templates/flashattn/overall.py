@@ -1,5 +1,7 @@
 """Main Flash Attention assembly code generation - orchestrates all components."""
 
+import os
+
 from .._imm import load_large_int_str as _load_large_int
 from ..reset_reg_asm import reset_fpreg_asm, reset_reg_asm, reset_vmask_asm
 from .online_softmax import online_softmax_code
@@ -31,6 +33,8 @@ def flash_attn_asm(
     inf_fp_address: int = 0,
     causal_mask: bool = True,
     kv_valid_len: int | None = None,
+    force_per_head: bool = False,
+    output_chunk_major: bool = False,
 ) -> str:
     """
     Args:
@@ -66,7 +70,7 @@ def flash_attn_asm(
     # Per-head path (M_TMM) for all other ratios — avoids M_BTMM over-read
     # panic when ratio < blen (the extra blen-ratio "dummy" heads would read
     # Q past the kv-group allocation).
-    use_batched = q_index_2_kv_index_ratio == blen
+    use_batched = q_index_2_kv_index_ratio == blen and not force_per_head
 
     # d_padded: pad head_dim to a multiple of mlen so that per-head VRAM
     # addresses are always vlen-aligned (contract requirement).
@@ -76,6 +80,7 @@ def flash_attn_asm(
     # kv_tile_size: number of KV tokens loaded per H_PREFETCH_M call.
     kv_tile_size = min(kv_len, mlen)
     mask_fp_sram_base = fp_sram_start_address + q_index_2_kv_index_ratio * 3 * br
+    trace_tiles = os.environ.get("FLASH_ATTN_TRACE_TILES", "0") == "1"
 
     # Memory Layout:
     # -- FP SRAM --
@@ -139,6 +144,15 @@ def flash_attn_asm(
             # With kv_tile_size=mlen, this simplifies to (kv_head*tiles + tile)*mlen*d_padded.
             kv_hbm_offset = (kv_head_index * k_seq_iteration_number + kv_seq_tile_idx) * kv_tile_size * d_padded
             valid_k_cols = max(0, min(kv_tile_size, kv_valid_total - kv_seq_tile_idx * kv_tile_size))
+            if trace_tiles:
+                print(
+                    "[flashattn tile] "
+                    f"kv_head={kv_head_index} "
+                    f"kv_tile={kv_seq_tile_idx}/{k_seq_iteration_number - 1} "
+                    f"kv_hbm_offset={kv_hbm_offset} "
+                    f"valid_k_cols={valid_k_cols}/{kv_tile_size} "
+                    f"use_batched={use_batched}"
+                )
 
             # Reset m_fp_sram_start_address for each iteration
             m_fp_sram_start_address = fp_sram_start_address
@@ -179,14 +193,15 @@ def flash_attn_asm(
                 generated_code += reset_vssram_code(
                     reset_start_address=o_old_base_address,
                     vect_dim=vlen,
-                    per_stride_dim=(hq * d_padded if not use_batched else q_index_2_kv_index_ratio) * br // vlen,
+                    per_stride_dim=(hq * d_padded if not use_batched else q_index_2_kv_index_ratio) * q_len // vlen,
                     reset_stride=vlen,
                     reset_amount=1,
                     alive_registers_int=alive_registers_int[0:3],
                 )
 
             # # loop over per q_index_2_kv_index_ratio q heads (q_len // MLEN), compute q_index_2_kv_index_ratio heads in parallel.
-            for _ in range(q_seq_iteration_number):
+            for q_seq_tile_idx in range(q_seq_iteration_number):
+                q_tile_start = q_seq_tile_idx * mlen
                 # Reuse the same FP SRAM scratch region for each Q tile.
                 # Accumulating this base across Q tiles can exceed FP SRAM bounds.
                 m_fp_sram_start_address = fp_sram_start_address
@@ -200,7 +215,11 @@ def flash_attn_asm(
                         mlen=mlen,
                         stage=stage,
                         alive_registers=alive_registers_int[0:2],
-                        q_base_address=q_base_address + kv_head_index * q_index_2_kv_index_ratio * d,
+                        q_base_address=(
+                            q_base_address
+                            + q_tile_start * hq * d
+                            + kv_head_index * q_index_2_kv_index_ratio * d
+                        ),
                         k_base_hbm_offset_reg=k_base_hbm_offset_reg,
                         q_head_index=kv_head_index * q_index_2_kv_index_ratio,
                         k_head_index=kv_head_index,
@@ -217,7 +236,7 @@ def flash_attn_asm(
                         # Q layout: head-major padded [hq, q_len, d_padded].
                         # Pre-compute per-head VRAM base so all addresses are vlen-aligned.
                         abs_q_head = kv_head_index * q_index_2_kv_index_ratio + inner_q_head_index
-                        q_head_base = q_base_address + abs_q_head * q_len * d_padded
+                        q_head_base = q_base_address + abs_q_head * q_len * d_padded + q_tile_start * d_padded
                         generated_code += qkt_multiply(
                             d=d_padded,
                             mlen=mlen,
@@ -233,6 +252,7 @@ def flash_attn_asm(
                             blen=blen,
                             q_len=q_len,
                             k_hbm_head_stride=k_seq_iteration_number * kv_tile_size * d_padded,
+                            k_hbm_offset=kv_hbm_offset,
                         )
                         generated_code += reset_reg_asm(alive_registers_int[0:9])
 
@@ -314,12 +334,20 @@ def flash_attn_asm(
                     generated_code += reset_reg_asm(alive_registers_int[0:6])
                     if use_batched:
                         generated_code += reset_vmask_asm(alive_registers_int[0], 1 << inner_q_head_index)
-                        o_base_for_head = o_old_base_address
+                        o_base_for_head = o_old_base_address + q_tile_start * hq * d_padded
                     else:
-                        # Interleaved (seq-major) output: head h at o_base + h * d_padded,
-                        # token stride = hq * d_padded  -> same format as seq-major [s_q, hq, d_padded]
+                        # Per-head output layout:
+                        # - token-major (legacy): [s_q, hq, d_padded]
+                        # - chunk-major (encoder): [hq, s_q, d_padded]
                         abs_q_head_o = kv_head_index * q_index_2_kv_index_ratio + inner_q_head_index
-                        o_base_for_head = o_old_base_address + abs_q_head_o * d_padded
+                        if output_chunk_major:
+                            o_base_for_head = (
+                                o_old_base_address
+                                + abs_q_head_o * q_len * d_padded
+                                + q_tile_start * d_padded
+                            )
+                        else:
+                            o_base_for_head = o_old_base_address + q_tile_start * hq * d_padded + abs_q_head_o * d_padded
                     generated_code += computing_o_code(
                         mlen=mlen,
                         stage=stage,
@@ -331,7 +359,7 @@ def flash_attn_asm(
                         head_dim=d_padded,
                         q_head_num=hq,
                         use_mask=use_batched,
-                        o_row_stride=None if use_batched else hq * d_padded,
+                        o_row_stride=None if use_batched else (d_padded if output_chunk_major else hq * d_padded),
                     )
                     stored_m_fp_res_address += 3 * br
 
@@ -343,10 +371,17 @@ def flash_attn_asm(
                         generated_code += reset_fpreg_asm(alive_registers_fp[0:1])
                         if use_batched:
                             generated_code += reset_vmask_asm(alive_registers_int[0], 1 << scale_head_index)
-                            o_base_for_scale = o_old_base_address
+                            o_base_for_scale = o_old_base_address + q_tile_start * hq * d_padded
                         else:
                             abs_q_head_s = kv_head_index * q_index_2_kv_index_ratio + scale_head_index
-                            o_base_for_scale = o_old_base_address + abs_q_head_s * d_padded
+                            if output_chunk_major:
+                                o_base_for_scale = (
+                                    o_old_base_address
+                                    + abs_q_head_s * q_len * d_padded
+                                    + q_tile_start * d_padded
+                                )
+                            else:
+                                o_base_for_scale = o_old_base_address + q_tile_start * hq * d_padded + abs_q_head_s * d_padded
 
                         l_old_base_address = fp_sram_start_address + scale_head_index * 3 * br + 2 * br
 
@@ -357,7 +392,7 @@ def flash_attn_asm(
                             alive_registers_fp=alive_registers_fp[0:1],
                             o_old_base_address=o_base_for_scale,
                             l_old_base_address=l_old_base_address,
-                            o_row_stride=hq * d_padded,
+                            o_row_stride=(d_padded if output_chunk_major else hq * d_padded),
                             use_mask=use_batched,
                         )
     return generated_code
