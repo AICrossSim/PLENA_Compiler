@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ._imm import load_large_int
+from ._imm import addi_large_int, load_large_int
 
 
 def sequence_scan_asm(
@@ -18,10 +18,11 @@ def sequence_scan_asm(
 ) -> str:
     """
     Emit assembly that scans a flattened sequence (B=1, S, D) layout and writes
-    it into VRAM. When `reverse=True`, the generated code walks source blocks
-    from the end of S toward the beginning and uses `H_PREFETCH_R_V` so each
-    prefetch loads a block in reverse order. This gives the same effect as
-    `x.flip(dims=[1])` but with fewer instructions than a per-element loop.
+    it into VRAM in chunk-major layout [NB, S, V]. When `reverse=True`, the
+    generated code walks source blocks from the end of S toward the beginning
+    and uses `H_PREFETCH_R_V` so each prefetch loads a block in reverse order.
+    This gives the same effect as `x.flip(dims=[1])` but with fewer
+    instructions than a per-element loop.
 
     The generated code uses `rstride=1` for block prefetching. When the total
     sequence length is not divisible by `prefetch_block_size`, the tail falls
@@ -54,6 +55,9 @@ def sequence_scan_asm(
     src_reg = alive_registers[0]
     dst_reg = alive_registers[1]
     temp_reg = alive_registers[2]
+    if len(alive_registers) < 4:
+        raise ValueError("sequence_scan_asm with hardware loops requires at least 4 GP registers")
+    loop_reg = alive_registers[3]
 
     feature_tiles = output_row_stride // vlen
 
@@ -73,34 +77,54 @@ def sequence_scan_asm(
     full_block_count = seq_len // prefetch_block_size
     tail_start = full_block_count * prefetch_block_size
 
-    block_indices = range(full_block_count - 1, -1, -1) if reverse else range(full_block_count)
-
-    output_cursor = 0
-    for block_idx in block_indices:
-        if reverse:
-            source_start = (block_idx + 1) * prefetch_block_size - 1
-        else:
-            source_start = block_idx * prefetch_block_size
-        dest_start = output_cursor
-        output_cursor += prefetch_block_size
-
+    if not reverse:
+        lines.append("; Forward scan loop path uses single-row prefetch like preload_act(batch=1)")
         for tile in range(feature_tiles):
-            source_offset = source_start * input_row_stride + tile * vlen
-            dest_offset = output_vram_base + dest_start * output_row_stride + tile * vlen
+            source_offset = tile * vlen
+            # Destination layout is chunk-major [NB, S, V].
+            # flat_idx = ((tile * seq_len) + token_idx) * vlen
+            dest_offset = output_vram_base + (tile * seq_len) * vlen
 
             lines.extend(load_large_int(src_reg, source_offset))
             lines.extend(load_large_int(dst_reg, dest_offset))
-            lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 1, 0")
+            lines.append(f"C_LOOP_START gp{loop_reg}, {seq_len}")
+            lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 0, 0")
+            lines.extend(addi_large_int(src_reg, src_reg, input_row_stride, temp_reg))
+            lines.extend(addi_large_int(dst_reg, dst_reg, vlen, temp_reg))
+            lines.append(f"C_LOOP_END gp{loop_reg}")
 
+        return "\n".join(lines) + "\n"
+
+    block_src_step = prefetch_block_size * input_row_stride
+    block_dst_step = prefetch_block_size * vlen
+    output_cursor = 0
     if tail_start < seq_len:
-        tail_indices = range(seq_len - 1, tail_start - 1, -1) if reverse else range(tail_start, seq_len)
-        for out_idx, source_idx in enumerate(tail_indices, start=output_cursor):
+        # For reverse scans with a non-divisible tail, emit tail rows first so
+        # destination order remains exactly [S-1, S-2, ..., 0].
+        reverse_tail_indices = range(seq_len - 1, tail_start - 1, -1)
+        for out_idx, source_idx in enumerate(reverse_tail_indices):
             for tile in range(feature_tiles):
                 source_offset = source_idx * input_row_stride + tile * vlen
-                dest_offset = output_vram_base + out_idx * output_row_stride + tile * vlen
+                dest_offset = output_vram_base + (tile * seq_len + out_idx) * vlen
 
                 lines.extend(load_large_int(src_reg, source_offset))
                 lines.extend(load_large_int(dst_reg, dest_offset))
                 lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 0, 0")
+        output_cursor = seq_len - tail_start
+
+    if full_block_count > 0:
+        lines.append("; Reverse scan block path using C_LOOP")
+        for tile in range(feature_tiles):
+            source_offset = (tail_start - 1) * input_row_stride + tile * vlen
+            dest_offset = output_vram_base + (tile * seq_len + output_cursor) * vlen
+
+            lines.extend(load_large_int(src_reg, source_offset))
+            lines.extend(load_large_int(dst_reg, dest_offset))
+            lines.extend(load_large_int(temp_reg, block_src_step))
+            lines.append(f"C_LOOP_START gp{loop_reg}, {full_block_count}")
+            lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 1, 0")
+            lines.append(f"S_SUB_INT gp{src_reg}, gp{src_reg}, gp{temp_reg}")
+            lines.extend(addi_large_int(dst_reg, dst_reg, block_dst_step, temp_reg))
+            lines.append(f"C_LOOP_END gp{loop_reg}")
 
     return "\n".join(lines) + "\n"

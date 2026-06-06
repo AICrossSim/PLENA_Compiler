@@ -15,9 +15,11 @@ def columnwise_scan_stride_asm(
     prefetch_block_size: int = 4,
     input_row_stride: int | None = None,
     output_row_stride: int | None = None,
+    reverse: bool = False,
 ) -> str:
     """
-    Stride-optimized reordering of batch=1 matrix from row-major to column-major layout.
+    Stride-optimized reordering of batch=1 matrix to column-major token order
+    with chunk-major VRAM layout [NB, S, V].
     
     This version uses H_PREFETCH_V with rstride=1 to load multiple rows from a column block with
     a single instruction call, reducing the number of prefetch instructions compared to the
@@ -29,8 +31,9 @@ def columnwise_scan_stride_asm(
     tiles for that column.
     
     The input is treated as a flattened (rows * cols, feature_dim) matrix.
-    Output rows are written in transposed order so that the logical index
-    (r, c) maps to output row c * rows + r.
+    Destination token order is transposed so that logical index (r, c) maps
+    to token index c * rows + r. When `reverse=True`, the transposed token
+    order is reversed to match a sequence flip after the columnwise reorder.
 
     Args:
         mlen: Matrix tile size
@@ -40,13 +43,13 @@ def columnwise_scan_stride_asm(
         feature_dim: Feature width per row (D) - should be divisible by vlen
         alive_registers: GP registers available for use [src_reg, dst_reg, ..., temp_reg]
         input_hbm_base_addr_reg: HBM base address register index.
-        output_vram_base: Base VRAM address for the transposed output.
+        output_vram_base: Base VRAM address for the chunk-major output.
         prefetch_block_size: Number of rows to prefetch per H_PREFETCH_V call (HBM_V_Prefetch_Amount parameter in plena_settings.toml).
         input_row_stride: Physical row stride for the source matrix.
         output_row_stride: Physical row stride for the destination matrix.
 
     Returns:
-        Assembly string that writes the transposed layout into VRAM using stride-based prefetch.
+        Assembly string that writes chunk-major [NB, S, V] layout using stride-based prefetch.
     """
     _ = mlen
 
@@ -76,13 +79,21 @@ def columnwise_scan_stride_asm(
 
     src_reg = alive_registers[0]
     dst_reg = alive_registers[1]
+    loop_reg = alive_registers[2]
     temp_reg = alive_registers[3]
 
+    seq_len = rows * cols
     feature_tiles = output_row_stride // vlen
+    prefetch_mnemonic = "H_PREFETCH_R_V" if reverse else "H_PREFETCH_V"
 
     lines: list[str] = []
-    lines.append("; Columnwise scan with stride-based prefetch optimization")
-    lines.append(f"; Reorder (rows={rows}, cols={cols}, D={feature_dim}) -> (cols, rows, D)")
+    lines.append("; Columnwise scan with stride-based prefetch optimization (chunk-major output)")
+    if reverse:
+        lines.append(
+            f"; Reorder token order (rows={rows}, cols={cols}, D={feature_dim}) -> reverse((cols, rows, D))"
+        )
+    else:
+        lines.append(f"; Reorder token order (rows={rows}, cols={cols}, D={feature_dim}) -> (cols, rows, D)")
     lines.append(f"; Prefetch block size: {prefetch_block_size} rows per full H_PREFETCH_V block")
     lines.append(f"; Source stride={input_row_stride}, destination stride={output_row_stride}")
     lines.append(f"; STRIDE_REG will be set to {cols * input_row_stride} (cols * input_row_stride)")
@@ -91,64 +102,100 @@ def columnwise_scan_stride_asm(
     # To go from (row_r, col_c) to (row_r+1, col_c), we move by:
     # ((r+1)*cols + c - (r*cols + c)) * input_row_stride = cols * input_row_stride
     col_stride = cols * input_row_stride
-    total_input_size = rows * cols * input_row_stride
+    total_input_size = seq_len * input_row_stride
     lines.extend(load_large_int(temp_reg, total_input_size))
     lines.append(f"C_SET_SCALE_REG gp{temp_reg}")
     lines.extend(load_large_int(temp_reg, col_stride))
     lines.append(f"C_SET_STRIDE_REG gp{temp_reg}")
 
-    # For each column
+    if not reverse:
+        # For each column
+        for col in range(cols):
+            full_block_count = rows // prefetch_block_size
+            tail_start = full_block_count * prefetch_block_size
+            tile_dst_step = seq_len * vlen
+
+            lines.append(f"; Column {col}: full blocks={full_block_count}, tail={rows - tail_start}")
+
+            # Full blocks: keep row-block iteration in Python, but loop tiles in hardware.
+            for block_idx in range(full_block_count):
+                row_start = block_idx * prefetch_block_size
+                source_offset = (row_start * cols + col) * input_row_stride
+                dest_token_index_first = col * rows + row_start
+                # Chunk-major [NB, S, V] for B=1:
+                # flat_idx = ((tile * seq_len) + token_idx) * vlen
+                dest_offset = output_vram_base + dest_token_index_first * vlen
+
+                lines.extend(load_large_int(src_reg, source_offset))
+                lines.extend(load_large_int(dst_reg, dest_offset))
+                lines.extend(load_large_int(temp_reg, tile_dst_step))
+                lines.append(f"C_LOOP_START gp{loop_reg}, {feature_tiles}")
+                lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 1, 0")
+                lines.append(f"S_ADDI_INT gp{src_reg}, gp{src_reg}, {vlen}")
+                lines.append(f"S_ADD_INT gp{dst_reg}, gp{dst_reg}, gp{temp_reg}")
+                lines.append(f"C_LOOP_END gp{loop_reg}")
+
+            # Tail rows: per-row source progression, with tile loop in hardware.
+            for row in range(tail_start, rows):
+                source_offset = (row * cols + col) * input_row_stride
+                dest_token_index = col * rows + row
+                dest_offset = output_vram_base + dest_token_index * vlen
+
+                lines.extend(load_large_int(src_reg, source_offset))
+                lines.extend(load_large_int(dst_reg, dest_offset))
+                lines.extend(load_large_int(temp_reg, tile_dst_step))
+                lines.append(f"C_LOOP_START gp{loop_reg}, {feature_tiles}")
+                lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 0, 0")
+                lines.append(f"S_ADDI_INT gp{src_reg}, gp{src_reg}, {vlen}")
+                lines.append(f"S_ADD_INT gp{dst_reg}, gp{dst_reg}, gp{temp_reg}")
+                lines.append(f"C_LOOP_END gp{loop_reg}")
+
+        return "\n".join(lines) + "\n"
+
+    block_src_step = prefetch_block_size * col_stride
     for col in range(cols):
+        _ = col
+
+    for reverse_col_idx, col in enumerate(range(cols - 1, -1, -1)):
         full_block_count = rows // prefetch_block_size
         tail_start = full_block_count * prefetch_block_size
+        tile_dst_step = seq_len * vlen
+        output_cursor = reverse_col_idx * rows
+
+        lines.append(f"; Reverse column {col}: full blocks={full_block_count}, tail={rows - tail_start}")
+
+        if tail_start < rows:
+            reverse_tail_indices = range(rows - 1, tail_start - 1, -1)
+            for out_idx, row in enumerate(reverse_tail_indices):
+                source_offset = (row * cols + col) * input_row_stride
+                dest_token_index = output_cursor + out_idx
+                dest_offset = output_vram_base + dest_token_index * vlen
+
+                lines.extend(load_large_int(src_reg, source_offset))
+                lines.extend(load_large_int(dst_reg, dest_offset))
+                lines.extend(load_large_int(temp_reg, tile_dst_step))
+                lines.append(f"C_LOOP_START gp{loop_reg}, {feature_tiles}")
+                lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 0, 0")
+                lines.append(f"S_ADDI_INT gp{src_reg}, gp{src_reg}, {vlen}")
+                lines.append(f"S_ADD_INT gp{dst_reg}, gp{dst_reg}, gp{temp_reg}")
+                lines.append(f"C_LOOP_END gp{loop_reg}")
+            output_cursor += rows - tail_start
 
         for block_idx in range(full_block_count):
-            row_start = block_idx * prefetch_block_size
-            row_end = row_start + prefetch_block_size
-            
-            lines.append(f"; Column {col}, row block [{row_start}, {row_end}), full stride block")
-            
-            # For each feature tile within this row block
-            for tile in range(feature_tiles):
-                # Calculate source address for the first row in the block
-                source_row_index_first = row_start * cols + col
-                source_row_base_first = source_row_index_first * input_row_stride
-                source_offset = source_row_base_first + tile * vlen
-                
-                # Calculate destination address for the first row in the block
-                # (where the output will start writing)
-                dest_row_index_first = col * rows + row_start
-                dest_row_base_first = output_vram_base + dest_row_index_first * output_row_stride
-                dest_offset = dest_row_base_first + tile * vlen
-                
-                lines.extend(load_large_int(src_reg, source_offset))
-                lines.extend(load_large_int(dst_reg, dest_offset))
-                
-                # Use H_PREFETCH_V with rstride=1 to load a full block with a single call.
-                # Source: reads from source_offset + 0, + stride, + 2*stride, ...
-                # Destination: writes consecutively to VRAM starting at dest_offset
-                # (which is exactly where we want row_start's data for this tile)
-                lines.append(
-                    f"H_PREFETCH_V gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 1, 0"
-                )
+            row_end = tail_start - 1 - block_idx * prefetch_block_size
+            source_offset = (row_end * cols + col) * input_row_stride
+            dest_token_index_first = output_cursor + block_idx * prefetch_block_size
+            dest_offset = output_vram_base + dest_token_index_first * vlen
 
-        # Tail rows cannot use the stride path safely because H_PREFETCH_V always loads the
-        # configured prefetch width. Fall back to the original row-wise pattern for the tail.
-        for row in range(tail_start, rows):
-            source_row_index = row * cols + col
-            dest_row_index = col * rows + row
-
-            source_row_base = source_row_index * input_row_stride
-            dest_row_base = output_vram_base + dest_row_index * output_row_stride
-
-            for tile in range(feature_tiles):
-                source_offset = source_row_base + tile * vlen
-                dest_offset = dest_row_base + tile * vlen
-
-                lines.extend(load_large_int(src_reg, source_offset))
-                lines.extend(load_large_int(dst_reg, dest_offset))
-                lines.append(
-                    f"H_PREFETCH_V gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 0, 0"
-                )
+            lines.extend(load_large_int(src_reg, source_offset))
+            lines.extend(load_large_int(dst_reg, dest_offset))
+            lines.extend(load_large_int(temp_reg, tile_dst_step))
+            lines.append(f"C_LOOP_START gp{loop_reg}, {feature_tiles}")
+            lines.append(f"{prefetch_mnemonic} gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 1, 0")
+            lines.append(f"S_ADDI_INT gp{src_reg}, gp{src_reg}, {vlen}")
+            lines.append(f"S_ADD_INT gp{dst_reg}, gp{dst_reg}, gp{temp_reg}")
+            lines.append(f"C_LOOP_END gp{loop_reg}")
+            lines.extend(load_large_int(temp_reg, block_src_step))
+            lines.append(f"S_SUB_INT gp{src_reg}, gp{src_reg}, gp{temp_reg}")
 
     return "\n".join(lines) + "\n"

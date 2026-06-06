@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ._imm import addi_large_int
 from ._imm import load_large_int
 
 
@@ -17,11 +18,11 @@ def columnwise_scan_asm(
 ) -> str:
     """
     Reorder a batch=1 matrix from row-major (rows, cols, D) layout to
-    column-major logical layout (cols, rows, D).
+    column-major logical token order with chunk-major VRAM layout [NB, S, V].
 
     The input is treated as a flattened (rows * cols, feature_dim) matrix.
-    Output rows are written in transposed order so that the logical index
-    (r, c) maps to output row c * rows + r.
+    Destination token order is transposed so that logical index (r, c) maps
+    to token index c * rows + r.
 
     Args:
         mlen: Matrix tile size
@@ -31,12 +32,12 @@ def columnwise_scan_asm(
         feature_dim: Feature width per row (D) - should be divisible by vlen
         alive_registers: GP registers available for use [src_reg, dst_reg, ..., temp_reg]
         input_hbm_base_addr_reg: HBM base address register index.
-        output_vram_base: Base VRAM address for the transposed output.
+        output_vram_base: Base VRAM address for the chunk-major output.
         input_row_stride: Physical row stride for the source matrix.
         output_row_stride: Physical row stride for the destination matrix.
 
     Returns:
-        Assembly string that writes the transposed layout into VRAM.
+        Assembly string that writes chunk-major [NB, S, V] layout into VRAM.
     """
     _ = mlen
 
@@ -64,37 +65,36 @@ def columnwise_scan_asm(
 
     src_reg = alive_registers[0]
     dst_reg = alive_registers[1]
-    temp_reg = alive_registers[3]
-
+    temp_reg = alive_registers[2]
+    loop_reg = alive_registers[3]
     feature_tiles = output_row_stride // vlen
 
     lines: list[str] = []
-    lines.append("; Columnwise scan generation")
-    lines.append(f"; Reorder (rows={rows}, cols={cols}, D={feature_dim}) -> (cols, rows, D)")
+    lines.append("; Columnwise scan generation (chunk-major output)")
+    lines.append(f"; Reorder token order (rows={rows}, cols={cols}, D={feature_dim}) -> (cols, rows, D)")
     lines.append(f"; Source stride={input_row_stride}, destination stride={output_row_stride}")
 
+    source_row_step = cols * input_row_stride
     total_input_size = rows * cols * input_row_stride
     lines.extend(load_large_int(temp_reg, total_input_size))
     lines.append(f"C_SET_SCALE_REG gp{temp_reg}")
-    lines.extend(load_large_int(temp_reg, input_row_stride))
+    lines.extend(load_large_int(temp_reg, source_row_step))
     lines.append(f"C_SET_STRIDE_REG gp{temp_reg}")
 
     for col in range(cols):
-        for row in range(rows):
-            source_row_index = row * cols + col
-            dest_row_index = col * rows + row
+        for tile in range(feature_tiles):
+            source_offset = col * input_row_stride + tile * vlen
+            # Chunk-major [NB, S, V] for B=1:
+            # flat_idx = ((tile * seq_len) + token_idx) * vlen
+            dest_token_base = col * rows
+            dest_offset = output_vram_base + (tile * (rows * cols) + dest_token_base) * vlen
 
-            source_row_base = source_row_index * input_row_stride
-            dest_row_base = output_vram_base + dest_row_index * output_row_stride
-
-            for tile in range(feature_tiles):
-                source_offset = source_row_base + tile * vlen
-                dest_offset = dest_row_base + tile * vlen
-
-                lines.extend(load_large_int(src_reg, source_offset))
-                lines.extend(load_large_int(dst_reg, dest_offset))
-                lines.append(
-                    f"H_PREFETCH_V gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 1, 0"
-                )
+            lines.extend(load_large_int(src_reg, source_offset))
+            lines.extend(load_large_int(dst_reg, dest_offset))
+            lines.append(f"C_LOOP_START gp{loop_reg}, {rows}")
+            lines.append(f"H_PREFETCH_V gp{dst_reg}, gp{src_reg}, a{input_hbm_base_addr_reg}, 0, 0")
+            lines.extend(addi_large_int(src_reg, src_reg, source_row_step, temp_reg))
+            lines.extend(addi_large_int(dst_reg, dst_reg, vlen, temp_reg))
+            lines.append(f"C_LOOP_END gp{loop_reg}")
 
     return "\n".join(lines) + "\n"
