@@ -402,6 +402,14 @@ class ProgramTensorMixin:
         activation_base_address = self.get_vram_addr(input_var.name)
         max_k_tiles = max(hidden_size // mlen, inter_dim // mlen)
         use_loop_instructions = max_k_tiles <= self.mram_tile_capacity
+        # Per-op unroll override for isolation experiments (PLENA_UNROLL_FFN:
+        # "1"=force unrolled, "0"=force rolled/use-loops, unset=auto rule above).
+        import os as _os
+        _ffn_env = _os.environ.get("PLENA_UNROLL_FFN", "")
+        if _ffn_env == "1":
+            use_loop_instructions = False
+        elif _ffn_env == "0":
+            use_loop_instructions = True
         workspace_elems = batch_size * (2 * inter_dim + max(hidden_size, inter_dim))
         workspace_rows = (workspace_elems + mlen - 1) // mlen
         workspace = self.alloc(

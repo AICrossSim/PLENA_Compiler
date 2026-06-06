@@ -56,6 +56,21 @@ class IsaCompiler(
         self.generated_code = ""
         self.unroll_attention = unroll_loops
 
+    def _op_unroll(self, op: str) -> bool:
+        """Per-op unroll override for rolled-vs-unrolled isolation experiments.
+
+        ``PLENA_UNROLL_<OP>``: ``"1"`` forces this op unrolled, ``"0"`` forces it
+        rolled, unset falls back to the global ``self._unroll`` (``ATEN_OPS_UNROLL``).
+        Lets one op be toggled while the rest of the model stays at the default.
+        """
+        import os
+        _v = os.environ.get(f"PLENA_UNROLL_{op}", "")
+        if _v == "1":
+            return True
+        if _v == "0":
+            return False
+        return self._unroll
+
     def load_batch(
         self,
         hbm_object_name: str,
@@ -284,7 +299,7 @@ class IsaCompiler(
                     vlen=vlen,
                     batch_size=batch_size,
                     hidden_dim=hidden_dim,
-                    unroll=self._unroll,
+                    unroll=self._op_unroll("NORM"),
                 )
             else:
                 isa_code += layer_norm_asm(
@@ -296,7 +311,7 @@ class IsaCompiler(
                     vlen=vlen,
                     batch_size=batch_size,
                     hidden_dim=hidden_dim,
-                    unroll=self._unroll,
+                    unroll=self._op_unroll("NORM"),
                 )
 
             return self._emit(isa_code)
@@ -336,7 +351,7 @@ class IsaCompiler(
 
         # Rolled RoPE needs one extra GP register (the C_LOOP counter); the unrolled
         # path keeps its original 5-register allocation so its output is byte-identical.
-        gp_regs = self.register_allocator.allocate_gp(5 if self._unroll else 6)
+        gp_regs = self.register_allocator.allocate_gp(5 if self._op_unroll("ROPE") else 6)
 
         scratch_name = f"__rope_scratch__{x_name}__{len(self.generated_code)}"
         scratch_addr = self.vram_allocator.allocate(vlen, name=scratch_name)
@@ -352,7 +367,7 @@ class IsaCompiler(
                 vlen=vlen,
                 seq_len=seq_len,
                 head_dim=head_dim,
-                unroll=self._unroll,
+                unroll=self._op_unroll("ROPE"),
             )
             return self._emit(isa_code)
         finally:
