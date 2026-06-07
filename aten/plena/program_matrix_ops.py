@@ -118,10 +118,36 @@ class ProgramMatrixOpsMixin:
         target_row_idx: int,
         target_col_idx: int,
         auto_reset_mram: bool = True,
+        mram_start_override: int | None = None,
     ):
         """
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[mram_row_idx][:]^T
+
+        KV-residency: when ``mram_start_override`` is set, K[mram_row_idx] is
+        assumed already resident in MRAM at that base (bulk-loaded once before
+        the q_idx loop). The per-block reset_mram + load_sub_matrix_row are
+        skipped and M_TMM reads the resident slot. The MRAM contents and read
+        addresses are identical to the per-block path, so numerics are
+        byte-for-byte unchanged.
         """
+        if mram_start_override is not None:
+            vram_matrix = self._require_var(vram_matrix, VRAMMatrixVar, "vram_matrix")
+            mram_input = self._require_var(mram_input, InputVar, "mram_input")
+            target = self._require_var(target, VRAMMatrixVar, "target")
+            self._ensure_vram_sub_matrix_registered(vram_matrix)
+            self._ensure_hbm_sub_matrix_registered(mram_input)
+            super().vram_sub_projection_T_to(
+                vram_mat_name=vram_matrix.name,
+                vram_row_idx=vram_row_idx,
+                mram_mat_name=mram_input.name,
+                mram_row_idx=mram_row_idx,
+                target_matrix=target.name,
+                target_row_idx=target_row_idx,
+                target_col_idx=target_col_idx,
+                mram_start_override=mram_start_override,
+            )
+            return
+
         vram_matrix, mram_input, target = self._prepare_projection(vram_matrix, mram_input, target, auto_reset_mram)
         super().load_sub_matrix_row(name=mram_input.name, row_idx=mram_row_idx)
         super().vram_sub_projection_T_to(

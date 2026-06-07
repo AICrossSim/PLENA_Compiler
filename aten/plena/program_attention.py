@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
@@ -71,6 +72,7 @@ class ProgramAttentionMixin:
         batch_size: int = 1,
         seq_len: int | None = None,
         kv_seq_len: int | None = None,
+        kv_residency: bool = False,
     ):
         """Emit flash attention, dispatching to MHA or fused GQA codegen by shape."""
         if hq == 1 and hkv == 1:
@@ -83,6 +85,7 @@ class ProgramAttentionMixin:
                 batch_size=batch_size,
                 seq_len=seq_len,
                 kv_seq_len=kv_seq_len,
+                kv_residency=kv_residency,
             )
 
         if h_qkv is None:
@@ -113,6 +116,7 @@ class ProgramAttentionMixin:
         batch_size: int = 1,
         seq_len: int | None = None,
         kv_seq_len: int | None = None,
+        kv_residency: bool = False,
     ):
         """Single-head online-softmax flash attention using compiler primitives."""
         total_q_rows, head_dim = Q.shape
@@ -166,6 +170,30 @@ class ProgramAttentionMixin:
         num_q_blocks = math.ceil(seq_len / mlen)
         num_k_blocks = math.ceil(kv_seq_len / mlen)
         k_row_blocks_per_batch = max(1, math.ceil(k_rows_per_batch / mlen))
+
+        # --- KV-residency planning (opt-in, vision MHA prefill) ---------------
+        # Load each head's full K and V into MRAM ONCE per (batch) before the
+        # q_idx loop, then read by k_idx slot in the inner loop instead of
+        # re-prefetching K/V for every (q_idx, k_idx). Same bytes -> identical
+        # numerics; only the redundant reload/reset is removed. Disabled unless
+        # the configured MRAM tile capacity can hold the resident K+V regions,
+        # so the default (small-MRAM) path stays byte-for-byte unchanged.
+        tile_elems = mlen * mlen
+        num_k_col_blocks = max(1, math.ceil(head_dim / mlen))
+        k_tile_span = num_k_col_blocks * tile_elems
+        v_tile_span = num_k_col_blocks * tile_elems
+        resident_tiles = num_k_blocks * (num_k_col_blocks + num_k_col_blocks)
+        # Kill-switch for A/B byte-identity validation against the per-block path.
+        residency_disabled = os.environ.get("PLENA_DISABLE_KV_RESIDENCY") == "1"
+        use_residency = (
+            bool(kv_residency)
+            and not residency_disabled
+            and (resident_tiles <= self.mram_tile_capacity)
+        )
+        if use_residency:
+            k_resident_base = 0
+            v_resident_base = num_k_blocks * k_tile_span
+
         valid_col_masks: dict[int, VRAMMatrixVar] = {}
         for k_idx in range(num_k_blocks):
             block_cols = min(mlen, kv_seq_len - k_idx * mlen)
@@ -231,6 +259,30 @@ class ProgramAttentionMixin:
                 )
 
             batch_k_block_base = batch_idx * k_row_blocks_per_batch
+
+            if use_residency:
+                # Bulk-load this head/batch's full K and V into MRAM ONCE.
+                # K[physical_k_idx] -> K_base + k_idx*k_tile_span (4 col-blocks,
+                # tile stride mlen*mlen, exactly the load_sub_matrix_row layout
+                # the QK^T M_TMM expects). V via residency_load_v into V_base.
+                self._ensure_hbm_sub_matrix_registered(K)
+                self._ensure_hbm_sub_matrix_registered(V)
+                self.reset_mram()
+                for k_idx in range(num_k_blocks):
+                    physical_k_idx = batch_k_block_base + k_idx
+                    k_slot = k_resident_base + k_idx * k_tile_span
+                    self.load_sub_matrix_row(
+                        name=K.name,
+                        row_idx=physical_k_idx,
+                        mram_start_addr=k_slot,
+                    )
+                self.residency_load_v(
+                    v_sub_matrix=V.name,
+                    k_indices=[batch_k_block_base + k for k in range(num_k_blocks)],
+                    head_dim=head_dim,
+                    v_resident_mram_base=v_resident_base,
+                )
+
             for q_idx in range(num_q_blocks):
                 block_rows = min(mlen, seq_len - q_idx * mlen)
                 self.init_online_softmax(q_idx, O_batch, rows=block_rows)
@@ -264,6 +316,12 @@ class ProgramAttentionMixin:
                                 f"(q_offset={q_offset}, q_idx={q_idx}, k_idx={k_idx})."
                             )
                     physical_k_idx = batch_k_block_base + k_idx
+                    k_override = (
+                        k_resident_base + k_idx * k_tile_span if use_residency else None
+                    )
+                    v_resident_base_k = (
+                        v_resident_base + k_idx * v_tile_span if use_residency else None
+                    )
                     self.vram_sub_projection_T_to(
                         Q_batch,
                         q_idx,
@@ -272,6 +330,7 @@ class ProgramAttentionMixin:
                         S_block,
                         target_row_idx=0,
                         target_col_idx=0,
+                        mram_start_override=k_override,
                     )
                     valid_col_mask = valid_col_masks.get(block_cols)
                     if valid_col_mask is not None:
@@ -280,7 +339,15 @@ class ProgramAttentionMixin:
                         self.vram_add(S_block, causal_mask)
                     softmax_valid_cols = None if valid_col_mask is not None else block_cols
                     self.online_softmax_block(S_block, scale, rows=block_rows, valid_cols=softmax_valid_cols)
-                    self.compute_pv(S_block, V, physical_k_idx, PV, head_dim, rows=block_rows)
+                    self.compute_pv(
+                        S_block,
+                        V,
+                        physical_k_idx,
+                        PV,
+                        head_dim,
+                        rows=block_rows,
+                        v_resident_mram_base=v_resident_base_k,
+                    )
                     self.scale_o_row(O_batch, q_idx, rows=block_rows)
                     self.vram_add(O_batch, PV, dst_row_offset=q_idx * mlen, num_rows=block_rows)
 
@@ -991,6 +1058,7 @@ class ProgramAttentionMixin:
         pv_matrix: VRAMMatrixVar,
         head_dim: int,
         rows: int | None = None,
+        v_resident_mram_base: int | None = None,
     ):
         """Compute PV = P @ V[k_idx] where P is stored in s_block."""
         if not isinstance(s_block, VRAMMatrixVar):
@@ -1008,6 +1076,7 @@ class ProgramAttentionMixin:
             pv_matrix=pv_matrix.name,
             head_dim=head_dim,
             rows=rows,
+            v_resident_mram_base=v_resident_mram_base,
         )
 
     def scale_o_row(self, o_matrix: VRAMMatrixVar, q_idx: int, rows: int | None = None):

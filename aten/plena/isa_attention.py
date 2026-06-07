@@ -36,7 +36,7 @@ class IsaAttentionMixin:
           [mlen, 2*mlen):   m_res = exp(m_old - m_curr)
           [2*mlen, 3*mlen): l_old / l_new
         """
-        if getattr(self, "unroll_attention", False):
+        if self._op_unroll("ATTENTION"):
             return self._online_softmax_asm_unrolled(
                 mlen=mlen,
                 s_address=s_address,
@@ -220,6 +220,7 @@ class IsaAttentionMixin:
         pv_address: int,
         rows: int | None = None,
         pv_physical_rows: int | None = None,
+        v_resident_mram_base: int | None = None,
     ) -> str:
         """
         Compute PV = P @ V via M_MM.
@@ -241,7 +242,7 @@ class IsaAttentionMixin:
         if pv_physical_rows is None:
             pv_physical_rows = mlen
 
-        if getattr(self, "unroll_attention", False):
+        if self._op_unroll("ATTENTION"):
             return self._pv_multiply_asm_unrolled(
                 mlen=mlen,
                 blen=blen,
@@ -251,6 +252,7 @@ class IsaAttentionMixin:
                 v_hbm_offset=v_hbm_offset,
                 pv_address=pv_address,
                 pv_physical_rows=pv_physical_rows,
+                v_resident_mram_base=v_resident_mram_base,
             )
 
         gp_regs = self.register_allocator.allocate_gp(8)
@@ -285,13 +287,21 @@ class IsaAttentionMixin:
                 f"; --- V column block {v_col_block} (columns {v_col_block * mlen} to {(v_col_block + 1) * mlen - 1}) ---"
             )
 
-            # Prefetch V[:, v_col_block*mlen:(v_col_block+1)*mlen] (mlen × mlen) to MSRAM.
-            # V is row-major in HBM: V[row, col] at offset row*head_dim + col, so the
-            # column-block base offset = v_hbm_offset + v_col_block * mlen (elements).
-            v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
-            lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
-            lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
+            if v_resident_mram_base is not None:
+                # KV-residency: V col-block already lives at a fixed MRAM slot loaded
+                # once before the q_idx loop. Skip the per-block HBM prefetch and read
+                # directly from the resident tile (col-block v at base + v*mlen*mlen).
+                v_block_mram_base = v_resident_mram_base + v_col_block * mlen * mlen
+                lines.append(f"; (resident V tile at MRAM[{v_block_mram_base}], no prefetch)")
+                lines.extend(load_large_int(gp_v, v_block_mram_base))
+            else:
+                # Prefetch V[:, v_col_block*mlen:(v_col_block+1)*mlen] (mlen × mlen) to MSRAM.
+                # V is row-major in HBM: V[row, col] at offset row*head_dim + col, so the
+                # column-block base offset = v_hbm_offset + v_col_block * mlen (elements).
+                v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
+                lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
+                lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
+                lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
 
             pv_col_block_base = pv_address + v_col_block * pv_physical_rows * mlen
             lines.extend(load_large_int(gp_pv_col_base, pv_col_block_base))
@@ -321,6 +331,7 @@ class IsaAttentionMixin:
         v_hbm_offset: int,
         pv_address: int,
         pv_physical_rows: int | None = None,
+        v_resident_mram_base: int | None = None,
     ) -> str:
         """Legacy Python-unrolled P @ V emission, kept for A/B comparisons."""
         if pv_physical_rows is None:
@@ -346,15 +357,20 @@ class IsaAttentionMixin:
             lines.append(
                 f"; --- V column block {v_col_block} (columns {v_col_block * mlen} to {(v_col_block + 1) * mlen - 1}) ---"
             )
-            v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
-            lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
-            lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
+            if v_resident_mram_base is not None:
+                v_block_mram_base = v_resident_mram_base + v_col_block * mlen * mlen
+                lines.append(f"; (resident V tile at MRAM[{v_block_mram_base}], no prefetch)")
+            else:
+                v_block_mram_base = 0
+                v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
+                lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
+                lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
+                lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
 
             for v_col in range(mlen // blen):
                 lines.append(f"; V column {v_col_block * mlen + v_col * blen}")
-                v_msram_offset = v_col * blen
-                lines.append(f"S_ADDI_INT gp{gp_v}, gp0, {v_msram_offset}")
+                v_msram_offset = v_block_mram_base + v_col * blen
+                lines.extend(load_large_int(gp_v, v_msram_offset))
 
                 for p_row in range(mlen // blen):
                     p_row_addr = p_address + p_row * blen * mlen
@@ -379,7 +395,7 @@ class IsaAttentionMixin:
         rows: int | None = None,
     ) -> str:
         """Scale each row of O by m_res: O[row] *= m_res[row]."""
-        if getattr(self, "unroll_attention", False):
+        if self._op_unroll("ATTENTION"):
             return self._scale_o_asm_unrolled(
                 mlen=mlen,
                 head_dim=head_dim,
@@ -520,7 +536,7 @@ class IsaAttentionMixin:
         V_MUL_VF processes mlen elements at a time; when head_dim > mlen,
         each row is split into head_dim // mlen mlen-wide blocks.
         """
-        if getattr(self, "unroll_attention", False):
+        if self._op_unroll("ATTENTION"):
             return self._final_scaling_asm_unrolled(
                 mlen=mlen,
                 head_dim=head_dim,
@@ -633,7 +649,7 @@ class IsaAttentionMixin:
         # Use f1 for FP scalar - FP registers don't go through GP allocator
         lines.append(f"S_LD_FP f1, gp0, {value_address}")
 
-        if getattr(self, "unroll_attention", False):
+        if self._op_unroll("ATTENTION"):
             for i in range(count):
                 lines.append(f"S_ST_FP f1, gp{gp_addr}, {i}")
         else:
@@ -672,7 +688,7 @@ class IsaAttentionMixin:
         lines.append("; Storage layout: (total_rows, mlen, cols/mlen), column-block major")
         lines.append(f"; total_rows = {total_rows}, row_offset = {row_offset}")
 
-        if getattr(self, "unroll_attention", False):
+        if self._op_unroll("ATTENTION"):
             for row in range(rows):
                 actual_row = row_offset + row
                 for col_block in range(num_col_blocks):
@@ -772,12 +788,19 @@ class IsaAttentionMixin:
         pv_matrix: str,
         head_dim: int,
         rows: int | None = None,
+        v_resident_mram_base: int | None = None,
     ) -> str:
         """
         Compute PV = P @ V[k_idx].
 
         P lives in s_block_matrix (softmax result); V is prefetched from
         HBM; PV is written to VRAM via pv_matrix.
+
+        When ``v_resident_mram_base`` is set, V[k_idx] is assumed to already be
+        resident in MRAM at that base (loaded once by the KV-residency bulk
+        loader before the q_idx loop), and the per-block HBM prefetch + addr
+        register setup are skipped. The data read is identical, so numerics are
+        byte-for-byte unchanged versus the prefetch path.
         """
         s_info = self[s_block_matrix]
         p_address = s_info.vram_addr
@@ -790,6 +813,21 @@ class IsaAttentionMixin:
         v_hbm_offset = k_idx * self.mlen * physical_head_dim
 
         isa_code = f"; === Compute PV = P @ V[k_idx={k_idx}] ===\n"
+
+        if v_resident_mram_base is not None:
+            isa_code += self._pv_multiply_asm(
+                mlen=self.mlen,
+                blen=self.blen,
+                head_dim=head_dim,
+                p_address=p_address,
+                v_hbm_offset_reg=0,
+                v_hbm_offset=v_hbm_offset,
+                pv_address=pv_address,
+                rows=rows,
+                pv_physical_rows=pv_info.physical_shape[0],
+                v_resident_mram_base=v_resident_mram_base,
+            )
+            return self._emit(isa_code)
 
         addr_regs = self.register_allocator.allocate_addr(1)
         v_hbm_reg = addr_regs[0]
@@ -816,6 +854,67 @@ class IsaAttentionMixin:
         self.register_allocator.free_gp(gp_regs)
         self.register_allocator.free_addr(addr_regs)
 
+        return self._emit(isa_code)
+
+    def residency_v_tile_span(self, head_dim: int) -> int:
+        """MRAM elements one V block (all col-blocks for one k_idx) occupies."""
+        num_v_col_blocks = max(1, math.ceil(head_dim / self.mlen))
+        return num_v_col_blocks * self.mlen * self.mlen
+
+    def residency_load_v(
+        self,
+        v_sub_matrix: str,
+        k_indices,
+        head_dim: int,
+        v_resident_mram_base: int,
+    ) -> str:
+        """Bulk-load V[k_idx] for every k_idx into distinct resident MRAM slots.
+
+        Emits exactly the per-col-block H_PREFETCH_M that ``_pv_multiply_asm``
+        would emit per (q_idx, k_idx), but only ONCE per head and targeting the
+        resident slot ``v_resident_mram_base + slot_idx*tile_span + col*tile``.
+        compute_pv(v_resident_mram_base=...) then reads these slots with no
+        reload, so the data fed to M_MM is byte-identical.
+        """
+        v_layout = self.get_hbm_layout(v_sub_matrix)
+        physical_head_dim = (v_layout.physical_shape or v_layout.full_shape)[1]
+        num_v_col_blocks = max(1, math.ceil(head_dim / self.mlen))
+        tile_span = self.residency_v_tile_span(head_dim)
+
+        addr_regs = self.register_allocator.allocate_addr(1)
+        v_hbm_reg = addr_regs[0]
+        gp_setup = self.register_allocator.allocate_gp(2)
+
+        from compiler.asm_templates import preload_addr_reg_asm
+
+        isa_code = "; === KV-residency: bulk-load V into MRAM (once per head) ===\n"
+        isa_code += preload_addr_reg_asm(
+            addr_reg_to_set=[v_hbm_reg],
+            available_registers=gp_setup,
+            addr_reg_val=[v_layout.hbm_base_addr],
+        )
+        self.register_allocator.free_gp(gp_setup)
+
+        gp_regs = self.register_allocator.allocate_gp(2)
+        gp_mram = gp_regs[0]
+        gp_hbm = gp_regs[1]
+        lines: list[str] = []
+        for slot_idx, k_idx in enumerate(k_indices):
+            v_hbm_offset = k_idx * self.mlen * physical_head_dim
+            slot_base = v_resident_mram_base + slot_idx * tile_span
+            for v_col_block in range(num_v_col_blocks):
+                v_block_hbm_offset = v_hbm_offset + v_col_block * self.mlen
+                v_block_mram_base = slot_base + v_col_block * self.mlen * self.mlen
+                lines.append(
+                    f"; V resident slot {slot_idx} (k_idx={k_idx}) col-block {v_col_block}"
+                    f" -> MRAM[{v_block_mram_base}]"
+                )
+                lines.extend(load_large_int(gp_mram, v_block_mram_base))
+                lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
+                lines.append(f"H_PREFETCH_M gp{gp_mram}, gp{gp_hbm}, a{v_hbm_reg}, 1, 1")
+        isa_code += "\n".join(lines) + "\n"
+        self.register_allocator.free_gp(gp_regs)
+        self.register_allocator.free_addr(addr_regs)
         return self._emit(isa_code)
 
     def scale_o_row(

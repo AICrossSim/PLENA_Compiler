@@ -311,8 +311,16 @@ class IsaMatrixMixin:
         result_vram_addr: int,
         gp_regs: list[int] | None = None,
         unroll: bool | None = None,
+        mram_start_override: int | None = None,
     ) -> str:
-        """Emit VRAM[row][:] @ MRAM[row][:]^T projection."""
+        """Emit VRAM[row][:] @ MRAM[row][:]^T projection.
+
+        ``mram_start_override`` lets the KV-residency path point M_TMM at a
+        fixed resident MRAM slot (where K[mram_row_idx]'s col-blocks were
+        bulk-loaded once before the q_idx loop) instead of resolving the start
+        from the per-block ``mram_addr`` bindings. The MRAM read addresses are
+        identical to the per-block-loaded layout, so numerics are unchanged.
+        """
         gp_regs = self._default_projection_gp_regs(gp_regs)
         vram_layout, mram_layout, vram_row_blocks = self._projection_context(vram_mat_name, vram_row_idx, mram_mat_name)
         mram_row_blocks = mram_layout.get_row_blocks(mram_row_idx)
@@ -327,10 +335,13 @@ class IsaMatrixMixin:
         valid_rows = vram_row_blocks[0].valid_shape[0] if vram_row_blocks[0].valid_shape else self.mlen
         row_loop_count = max(1, math.ceil(valid_rows / self.blen))
         vram_row_start_addr = vram_row_blocks[0].vram_addr
-        mram_row_start_addr = self._loaded_mram_start(
-            mram_row_blocks,
-            lambda block: f"{mram_mat_name}[{mram_row_idx}][{block.col_idx}]",
-        )
+        if mram_start_override is not None:
+            mram_row_start_addr = mram_start_override
+        else:
+            mram_row_start_addr = self._loaded_mram_start(
+                mram_row_blocks,
+                lambda block: f"{mram_mat_name}[{mram_row_idx}][{block.col_idx}]",
+            )
         # M_TMM reads the weight in transposed layout, so the outer-column
         # stride is one full sub-block instead of the non-transposed blen stride.
         mat_col_stride = self.blen * self.mlen
@@ -760,6 +771,7 @@ class IsaMatrixMixin:
         target_col_idx: int,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        mram_start_override: int | None = None,
     ) -> str:
         result_vram_addr, target_base_addr, target_rows = self._target_tile_addr(
             target_matrix, target_row_idx, target_col_idx
@@ -775,6 +787,7 @@ class IsaMatrixMixin:
                 mram_row_idx=mram_idx,
                 result_vram_addr=result_vram_addr,
                 gp_regs=gp_regs,
+                mram_start_override=mram_start_override,
             )
         else:
             isa_code = f"; VRAM Sub Projection To: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[:][{mram_idx}] -> {target_matrix}[{target_row_idx}][{target_col_idx}]\n"
@@ -833,6 +846,7 @@ class IsaMatrixMixin:
         target_matrix: str,
         target_row_idx: int,
         target_col_idx: int,
+        mram_start_override: int | None = None,
     ) -> str:
         """
         Transposed sub-block multiplication:
@@ -842,6 +856,10 @@ class IsaMatrixMixin:
           Q[i][:]: (mlen, hidden_size) row sub-block
           K[j][:]: (mlen, hidden_size) row sub-block, transposed to (hidden_size, mlen)
           S[i][j]: (mlen, mlen)
+
+        ``mram_start_override`` selects the KV-residency path: M_TMM reads K from
+        the given resident MRAM slot rather than from per-block ``mram_addr``
+        bindings (set by a prior reset_mram + load_sub_matrix_row).
         """
         return self._emit_vram_sub_projection_to(
             transposed=True,
@@ -852,6 +870,7 @@ class IsaMatrixMixin:
             target_matrix=target_matrix,
             target_row_idx=target_row_idx,
             target_col_idx=target_col_idx,
+            mram_start_override=mram_start_override,
         )
 
 

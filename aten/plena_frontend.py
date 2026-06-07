@@ -1472,8 +1472,12 @@ def _emit_vision_attention_block(
 
         K_stored = prog.store(K_h, name=f"V_K_stored_{layer_idx}_h{h}")
         V_stored = prog.store(V_h, name=f"V_V_stored_{layer_idx}_h{h}")
-        O_h = ops.flash_attention(
-            prog,
+        # Vision MHA prefill: opt in to flash-attention KV-residency. Each head's
+        # full K and V are loaded into MRAM once before the q_idx loop and read
+        # by k_idx slot (no per-(q,k) reload). Numerically byte-identical; only
+        # engages when the configured MRAM tile capacity can hold K+V (otherwise
+        # the kernel transparently falls back to the per-block prefetch path).
+        O_h = prog.flash_attention(
             Q_h,
             K_stored,
             V_stored,
@@ -1482,6 +1486,7 @@ def _emit_vision_attention_block(
             batch_size=1,
             seq_len=seq_len,
             kv_seq_len=seq_len,
+            kv_residency=True,
         )
 
         _copy_into_vram_view(
