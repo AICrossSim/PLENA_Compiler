@@ -74,18 +74,28 @@ class ProgramMatrixOpsMixin:
         auto_reset_mram: bool = True,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        load_mram_col: bool = True,
     ):
         """
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[:][mram_col_idx]
         Supports K-split: k_block_start/k_block_count select a subset of K tiles.
+
+        Weight-stationary hoisting: callers that sweep multiple activation rows
+        against the same weight column may reset + stream the column once (on the
+        first row) and then reuse it by passing ``auto_reset_mram=False`` and
+        ``load_mram_col=False`` on the remaining rows. The MRAM bindings created
+        by the single ``load_sub_matrix_col`` stay valid for the whole sweep
+        because no intervening ``reset_mram`` clears them, so the projection ASM
+        reads the already-resident weights for every row.
         """
         vram_matrix, mram_input, target = self._prepare_projection(vram_matrix, mram_input, target, auto_reset_mram)
-        super().load_sub_matrix_col(
-            name=mram_input.name,
-            col_idx=mram_col_idx,
-            k_block_start=k_block_start,
-            k_block_count=k_block_count,
-        )
+        if load_mram_col:
+            super().load_sub_matrix_col(
+                name=mram_input.name,
+                col_idx=mram_col_idx,
+                k_block_start=k_block_start,
+                k_block_count=k_block_count,
+            )
         super().vram_sub_projection_to(
             vram_mat_name=vram_matrix.name,
             vram_row_idx=vram_row_idx,
@@ -162,7 +172,21 @@ class ProgramMatrixOpsMixin:
             physical_shape=(physical_rows, physical_out_features),
         )
 
-        def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split):
+        def emit_projection(
+            row_idx,
+            col_idx,
+            target,
+            target_row_idx,
+            target_col_idx,
+            *,
+            stream_weights,
+            **k_split,
+        ):
+            # Weight-stationary reorder: reset MRAM + stream the weight column
+            # only on the first activation row of each (col_idx, k_chunk) sweep
+            # (stream_weights=True). Subsequent rows reuse the resident column,
+            # so they must neither reset MRAM nor reload the weights, otherwise
+            # the redundant per-row reload dominates the projection.
             self.vram_sub_projection_to(
                 input_var,
                 row_idx,
@@ -171,13 +195,22 @@ class ProgramMatrixOpsMixin:
                 target,
                 target_row_idx,
                 target_col_idx,
+                auto_reset_mram=stream_weights,
+                load_mram_col=stream_weights,
                 **k_split,
             )
 
         if num_k_tiles <= max_k_tiles:
             for col_idx in range(num_col_blocks):
                 for row_idx in range(num_row_blocks):
-                    emit_projection(row_idx, col_idx, output, row_idx, col_idx)
+                    emit_projection(
+                        row_idx,
+                        col_idx,
+                        output,
+                        row_idx,
+                        col_idx,
+                        stream_weights=(row_idx == 0),
+                    )
             return output
 
         # Temp buffer for one partial-sum tile. Allocating the full output shape
@@ -190,10 +223,31 @@ class ProgramMatrixOpsMixin:
             }
             for col_idx in range(num_col_blocks):
                 for row_idx in range(num_row_blocks):
+                    # Reset + stream the (col_idx, k_chunk) weight slice once per
+                    # column sweep; reuse it across all activation rows. The
+                    # partial-sum accumulation below is unchanged because it only
+                    # touches VRAM, never the MRAM weight bindings.
+                    stream_weights = row_idx == 0
                     if k_chunk_idx == 0:
-                        emit_projection(row_idx, col_idx, output, row_idx, col_idx, **k_split)
+                        emit_projection(
+                            row_idx,
+                            col_idx,
+                            output,
+                            row_idx,
+                            col_idx,
+                            stream_weights=stream_weights,
+                            **k_split,
+                        )
                     else:
-                        emit_projection(row_idx, col_idx, temp, 0, 0, **k_split)
+                        emit_projection(
+                            row_idx,
+                            col_idx,
+                            temp,
+                            0,
+                            0,
+                            stream_weights=stream_weights,
+                            **k_split,
+                        )
                         self.vram_block_add_to(
                             output,
                             row_idx,
