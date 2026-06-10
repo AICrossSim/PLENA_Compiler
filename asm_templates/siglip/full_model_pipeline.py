@@ -307,20 +307,31 @@ def build_full_model_asm(
         if final_ln_weight_base is None or final_ln_bias_base is None:
             raise ValueError("apply_post_layernorm=True requires final_ln_weight_base/final_ln_bias_base in vram_layout")
         final_ln_scratch_base = _align_up(final_output_base + seq_len * hidden_padded, mlen)
+        ln_activation_base = final_output_base
 
         asm_code += "\n; --- FINAL: Post-Encoder LayerNorm ---\n"
+        if final_output_base != int(final_input_base):
+            # Final compare reads from final_output_base; copy current activation there first.
+            asm_code += _copy_chunk_major_probe(
+                seq_len=seq_len,
+                hidden_size=hidden_padded,
+                vlen=vlen,
+                src_base=int(final_input_base),
+                dst_base=final_output_base,
+            )
+            asm_code += "\n"
+
         asm_code += layer_norm_asm(
             _eps_offset=2,
             reci_hid_offset=3,
             alive_registers=[5, 6, 7],
-            activation_base_address=final_input_base,
+            activation_base_address=ln_activation_base,
             scratchpad_base_address=final_ln_scratch_base,
             vlen=vlen,
             batch_size=seq_len,
             hidden_dim=hidden_padded,
             affine_weight_base_address=final_ln_weight_base,
             affine_bias_base_address=final_ln_bias_base,
-            output_base_address=final_output_base,
         )
         asm_code += "\n"
 
