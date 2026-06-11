@@ -54,6 +54,19 @@ def rms_norm_asm(
             generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
             generated_code += f"C_LOOP_END gp{loop_addr} \n"
 
+        # Second loop: normalize the activation in-place. Ping-pong the per-chunk
+        # address across two registers with a settle gap so the in-place V_MUL_VF
+        # never reads a just-written (stale) write-address register. chunk 0 uses
+        # act_addr (settled since the batch top); chunk 1 is pre-loaded before the FP
+        # tail; chunk i>=2 is loaded after chunk i-2 frees its register.
+        base = activation_base_address + vlen * batch
+        stride = vlen * batch_size
+        n_chunks = hidden_dim // vlen
+        addr_regs = (act_addr, stats_addr)
+
+        if n_chunks > 1:
+            generated_code += _load_large_int(addr_regs[1], base + stride)
+
         # Taking the avg
         generated_code += "S_MUL_FP f2, f2, f3 \n"
 
@@ -66,19 +79,22 @@ def rms_norm_asm(
         # Compute reciprocal
         generated_code += "S_RECI_FP f2, f2 \n"
 
-        # Second loop: normalize using act_addr
-        if unroll:
-            for i in range(hidden_dim // vlen):
-                # Normalize the activation vector
-                generated_code += f"V_MUL_VF gp{act_addr}, gp{act_addr}, f2, 0 \n"
+        # Spacer so the multi-cycle S_RECI_FP retires before the first V_MUL_VF reads f2.
+        for _ in range(4):
+            generated_code += "S_ADDI_INT gp0, gp0, 0 \n"
 
-                # Move to next vector
-                generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
-        else:
-            generated_code += f"C_LOOP_START gp{loop_addr}, {hidden_dim // vlen} \n"
-            generated_code += f"V_MUL_VF gp{act_addr}, gp{act_addr}, f2, 0 \n"
-            generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
-            generated_code += f"C_LOOP_END gp{loop_addr} \n"
+        for i in range(n_chunks):
+            cur = addr_regs[i % 2]
+            generated_code += f"V_MUL_VF gp{cur}, gp{cur}, f2, 0 \n"
+            if i + 2 < n_chunks:
+                # Loading the next-next chunk address also spaces consecutive V_MUL_VF.
+                generated_code += _load_large_int(cur, base + stride * (i + 2))
+            elif i + 1 < n_chunks:
+                # No load to emit but another V_MUL_VF follows: insert a one-instruction
+                # spacer so the two in-place writebacks land on different port-A cycles
+                # (adjacent V_MUL_VF collide on the shared write port and the first write
+                # is dropped, leaving that chunk un-normalized). Writes gp0 (zero reg) = NOP.
+                generated_code += "S_ADDI_INT gp0, gp0, 0 \n"
 
         # Reset accumulator for next batch
         generated_code += "S_ADD_FP f2, f0, f0 \n"
