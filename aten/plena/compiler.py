@@ -72,7 +72,7 @@ class PlenaCompiler(
         blen: int = 4,
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
-        mram_tile_capacity: int = 4,
+        mram_tile_capacity: int = 128,
         hbm_v_prefetch_amount: int | None = None,
         hbm_v_writeback_amount: int | None = None,
     ):
@@ -109,13 +109,19 @@ class PlenaCompiler(
         if hbm_v_writeback_amount is None:
             hbm_v_writeback_amount = _behavior_config_value("HBM_V_Writeback_Amount", 4)
         if hbm_v_prefetch_amount <= 0:
-            raise ValueError(f"hbm_v_prefetch_amount must be > 0, got {hbm_v_prefetch_amount}")
+            raise ValueError(
+                f"hbm_v_prefetch_amount must be > 0, got {hbm_v_prefetch_amount}"
+            )
         if hbm_v_writeback_amount <= 0:
-            raise ValueError(f"hbm_v_writeback_amount must be > 0, got {hbm_v_writeback_amount}")
+            raise ValueError(
+                f"hbm_v_writeback_amount must be > 0, got {hbm_v_writeback_amount}"
+            )
         self.hbm_v_prefetch_amount = hbm_v_prefetch_amount
         self.hbm_v_writeback_amount = hbm_v_writeback_amount
         self.hlen = _behavior_config_value("HLEN", mlen)
-        self.broadcast_amount = _behavior_config_value("BROADCAST_AMOUNT", max(1, mlen // max(1, self.hlen)))
+        self.broadcast_amount = _behavior_config_value(
+            "BROADCAST_AMOUNT", max(1, mlen // max(1, self.hlen))
+        )
 
         # HBM address auto-allocation
         self._next_hbm_addr: int = 0
@@ -166,7 +172,11 @@ class PlenaCompiler(
         best_idx = None
         best_waste = None
         for i, (addr, size) in enumerate(self._hbm_free_blocks):
-            aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes if needs_tile_align else addr
+            aligned_addr = (
+                ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+                if needs_tile_align
+                else addr
+            )
             aligned_waste = aligned_addr - addr
             effective_size = size - aligned_waste
             if effective_size >= hbm_size:
@@ -193,7 +203,9 @@ class PlenaCompiler(
             addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
         self._next_hbm_addr = ((addr + hbm_size + m - 1) // m) * m
         if needs_tile_align:
-            self._next_hbm_addr = ((self._next_hbm_addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+            self._next_hbm_addr = (
+                (self._next_hbm_addr + tile_bytes - 1) // tile_bytes
+            ) * tile_bytes
         return addr
 
     def _recycle_hbm(self, hbm_addr: int, hbm_size: int):

@@ -15,7 +15,9 @@ sys.path.insert(0, str(_PROJECT_ROOT / "tools"))  # `quant` package lives here
 
 import unittest  # noqa: E402
 
-from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl  # noqa: E402
+from compiler.asm_templates.vram_sub_projection_asm import (
+    vram_sub_projection_asm_impl,
+)  # noqa: E402
 
 
 def _base_kwargs(**overrides):
@@ -42,7 +44,9 @@ class TestVramSubProjectionAsmImpl(unittest.TestCase):
     def test_requires_9_gp_regs(self):
         """Passing fewer than 9 gp regs raises ValueError with caller_name."""
         with self.assertRaises(ValueError) as cm:
-            vram_sub_projection_asm_impl(**_base_kwargs(gp_regs=[1, 2, 3, 4, 5, 6, 7, 8]))
+            vram_sub_projection_asm_impl(
+                **_base_kwargs(gp_regs=[1, 2, 3, 4, 5, 6, 7, 8])
+            )
         self.assertIn("requires at least 9 gp registers", str(cm.exception))
 
     def test_looped_non_transposed_basic(self):
@@ -77,8 +81,12 @@ class TestVramSubProjectionAsmImpl(unittest.TestCase):
         # Must NOT contain an M_MM instruction (M_MM_WO is fine — stricter check below).
         for line in asm.splitlines():
             stripped = line.strip()
-            if stripped.startswith("M_MM "):  # trailing space distinguishes from M_MM_WO
-                self.fail(f"Unexpected M_MM (non-transposed) instruction in transposed output: {stripped}")
+            if stripped.startswith(
+                "M_MM "
+            ):  # trailing space distinguishes from M_MM_WO
+                self.fail(
+                    f"Unexpected M_MM (non-transposed) instruction in transposed output: {stripped}"
+                )
 
     def test_unrolled_no_loops(self):
         """Fully unrolled emits no C_LOOP and bakes every M_MM by hand."""
@@ -88,7 +96,9 @@ class TestVramSubProjectionAsmImpl(unittest.TestCase):
         self.assertNotIn("C_LOOP_END", asm)
 
         # Multiple inlined M_MM 0, gp2, gp1 — one per (oc, or_, ih) iteration.
-        mm_count = sum(1 for line in asm.splitlines() if line.strip().startswith("M_MM 0,"))
+        mm_count = sum(
+            1 for line in asm.splitlines() if line.strip().startswith("M_MM 0,")
+        )
         self.assertGreater(mm_count, 1)
 
         # At least one write-out per output-row tile.
@@ -122,6 +132,25 @@ class TestVramSubProjectionAsmImpl(unittest.TestCase):
         )
 
         self.assertEqual(method_out, free_out)
+
+    def test_transposed_large_stride_avoids_overflow_immediate(self):
+        """The transposed path must not emit raw 262144-sized S_ADDI_INT steps."""
+        asm = vram_sub_projection_asm_impl(
+            **_base_kwargs(
+                mlen=512,
+                blen=512,
+                full_batch=512,
+                num_hidden_blocks=1,
+                mat_col_stride=262144,
+                transposed=True,
+            )
+        )
+
+        self.assertNotIn("S_ADDI_INT gp1, gp1, 262144", asm)
+        self.assertNotIn("S_ADDI_INT gp2, gp2, 262144", asm)
+        self.assertNotIn("S_ADDI_INT gp3, gp3, 262144", asm)
+        self.assertNotIn("S_ADDI_INT gp7, gp7, 262144", asm)
+        self.assertNotIn("S_ADDI_INT gp8, gp8, 262144", asm)
 
 
 if __name__ == "__main__":

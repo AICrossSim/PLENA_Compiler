@@ -42,7 +42,7 @@ class IsaCompiler(
         blen: int = 4,
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
-        mram_tile_capacity: int = 4,
+        mram_tile_capacity: int = 128,
     ):
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
         super().__init__(
@@ -99,7 +99,9 @@ class IsaCompiler(
         isa_code += f"; HBM[{hbm_addr}] → VRAM[{vram_base}], shape=({h}, {w})\n"
 
         isa_code += preload_addr_reg_asm(
-            addr_reg_to_set=[addr_reg], available_registers=gp_regs_for_addr, addr_reg_val=[hbm_addr]
+            addr_reg_to_set=[addr_reg],
+            available_registers=gp_regs_for_addr,
+            addr_reg_val=[hbm_addr],
         )
 
         # preload_act_asm requires 5 GP registers: [a_actual, stride, result, outer_loop, inner_loop].
@@ -161,10 +163,20 @@ class IsaCompiler(
             if tensor_info.hbm_addr >= 0:
                 hbm_addr = tensor_info.hbm_addr
             else:
-                raise ValueError(f"Tensor '{tensor_name}' has no HBM address. Please specify hbm_addr.")
+                raise ValueError(
+                    f"Tensor '{tensor_name}' has no HBM address. Please specify hbm_addr."
+                )
 
-        batch_size = tensor_info.physical_shape[0] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[0]
-        hidden_size = tensor_info.physical_shape[1] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[1]
+        batch_size = (
+            tensor_info.physical_shape[0]
+            if tensor_info.physical_shape != (0, 0)
+            else tensor_info.shape[0]
+        )
+        hidden_size = (
+            tensor_info.physical_shape[1]
+            if tensor_info.physical_shape != (0, 0)
+            else tensor_info.shape[1]
+        )
 
         isa_code = f"; Store {tensor_name} from VRAM to HBM\n"
         isa_code += f"; VRAM[{tensor_info.vram_addr}] -> HBM[{hbm_addr}], shape=({batch_size}, {hidden_size})\n"
@@ -182,7 +194,9 @@ class IsaCompiler(
         try:
             gp_regs_for_addr = self.register_allocator.allocate_gp(2)
             isa_code += preload_addr_reg_asm(
-                addr_reg_to_set=[hbm_addr_reg], available_registers=gp_regs_for_addr, addr_reg_val=[hbm_addr]
+                addr_reg_to_set=[hbm_addr_reg],
+                available_registers=gp_regs_for_addr,
+                addr_reg_val=[hbm_addr],
             )
             self.register_allocator.free_gp(gp_regs_for_addr)
 
@@ -255,18 +269,26 @@ class IsaCompiler(
         if vlen is None:
             vlen = self.mlen
         if hidden_dim % vlen != 0:
-            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by vlen ({vlen}) for normalization_asm")
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by vlen ({vlen}) for normalization_asm"
+            )
 
         mode = mode.lower()
         if mode not in ("rms", "layer"):
-            raise ValueError(f"Unsupported normalization mode: {mode}. Expected 'rms' or 'layer'.")
+            raise ValueError(
+                f"Unsupported normalization mode: {mode}. Expected 'rms' or 'layer'."
+            )
 
         gp_regs = self.register_allocator.allocate_gp(4)
 
         temp_scratchpad_name = None
         if scratchpad_vram_addr is None:
-            temp_scratchpad_name = f"__norm_scratch__{tensor_name}__{len(self.generated_code)}"
-            scratchpad_vram_addr = self.vram_allocator.allocate(vlen, name=temp_scratchpad_name)
+            temp_scratchpad_name = (
+                f"__norm_scratch__{tensor_name}__{len(self.generated_code)}"
+            )
+            scratchpad_vram_addr = self.vram_allocator.allocate(
+                vlen, name=temp_scratchpad_name
+            )
 
         try:
             isa_code = (
@@ -326,11 +348,21 @@ class IsaCompiler(
 
         seq_len, logical_head_dim = x_info.shape
         vlen = self.mlen
-        physical_head_dim = x_info.physical_shape[1] if x_info.physical_shape != (0, 0) else logical_head_dim
-        head_dim = physical_head_dim if physical_head_dim >= logical_head_dim else logical_head_dim
+        physical_head_dim = (
+            x_info.physical_shape[1]
+            if x_info.physical_shape != (0, 0)
+            else logical_head_dim
+        )
+        head_dim = (
+            physical_head_dim
+            if physical_head_dim >= logical_head_dim
+            else logical_head_dim
+        )
 
         if head_dim % vlen != 0:
-            raise ValueError(f"head_dim ({head_dim}) must be divisible by vlen ({vlen}) for rope")
+            raise ValueError(
+                f"head_dim ({head_dim}) must be divisible by vlen ({vlen}) for rope"
+            )
 
         gp_regs = self.register_allocator.allocate_gp(5)
 

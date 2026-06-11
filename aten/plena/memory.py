@@ -7,7 +7,6 @@ import math
 
 from compiler.aten.plena.constants import MLEN
 
-
 # ==============================================================================
 # Virtual Memory Manager
 # ==============================================================================
@@ -23,7 +22,9 @@ class MemoryBlock:
 class VirtualMemoryManager:
     """Best-fit reuse plus bump allocation for PLENA virtual memories."""
 
-    def __init__(self, total_size: int, alignment: int = MLEN, mem_name: str = "Memory"):
+    def __init__(
+        self, total_size: int, alignment: int = MLEN, mem_name: str = "Memory"
+    ):
         self.total_size = total_size
         self.alignment = alignment
         self.mem_name = mem_name
@@ -42,7 +43,11 @@ class VirtualMemoryManager:
         aligned_size = self._align(size)
 
         best = min(
-            ((block.size - aligned_size, i) for i, block in enumerate(self.free_stack) if block.size >= aligned_size),
+            (
+                (block.size - aligned_size, i)
+                for i, block in enumerate(self.free_stack)
+                if block.size >= aligned_size
+            ),
             default=None,
         )
 
@@ -53,11 +58,15 @@ class VirtualMemoryManager:
             # If block is larger than needed, split remaining part and return to free_stack
             if reused_block.size > aligned_size:
                 remaining = MemoryBlock(
-                    name="<fragment>", addr=reused_block.addr + aligned_size, size=reused_block.size - aligned_size
+                    name="<fragment>",
+                    addr=reused_block.addr + aligned_size,
+                    size=reused_block.size - aligned_size,
                 )
                 self.free_stack.append(remaining)
 
-            new_block = MemoryBlock(name=name, addr=reused_block.addr, size=aligned_size)
+            new_block = MemoryBlock(
+                name=name, addr=reused_block.addr, size=aligned_size
+            )
             self.used_stack.append(new_block)
             return new_block.addr
 
@@ -142,7 +151,9 @@ class SubMatrixInfo:
     row_idx: int  # Sub-block row index
     col_idx: int  # Sub-block column index
     shape: tuple[int, int]  # Physical sub-block shape (typically mlen x mlen)
-    valid_shape: tuple[int, int] | None = None  # Logical rows/cols carried by this physical tile
+    valid_shape: tuple[int, int] | None = (
+        None  # Logical rows/cols carried by this physical tile
+    )
 
     # Pre-calculated addresses (computed during compiler phase, used directly at runtime)
     hbm_offset: int = 0  # Offset in HBM (in elements)
@@ -232,7 +243,9 @@ class VRAMSubMatrixInfo:
     row_idx: int  # Sub-block row index (batch dimension)
     col_idx: int  # Sub-block column index (hidden dimension)
     shape: tuple[int, int]  # Physical sub-block shape (typically mlen x mlen)
-    valid_shape: tuple[int, int] | None = None  # Logical rows/cols carried by this physical tile
+    valid_shape: tuple[int, int] | None = (
+        None  # Logical rows/cols carried by this physical tile
+    )
 
     # Pre-calculated VRAM address
     vram_addr: int = 0
@@ -280,7 +293,9 @@ class VRAMMatrixBlockLayout:
         # row sub-block r offset within column block = r * mlen * mlen
         for r in range(self.num_row_blocks):
             for c in range(self.num_col_blocks):
-                col_block_base = self.vram_base_addr + c * physical_batch * self.block_size
+                col_block_base = (
+                    self.vram_base_addr + c * physical_batch * self.block_size
+                )
                 row_offset = r * self.block_size * self.block_size
                 vram_addr = col_block_base + row_offset
                 valid_rows = max(0, min(self.block_size, batch - r * self.block_size))
@@ -355,7 +370,9 @@ class MemoryAllocatorBase:
     def __init__(self, total_size: int, alignment: int, mem_name: str):
         self.total_size = total_size
         self.alignment = alignment
-        self._vmm = VirtualMemoryManager(total_size=total_size, alignment=alignment, mem_name=mem_name)
+        self._vmm = VirtualMemoryManager(
+            total_size=total_size, alignment=alignment, mem_name=mem_name
+        )
 
     @property
     def next_free(self) -> int:
@@ -381,10 +398,16 @@ class MRAMAllocator(MemoryAllocatorBase):
     Matrix RAM address allocator.
 
     Each sub-block is mlen x mlen elements; aligned to mlen*mlen.
-    By default the allocator holds four matrix tiles.
+    By default the allocator holds sixteen matrix tiles.
     """
 
-    def __init__(self, total_size: int | None = None, *, mlen: int = MLEN, tile_capacity: int = 4):
+    def __init__(
+        self,
+        total_size: int | None = None,
+        *,
+        mlen: int = MLEN,
+        tile_capacity: int = 128,
+    ):
         if mlen <= 0:
             raise ValueError(f"mlen must be > 0, got {mlen}")
         if tile_capacity <= 0:
@@ -395,7 +418,9 @@ class MRAMAllocator(MemoryAllocatorBase):
         self.tile_elems = mlen * mlen
         if total_size is None:
             total_size = self.tile_elems * tile_capacity
-        super().__init__(total_size=total_size, alignment=self.tile_elems, mem_name="MRAM")
+        super().__init__(
+            total_size=total_size, alignment=self.tile_elems, mem_name="MRAM"
+        )
 
     def allocate(self, name: str, size: int) -> int:
         return self._vmm.allocate(name, size)
@@ -409,7 +434,9 @@ class VRAMAllocator(MemoryAllocatorBase):
 
     def allocate(self, size: int, name: str = "") -> int:
         if not name:
-            raise ValueError("VRAMAllocator.allocate() requires name for subsequent free.")
+            raise ValueError(
+                "VRAMAllocator.allocate() requires name for subsequent free."
+            )
         return self._vmm.allocate(name, size)
 
 
@@ -444,7 +471,9 @@ class FPRAMAllocator(MemoryAllocatorBase):
 
     def _validate_next_free(self, value: int) -> None:
         if value < 0 or value > self.total_size:
-            raise ValueError(f"next_free out of range: {value}, expected [0, {self.total_size}]")
+            raise ValueError(
+                f"next_free out of range: {value}, expected [0, {self.total_size}]"
+            )
 
     def allocate(self, name: str, size: int) -> int:
         """Allocate FP RAM space (best-fit + bump)."""

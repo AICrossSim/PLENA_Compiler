@@ -1,3 +1,4 @@
+from ._imm import add_large_int_str as _add_large_int
 from ._imm import load_large_int_str as _load_large_int
 
 
@@ -17,6 +18,7 @@ def rms_norm_asm(
     act_addr = alive_registers[0]
     scratchpad_addr = alive_registers[1]
     stats_addr = alive_registers[2]
+    temp_addr = alive_registers[3]
 
     generated_code = "; RMS Norm generation \n"
     generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
@@ -30,18 +32,26 @@ def rms_norm_asm(
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch
-        generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
+        generated_code += _load_large_int(
+            act_addr, activation_base_address + vlen * batch
+        )
         # Set stats_addr to same position for iteration
-        generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
+        generated_code += _load_large_int(
+            stats_addr, activation_base_address + vlen * batch
+        )
 
         # First loop: compute sum of squares using stats_addr
         for i in range(hidden_dim // vlen):
             # Compute square of the activation vector and summation
-            generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+            generated_code += (
+                f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+            )
             generated_code += f"V_RED_SUM f2, gp{scratchpad_addr} \n"
 
             # Move stats pointer to next vector
-            generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+            generated_code += _add_large_int(
+                stats_addr, stats_addr, vlen * batch_size, temp_reg=temp_addr
+            )
 
         # Taking the avg
         generated_code += "S_MUL_FP f2, f2, f3 \n"
@@ -61,7 +71,9 @@ def rms_norm_asm(
             generated_code += f"V_MUL_VF gp{act_addr}, gp{act_addr}, f2, 0 \n"
 
             # Move to next vector
-            generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
+            generated_code += _add_large_int(
+                act_addr, act_addr, vlen * batch_size, temp_reg=temp_addr
+            )
 
         # Reset accumulator for next batch
         generated_code += "S_ADD_FP f2, f0, f0 \n"
@@ -85,6 +97,7 @@ def layer_norm_asm(
     act_addr = alive_registers[0]
     scratchpad_addr = alive_registers[1]
     stats_addr = alive_registers[2]
+    temp_addr = alive_registers[3]
 
     generated_code = "; Layer Norm generation \n"
     generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
@@ -97,9 +110,13 @@ def layer_norm_asm(
 
     for batch in range(batch_size):
         # Set act_addr to start of current batch
-        generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
+        generated_code += _load_large_int(
+            act_addr, activation_base_address + vlen * batch
+        )
         # Set stats_addr to same position for iteration
-        generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
+        generated_code += _load_large_int(
+            stats_addr, activation_base_address + vlen * batch
+        )
 
         # First loop: compute sum(x) and sum(x^2) using stats_addr
         for i in range(hidden_dim // vlen):
@@ -107,11 +124,15 @@ def layer_norm_asm(
             generated_code += f"V_RED_SUM f2, gp{stats_addr} \n"
 
             # sum(x^2)
-            generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+            generated_code += (
+                f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+            )
             generated_code += f"V_RED_SUM f3, gp{scratchpad_addr} \n"
 
             # Move stats pointer to next vector
-            generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+            generated_code += _add_large_int(
+                stats_addr, stats_addr, vlen * batch_size, temp_reg=temp_addr
+            )
 
         # f2 = sum(x) * (1/hidden_dim) = mean(x)
         generated_code += "S_MUL_FP f2, f2, f4 \n"
@@ -143,7 +164,9 @@ def layer_norm_asm(
             generated_code += f"V_MUL_VF gp{act_addr}, gp{scratchpad_addr}, f5, 0 \n"
 
             # Move to next vector
-            generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen * batch_size} \n"
+            generated_code += _add_large_int(
+                act_addr, act_addr, vlen * batch_size, temp_reg=temp_addr
+            )
 
         # Reset accumulators for next batch
         generated_code += "S_ADD_FP f2, f0, f0 \n"

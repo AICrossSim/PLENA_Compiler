@@ -23,12 +23,14 @@ class MemoryStateMixin:
         mlen: int = MLEN,
         blen: int = BLEN,
         unroll_loops: bool = False,
-        mram_tile_capacity: int = 4,
+        mram_tile_capacity: int = 128,
     ):
         if mlen <= 0:
             raise ValueError(f"mlen must be > 0, got {mlen}")
         if mram_tile_capacity <= 0:
-            raise ValueError(f"mram_tile_capacity must be > 0, got {mram_tile_capacity}")
+            raise ValueError(
+                f"mram_tile_capacity must be > 0, got {mram_tile_capacity}"
+            )
 
         self.mlen = mlen
         self.blen = blen
@@ -50,7 +52,11 @@ class MemoryStateMixin:
         self.fpram_allocator = FPRAMAllocator()
 
     def __contains__(self, name: str) -> bool:
-        return name in self.hbm_matrices or name in self.vram_matrices or name in self.fpram_matrices
+        return (
+            name in self.hbm_matrices
+            or name in self.vram_matrices
+            or name in self.fpram_matrices
+        )
 
     def __getitem__(self, name: str) -> MemoryObjectInfo:
         if name not in self:
@@ -130,7 +136,9 @@ class MemoryStateMixin:
         )
         return self[name]
 
-    def free_hbm_object(self, name: str, strict: bool = True) -> MemoryObjectInfo | None:
+    def free_hbm_object(
+        self, name: str, strict: bool = True
+    ) -> MemoryObjectInfo | None:
         if name not in self.hbm_matrices:
             if strict:
                 raise KeyError(f"HBM object '{name}' not found")
@@ -166,7 +174,9 @@ class MemoryStateMixin:
         )
         return self[name]
 
-    def free_vram_object(self, name: str, strict: bool = True) -> MemoryObjectInfo | None:
+    def free_vram_object(
+        self, name: str, strict: bool = True
+    ) -> MemoryObjectInfo | None:
         if name not in self.vram_matrices:
             if strict:
                 raise KeyError(f"VRAM object '{name}' not found")
@@ -193,7 +203,9 @@ class MemoryStateMixin:
         )
         return self[name]
 
-    def free_fpram_object(self, name: str, strict: bool = True) -> MemoryObjectInfo | None:
+    def free_fpram_object(
+        self, name: str, strict: bool = True
+    ) -> MemoryObjectInfo | None:
         if name not in self.fpram_matrices:
             if strict:
                 raise KeyError(f"FPRAM object '{name}' not found")
@@ -218,9 +230,13 @@ class MemoryStateMixin:
 
         if strict:
             if physical_rows % self.mlen != 0:
-                raise ValueError(f"Matrix physical rows ({physical_rows}) must be multiple of mlen ({self.mlen})")
+                raise ValueError(
+                    f"Matrix physical rows ({physical_rows}) must be multiple of mlen ({self.mlen})"
+                )
             if physical_cols % self.mlen != 0:
-                raise ValueError(f"Matrix physical cols ({physical_cols}) must be multiple of mlen ({self.mlen})")
+                raise ValueError(
+                    f"Matrix physical cols ({physical_cols}) must be multiple of mlen ({self.mlen})"
+                )
 
         size = physical_rows * physical_cols
         hbm_size = int(size * real_data_ratio)
@@ -284,7 +300,9 @@ class MemoryStateMixin:
         self.vram_matrices[name] = layout
         return layout
 
-    def get_vram_sub_block(self, name: str, row_idx: int, col_idx: int) -> VRAMSubMatrixInfo:
+    def get_vram_sub_block(
+        self, name: str, row_idx: int, col_idx: int
+    ) -> VRAMSubMatrixInfo:
         """Get VRAM sub-block information"""
         if name not in self.vram_matrices:
             raise KeyError(f"VRAM matrix '{name}' not registered")

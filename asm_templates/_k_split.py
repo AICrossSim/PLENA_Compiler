@@ -1,7 +1,7 @@
 """Shared K-split chunking utility for asm_templates.
 
 Both ``ffn_asm`` and ``projection_asm`` need to split a K-dimension tile count
-into chunks of at most ``max_k_tiles``.  This module provides one canonical
+into chunks of at most ````.  This module provides one canonical
 implementation so the two callers stay in sync.
 """
 

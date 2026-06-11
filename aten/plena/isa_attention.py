@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
 
 
@@ -255,12 +256,20 @@ class IsaAttentionMixin:
 
         num_v_col_blocks = max(1, math.ceil(head_dim / mlen))
         tiles_per_mlen = mlen // blen
-        p_row_groups = tiles_per_mlen if rows is None else max(1, min(tiles_per_mlen, (rows + blen - 1) // blen))
+        p_row_groups = (
+            tiles_per_mlen
+            if rows is None
+            else max(1, min(tiles_per_mlen, (rows + blen - 1) // blen))
+        )
 
         lines = []
         lines.append("; === PV Multiply (P @ V) using M_MM ===")
-        lines.append(f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})")
-        lines.append("; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot")
+        lines.append(
+            f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})"
+        )
+        lines.append(
+            "; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot"
+        )
         lines.append(f"; V split into {num_v_col_blocks} column blocks of width {mlen}")
         lines.append("; Storage layout: (batch, mlen, hidden/mlen), column-block major")
 
@@ -281,7 +290,9 @@ class IsaAttentionMixin:
             v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
+            lines.append(
+                f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1"
+            )
 
             pv_col_block_base = pv_address + v_col_block * mlen * mlen
             lines.extend(load_large_int(gp_pv_col_base, pv_col_block_base))
@@ -291,8 +302,8 @@ class IsaAttentionMixin:
             lines.append(f"C_LOOP_START gp{gp_p_loop}, {p_row_groups}")
             lines.append(f"M_MM 0, gp{gp_v}, gp{gp_p}")
             lines.append(f"M_MM_WO gp{gp_pv}, gp{gp_stride}, 0")
-            lines.append(f"S_ADDI_INT gp{gp_p}, gp{gp_p}, {blen * mlen}")
-            lines.append(f"S_ADDI_INT gp{gp_pv}, gp{gp_pv}, {blen * mlen}")
+            lines.extend(add_large_int(gp_p, gp_p, blen * mlen))
+            lines.extend(add_large_int(gp_pv, gp_pv, blen * mlen))
             lines.append(f"C_LOOP_END gp{gp_p_loop}")
             lines.append(f"S_ADDI_INT gp{gp_v}, gp{gp_v}, {blen}")
             lines.append(f"S_ADDI_INT gp{gp_pv_col_base}, gp{gp_pv_col_base}, {blen}")
@@ -323,8 +334,12 @@ class IsaAttentionMixin:
 
         lines = []
         lines.append("; === PV Multiply (P @ V) using M_MM ===")
-        lines.append(f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})")
-        lines.append("; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot")
+        lines.append(
+            f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})"
+        )
+        lines.append(
+            "; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot"
+        )
         lines.append(f"; V split into {num_v_col_blocks} column blocks of width {mlen}")
         lines.append("; Storage layout: (batch, mlen, hidden/mlen), column-block major")
         lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, 1")
@@ -336,19 +351,23 @@ class IsaAttentionMixin:
             v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
+            lines.append(
+                f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1"
+            )
 
             for v_col in range(mlen // blen):
                 lines.append(f"; V column {v_col_block * mlen + v_col * blen}")
                 v_msram_offset = v_col * blen
-                lines.append(f"S_ADDI_INT gp{gp_v}, gp0, {v_msram_offset}")
+                lines.extend(load_large_int(gp_v, v_msram_offset))
 
                 for p_row in range(mlen // blen):
                     p_row_addr = p_address + p_row * blen * mlen
                     lines.extend(load_large_int(gp_p, p_row_addr))
                     lines.append(f"M_MM 0, gp{gp_v}, gp{gp_p}")
 
-                    pv_offset = v_col_block * mlen * mlen + p_row * blen * mlen + v_col * blen
+                    pv_offset = (
+                        v_col_block * mlen * mlen + p_row * blen * mlen + v_col * blen
+                    )
                     lines.extend(load_large_int(gp_pv, pv_address + pv_offset))
                     lines.append(f"M_MM_WO gp{gp_pv}, gp{gp_stride}, 0")
 
@@ -411,7 +430,7 @@ class IsaAttentionMixin:
             lines.append(f"S_ADDI_INT gp{gp_o}, gp{gp_o_row_base}, 0")
             lines.append(f"C_LOOP_START gp{gp_col_loop}, {num_col_blocks}")
             lines.append(f"V_MUL_VF gp{gp_o}, gp{gp_o}, f{fp_m_res}, 0")
-            lines.append(f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {seq_len * mlen}")
+            lines.extend(add_large_int(gp_o, gp_o, seq_len * mlen))
             lines.append(f"C_LOOP_END gp{gp_col_loop}")
             lines.append(f"S_ADDI_INT gp{gp_m_res}, gp{gp_m_res}, 1")
             lines.append(f"S_ADDI_INT gp{gp_o_row_base}, gp{gp_o_row_base}, {mlen}")
@@ -530,7 +549,9 @@ class IsaAttentionMixin:
         lines = []
         lines.append("; === Final Scaling O = O / l ===")
         lines.append(f"; head_dim = {head_dim}, {num_col_blocks} mlen-blocks per row")
-        lines.append("; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major")
+        lines.append(
+            "; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major"
+        )
         lines.append(f"; seq_len = {seq_len}, row_offset = {row_offset}")
 
         if num_col_blocks == 1:
@@ -555,7 +576,7 @@ class IsaAttentionMixin:
             lines.append(f"S_ADDI_INT gp{gp_o}, gp{gp_o_row_base}, 0")
             lines.append(f"C_LOOP_START gp{gp_col_loop}, {num_col_blocks}")
             lines.append(f"V_MUL_VF gp{gp_o}, gp{gp_o}, f{fp_l}, 0")
-            lines.append(f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {seq_len * mlen}")
+            lines.extend(add_large_int(gp_o, gp_o, seq_len * mlen))
             lines.append(f"C_LOOP_END gp{gp_col_loop}")
             lines.append(f"S_ADDI_INT gp{gp_l}, gp{gp_l}, 1")
             lines.append(f"S_ADDI_INT gp{gp_o_row_base}, gp{gp_o_row_base}, {mlen}")
@@ -585,7 +606,9 @@ class IsaAttentionMixin:
         lines = []
         lines.append("; === Final Scaling O = O / l ===")
         lines.append(f"; head_dim = {head_dim}, {num_col_blocks} mlen-blocks per row")
-        lines.append("; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major")
+        lines.append(
+            "; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major"
+        )
         lines.append(f"; seq_len = {seq_len}, row_offset = {row_offset}")
         lines.extend(load_large_int(gp_l, l_address))
 
@@ -616,7 +639,7 @@ class IsaAttentionMixin:
         lines = []
         lines.append(f"; Reset FP SRAM [{start_address}, {start_address + count})")
 
-        lines.append(f"S_ADDI_INT gp{gp_addr}, gp0, {start_address}")
+        lines.extend(load_large_int(gp_addr, start_address))
         # Use f1 for FP scalar - FP registers don't go through GP allocator
         lines.append(f"S_LD_FP f1, gp0, {value_address}")
 
@@ -654,16 +677,24 @@ class IsaAttentionMixin:
         num_col_blocks = (cols + mlen - 1) // mlen
 
         lines = []
-        lines.append(f"; Reset VRAM rows [{row_offset}, {row_offset + rows}) of matrix at {start_address}")
+        lines.append(
+            f"; Reset VRAM rows [{row_offset}, {row_offset + rows}) of matrix at {start_address}"
+        )
         lines.append(f"; {rows} rows x {cols} cols, {num_col_blocks} blocks per row")
-        lines.append("; Storage layout: (total_rows, mlen, cols/mlen), column-block major")
+        lines.append(
+            "; Storage layout: (total_rows, mlen, cols/mlen), column-block major"
+        )
         lines.append(f"; total_rows = {total_rows}, row_offset = {row_offset}")
 
         if getattr(self, "unroll_attention", False):
             for row in range(rows):
                 actual_row = row_offset + row
                 for col_block in range(num_col_blocks):
-                    addr = start_address + col_block * total_rows * mlen + actual_row * mlen
+                    addr = (
+                        start_address
+                        + col_block * total_rows * mlen
+                        + actual_row * mlen
+                    )
                     lines.extend(load_large_int(gp_addr, addr))
                     lines.append(f"V_MUL_VF gp{gp_addr}, gp{gp_addr}, f0, 0")
         else:
@@ -785,7 +816,9 @@ class IsaAttentionMixin:
         from compiler.asm_templates import preload_addr_reg_asm
 
         isa_code += preload_addr_reg_asm(
-            addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
+            addr_reg_to_set=[v_hbm_reg],
+            available_registers=gp_regs,
+            addr_reg_val=[v_layout.hbm_base_addr],
         )
 
         isa_code += self._pv_multiply_asm(

@@ -12,6 +12,8 @@ from typing import ClassVar
 
 from asm_templates._imm import add_large_int as _add_large_int
 from asm_templates._imm import load_large_int as _load_large_int
+from compiler.aten.plena import IsaCompiler
+from asm_templates.normalization_asm import rms_norm_asm
 from asm_templates.projection_asm import projection_asm, projection_T_asm
 
 
@@ -164,6 +166,49 @@ class TestProjectionAsmLargeMatrix(unittest.TestCase):
         _check_all_addi_immediates(self, asm, "projection_asm(2048,8192)")
 
 
+class TestNormalizationAsmLargeMatrix(unittest.TestCase):
+    """Regression tests for large pointer increments in normalization asm."""
+
+    def test_rms_norm_uses_large_int_helper_for_262144_step(self):
+        asm = rms_norm_asm(
+            _eps_offset=1,
+            reci_hid_offset=2,
+            alive_registers=[1, 2, 3, 4],
+            activation_base_address=0,
+            scratchpad_base_address=0,
+            vlen=512,
+            batch_size=512,
+            hidden_dim=512,
+        )
+
+        self.assertIn("S_LUI_INT gp4, 64", asm)
+        self.assertIn("S_ADD_INT gp2, gp2, gp4", asm)
+        self.assertNotIn("S_ADDI_INT gp2, gp2, 262144", asm)
+        self.assertNotIn("S_ADDI_INT gp1, gp1, 262144", asm)
+        _check_all_addi_immediates(self, asm, "rms_norm_asm(512,512)")
+
+
+class TestPVMultiplyLargeMatrix(unittest.TestCase):
+    """Regression tests for large pointer increments in PV multiply asm."""
+
+    def test_pv_multiply_avoids_raw_262144_stride_addi(self):
+        compiler = IsaCompiler(mlen=512, blen=4, unroll_loops=False)
+        asm = compiler._pv_multiply_asm(
+            mlen=512,
+            blen=4,
+            head_dim=512,
+            p_address=0,
+            v_hbm_offset_reg=0,
+            v_hbm_offset=0,
+            pv_address=0,
+        )
+
+        self.assertIn("S_ADDI_INT gp7, gp0, 1", asm)
+        self.assertNotIn("S_ADDI_INT gp3, gp3, 262144", asm)
+        self.assertNotIn("S_ADDI_INT gp5, gp5, 262144", asm)
+        _check_all_addi_immediates(self, asm, "_pv_multiply_asm(512,512)")
+
+
 class TestProjectionTAsmLargeMatrix(unittest.TestCase):
     """Test that projection_T_asm also handles large matrices correctly."""
 
@@ -185,7 +230,9 @@ class TestProjectionTAsmLargeMatrix(unittest.TestCase):
     def test_2048x2048_no_assertion_error(self):
         """2048x2048 projection_T_asm should not raise AssertionError."""
         try:
-            asm = projection_T_asm(hidden_size=2048, out_features=2048, **self.BASE_ARGS)
+            asm = projection_T_asm(
+                hidden_size=2048, out_features=2048, **self.BASE_ARGS
+            )
         except AssertionError as e:
             self.fail(f"projection_T_asm raised AssertionError for 2048x2048: {e}")
         self.assertIn("S_LUI_INT", asm)
@@ -272,7 +319,12 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         args = dict(self.BASE_ARGS)
         args["alive_registers"] = list(range(10))  # loop version needs 10
         try:
-            asm = ffn_asm(hidden_size=2048, intermediate_size=8192, use_loop_instructions=True, **args)
+            asm = ffn_asm(
+                hidden_size=2048,
+                intermediate_size=8192,
+                use_loop_instructions=True,
+                **args,
+            )
         except AssertionError as e:
             self.fail(f"ffn_asm loop path raised AssertionError for 2048x8192: {e}")
         self.assertIn("S_LUI_INT", asm)
@@ -283,7 +335,9 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         ffn_asm = self._import_ffn_asm()
         args = dict(self.BASE_ARGS)
         args["alive_registers"] = list(range(10))
-        asm = ffn_asm(hidden_size=128, intermediate_size=256, use_loop_instructions=True, **args)
+        asm = ffn_asm(
+            hidden_size=128, intermediate_size=256, use_loop_instructions=True, **args
+        )
         _check_all_addi_immediates(self, asm, "ffn_asm(loop,128,256)")
 
     def test_workspace_base_offsets_loop_path(self):
@@ -322,7 +376,9 @@ def _check_all_addi_immediates(test_case, asm: str, label: str) -> None:
             try:
                 imm = int(parts[-1].strip())
                 test_case.assertLess(
-                    imm, IMM2_BOUND, f"[{label}] S_ADDI_INT with large immediate {imm} (>= 2^18): {line}"
+                    imm,
+                    IMM2_BOUND,
+                    f"[{label}] S_ADDI_INT with large immediate {imm} (>= 2^18): {line}",
                 )
             except ValueError:
                 pass  # not a plain integer literal, skip

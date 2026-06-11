@@ -67,9 +67,9 @@ def _fix_large_immediates(isa_code: str) -> str:
     adds use asm_templates._imm.add_large_int without a temp register, which
     lowers to bounded S_ADDI_INT chunks and is safe as a compiler-wide pass.
     """
-    pattern = re.compile(r'^(\s*)S_ADDI_INT gp(\d+), gp(\d+), (\d+)(.*)')
+    pattern = re.compile(r"^(\s*)S_ADDI_INT gp(\d+), gp(\d+), (\d+)(.*)")
     out = []
-    for line in isa_code.split('\n'):
+    for line in isa_code.split("\n"):
         m = pattern.match(line)
         if m:
             indent, rd_str, rs_str, imm_str, rest = m.groups()
@@ -82,10 +82,13 @@ def _fix_large_immediates(isa_code: str) -> str:
                     if rs == 0
                     else _add_large_int_lines(rd, rs, imm, temp_reg=None)
                 )
-                out.extend(f"{indent}{replacement_line}{rest}" for replacement_line in replacement)
+                out.extend(
+                    f"{indent}{replacement_line}{rest}"
+                    for replacement_line in replacement
+                )
                 continue
         out.append(line)
-    return '\n'.join(out)
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +209,10 @@ class StageCheckpointRecorder:
                 "vram_addr": addr,
                 "active_shape": [int(active_shape[0]), int(active_shape[1])],
                 "logical_shape": [int(tensor.shape[0]), int(tensor.shape[1])],
-                "physical_shape": [int(tensor.physical_shape[0]), int(tensor.physical_shape[1])],
+                "physical_shape": [
+                    int(tensor.physical_shape[0]),
+                    int(tensor.physical_shape[1]),
+                ],
             }
         )
         return checkpoint
@@ -227,7 +233,9 @@ def _pad_2d(tensor: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     """Zero-pad a 2D tensor to the requested shape, preserving the top-left data."""
     src_rows, src_cols = tensor.shape
     if src_rows > rows or src_cols > cols:
-        raise ValueError(f"Cannot pad tensor of shape {tuple(tensor.shape)} to smaller shape {(rows, cols)}")
+        raise ValueError(
+            f"Cannot pad tensor of shape {tuple(tensor.shape)} to smaller shape {(rows, cols)}"
+        )
     if src_rows == rows and src_cols == cols:
         return tensor.contiguous()
     out = torch.zeros((rows, cols), dtype=tensor.dtype, device=tensor.device)
@@ -246,23 +254,31 @@ def _pad_batched_sequence_storage(
     """Pad (B, S, C) data into independent per-batch row slabs."""
     if tensor.dim() == 2:
         if batch_size != 1:
-            raise ValueError(f"2D tensor storage is only valid for batch_size=1, got {batch_size}")
+            raise ValueError(
+                f"2D tensor storage is only valid for batch_size=1, got {batch_size}"
+            )
         tensor = tensor.unsqueeze(0)
     if tensor.dim() != 3:
-        raise ValueError(f"Expected 2D or 3D sequence tensor, got shape {tuple(tensor.shape)}")
+        raise ValueError(
+            f"Expected 2D or 3D sequence tensor, got shape {tuple(tensor.shape)}"
+        )
     if tensor.shape[0] != batch_size or tensor.shape[1] != seq_len:
         raise ValueError(
             f"Expected tensor shape ({batch_size}, {seq_len}, C), got {tuple(tensor.shape)}"
         )
     if rows_per_batch < seq_len:
-        raise ValueError(f"rows_per_batch={rows_per_batch} cannot cover seq_len={seq_len}")
+        raise ValueError(
+            f"rows_per_batch={rows_per_batch} cannot cover seq_len={seq_len}"
+        )
     if tensor.shape[2] > cols:
         raise ValueError(f"Cannot pad tensor with {tensor.shape[2]} cols to {cols}")
 
-    out = torch.zeros((batch_size * rows_per_batch, cols), dtype=tensor.dtype, device=tensor.device)
+    out = torch.zeros(
+        (batch_size * rows_per_batch, cols), dtype=tensor.dtype, device=tensor.device
+    )
     for batch_idx in range(batch_size):
         start = batch_idx * rows_per_batch
-        out[start:start + seq_len, : tensor.shape[2]] = tensor[batch_idx]
+        out[start : start + seq_len, : tensor.shape[2]] = tensor[batch_idx]
     return out.contiguous()
 
 
@@ -285,7 +301,7 @@ def _repeat_sequence_storage(
     )
     for batch_idx in range(batch_size):
         start = batch_idx * rows_per_batch
-        out[start:start + seq_len] = tensor[:seq_len]
+        out[start : start + seq_len] = tensor[:seq_len]
     return out.contiguous()
 
 
@@ -301,7 +317,9 @@ def _repeat_feature_vector_storage(
     if vector.dim() != 1:
         raise ValueError(f"Expected 1D feature vector, got shape {tuple(vector.shape)}")
     if vector.numel() > cols:
-        raise ValueError(f"Cannot pad feature vector with {vector.numel()} elements to {cols}")
+        raise ValueError(
+            f"Cannot pad feature vector with {vector.numel()} elements to {cols}"
+        )
     out = torch.zeros(
         (batch_size * rows_per_batch, cols),
         dtype=vector.dtype,
@@ -309,7 +327,7 @@ def _repeat_feature_vector_storage(
     )
     for batch_idx in range(batch_size):
         start = batch_idx * rows_per_batch
-        out[start:start + seq_len, : vector.numel()] = vector
+        out[start : start + seq_len, : vector.numel()] = vector
     return out.contiguous()
 
 
@@ -353,7 +371,9 @@ def _lazy_repeat_feature_vector_storage(
     if vector.dim() != 1:
         raise ValueError(f"Expected 1D feature vector, got shape {tuple(vector.shape)}")
     if vector.numel() > cols:
-        raise ValueError(f"Cannot pad feature vector with {vector.numel()} elements to {cols}")
+        raise ValueError(
+            f"Cannot pad feature vector with {vector.numel()} elements to {cols}"
+        )
     return LazyRepeatedFeatureVector(
         vector=vector,
         batch_size=batch_size,
@@ -375,7 +395,9 @@ def _repeat_matrix_rows_storage(
     if matrix.dim() != 2:
         raise ValueError(f"Expected 2D matrix, got shape {tuple(matrix.shape)}")
     if matrix.shape[0] < seq_len:
-        raise ValueError(f"Matrix rows {matrix.shape[0]} cannot cover seq_len={seq_len}")
+        raise ValueError(
+            f"Matrix rows {matrix.shape[0]} cannot cover seq_len={seq_len}"
+        )
     if matrix.shape[1] > cols:
         raise ValueError(f"Cannot pad matrix with {matrix.shape[1]} cols to {cols}")
     out = torch.zeros(
@@ -385,7 +407,7 @@ def _repeat_matrix_rows_storage(
     )
     for batch_idx in range(batch_size):
         start = batch_idx * rows_per_batch
-        out[start:start + seq_len, : matrix.shape[1]] = matrix[:seq_len]
+        out[start : start + seq_len, : matrix.shape[1]] = matrix[:seq_len]
     return out.contiguous()
 
 
@@ -401,29 +423,53 @@ def _compact_active_sequence_rows(
     rows = []
     for batch_idx in range(batch_size):
         start = batch_idx * rows_per_batch
-        rows.append(tensor[start:start + seq_len, :cols])
+        rows.append(tensor[start : start + seq_len, :cols])
     return torch.cat(rows, dim=0).contiguous()
 
 
-def _pad_q_weight_grouped(weight: torch.Tensor, num_heads: int, head_dim: int, padded_hidden: int, padded_head_dim: int):
+def _pad_q_weight_grouped(
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    padded_hidden: int,
+    padded_head_dim: int,
+):
     """Pad Q weights while keeping each head in its own padded head block."""
     hidden, _ = weight.shape
-    out = torch.zeros((padded_hidden, num_heads * padded_head_dim), dtype=weight.dtype, device=weight.device)
+    out = torch.zeros(
+        (padded_hidden, num_heads * padded_head_dim),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
     for h in range(num_heads):
         src_start = h * head_dim
         dst_start = h * padded_head_dim
-        out[:hidden, dst_start:dst_start + head_dim] = weight[:, src_start:src_start + head_dim]
+        out[:hidden, dst_start : dst_start + head_dim] = weight[
+            :, src_start : src_start + head_dim
+        ]
     return out.contiguous()
 
 
-def _pad_o_weight_grouped(weight: torch.Tensor, num_heads: int, head_dim: int, padded_head_dim: int, padded_hidden: int):
+def _pad_o_weight_grouped(
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    padded_head_dim: int,
+    padded_hidden: int,
+):
     """Pad O-projection weights from packed native heads into padded head blocks."""
     _, hidden = weight.shape
-    out = torch.zeros((num_heads * padded_head_dim, padded_hidden), dtype=weight.dtype, device=weight.device)
+    out = torch.zeros(
+        (num_heads * padded_head_dim, padded_hidden),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
     for h in range(num_heads):
         src_start = h * head_dim
         dst_start = h * padded_head_dim
-        out[dst_start:dst_start + head_dim, :hidden] = weight[src_start:src_start + head_dim, :]
+        out[dst_start : dst_start + head_dim, :hidden] = weight[
+            src_start : src_start + head_dim, :
+        ]
     return out.contiguous()
 
 
@@ -439,20 +485,28 @@ def _pad_q_weight_grouped_by_kv(
     """Pad Q weights into KV-group MLEN rows with HLEN-sized head slots."""
     hidden, _ = weight.shape
     if num_heads % num_kv_heads != 0:
-        raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )
     ratio = num_heads // num_kv_heads
     if ratio * head_slot_dim > group_width:
         raise ValueError(
             f"Q head slots do not fit one group: ratio={ratio}, "
             f"head_slot_dim={head_slot_dim}, group_width={group_width}"
         )
-    out = torch.zeros((padded_hidden, num_kv_heads * group_width), dtype=weight.dtype, device=weight.device)
+    out = torch.zeros(
+        (padded_hidden, num_kv_heads * group_width),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
     for h in range(num_heads):
         kv_h = h // ratio
         lane = h % ratio
         src_start = h * head_dim
         dst_start = kv_h * group_width + lane * head_slot_dim
-        out[:hidden, dst_start:dst_start + head_dim] = weight[:, src_start:src_start + head_dim]
+        out[:hidden, dst_start : dst_start + head_dim] = weight[
+            :, src_start : src_start + head_dim
+        ]
     return out.contiguous()
 
 
@@ -468,20 +522,28 @@ def _pad_o_weight_grouped_by_kv(
     """Pad O weights from KV-group HLEN head slots into hidden projection."""
     _, hidden = weight.shape
     if num_heads % num_kv_heads != 0:
-        raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )
     ratio = num_heads // num_kv_heads
     if ratio * head_slot_dim > group_width:
         raise ValueError(
             f"O head slots do not fit one group: ratio={ratio}, "
             f"head_slot_dim={head_slot_dim}, group_width={group_width}"
         )
-    out = torch.zeros((num_kv_heads * group_width, padded_hidden), dtype=weight.dtype, device=weight.device)
+    out = torch.zeros(
+        (num_kv_heads * group_width, padded_hidden),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
     for h in range(num_heads):
         kv_h = h // ratio
         lane = h % ratio
         src_start = h * head_dim
         dst_start = kv_h * group_width + lane * head_slot_dim
-        out[dst_start:dst_start + head_dim, :hidden] = weight[src_start:src_start + head_dim, :]
+        out[dst_start : dst_start + head_dim, :hidden] = weight[
+            src_start : src_start + head_dim, :
+        ]
     return out.contiguous()
 
 
@@ -518,10 +580,18 @@ def _pad_decoder_weights_for_tiles(
             padded_hidden,
         )
     else:
-        w_q = _pad_q_weight_grouped(weights.w_q, num_heads, head_dim, padded_hidden, padded_head_dim)
-        w_o = _pad_o_weight_grouped(weights.w_o, num_heads, head_dim, padded_head_dim, padded_hidden)
+        w_q = _pad_q_weight_grouped(
+            weights.w_q, num_heads, head_dim, padded_hidden, padded_head_dim
+        )
+        w_o = _pad_o_weight_grouped(
+            weights.w_o, num_heads, head_dim, padded_head_dim, padded_hidden
+        )
 
-    kv_head_dim = head_packing.head_slot_dim if head_packing is not None and head_packing.enabled else padded_head_dim
+    kv_head_dim = (
+        head_packing.head_slot_dim
+        if head_packing is not None and head_packing.enabled
+        else padded_head_dim
+    )
     return LayerWeights(
         w_q=w_q,
         w_o=w_o,
@@ -568,14 +638,24 @@ def _pad_vision_layer_weights_for_tiles(
         for h in range(num_heads):
             src_start = h * head_dim
             dst_start = h * padded_head_dim
-            out[dst_start:dst_start + head_dim] = bias[src_start:src_start + head_dim]
+            out[dst_start : dst_start + head_dim] = bias[
+                src_start : src_start + head_dim
+            ]
         return out.contiguous()
 
     return VisionLayerWeights(
-        w_q=_pad_q_weight_grouped(weights.w_q, num_heads, head_dim, padded_hidden, padded_head_dim),
-        w_k=_pad_q_weight_grouped(weights.w_k, num_heads, head_dim, padded_hidden, padded_head_dim),
-        w_v=_pad_q_weight_grouped(weights.w_v, num_heads, head_dim, padded_hidden, padded_head_dim),
-        w_o=_pad_o_weight_grouped(weights.w_o, num_heads, head_dim, padded_head_dim, padded_hidden),
+        w_q=_pad_q_weight_grouped(
+            weights.w_q, num_heads, head_dim, padded_hidden, padded_head_dim
+        ),
+        w_k=_pad_q_weight_grouped(
+            weights.w_k, num_heads, head_dim, padded_hidden, padded_head_dim
+        ),
+        w_v=_pad_q_weight_grouped(
+            weights.w_v, num_heads, head_dim, padded_hidden, padded_head_dim
+        ),
+        w_o=_pad_o_weight_grouped(
+            weights.w_o, num_heads, head_dim, padded_head_dim, padded_hidden
+        ),
         b_q=pad_head_bias(weights.b_q),
         b_k=pad_head_bias(weights.b_k),
         b_v=pad_head_bias(weights.b_v),
@@ -623,7 +703,9 @@ def _pad_vision_connector_weight_for_tiles(
         src_start = segment_idx * hidden
         src_end = src_start + hidden
         dst_start = segment_idx * padded_hidden
-        out[dst_start:dst_start + hidden, :weights.output_dim] = weights.weight[src_start:src_end]
+        out[dst_start : dst_start + hidden, : weights.output_dim] = weights.weight[
+            src_start:src_end
+        ]
     return out.contiguous()
 
 
@@ -668,15 +750,21 @@ def _pad_rope_inputs_for_head_slots(
     if head_dim > head_slot_dim:
         raise ValueError(f"head_dim {head_dim} exceeds head_slot_dim {head_slot_dim}")
 
-    r = torch.zeros((group_width, group_width), dtype=rope_matrix.dtype, device=rope_matrix.device)
-    cos = torch.zeros((padded_seq_len, group_width), dtype=cos_table.dtype, device=cos_table.device)
-    sin = torch.zeros((padded_seq_len, group_width), dtype=sin_table.dtype, device=sin_table.device)
+    r = torch.zeros(
+        (group_width, group_width), dtype=rope_matrix.dtype, device=rope_matrix.device
+    )
+    cos = torch.zeros(
+        (padded_seq_len, group_width), dtype=cos_table.dtype, device=cos_table.device
+    )
+    sin = torch.zeros(
+        (padded_seq_len, group_width), dtype=sin_table.dtype, device=sin_table.device
+    )
     seq = cos_table.shape[0]
     for lane in range(broadcast_amount):
         start = lane * head_slot_dim
-        r[start:start + head_dim, start:start + head_dim] = rope_matrix
-        cos[:seq, start:start + head_dim] = cos_table
-        sin[:seq, start:start + head_dim] = sin_table
+        r[start : start + head_dim, start : start + head_dim] = rope_matrix
+        cos[:seq, start : start + head_dim] = cos_table
+        sin[:seq, start : start + head_dim] = sin_table
     return r.contiguous(), cos.contiguous(), sin.contiguous()
 
 
@@ -692,9 +780,17 @@ def _add_residual(prog, target, scratch):
     return target
 
 
-def _linear_projection(prog, input_var, weight_var, name: str, physical_shape: tuple[int, int] | None = None):
+def _linear_projection(
+    prog,
+    input_var,
+    weight_var,
+    name: str,
+    physical_shape: tuple[int, int] | None = None,
+):
     if physical_shape is not None:
-        return prog.linear_projection(input_var, weight_var, name=name, physical_shape=physical_shape)
+        return prog.linear_projection(
+            input_var, weight_var, name=name, physical_shape=physical_shape
+        )
     return ops.linear(prog, input_var, weight_var, name=name)
 
 
@@ -705,7 +801,9 @@ def _apply_rope_projection(prog, x_var, rope_matrix, cos_var, sin_var, name):
     return x_var
 
 
-def _copy_into_vram_view(prog, source, name, rows, cols, vram_addr, physical_shape=None):
+def _copy_into_vram_view(
+    prog, source, name, rows, cols, vram_addr, physical_shape=None
+):
     target = prog.alloc_at(
         name,
         rows,
@@ -744,7 +842,10 @@ def _emit_kv_stores(
     for kv_h in range(num_kv_heads):
         kv_physical_shape = None
         if physical_rows is not None:
-            kv_physical_shape = (physical_rows, layer_inputs.w_k_heads[kv_h].physical_shape[1])
+            kv_physical_shape = (
+                physical_rows,
+                layer_inputs.w_k_heads[kv_h].physical_shape[1],
+            )
         K_h = _linear_projection(
             prog,
             current,
@@ -754,7 +855,10 @@ def _emit_kv_stores(
         )
         v_physical_shape = None
         if physical_rows is not None:
-            v_physical_shape = (physical_rows, layer_inputs.w_v_heads[kv_h].physical_shape[1])
+            v_physical_shape = (
+                physical_rows,
+                layer_inputs.w_v_heads[kv_h].physical_shape[1],
+            )
         V_h = _linear_projection(
             prog,
             current,
@@ -840,7 +944,9 @@ def _emit_packed_attention_block(
         raise ValueError(
             f"rows_per_batch={rows_per_batch} cannot cover active_seq_len={active_seq_len_per_batch}"
         )
-    total_physical_rows = batch_size * rows_per_batch if batch_size > 1 else max(prog.mlen, seq_len)
+    total_physical_rows = (
+        batch_size * rows_per_batch if batch_size > 1 else max(prog.mlen, seq_len)
+    )
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -969,7 +1075,9 @@ def _emit_packed_attention_block(
     else:
         row_block_stride = rows_per_batch // prog.mlen
         if rows_per_batch % prog.mlen != 0:
-            raise ValueError(f"rows_per_batch={rows_per_batch} must be a multiple of MLEN={prog.mlen}")
+            raise ValueError(
+                f"rows_per_batch={rows_per_batch} must be a multiple of MLEN={prog.mlen}"
+            )
         batch_vram_stride = rows_per_batch * prog.mlen
         for batch_idx in range(batch_size):
             batch_row_offset = batch_idx * batch_vram_stride
@@ -997,7 +1105,9 @@ def _emit_packed_attention_block(
                     V_stored,
                     group_heads=ratio,
                     head_slot_dim=head_packing.head_slot_dim,
-                    output_base_address=o_full_addr + kv_h * o_group_stride + batch_row_offset,
+                    output_base_address=o_full_addr
+                    + kv_h * o_group_stride
+                    + batch_row_offset,
                     scratch_base_address=attn_scratch_addr,
                     broadcast_amount=head_packing.broadcast_amount,
                     scale=scale,
@@ -1250,7 +1360,9 @@ def _apply_vision_layer_norm(prog, current, gamma, beta, *, name: str):
     return current
 
 
-def _gelu_inplace(prog, tensor, *, const_one_fp_address: int = 5, const_1702_fp_address: int = 6):
+def _gelu_inplace(
+    prog, tensor, *, const_one_fp_address: int = 5, const_1702_fp_address: int = 6
+):
     scratch = prog.alloc(
         f"gelu_scratch_{tensor.name}",
         1,
@@ -1330,7 +1442,9 @@ def _emit_vision_attention_block(
             f"V_Q_{layer_idx}_h{h}",
             physical_shape=(current.physical_shape[0], padded_head_dim),
         )
-        _load_and_add(prog, Q_h, layer_inputs.b_q_heads[h], f"V_B_q_{layer_idx}_h{h}_load")
+        _load_and_add(
+            prog, Q_h, layer_inputs.b_q_heads[h], f"V_B_q_{layer_idx}_h{h}_load"
+        )
 
         K_h = _linear_projection(
             prog,
@@ -1339,7 +1453,9 @@ def _emit_vision_attention_block(
             f"V_K_{layer_idx}_h{h}",
             physical_shape=(current.physical_shape[0], padded_head_dim),
         )
-        _load_and_add(prog, K_h, layer_inputs.b_k_heads[h], f"V_B_k_{layer_idx}_h{h}_load")
+        _load_and_add(
+            prog, K_h, layer_inputs.b_k_heads[h], f"V_B_k_{layer_idx}_h{h}_load"
+        )
 
         V_h = _linear_projection(
             prog,
@@ -1348,7 +1464,9 @@ def _emit_vision_attention_block(
             f"V_V_{layer_idx}_h{h}",
             physical_shape=(current.physical_shape[0], padded_head_dim),
         )
-        _load_and_add(prog, V_h, layer_inputs.b_v_heads[h], f"V_B_v_{layer_idx}_h{h}_load")
+        _load_and_add(
+            prog, V_h, layer_inputs.b_v_heads[h], f"V_B_v_{layer_idx}_h{h}_load"
+        )
 
         K_stored = prog.store(K_h, name=f"V_K_stored_{layer_idx}_h{h}")
         V_stored = prog.store(V_h, name=f"V_V_stored_{layer_idx}_h{h}")
@@ -1478,16 +1596,20 @@ def _emit_vision_pixel_shuffle(
     del hidden
     grid = int(math.isqrt(seq_len))
     if grid * grid != seq_len:
-        raise ValueError(f"vision connector pixel_shuffle requires square seq_len, got {seq_len}")
+        raise ValueError(
+            f"vision connector pixel_shuffle requires square seq_len, got {seq_len}"
+        )
     if grid % scale_factor != 0:
         raise ValueError(
             f"vision connector scale_factor={scale_factor} must divide patch grid {grid}x{grid}"
         )
     if padded_hidden % prog.mlen != 0:
-        raise ValueError(f"padded_hidden={padded_hidden} must be a multiple of MLEN={prog.mlen}")
+        raise ValueError(
+            f"padded_hidden={padded_hidden} must be a multiple of MLEN={prog.mlen}"
+        )
 
     out_grid = grid // scale_factor
-    connector_seq_len = seq_len // (scale_factor ** 2)
+    connector_seq_len = seq_len // (scale_factor**2)
     shuffled = prog.alloc(
         "V_CONNECTOR_SHUFFLED",
         connector_seq_len,
@@ -1506,7 +1628,9 @@ def _emit_vision_pixel_shuffle(
             target_row = out_y * out_grid + out_x
             for dy in range(scale_factor):
                 for dx in range(scale_factor):
-                    source_row = (out_y * scale_factor + dy) * grid + (out_x * scale_factor + dx)
+                    source_row = (out_y * scale_factor + dy) * grid + (
+                        out_x * scale_factor + dx
+                    )
                     segment_idx = dy * scale_factor + dx
                     for col_block in range(hidden_blocks):
                         source_addr = (
@@ -1582,7 +1706,11 @@ def _register_layer_inputs(
     w_v_heads = []
     physical_shapes = physical_shapes or {}
     for tensor_name, tensor in weights.tensor_entries(layer_idx):
-        var = prog.input(tensor_name, shape=tuple(tensor.shape), physical_shape=physical_shapes.get(tensor_name))
+        var = prog.input(
+            tensor_name,
+            shape=tuple(tensor.shape),
+            physical_shape=physical_shapes.get(tensor_name),
+        )
         if tensor_name.startswith(f"W_k_{layer_idx}_h"):
             w_k_heads.append(var)
         elif tensor_name.startswith(f"W_v_{layer_idx}_h"):
@@ -1747,12 +1875,15 @@ def _register_vision_connector_inputs(
                 shape=(connector_rows, padded_output_dim),
                 physical_shape=(connector_rows, padded_output_dim),
             )
-            if has_bias else None
+            if has_bias
+            else None
         ),
     )
 
 
-def _vision_position_ids(vision_model, *, batch_size: int, patches_h: int, patches_w: int, device) -> torch.Tensor:
+def _vision_position_ids(
+    vision_model, *, batch_size: int, patches_h: int, patches_w: int, device
+) -> torch.Tensor:
     """Match SmolVLM dynamic position bucketing for an all-valid patch mask."""
     embeddings = vision_model.embeddings
     num_patches_per_side = int(getattr(embeddings, "num_patches_per_side", patches_h))
@@ -1762,36 +1893,58 @@ def _vision_position_ids(vision_model, *, batch_size: int, patches_h: int, patch
         1 / num_patches_per_side,
         device=device,
     )
-    nb_patches_h = torch.full((batch_size,), patches_h, device=device, dtype=torch.float32)
-    nb_patches_w = torch.full((batch_size,), patches_w, device=device, dtype=torch.float32)
+    nb_patches_h = torch.full(
+        (batch_size,), patches_h, device=device, dtype=torch.float32
+    )
+    nb_patches_w = torch.full(
+        (batch_size,), patches_w, device=device, dtype=torch.float32
+    )
     step_h = 1.0 / nb_patches_h
     step_w = 1.0 / nb_patches_w
     h_indices = torch.arange(patches_h, device=device, dtype=torch.float32)
     w_indices = torch.arange(patches_w, device=device, dtype=torch.float32)
-    fractional_coords_h = torch.clamp(h_indices[None, :] * step_h[:, None], max=(1.0 - 1e-6))
-    fractional_coords_w = torch.clamp(w_indices[None, :] * step_w[:, None], max=(1.0 - 1e-6))
+    fractional_coords_h = torch.clamp(
+        h_indices[None, :] * step_h[:, None], max=(1.0 - 1e-6)
+    )
+    fractional_coords_w = torch.clamp(
+        w_indices[None, :] * step_w[:, None], max=(1.0 - 1e-6)
+    )
     bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
     bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
-    pos_ids = bucket_coords_h[:, :, None] * num_patches_per_side + bucket_coords_w[:, None, :]
+    pos_ids = (
+        bucket_coords_h[:, :, None] * num_patches_per_side + bucket_coords_w[:, None, :]
+    )
     return pos_ids.reshape(batch_size, -1)
 
 
-def _pixel_values_to_raw_storage(pixel_values: torch.Tensor, *, w_padded: int) -> torch.Tensor:
+def _pixel_values_to_raw_storage(
+    pixel_values: torch.Tensor, *, w_padded: int
+) -> torch.Tensor:
     """Convert B=1 NCHW pixels to conv2d_plena's raw HBM row layout."""
     if pixel_values.shape[0] != 1:
-        raise NotImplementedError("native vision compile currently supports batch_size=1")
+        raise NotImplementedError(
+            "native vision compile currently supports batch_size=1"
+        )
     _, channels, height, width = pixel_values.shape
     if w_padded < width:
         raise ValueError(f"w_padded={w_padded} cannot cover image width {width}")
-    raw = torch.zeros((channels * height, w_padded), dtype=pixel_values.dtype, device=pixel_values.device)
+    raw = torch.zeros(
+        (channels * height, w_padded),
+        dtype=pixel_values.dtype,
+        device=pixel_values.device,
+    )
     for c in range(channels):
-        raw[c * height:(c + 1) * height, :width] = pixel_values[0, c]
+        raw[c * height : (c + 1) * height, :width] = pixel_values[0, c]
     return raw.contiguous()
 
 
 def _im2col_vision(pixel_values: torch.Tensor, *, patch_size: int) -> torch.Tensor:
     col = F.unfold(pixel_values.float(), kernel_size=patch_size, stride=patch_size)
-    return col.permute(0, 2, 1).reshape(-1, pixel_values.shape[1] * patch_size * patch_size).contiguous()
+    return (
+        col.permute(0, 2, 1)
+        .reshape(-1, pixel_values.shape[1] * patch_size * patch_size)
+        .contiguous()
+    )
 
 
 def _quantize_vision_pixels_like_hbm(
@@ -1808,7 +1961,7 @@ def _quantize_vision_pixels_like_hbm(
     out = torch.zeros_like(pixel_values.float())
     _, channels, height, _ = pixel_values.shape
     for c in range(channels):
-        out[0, c] = raw_q[c * height:(c + 1) * height, :width]
+        out[0, c] = raw_q[c * height : (c + 1) * height, :width]
     return out
 
 
@@ -1822,12 +1975,16 @@ def _layer_norm_ref(
 ) -> torch.Tensor:
     gamma = precision.quantize(weight)
     beta = precision.quantize(bias)
-    y = _round_vision_intermediate(F.layer_norm(x.float(), (x.shape[-1],), eps=eps), precision)
+    y = _round_vision_intermediate(
+        F.layer_norm(x.float(), (x.shape[-1],), eps=eps), precision
+    )
     y = _round_vision_intermediate(y.float() * gamma.float() + beta.float(), precision)
     return y
 
 
-def _round_vision_intermediate(x: torch.Tensor, precision: ReferencePrecision) -> torch.Tensor:
+def _round_vision_intermediate(
+    x: torch.Tensor, precision: ReferencePrecision
+) -> torch.Tensor:
     return precision.from_inter(precision.to_inter(x))
 
 
@@ -1876,9 +2033,15 @@ def _vision_attention_heads_ref(
     for h in range(config.num_heads):
         start = h * config.head_dim
         end = start + config.head_dim
-        q = _vision_linear_ref(x, weights.w_q[:, start:end], weights.b_q[start:end], precision=precision)
-        k = _vision_linear_ref(x, weights.w_k[:, start:end], weights.b_k[start:end], precision=precision)
-        v = _vision_linear_ref(x, weights.w_v[:, start:end], weights.b_v[start:end], precision=precision)
+        q = _vision_linear_ref(
+            x, weights.w_q[:, start:end], weights.b_q[start:end], precision=precision
+        )
+        k = _vision_linear_ref(
+            x, weights.w_k[:, start:end], weights.b_k[start:end], precision=precision
+        )
+        v = _vision_linear_ref(
+            x, weights.w_v[:, start:end], weights.b_v[start:end], precision=precision
+        )
         scores = _round(q.float() @ k.float().T, precision)
         scale = _scalar_preload_ref(1.0 / math.sqrt(config.head_dim), precision)
         scores = _round(scores.float() * scale, precision)
@@ -1905,7 +2068,9 @@ def _pad_vision_attention_heads_ref(
     for h in range(num_heads):
         src_start = h * head_dim
         dst_start = h * padded_head_dim
-        out[:, dst_start:dst_start + head_dim] = o_full[:, src_start:src_start + head_dim]
+        out[:, dst_start : dst_start + head_dim] = o_full[
+            :, src_start : src_start + head_dim
+        ]
     return out.contiguous()
 
 
@@ -1949,9 +2114,13 @@ def _run_vision_reference_trace(
     """Return hardware-shaped vision reference values at compiler stop points."""
     trace: dict[str, torch.Tensor] = {}
     patch_w = precision.quantize(patch_weights.weight_2d)
-    patch_bias_pos = precision.quantize(position_embeddings + patch_weights.bias.detach().float().view(1, -1))
+    patch_bias_pos = precision.quantize(
+        position_embeddings + patch_weights.bias.detach().float().view(1, -1)
+    )
     pixel_values = _quantize_vision_pixels_like_hbm(pixel_values, precision=precision)
-    x_col = _round_vision_intermediate(_im2col_vision(pixel_values, patch_size=config.patch_size), precision)
+    x_col = _round_vision_intermediate(
+        _im2col_vision(pixel_values, patch_size=config.patch_size), precision
+    )
     trace["patch_im2col"] = x_col.float().contiguous()
     x = _round_vision_intermediate(x_col.float() @ patch_w.float(), precision)
     trace["patch"] = x.float().contiguous()
@@ -1974,12 +2143,16 @@ def _run_vision_reference_trace(
             config,
             precision=precision,
         )
-        trace[f"layer{layer_idx}_attn_o_full"] = _pad_vision_attention_heads_ref(
-            attn_heads,
-            num_heads=config.num_heads,
-            head_dim=config.head_dim,
-            padded_head_dim=padded_head_dim,
-        ).float().contiguous()
+        trace[f"layer{layer_idx}_attn_o_full"] = (
+            _pad_vision_attention_heads_ref(
+                attn_heads,
+                num_heads=config.num_heads,
+                head_dim=config.head_dim,
+                padded_head_dim=padded_head_dim,
+            )
+            .float()
+            .contiguous()
+        )
         attn = _vision_linear_ref(attn_heads, layer.w_o, layer.b_o, precision=precision)
         trace[f"layer{layer_idx}_attn_proj"] = attn.float().contiguous()
         x = _round_vision_intermediate(residual.float() + attn.float(), precision)
@@ -1999,7 +2172,9 @@ def _run_vision_reference_trace(
         if gelu_mode == "hardware":
             act = _gelu_hw_ref(fc1, precision)
         else:
-            act = _round_vision_intermediate(F.gelu(fc1.float(), approximate="tanh"), precision)
+            act = _round_vision_intermediate(
+                F.gelu(fc1.float(), approximate="tanh"), precision
+            )
         trace[f"layer{layer_idx}_gelu"] = act.float().contiguous()
         mlp = _vision_linear_ref(act, layer.w_fc2, layer.b_fc2, precision=precision)
         trace[f"layer{layer_idx}_fc2"] = mlp.float().contiguous()
@@ -2043,10 +2218,12 @@ def _vision_pixel_shuffle_ref(x: torch.Tensor, scale_factor: int) -> torch.Tenso
         batch_size,
         width // scale_factor,
         height // scale_factor,
-        embed_dim * (scale_factor ** 2),
+        embed_dim * (scale_factor**2),
     )
     y = y.permute(0, 2, 1, 3)
-    y = y.reshape(batch_size, seq_len // (scale_factor ** 2), embed_dim * (scale_factor ** 2))
+    y = y.reshape(
+        batch_size, seq_len // (scale_factor**2), embed_dim * (scale_factor**2)
+    )
     return y[0].contiguous() if squeeze else y.contiguous()
 
 
@@ -2081,7 +2258,9 @@ def _weight_physical_shapes_for_layer(
     return physical_shapes
 
 
-def _tensor_layout_metadata(prog, input_tensors: dict[str, torch.Tensor]) -> dict[str, dict[str, list[int] | int]]:
+def _tensor_layout_metadata(
+    prog, input_tensors: dict[str, torch.Tensor]
+) -> dict[str, dict[str, list[int] | int]]:
     layouts = {}
     for name, tensor in input_tensors.items():
         hbm_layout = prog.hbm_matrices.get(name)
@@ -2091,7 +2270,9 @@ def _tensor_layout_metadata(prog, input_tensors: dict[str, torch.Tensor]) -> dic
         if tensor_shape is None:
             continue
         source_shape = tuple(int(dim) for dim in tensor_shape)
-        storage_shape = tuple(int(dim) for dim in (hbm_layout.physical_shape or hbm_layout.full_shape))
+        storage_shape = tuple(
+            int(dim) for dim in (hbm_layout.physical_shape or hbm_layout.full_shape)
+        )
         if len(source_shape) < 2 or len(storage_shape) < 2:
             continue
         layouts[name] = {
@@ -2117,7 +2298,7 @@ def compile_native_hf_vision_encoder(
     layer_idx_start: int = 0,
     mlen: int = 64,
     blen: int = 4,
-    mram_tile_capacity: int = 4,
+    mram_tile_capacity: int = 128,
     seed: int = 42,
     golden_precision: str = "hardware",
     reference_backend: str = "scheduled",
@@ -2134,7 +2315,9 @@ def compile_native_hf_vision_encoder(
             print(message)
 
     if batch_size != 1:
-        raise NotImplementedError("native vision compile currently supports batch_size=1")
+        raise NotImplementedError(
+            "native vision compile currently supports batch_size=1"
+        )
     if seq_len <= 0:
         raise ValueError(f"seq_len must be positive, got {seq_len}")
 
@@ -2176,7 +2359,11 @@ def compile_native_hf_vision_encoder(
     padded_total_q_dim = num_heads * padded_head_dim
     padded_k_col = _ceil_to_multiple(k_col, mlen)
     scale = 1.0 / math.sqrt(head_dim)
-    connector_weights = extract_vision_connector_weights(model, model_cfg) if include_connector else None
+    connector_weights = (
+        extract_vision_connector_weights(model, model_cfg)
+        if include_connector
+        else None
+    )
     connector_seq_len = seq_len
     connector_rows = rows_per_batch
     connector_storage_dim = padded_hidden
@@ -2188,10 +2375,10 @@ def compile_native_hf_vision_encoder(
             raise ValueError(
                 f"vision connector scale_factor={connector_scale} must divide patch grid {grid}x{grid}"
             )
-        connector_seq_len = seq_len // (connector_scale ** 2)
+        connector_seq_len = seq_len // (connector_scale**2)
         connector_padded_seq_len = _ceil_to_multiple(connector_seq_len, blen)
         connector_rows = max(mlen, connector_padded_seq_len)
-        connector_storage_dim = padded_hidden * (connector_scale ** 2)
+        connector_storage_dim = padded_hidden * (connector_scale**2)
         connector_output_dim = connector_weights.output_dim
         padded_connector_output_dim = _ceil_to_multiple(connector_output_dim, mlen)
 
@@ -2203,7 +2390,9 @@ def compile_native_hf_vision_encoder(
     )
 
     print("=" * 80)
-    print(f"Vision Compiler - {model_cfg.model_type} ({n_layers} layer{'s' if n_layers != 1 else ''})")
+    print(
+        f"Vision Compiler - {model_cfg.model_type} ({n_layers} layer{'s' if n_layers != 1 else ''})"
+    )
     print(
         f"  vision: hidden={hidden}, inter={inter}, heads={num_heads}, "
         f"head_dim={head_dim}, patch={model_cfg.patch_size}, channels={model_cfg.num_channels}"
@@ -2227,7 +2416,9 @@ def compile_native_hf_vision_encoder(
         )
     print("=" * 80)
 
-    print(f"\nExtracting vision weights from layers {layer_idx_start}..{layer_idx_start + n_layers - 1}...")
+    print(
+        f"\nExtracting vision weights from layers {layer_idx_start}..{layer_idx_start + n_layers - 1}..."
+    )
     patch_weights = extract_vision_patch_weights(vision_model, model_cfg)
     all_weights = [
         extract_vision_layer_weights(layers[layer_idx_start + i], model_cfg)
@@ -2251,7 +2442,9 @@ def compile_native_hf_vision_encoder(
         )
         for w in all_weights
     ]
-    compile_post_norm = _pad_vision_post_norm_for_tiles(post_norm, padded_hidden=padded_hidden)
+    compile_post_norm = _pad_vision_post_norm_for_tiles(
+        post_norm, padded_hidden=padded_hidden
+    )
     compile_connector_weight = None
     compile_connector_bias = None
     if connector_weights is not None:
@@ -2277,8 +2470,12 @@ def compile_native_hf_vision_encoder(
         patches_w=patches_w,
         device=pixel_values.device,
     )
-    position_embeddings = vision_model.embeddings.position_embedding(position_ids)[0].detach().float()
-    patch_bias_pos = position_embeddings + patch_weights.bias.detach().float().view(1, -1)
+    position_embeddings = (
+        vision_model.embeddings.position_embedding(position_ids)[0].detach().float()
+    )
+    patch_bias_pos = position_embeddings + patch_weights.bias.detach().float().view(
+        1, -1
+    )
     compile_patch_bias_pos = _repeat_matrix_rows_storage(
         _pad_2d(patch_bias_pos, seq_len, padded_hidden),
         batch_size=batch_size,
@@ -2288,7 +2485,11 @@ def compile_native_hf_vision_encoder(
     )
 
     golden_policy = ReferencePrecision.from_mode(golden_precision)
-    requested_stop = None if stop_after in (None, "", "final") else str(stop_after).lower().replace("-", "_")
+    requested_stop = (
+        None
+        if stop_after in (None, "", "final")
+        else str(stop_after).lower().replace("-", "_")
+    )
     print(f"\nComputing CPU golden vision reference ({golden_policy.label})")
     encoder_trace = _run_vision_reference_trace(
         pixel_values,
@@ -2512,7 +2713,10 @@ def compile_native_hf_vision_encoder(
             if output_stage == emitted_stage:
                 break
 
-        if output_stage == "post_ln" or output_stage in {"connector_shuffle", "connector"}:
+        if output_stage == "post_ln" or output_stage in {
+            "connector_shuffle",
+            "connector",
+        }:
             _apply_vision_layer_norm(
                 prog,
                 current,
@@ -2552,7 +2756,9 @@ def compile_native_hf_vision_encoder(
             emitted_stage = "connector"
 
     if emitted_stage != output_stage:
-        raise AssertionError(f"Vision compiler emitted {emitted_stage!r}, expected {output_stage!r}")
+        raise AssertionError(
+            f"Vision compiler emitted {emitted_stage!r}, expected {output_stage!r}"
+        )
 
     isa_code = prog.compile()
     isa_code = _fix_large_immediates(isa_code)
@@ -2594,76 +2800,103 @@ def compile_native_hf_vision_encoder(
 
         for name, tensor in (
             (f"V_W_o_{i}", w.w_o),
-            (f"V_B_o_{i}", _lazy_repeat_feature_vector_storage(
-                w.b_o,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=padded_hidden,
-            )),
+            (
+                f"V_B_o_{i}",
+                _lazy_repeat_feature_vector_storage(
+                    w.b_o,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=padded_hidden,
+                ),
+            ),
             (f"V_W_fc1_{i}", w.w_fc1),
             (f"V_W_fc2_{i}", w.w_fc2),
-            (f"V_B_fc1_{i}", _lazy_repeat_feature_vector_storage(
-                w.b_fc1,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=padded_inter,
-            )),
-            (f"V_B_fc2_{i}", _lazy_repeat_feature_vector_storage(
-                w.b_fc2,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=padded_hidden,
-            )),
-            (f"V_LN1_weight_{i}", _lazy_repeat_feature_vector_storage(
-                w.ln1_weight,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=padded_hidden,
-            )),
-            (f"V_LN1_bias_{i}", _lazy_repeat_feature_vector_storage(
-                w.ln1_bias,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=padded_hidden,
-            )),
-            (f"V_LN2_weight_{i}", _lazy_repeat_feature_vector_storage(
-                w.ln2_weight,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=padded_hidden,
-            )),
-            (f"V_LN2_bias_{i}", _lazy_repeat_feature_vector_storage(
-                w.ln2_bias,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=padded_hidden,
-            )),
+            (
+                f"V_B_fc1_{i}",
+                _lazy_repeat_feature_vector_storage(
+                    w.b_fc1,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=padded_inter,
+                ),
+            ),
+            (
+                f"V_B_fc2_{i}",
+                _lazy_repeat_feature_vector_storage(
+                    w.b_fc2,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=padded_hidden,
+                ),
+            ),
+            (
+                f"V_LN1_weight_{i}",
+                _lazy_repeat_feature_vector_storage(
+                    w.ln1_weight,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=padded_hidden,
+                ),
+            ),
+            (
+                f"V_LN1_bias_{i}",
+                _lazy_repeat_feature_vector_storage(
+                    w.ln1_bias,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=padded_hidden,
+                ),
+            ),
+            (
+                f"V_LN2_weight_{i}",
+                _lazy_repeat_feature_vector_storage(
+                    w.ln2_weight,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=padded_hidden,
+                ),
+            ),
+            (
+                f"V_LN2_bias_{i}",
+                _lazy_repeat_feature_vector_storage(
+                    w.ln2_bias,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=padded_hidden,
+                ),
+            ),
         ):
             input_tensors[name] = tensor
             data_order.append(name)
 
     for name, tensor in (
-        ("V_POST_LN_weight", _lazy_repeat_feature_vector_storage(
-            compile_post_norm.weight,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            rows_per_batch=rows_per_batch,
-            cols=padded_hidden,
-        )),
-        ("V_POST_LN_bias", _lazy_repeat_feature_vector_storage(
-            compile_post_norm.bias,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            rows_per_batch=rows_per_batch,
-            cols=padded_hidden,
-        )),
+        (
+            "V_POST_LN_weight",
+            _lazy_repeat_feature_vector_storage(
+                compile_post_norm.weight,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                rows_per_batch=rows_per_batch,
+                cols=padded_hidden,
+            ),
+        ),
+        (
+            "V_POST_LN_bias",
+            _lazy_repeat_feature_vector_storage(
+                compile_post_norm.bias,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                rows_per_batch=rows_per_batch,
+                cols=padded_hidden,
+            ),
+        ),
     ):
         input_tensors[name] = tensor
         data_order.append(name)
@@ -2741,8 +2974,10 @@ def compile_native_hf_vision_encoder(
             }
         )
 
-    print(f"\nVision compilation complete: {info['isa_lines']} ISA lines, "
-          f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
+    print(
+        f"\nVision compilation complete: {info['isa_lines']} ISA lines, "
+        f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}"
+    )
     hbm_addrs = {}
     for name, inp in prog._inputs.items():
         if hasattr(inp, "hbm_addr"):
@@ -2786,7 +3021,7 @@ def compile_native_hf_decoder(
     hlen: int | None = None,
     broadcast_amount: int | None = None,
     attention_head_packing: bool | None = None,
-    mram_tile_capacity: int = 4,
+    mram_tile_capacity: int = 128,
     seed: int = 42,
     golden_precision: str = "hardware",
     reference_backend: str = "scheduled",
@@ -2852,7 +3087,9 @@ def compile_native_hf_decoder(
     #
     # Keep an opt-in compatibility path for reproducing older tile-scaling
     # reports that padded sequence rows to MLEN.
-    seq_padding_multiple = mlen if os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1" else blen
+    seq_padding_multiple = (
+        mlen if os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1" else blen
+    )
     padded_seq_len = _ceil_to_multiple(seq_len, seq_padding_multiple)
     rows_per_batch = (
         padded_seq_len
@@ -2866,21 +3103,31 @@ def compile_native_hf_decoder(
     padded_inter = _ceil_to_multiple(inter, mlen)
     padded_head_dim = _ceil_to_multiple(head_dim, mlen)
     if attention_head_packing is None:
-        attention_head_packing = hlen is not None and broadcast_amount is not None and head_dim < mlen
+        attention_head_packing = (
+            hlen is not None and broadcast_amount is not None and head_dim < mlen
+        )
     if attention_head_packing:
         if hlen is None or broadcast_amount is None:
-            raise ValueError("attention_head_packing requires hlen and broadcast_amount")
+            raise ValueError(
+                "attention_head_packing requires hlen and broadcast_amount"
+            )
         if hlen <= 0 or broadcast_amount <= 0:
-            raise ValueError(f"hlen and broadcast_amount must be positive, got {hlen}, {broadcast_amount}")
+            raise ValueError(
+                f"hlen and broadcast_amount must be positive, got {hlen}, {broadcast_amount}"
+            )
         if broadcast_amount * hlen != mlen:
             raise ValueError(
                 f"Packed attention requires broadcast_amount*hlen == mlen "
                 f"({broadcast_amount}*{hlen} != {mlen})"
             )
         if head_dim > hlen:
-            raise ValueError(f"head_dim={head_dim} exceeds hlen={hlen}; cannot head-pack")
+            raise ValueError(
+                f"head_dim={head_dim} exceeds hlen={hlen}; cannot head-pack"
+            )
         if ratio > broadcast_amount:
-            raise ValueError(f"GQA ratio={ratio} exceeds broadcast_amount={broadcast_amount}")
+            raise ValueError(
+                f"GQA ratio={ratio} exceeds broadcast_amount={broadcast_amount}"
+            )
         head_packing = AttentionHeadPacking(
             enabled=True,
             hlen=hlen,
@@ -2891,7 +3138,11 @@ def compile_native_hf_decoder(
         )
     else:
         head_packing = None
-    padded_total_q_dim = head_packing.total_q_dim if head_packing is not None else num_heads * padded_head_dim
+    padded_total_q_dim = (
+        head_packing.total_q_dim
+        if head_packing is not None
+        else num_heads * padded_head_dim
+    )
     padding_enabled = (
         padded_seq_len != seq_len
         or rows_per_batch != seq_len
@@ -2914,7 +3165,9 @@ def compile_native_hf_decoder(
     embed = embedding_module(root)
 
     print("=" * 80)
-    print(f"Model Compiler - {model_cfg.model_type} ({n_layers} layer{'s' if n_layers != 1 else ''})")
+    print(
+        f"Model Compiler - {model_cfg.model_type} ({n_layers} layer{'s' if n_layers != 1 else ''})"
+    )
     print(
         f"  decoder: hidden={hidden}, inter={inter}, heads={num_heads}/{num_kv_heads}, "
         f"head_dim={head_dim}"
@@ -2943,7 +3196,9 @@ def compile_native_hf_decoder(
     print("=" * 80)
 
     # ----------------------------------------------------------- weights
-    print(f"\nExtracting weights from layers {layer_idx_start}..{layer_idx_start + n_layers - 1}...")
+    print(
+        f"\nExtracting weights from layers {layer_idx_start}..{layer_idx_start + n_layers - 1}..."
+    )
     all_weights = []
     for i in range(n_layers):
         layer_module = layers[layer_idx_start + i]
@@ -2970,7 +3225,9 @@ def compile_native_hf_decoder(
 
     torch.manual_seed(seed)
 
-    decoder_input_source = "decoder_input_embeds" if decoder_input_embeds is not None else None
+    decoder_input_source = (
+        "decoder_input_embeds" if decoder_input_embeds is not None else None
+    )
     if decoder_input_embeds is not None:
         token_embeds = decoder_input_embeds.detach().float()
         if token_embeds.dim() == 2:
@@ -3018,8 +3275,14 @@ def compile_native_hf_decoder(
         )
     else:
         decoder_input_source = "random"
-        token_embeds = torch.randn(seq_len, hidden) if batch_size == 1 else torch.randn(batch_size, seq_len, hidden)
-        print(f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}")
+        token_embeds = (
+            torch.randn(seq_len, hidden)
+            if batch_size == 1
+            else torch.randn(batch_size, seq_len, hidden)
+        )
+        print(
+            f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}"
+        )
 
     # Llama-style models use RoPE (not learned position embeddings).
     # Set pos_weight to zeros so embedding_add is a no-op for position.
@@ -3039,7 +3302,9 @@ def compile_native_hf_decoder(
         cols=padded_hidden,
     )
 
-    _verbose(f"pos_weight: zeros {pos_weight.shape} (RoPE model; learned position add is a no-op)")
+    _verbose(
+        f"pos_weight: zeros {pos_weight.shape} (RoPE model; learned position add is a no-op)"
+    )
     for i in range(n_layers):
         for kv_h in range(num_kv_heads):
             _verbose(
@@ -3050,23 +3315,27 @@ def compile_native_hf_decoder(
 
     R_matrix, cos_table, sin_table = make_rope_inputs(seq_len, model_cfg)
     if head_packing is not None:
-        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = _pad_rope_inputs_for_head_slots(
-            R_matrix,
-            cos_table,
-            sin_table,
-            padded_seq_len=padded_seq_len,
-            group_width=head_packing.group_width,
-            head_slot_dim=head_packing.head_slot_dim,
-            broadcast_amount=head_packing.broadcast_amount,
+        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = (
+            _pad_rope_inputs_for_head_slots(
+                R_matrix,
+                cos_table,
+                sin_table,
+                padded_seq_len=padded_seq_len,
+                group_width=head_packing.group_width,
+                head_slot_dim=head_packing.head_slot_dim,
+                broadcast_amount=head_packing.broadcast_amount,
+            )
         )
         rope_width = head_packing.group_width
     else:
-        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = _pad_rope_inputs_for_tiles(
-            R_matrix,
-            cos_table,
-            sin_table,
-            padded_seq_len=padded_seq_len,
-            padded_head_dim=padded_head_dim,
+        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = (
+            _pad_rope_inputs_for_tiles(
+                R_matrix,
+                cos_table,
+                sin_table,
+                padded_seq_len=padded_seq_len,
+                padded_head_dim=padded_head_dim,
+            )
         )
         rope_width = padded_head_dim
     compile_cos_table = _repeat_sequence_storage(
@@ -3084,7 +3353,9 @@ def compile_native_hf_decoder(
 
     golden_policy = ReferencePrecision.from_mode(golden_precision)
     reference_backend = reference_backend.lower()
-    print(f"\nComputing CPU golden reference ({golden_policy.label}, backend={reference_backend})")
+    print(
+        f"\nComputing CPU golden reference ({golden_policy.label}, backend={reference_backend})"
+    )
     if reference_backend == "scheduled":
         scheduled_cfg = ScheduledReferenceConfig(
             seq_len=seq_len,
@@ -3103,8 +3374,14 @@ def compile_native_hf_decoder(
             blen=blen,
             max_k_tiles=mram_tile_capacity,
             attention_head_packing=head_packing is not None,
-            head_slot_dim=head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
-            broadcast_amount=head_packing.broadcast_amount if head_packing is not None else None,
+            head_slot_dim=(
+                head_packing.head_slot_dim
+                if head_packing is not None
+                else padded_head_dim
+            ),
+            broadcast_amount=(
+                head_packing.broadcast_amount if head_packing is not None else None
+            ),
             total_q_dim=padded_total_q_dim,
         )
         padded_golden_output = run_native_decoder_scheduled_reference(
@@ -3116,7 +3393,9 @@ def compile_native_hf_decoder(
             compile_cos_table,
             compile_sin_table,
             precision=golden_policy,
-            trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
+            trace=lambda i, x: _verbose(
+                f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"
+            ),
         )
         golden_out = _compact_active_sequence_rows(
             padded_golden_output,
@@ -3127,7 +3406,9 @@ def compile_native_hf_decoder(
         )
     elif reference_backend == "legacy":
         if batch_size != 1:
-            raise NotImplementedError("legacy reference_backend does not support batch_size > 1")
+            raise NotImplementedError(
+                "legacy reference_backend does not support batch_size > 1"
+            )
         golden_out = run_decoder_reference(
             token_embeds,
             pos_weight,
@@ -3139,7 +3420,9 @@ def compile_native_hf_decoder(
             mlen=mlen,
             max_k_tiles=mram_tile_capacity,
             precision=golden_policy,
-            trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
+            trace=lambda i, x: _verbose(
+                f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"
+            ),
         )
         padded_golden_output = _pad_2d(golden_out, padded_seq_len, padded_hidden)
     else:
@@ -3147,7 +3430,9 @@ def compile_native_hf_decoder(
     print(f"  golden_out: {golden_out.shape}")
     _verbose(f"  golden_out[0,:4]: {golden_out[0, :4].tolist()}")
 
-    print(f"\nComputing HF reference (float32, {n_layers} layer{'s' if n_layers != 1 else ''}, no quantization)")
+    print(
+        f"\nComputing HF reference (float32, {n_layers} layer{'s' if n_layers != 1 else ''}, no quantization)"
+    )
     with torch.no_grad():
         if batch_size == 1:
             hf_ground_truth = run_decoder_reference(
@@ -3161,7 +3446,9 @@ def compile_native_hf_decoder(
                 mlen=mlen,
                 max_k_tiles=mram_tile_capacity,
                 precision=ReferencePrecision.from_mode("hf_fp32"),
-                trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
+                trace=lambda i, x: _verbose(
+                    f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"
+                ),
             )
         else:
             padded_hf_output = run_native_decoder_scheduled_reference(
@@ -3173,7 +3460,9 @@ def compile_native_hf_decoder(
                 compile_cos_table,
                 compile_sin_table,
                 precision=ReferencePrecision.from_mode("hf_fp32"),
-                trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
+                trace=lambda i, x: _verbose(
+                    f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"
+                ),
             )
             hf_ground_truth = _compact_active_sequence_rows(
                 padded_hf_output,
@@ -3206,12 +3495,28 @@ def compile_native_hf_decoder(
     # Shared inputs
     sequence_physical_shape = (compile_seq_rows, padded_hidden)
     rope_table_physical_shape = (compile_seq_rows, rope_width)
-    x_input = prog.input("X", shape=(compile_seq_rows, padded_hidden), physical_shape=sequence_physical_shape)
-    pos_input = prog.input("POS", shape=(compile_seq_rows, padded_hidden), physical_shape=sequence_physical_shape)
+    x_input = prog.input(
+        "X",
+        shape=(compile_seq_rows, padded_hidden),
+        physical_shape=sequence_physical_shape,
+    )
+    pos_input = prog.input(
+        "POS",
+        shape=(compile_seq_rows, padded_hidden),
+        physical_shape=sequence_physical_shape,
+    )
 
     r_input = prog.input("R_rope", shape=(rope_width, rope_width))
-    cos_input = prog.input("COS", shape=(compile_seq_rows, rope_width), physical_shape=rope_table_physical_shape)
-    sin_input = prog.input("SIN", shape=(compile_seq_rows, rope_width), physical_shape=rope_table_physical_shape)
+    cos_input = prog.input(
+        "COS",
+        shape=(compile_seq_rows, rope_width),
+        physical_shape=rope_table_physical_shape,
+    )
+    sin_input = prog.input(
+        "SIN",
+        shape=(compile_seq_rows, rope_width),
+        physical_shape=rope_table_physical_shape,
+    )
     COS = prog.load_batch(cos_input, name="COS")
     SIN = prog.load_batch(sin_input, name="SIN")
 
@@ -3220,7 +3525,7 @@ def compile_native_hf_decoder(
     causal_mask_data = torch.zeros(mlen, mlen)
     if model_cfg.model_type != "llada":
         causal_mask_data.masked_fill_(
-            torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
+            torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float("-inf")
         )
     causal_mask_input = prog.input("causal_mask", shape=(mlen, mlen))
     CAUSAL_MASK = prog.load_batch(causal_mask_input, name="CAUSAL_MASK")
@@ -3297,7 +3602,9 @@ def compile_native_hf_decoder(
             )
         else:
             if batch_size != 1:
-                raise NotImplementedError("native non-packed MHA decoder lowering does not yet support batch_size > 1")
+                raise NotImplementedError(
+                    "native non-packed MHA decoder lowering does not yet support batch_size > 1"
+                )
             current_after_attn = _emit_attention_block(
                 prog,
                 current,
@@ -3397,7 +3704,9 @@ def compile_native_hf_decoder(
     _num_col_blocks = (out_features + mlen - 1) // mlen
     comparison_params = {
         "start_row_idx": o_vram_addr // mlen,
-        "num_rows": _num_col_blocks * _physical_rows if out_features > mlen else comparison_rows,
+        "num_rows": (
+            _num_col_blocks * _physical_rows if out_features > mlen else comparison_rows
+        ),
         "num_batches": comparison_rows,
         "elements_per_batch": out_features,
         "row_dim": mlen,
@@ -3421,9 +3730,13 @@ def compile_native_hf_decoder(
         "head_dim": head_dim,
         "padded_head_dim": padded_head_dim,
         "attention_head_packing": head_packing is not None,
-        "attention_head_slot_dim": head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
+        "attention_head_slot_dim": (
+            head_packing.head_slot_dim if head_packing is not None else padded_head_dim
+        ),
         "attention_kv_storage_head_dim": padded_head_dim,
-        "attention_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
+        "attention_broadcast_amount": (
+            head_packing.broadcast_amount if head_packing is not None else None
+        ),
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "mlen": mlen,
@@ -3467,8 +3780,10 @@ def compile_native_hf_decoder(
         )
     }
 
-    print(f"\nCompilation complete: {info['isa_lines']} ISA lines, "
-          f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}")
+    print(
+        f"\nCompilation complete: {info['isa_lines']} ISA lines, "
+        f"{n_layers} layers, output at VRAM row {o_vram_addr // mlen}"
+    )
     hbm_addrs = {}
     for name, inp in prog._inputs.items():
         if hasattr(inp, "hbm_addr"):
@@ -3497,5 +3812,7 @@ def compile_native_hf_decoder(
         "golden_precision": golden_precision,
         "reference_backend": reference_backend,
     }
+
+
 # Backwards-compatible alias for older callers.
 compile_hf_model = compile_native_hf_decoder

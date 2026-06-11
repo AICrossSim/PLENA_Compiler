@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+from ._imm import add_large_int_str as _add_large_int
 from ._imm import addi_large_int_str as _addi_large_int
 from ._imm import load_large_int_str as _load_large_int
 from ._k_split import k_chunks as _k_chunks
@@ -544,7 +545,7 @@ def _emit_ffn_projection_chunk(
                     f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{weight_hbm_offset_reg}, 1, 0 \n"
                 )
                 lines.append(
-                    f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n"
+                    _add_large_int(w_actual_register, w_actual_register, mlen * mlen)
                 )
                 lines.append(
                     _addi_large_int(
@@ -580,6 +581,7 @@ def _emit_ffn_projection_chunk(
                 # Activation base comes from a register (e.g. up_result_register).
                 # a_actual = activation_base_register + act_col*mlen*blen + chunk_act_base_offset
                 offset = act_col * mlen * blen + chunk_act_base_offset
+                assert activation_base_register is not None
                 lines.append(
                     _addi_large_int(
                         a_actual_register,
@@ -595,21 +597,29 @@ def _emit_ffn_projection_chunk(
             for _ in range(k_tile_count):
                 lines.append(f"M_MM 0, gp{w_temp_register}, gp{a_actual_register} \n")
                 lines.append(
-                    f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} \n"
+                    _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
                 )
                 lines.append(
-                    f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n"
+                    _add_large_int(
+                        a_actual_register, a_actual_register, mlen * batch * seq_len
+                    )
                 )
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 \n")
             lines.append(
-                f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} \n"
+                _add_large_int(
+                    intermediate_register, intermediate_register, blen * mlen
+                )
             )
 
         if (weight_row + 1) % (
             mlen // blen
         ) == 0 and weight_row != out_size // blen - 1:
             lines.append(
-                f"S_ADDI_INT gp{result_base_register}, gp{result_base_register}, {mlen * batch * seq_len} \n"
+                _add_large_int(
+                    result_base_register,
+                    result_base_register,
+                    mlen * batch * seq_len,
+                )
             )
 
     return "".join(lines)
@@ -684,8 +694,8 @@ def ffn_up_silu_asm(
     )
     for weight_col in range(num_weight_tiles):
         generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+        generated_code += _add_large_int(
+            w_actual_register, w_actual_register, mlen * mlen
         )
         generated_code += _addi_large_int(
             a_actual_register,
@@ -717,20 +727,25 @@ def ffn_up_silu_asm(
     # Innermost accumulation (unrolled)
     for inner_loop_index in range(num_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
         if inner_loop_index < num_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     # Write output
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
-
+    # generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
     # Restore a_actual_register and advance to next activation column
     act_col_advance = mlen * blen
-    generated_code += (
-        f"S_ADDI_INT gp{a_actual_register}, gp{temp_save_reg}, {act_col_advance}\n"
+    # generated_code += (
+    #     f"S_ADDI_INT gp{a_actual_register}, gp{temp_save_reg}, {act_col_advance}\n"
+    # )
+    generated_code += _add_large_int(
+        a_actual_register, a_actual_register, act_col_advance
     )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
@@ -753,7 +768,9 @@ def ffn_up_silu_asm(
         f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
     )
     # Advance up_result_register for next MLEN block
-    generated_code += f"S_ADDI_INT gp{up_result_register}, gp{up_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        up_result_register, up_result_register, mlen * batch * seq_len
+    )
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
@@ -832,8 +849,8 @@ def ffn_intermediate_asm(
     )
     for weight_col in range(num_weight_tiles):
         generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+        generated_code += _add_large_int(
+            w_actual_register, w_actual_register, mlen * mlen
         )
         generated_code += _addi_large_int(
             a_actual_register,
@@ -864,17 +881,22 @@ def ffn_intermediate_asm(
     # Innermost accumulation (unrolled)
     for inner_loop_index in range(num_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
         if inner_loop_index < num_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
+    # generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
     # Restore a_actual_register and advance to next activation column
     act_col_advance = mlen * blen
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{gate_result_register}, {act_col_advance}\n"
+    generated_code += _add_large_int(
+        a_actual_register, gate_result_register, act_col_advance
+    )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
 
@@ -886,7 +908,7 @@ def ffn_intermediate_asm(
     generated_code += (
         f"S_ADDI_INT gp{intermediate_register}, gp{up_result_register}, 0\n"
     )
-    # Add offset for current tile
+    # Add offset for current tilei
     generated_code += f"S_ADD_INT gp{intermediate_register}, gp{intermediate_register}, gp{w_actual_register}\n"
 
     generated_code += f"C_LOOP_END gp{loop_inner_reg}\n"
@@ -896,7 +918,9 @@ def ffn_intermediate_asm(
         f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
     )
     # Advance up_result_register for next MLEN block
-    generated_code += f"S_ADDI_INT gp{up_result_register}, gp{up_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        up_result_register, up_result_register, mlen * batch * seq_len
+    )
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
@@ -918,8 +942,8 @@ def ffn_intermediate_asm(
     )
     for weight_col in range(num_weight_tiles):
         generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{gate_weight_hbm_offset_reg}, 1, 0\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+        generated_code += _add_large_int(
+            w_actual_register, w_actual_register, mlen * mlen
         )
         generated_code += _addi_large_int(
             a_actual_register,
@@ -950,17 +974,22 @@ def ffn_intermediate_asm(
     # Innermost accumulation (unrolled)
     for inner_loop_index in range(num_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
+        # generated_code += (
+        #     f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
+        # )
         if inner_loop_index < num_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
     # Restore a_actual_register and advance to next activation column
-    generated_code += (
-        f"S_ADDI_INT gp{a_actual_register}, gp{up_result_register}, {act_col_advance}\n"
+    generated_code += _add_large_int(
+        a_actual_register, up_result_register, act_col_advance
     )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
@@ -983,7 +1012,9 @@ def ffn_intermediate_asm(
         f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
     )
     # Advance gate_result_register for next MLEN block
-    generated_code += f"S_ADDI_INT gp{gate_result_register}, gp{gate_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        gate_result_register, gate_result_register, mlen * batch * seq_len
+    )
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
@@ -1101,8 +1132,8 @@ def _ffn_asm_with_loops(
     )
     for weight_col in range(num_weight_tiles):
         generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+        generated_code += _add_large_int(
+            w_actual_register, w_actual_register, mlen * mlen
         )
         generated_code += _addi_large_int(
             a_actual_register,
@@ -1133,17 +1164,24 @@ def _ffn_asm_with_loops(
     # Innermost accumulation (unrolled)
     for inner_loop_index in range(num_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
+        # generated_code += (
+        #     f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
+        # )
         if inner_loop_index < num_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
     # Restore a_actual_register and advance to next activation column
     act_col_advance = mlen * blen
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{gate_result_register}, {act_col_advance}\n"
+    generated_code += _add_large_int(
+        a_actual_register, gate_result_register, act_col_advance
+    )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
 
@@ -1165,7 +1203,9 @@ def _ffn_asm_with_loops(
         f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
     )
     # Advance up_result_register for next MLEN block
-    generated_code += f"S_ADDI_INT gp{up_result_register}, gp{up_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        up_result_register, up_result_register, mlen * batch * seq_len
+    )
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
@@ -1187,8 +1227,8 @@ def _ffn_asm_with_loops(
     )
     for weight_col in range(num_weight_tiles):
         generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{gate_weight_hbm_offset_reg}, 1, 0\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+        generated_code += _add_large_int(
+            w_actual_register, w_actual_register, mlen * mlen
         )
         generated_code += _addi_large_int(
             a_actual_register,
@@ -1219,17 +1259,19 @@ def _ffn_asm_with_loops(
     # Innermost accumulation (unrolled)
     for inner_loop_index in range(num_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
         if inner_loop_index < num_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
     # Restore a_actual_register and advance to next activation column
-    generated_code += (
-        f"S_ADDI_INT gp{a_actual_register}, gp{up_result_register}, {act_col_advance}\n"
+    generated_code += _add_large_int(
+        a_actual_register, up_result_register, act_col_advance
     )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
@@ -1252,7 +1294,9 @@ def _ffn_asm_with_loops(
         f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
     )
     # Advance gate_result_register for next MLEN block
-    generated_code += f"S_ADDI_INT gp{gate_result_register}, gp{gate_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        gate_result_register, gate_result_register, mlen * batch * seq_len
+    )
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
@@ -1327,8 +1371,8 @@ def _ffn_asm_with_loops(
     )
     for weight_col in range(num_down_weight_tiles):
         generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{down_weight_hbm_offset_reg}, 1, 0\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+        generated_code += _add_large_int(
+            w_actual_register, w_actual_register, mlen * mlen
         )
         generated_code += _addi_large_int(
             a_actual_register,
@@ -1362,16 +1406,20 @@ def _ffn_asm_with_loops(
     # Innermost accumulation (unrolled)
     for inner_loop_index in range(num_down_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
         if inner_loop_index < num_down_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
     # Restore a_actual_register and advance to next activation column
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{down_act_save_reg}, {down_act_col_advance}\n"
+    generated_code += _add_large_int(
+        a_actual_register, down_act_save_reg, down_act_col_advance
+    )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
 
@@ -1393,7 +1441,9 @@ def _ffn_asm_with_loops(
         f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
     )
     # Advance act_result_register for next MLEN block
-    generated_code += f"S_ADDI_INT gp{act_result_register}, gp{act_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        act_result_register, act_result_register, mlen * batch * seq_len
+    )
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
@@ -1484,8 +1534,8 @@ def _ffn_asm_fused_up_gate(
     # Prefetch up weights (to MRAM at offset 0)
     for weight_col in range(num_weight_tiles):
         generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{up_weight_hbm_offset_reg}, 1, 0\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+        generated_code += _add_large_int(
+            w_actual_register, w_actual_register, mlen * mlen
         )
         generated_code += _addi_large_int(
             a_actual_register,
@@ -1555,16 +1605,24 @@ def _ffn_asm_fused_up_gate(
                 generated_code += (
                     f"M_MM 0, gp{a_save_register}, gp{a_actual_register}\n"
                 )
-                generated_code += f"S_ADDI_INT gp{a_save_register}, gp{a_save_register}, {mlen * mlen}\n"
+                generated_code += _add_large_int(
+                    a_save_register, a_save_register, mlen * mlen
+                )
                 if inner_idx < num_weight_tiles - 1:
-                    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+                    generated_code += _add_large_int(
+                        a_actual_register, a_actual_register, mlen * batch * seq_len
+                    )
 
             generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-            generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
+            generated_code += _add_large_int(
+                intermediate_register, intermediate_register, blen * mlen
+            )
 
             # Restore activation and advance to next column
             if act_col < num_act_cols - 1:
-                generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{w_temp_register}, {act_col_advance}\n"
+                generated_code += _add_large_int(
+                    a_actual_register, w_temp_register, act_col_advance
+                )
 
         # After all act_cols for this tile, advance weight offset
         generated_code += (
@@ -1598,16 +1656,19 @@ def _ffn_asm_fused_up_gate(
 
     for inner_idx in range(num_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
         if inner_idx < num_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
-    # Restore activation from saved base + advance to next column
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{w_gate_base_register}, {act_col_advance}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
+    generated_code += _add_large_int(
+        a_actual_register, w_gate_base_register, act_col_advance
+    )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
 
@@ -1626,8 +1687,12 @@ def _ffn_asm_fused_up_gate(
     generated_code += (
         f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
     )
-    generated_code += f"S_ADDI_INT gp{up_result_register}, gp{up_result_register}, {mlen * batch * seq_len}\n"
-    generated_code += f"S_ADDI_INT gp{gate_result_register}, gp{gate_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        up_result_register, up_result_register, mlen * batch * seq_len
+    )
+    generated_code += _add_large_int(
+        gate_result_register, gate_result_register, mlen * batch * seq_len
+    )
 
     generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
@@ -1695,7 +1760,9 @@ def _ffn_asm_fused_up_gate(
         if silu_iter % prefetch_interval == 0 and prefetch_idx < num_down_weight_tiles:
             generated_code += f"; Prefetch DOWN weight tile {prefetch_idx}\n"
             generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{down_weight_hbm_offset_reg}, 1, 0\n"
-            generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+            generated_code += _add_large_int(
+                w_actual_register, w_actual_register, mlen * mlen
+            )
             generated_code += _addi_large_int(
                 a_actual_register,
                 a_actual_register,
@@ -1740,15 +1807,19 @@ def _ffn_asm_fused_up_gate(
 
     for inner_idx in range(num_down_weight_tiles):
         generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-        generated_code += (
-            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
-        )
+        generated_code += _add_large_int(w_temp_register, w_temp_register, mlen * mlen)
         if inner_idx < num_down_weight_tiles - 1:
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+            generated_code += _add_large_int(
+                a_actual_register, a_actual_register, mlen * batch * seq_len
+            )
 
     generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-    generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
-    generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{up_result_register}, {down_act_col_advance}\n"
+    generated_code += _add_large_int(
+        intermediate_register, intermediate_register, blen * mlen
+    )
+    generated_code += _add_large_int(
+        a_actual_register, up_result_register, down_act_col_advance
+    )
 
     generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
 
@@ -1763,7 +1834,9 @@ def _ffn_asm_fused_up_gate(
     generated_code += f"C_LOOP_END gp{loop_inner_reg}\n"
 
     # Advance to second block base
-    generated_code += f"S_ADDI_INT gp{act_result_register}, gp{act_result_register}, {mlen * batch * seq_len}\n"
+    generated_code += _add_large_int(
+        act_result_register, act_result_register, mlen * batch * seq_len
+    )
 
     # Remaining blocks (if any) - standard prefetch then compute
     if num_down_mlen_blocks > 1:
@@ -1778,7 +1851,9 @@ def _ffn_asm_fused_up_gate(
         )
         for weight_col in range(num_down_weight_tiles):
             generated_code += f"H_PREFETCH_M gp{w_actual_register}, gp{a_actual_register}, a{down_weight_hbm_offset_reg}, 1, 0\n"
-            generated_code += f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen}\n"
+            generated_code += _add_large_int(
+                w_actual_register, w_actual_register, mlen * mlen
+            )
             generated_code += _addi_large_int(
                 a_actual_register,
                 a_actual_register,
@@ -1808,16 +1883,21 @@ def _ffn_asm_fused_up_gate(
 
         for inner_idx in range(num_down_weight_tiles):
             generated_code += f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n"
-            generated_code += (
-                f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen}\n"
+            generated_code += _add_large_int(
+                w_temp_register, w_temp_register, mlen * mlen
             )
             if inner_idx < num_down_weight_tiles - 1:
-                generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len}\n"
+                generated_code += _add_large_int(
+                    a_actual_register, a_actual_register, mlen * batch * seq_len
+                )
 
         generated_code += f"M_MM_WO gp{intermediate_register}, gp0, 0\n"
-        generated_code += f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen}\n"
-        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{up_result_register}, {down_act_col_advance}\n"
-
+        generated_code += _add_large_int(
+            intermediate_register, intermediate_register, blen * mlen
+        )
+        generated_code += _add_large_int(
+            a_actual_register, a_actual_register, down_act_col_advance
+        )
         generated_code += f"C_LOOP_END gp{loop_inner2_reg}\n"
 
         generated_code += (
@@ -1833,7 +1913,9 @@ def _ffn_asm_fused_up_gate(
         generated_code += (
             f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen}\n"
         )
-        generated_code += f"S_ADDI_INT gp{act_result_register}, gp{act_result_register}, {mlen * batch * seq_len}\n"
+        generated_code += _add_large_int(
+            act_result_register, act_result_register, mlen * batch * seq_len
+        )
 
         generated_code += f"C_LOOP_END gp{loop_outer_reg}\n"
 
