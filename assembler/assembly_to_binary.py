@@ -114,6 +114,7 @@ class AssemblyToBinary:
             "M_BMM",
             "M_BMV",
             "M_TMM",
+            "M_TMM_A",
             "M_TMV",
             "M_BTMM",
             "M_BTMV",

@@ -95,6 +95,7 @@ KNOWN_OPCODES = frozenset({
     "C_SET_SCALE_REG", "C_SET_STRIDE_REG",
     # scalar int
     "S_ADDI_INT", "S_ADD_INT", "S_SUB_INT", "S_MUL_INT",
+    "S_DIV_INT", "S_REM_INT",
     "S_LUI_INT", "S_LD_INT", "S_ST_INT",
     "S_SLLI_INT", "S_SRLI_INT",
     # scalar fp
@@ -111,7 +112,7 @@ KNOWN_OPCODES = frozenset({
     "M_BTMM", "M_BMM_WO",
     "M_BTMV", "M_BMV_WO",
     "M_MV", "M_MV_WO",
-    "M_MM", "M_MM_WO", "M_TMM",
+    "M_MM", "M_MM_WO", "M_TMM", "M_TMM_A",
     # HBM
     "H_LOAD_V", "H_STORE_V", "H_PREFETCH_V", "H_PREFETCH_M",
     # meta — emitted as ``; ...`` comment, not a real instruction.

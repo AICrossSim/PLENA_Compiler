@@ -41,7 +41,7 @@ Instructions follow one of the following encoding formats:
 | `OPCODE rd, rs1, fp2, rmask, rorder` | 5 operands | V_SUB_VF |
 | `OPCODE rd, rs1, rs2, rmask` | 4 operands | V_ADD_VV, V_MUL_VV, V_ADD_VF, V_MUL_VF, V_SUB_VV |
 | `OPCODE rd, rs1, rmask` | 3 operands | V_EXP_V, V_RECI_V |
-| `OPCODE 0, rs1, rs2` | 3 operands | M_MM, M_TMM, M_MV, M_TMV |
+| `OPCODE 0, rs1, rs2` | 3 operands | M_MM, M_TMM, M_TMM_A, M_MV, M_TMV |
 | `OPCODE rd, rs1, rs2` | 3 operands | S_ADD_INT, C_SET_ADDR_REG |
 | `OPCODE rd, rs1, imm` | 3 operands | S_ADDI_INT, M_MM_WO |
 | `OPCODE rd, imm` | 2 operands | S_LUI_INT, M_BMM_WO, M_MV_WO |
@@ -100,6 +100,16 @@ M_MM 0, gp2, gp4   ; Accumulate Vector[gp4] @ Matrix[gp2]
 **Description:**
 
 Similar to `M_MM`, but transposes the matrix.
+
+### M_TMM_A
+
+**Format:** `M_TMM_A 0, rs1, rs2`
+
+**Operation:** `Systolic Array += Vector_SRAM[gp_reg<rs2>]^T @ Matrix_SRAM[gp_reg<rs1>]`
+
+**Description:**
+
+The A-side counterpart of `M_TMM`. Same operand layout as `M_MM` (`rs1` = Matrix-SRAM operand, `rs2` = Vector-SRAM operand), but transposes the **Vector-SRAM (A / activation) tile** as it streams into the systolic array, instead of the Matrix-SRAM (B) tile. Used by the backward GEMMs whose contracted axis sits on the VRAM operand — the linear `dW = dY^T·X` and attention `dQ = dS·K`. Shares `M_TMM` / `M_MM`'s cycle cost, so the transpose is exact at no extra cost. Like `M_MM`, call it across the K dimension and drain with `M_MM_WO`.
 
 ### M_BMM
 

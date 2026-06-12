@@ -118,6 +118,19 @@ OPCODES: Dict[str, _OpcodeSpec] = {
         operand_kinds=("i32", "i32"),
         isa_mnemonic="S_MUL_INT",
     ),
+    # Integer divide / remainder (unsigned). Added for non-power-of-2 runtime
+    # divisors (real Open-Sora dims). ISA-text emit only for now; .svh opcode
+    # numbers + simulator semantics to be filled in later.
+    "S_DIV_INT": _OpcodeSpec(
+        result_type="i32",
+        operand_kinds=("i32", "i32"),
+        isa_mnemonic="S_DIV_INT",
+    ),
+    "S_REM_INT": _OpcodeSpec(
+        result_type="i32",
+        operand_kinds=("i32", "i32"),
+        isa_mnemonic="S_REM_INT",
+    ),
     "S_LUI_INT": _OpcodeSpec(
         result_type="i32",
         operand_kinds=("literal_int",),
@@ -324,6 +337,11 @@ OPCODES: Dict[str, _OpcodeSpec] = {
         result_type="void",
         operand_kinds=("literal_int", "i32", "i32"),
         isa_mnemonic="M_TMM",
+    ),
+    "M_TMM_A": _OpcodeSpec(
+        result_type="void",
+        operand_kinds=("literal_int", "i32", "i32"),
+        isa_mnemonic="M_TMM_A",
     ),
     # ---- control / setup ----
     "C_SET_SCALE_REG": _OpcodeSpec(

@@ -174,7 +174,7 @@ once per softmax row, so flash-attention pays
 
 | Opcode | Cycles |
 |--------|-------:|
-| `M_MM` / `M_TMM` | **mlen = 1024** |
+| `M_MM` / `M_TMM` / `M_TMM_A` | **mlen = 1024** |
 | `M_BMM` / `M_BTMM` | 1024 |
 | `M_MV` / `M_TMV` | 1024 |
 | `M_BMV` / `M_BTMV` | **1** |

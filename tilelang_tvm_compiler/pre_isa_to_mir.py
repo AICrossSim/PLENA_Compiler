@@ -580,11 +580,17 @@ class PreIsaToMir:
                     result=dst,
                 ))
                 return dst
-        raise PreIsaToMirError(
-            f"FloorDiv with non-power-of-2 divisor and non-literal LHS "
-            f"is not lowerable on PLENA (no integer divide); "
-            f"got {a!r} // {b!r}"
-        )
+        # Non-power-of-2 divisor: explicit unsigned integer divide.
+        # (Added for real Open-Sora dims, e.g. hidden/MLEN=3, head_count=24.)
+        lhs = self._lower_primexpr(a)
+        rhs = self._lower_primexpr(b)
+        dst = self.fn.mint_value("i32")
+        self.cur_block.append(mir.MirInstr(
+            opcode="S_DIV_INT",
+            operands=[lhs, rhs],
+            result=dst,
+        ))
+        return dst
 
     def _emit_floormod(self, a, b) -> mir.MirValue:
         if _is_intlike(a) and _is_intlike(b):
@@ -616,9 +622,16 @@ class PreIsaToMir:
                     result=dst,
                 ))
                 return dst
-        raise PreIsaToMirError(
-            f"FloorMod by non-power-of-2 not lowerable; got {a!r} % {b!r}"
-        )
+        # Non-power-of-2 modulus: explicit unsigned remainder.
+        lhs = self._lower_primexpr(a)
+        rhs = self._lower_primexpr(b)
+        dst = self.fn.mint_value("i32")
+        self.cur_block.append(mir.MirInstr(
+            opcode="S_REM_INT",
+            operands=[lhs, rhs],
+            result=dst,
+        ))
+        return dst
 
 
 # ---------------------------------------------------------------------

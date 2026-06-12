@@ -112,6 +112,12 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     // Matrix Operations
     M_MM                   = 6'h01,
     M_TMM                  = 6'h02,
+    // Transpose-A matmul: transposes the (MLEN, MLEN) VRAM (activation /
+    // A) tile on the fly as it streams into the array — the symmetric
+    // counterpart of M_TMM (which transposes the MRAM / B tile). Used by
+    // the backward GEMMs dW = dY^T·X and dQ = dS·K, whose contracted axis
+    // sits on the VRAM operand.
+    M_TMM_A                = 6'h3C,
     M_BMM                  = 6'h03,
     M_BTMM                 = 6'h04,
     M_BMM_WO               = 6'h05,

@@ -105,7 +105,7 @@ KNOWN_OPCODES = frozenset({
     "M_BTMV", "M_BMV_WO",
     "M_MV", "M_MV_WO",
     "M_MM", "M_MM_WO",
-    "M_TMM",
+    "M_TMM", "M_TMM_A",
     # HBM
     "H_LOAD_V", "H_STORE_V", "H_PREFETCH_V", "H_PREFETCH_M",
     # meta — translated by BackendEmit into a "; ..." comment line.

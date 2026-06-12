@@ -132,6 +132,7 @@ def _is_side_effecting(instr: mir.MirInstr) -> bool:
         "S_ADDI_INT", "S_SLLI_INT", "S_SRLI_INT", "S_LUI_INT",
         "S_SLL_INT", "S_SRL_INT",
         "S_ADD_INT", "S_SUB_INT", "S_MUL_INT",
+        "S_DIV_INT", "S_REM_INT",
     }
     return instr.opcode not in pure
 
@@ -227,7 +228,11 @@ def dead_loop_elim(fn: mir.MirFunction) -> bool:
                     i += 1
                     continue
                 body = lp.body[0]
-                init_const = tir.IntImm("int32", int(lp.init))
+                # Use a plain Python int (not tir.IntImm): the emit layer's
+                # _fmt_operand accepts MirValue / int but NOT tir.IntImm, and
+                # const_fold's _is_int_const treats int as constant too. Passing
+                # IntImm here leaked into S_MUL_INT operands -> "got 0" at emit.
+                init_const = int(lp.init)
                 _replace_all_uses(lp.loop_var, init_const)
                 lp.loop_var.block_arg_of = None
                 # Splice body items into parent_blk at position

@@ -1369,7 +1369,15 @@ class PreIsaPassV2:
         M_tiles = M // mlen
         K_tiles = K // mlen
         N_mlen_tiles = (N + mlen - 1) // mlen
+        # Transpose is encoded purely in the dim-role axis order (no flag).
+        #   B: standard (K, N) has K before N; transposed (N, K) -> M_TMM,
+        #      which transposes the MRAM (B) tile on the fly.
+        #   A: standard (M, K) has M before K; transposed (K, M) -> M_TMM_A,
+        #      which transposes the VRAM (A) tile on the fly. This is the
+        #      backward-pass case: dW = dY^T·X and dQ = dS·K contract on the
+        #      VRAM operand, so A arrives laid out (K, M).
         transpose_b = b_N_axis < b_K_axis
+        transpose_a = a_K_axis < a_M_axis
 
         # dst_row_stride — packed-head (cluster_dim==2, lane_count>1, M
         # on S axis) uses physical s_inner_stride; otherwise extents
@@ -1406,14 +1414,41 @@ class PreIsaPassV2:
         rhs_off_e = _as_expr(rhs_raw_off)
         dst_off_e = _as_expr(dst_raw_off)
 
+        if transpose_a and transpose_b:
+            raise PreIsaPassV2Error(
+                "plena.matmul: simultaneous transpose-A and transpose-B is "
+                "not supported (only one operand can be corner-turned per GEMM)"
+            )
+
         # Strides matching emit_matmul_general defaults.
-        lhs_k_tile_stride = mlen * mlen
-        lhs_m_tile_stride = K_tiles * mlen * mlen
+        #
+        # A side. Standard A is (M, K) packed M-major: M-tile stride spans a
+        # full K-row of tiles, K-tile stride is one tile, and each blen-row
+        # band within a tile steps by ``blen * mlen``. Transposed A is (K, M)
+        # packed K-major: the M-tiles become inner (stride one tile) and the
+        # K-tiles outer (stride a full M-row of tiles); A^T's rows are stored
+        # A's columns, so the in-tile band step collapses to ``blen`` — the
+        # exact A-side mirror of how ``oc_b_step`` flips for transpose-B.
+        if transpose_a:
+            lhs_k_tile_stride = M_tiles * mlen * mlen
+            lhs_m_tile_stride = mlen * mlen
+            a_orow_step = blen
+        else:
+            lhs_k_tile_stride = mlen * mlen
+            lhs_m_tile_stride = K_tiles * mlen * mlen
+            a_orow_step = blen * mlen
+
+        # B side.
         if transpose_b:
             rhs_n_mlen_tile_stride = K_tiles * mlen * mlen
             rhs_k_tile_stride = mlen * mlen
             oc_b_step = blen * mlen
             mm_opcode = "M_TMM"
+        elif transpose_a:
+            rhs_n_mlen_tile_stride = mlen * mlen
+            rhs_k_tile_stride = N_mlen_tiles * mlen * mlen
+            oc_b_step = blen
+            mm_opcode = "M_TMM_A"
         else:
             rhs_n_mlen_tile_stride = mlen * mlen
             rhs_k_tile_stride = N_mlen_tiles * mlen * mlen
@@ -1422,14 +1457,14 @@ class PreIsaPassV2:
         dst_m_tile_stride = mlen * int(dst_row_stride)
 
         tiles_per_mlen = mlen // blen
-        a_orow_step = blen * mlen
         c_orow_step = blen * mlen
 
         task_id = op.annotations.get("intrinsic", "matmul")
         self._comment(
             f"matmul (general) task {task_id} M={M_tiles*mlen} K={K_tiles*mlen} N={N} "
             f"(M_tiles={M_tiles} K_tiles={K_tiles} N_mlen_tiles={N_mlen_tiles}"
-            f"{', transpose_b' if transpose_b else ''})"
+            f"{', transpose_b' if transpose_b else ''}"
+            f"{', transpose_a' if transpose_a else ''})"
         )
 
         # Loop vars for the 5-level nest.
@@ -1522,6 +1557,14 @@ class PreIsaPassV2:
                                 self._append(pi.PreIsaOp(
                                     opcode="M_TMM",
                                     operands=[0, act_addr, mat_addr],
+                                ))
+                            elif transpose_a:
+                                # M_TMM_A 0, mat, act — same operand order as
+                                # M_MM (rs1=mram_rhs, rs2=vram_lhs); the A
+                                # (VRAM) tile is transposed on the fly.
+                                self._append(pi.PreIsaOp(
+                                    opcode="M_TMM_A",
+                                    operands=[0, mat_addr, act_addr],
                                 ))
                             else:
                                 # M_MM 0, mat, act
@@ -2284,8 +2327,22 @@ class PreIsaPassV2:
                 f"plena.mv: dynamic region offsets not yet supported on v2"
             )
         task_id = op.annotations.get("intrinsic", "mv")
-        n = int(self.shim.btmm_hlen)
+        # N is the mv output width — read it from the RHS weight's N-role
+        # axis (NOT btmm_hlen). Using btmm_hlen hard-codes N=hlen, which is
+        # only correct when N happens to equal one head width (e.g. flash
+        # decode's P@V). For a general rows=1 linear N = MLEN (or more), so
+        # the tile loop must cover all ``N // blen`` blen-wide column slices —
+        # mirror the matmul path which derives N from b_reg.extents.
         blen = int(self.shim.blen)
+        a_roles, b_roles, c_roles = op.scalar_args
+        if len(b_roles) != 4:
+            raise PreIsaPassV2Error("plena.mv b dim_roles must be a 4-tuple")
+        _n_hits = [i for i, r in enumerate(b_roles) if r == "N"]
+        if len(_n_hits) != 1:
+            raise PreIsaPassV2Error(
+                f"plena.mv b: expected exactly one N-role axis, got {_n_hits}"
+            )
+        n = int(b_reg.extents[_n_hits[0]])
         if n % blen != 0:
             raise PreIsaPassV2Error(
                 f"plena.mv: n={n} must be a multiple of blen={blen}"

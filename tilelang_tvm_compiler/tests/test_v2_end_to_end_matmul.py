@@ -210,6 +210,53 @@ def test_matmul_k_accumulation_v2_matches_legacy():
     assert _count(legacy, "M_MM_WO") == _count(new, "M_MM_WO") == expected_wo
 
 
+def test_matmul_transpose_a_v2_emits_m_tmm_a():
+    """A as (K, M) — transpose_a inferred from a_K_axis < a_M_axis.
+    Should emit M_TMM_A, not M_MM (the backward dW = dY^T·X / dQ = dS·K
+    case where the contracted axis sits on the VRAM operand). v2-only:
+    the legacy IsaEmitterPass has no transpose-A path."""
+    M = MLEN
+    K = MLEN
+    N = MLEN
+    # A physical shape with K before M (axis 1 = K, axis 3 = M).
+    a = _vram("a", 0, (1, K, 1, M))
+    b = _mram("b", 4096, (1, K, 1, N))
+    c = _vram("c", 8192, (1, M, 1, N))
+    op = _hlir.Op(
+        kind="matmul",
+        buffer_args=[
+            _hlir.VramRegion(parent="a", starts=(0, 0, 0, 0),
+                             extents=(1, K, 1, M)),
+            _hlir.MramRegion(parent="b", starts=(0, 0, 0, 0),
+                             extents=(1, K, 1, N)),
+            _hlir.VramRegion(parent="c", starts=(0, 0, 0, 0),
+                             extents=(1, M, 1, N)),
+        ],
+        scalar_args=[
+            ("_", "K", "_", "M"),
+            ("_", "K", "_", "N"),
+            ("_", "M", "_", "N"),
+        ],
+        annotations={"intrinsic": "matmul_transpose_a"},
+    )
+    hlir = _hlir.HLIRModule(
+        name="matmul_transpose_a",
+        buffers={"a": a, "b": b, "c": c},
+        ops=[op], param_names=[],
+    )
+    new = _v2_emit(hlir)
+    # v2 keeps the (m, oc, orow, k) nest rolled, so one M_TMM_A sits in
+    # the k-loop body (vs the legacy 256 physical copies). The task
+    # comment must carry the transpose_a tag, and there must be exactly
+    # one M_TMM_A / one M_MM_WO drain in the rolled body.
+    assert "transpose_a" in new, f"\nv2:\n{new}"
+    assert _count(new, "M_TMM_A") == 1, f"\nv2:\n{new}"
+    assert _count(new, "M_MM_WO") == 1
+    # No plain M_MM and no M_TMM (B-side transpose).
+    assert _count(new, "M_MM") == 0
+    assert _count(new, "M_TMM") == 0
+
+
 def test_matmul_transpose_b_v2_matches_legacy():
     """B as (N, K) — transpose_b inferred from b_N_axis < b_K_axis.
     Should emit M_TMM, not M_MM."""

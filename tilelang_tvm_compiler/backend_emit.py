@@ -377,6 +377,14 @@ _TEMPLATES: Dict[str, _Template] = {
         slots=[_slot_literal_int, _slot_expr_cached, _slot_expr_cached],
         fmt="M_TMM {0}, {1}, {2}",
     ),
+    # M_TMM_A — transpose-A matmul:
+    #   M_TMM_A 0, gp{mat_mram}, gp{act_vram}
+    # (operand order matches M_MM — rs1 is mram rhs, rs2 is vram lhs; the
+    # VRAM/A tile is transposed on the fly).
+    "M_TMM_A": _Template(
+        slots=[_slot_literal_int, _slot_expr_cached, _slot_expr_cached],
+        fmt="M_TMM_A {0}, {1}, {2}",
+    ),
     # DMA control / data-movement instructions.
     #
     # C_SET_SCALE_REG gp{r}       — set scale length (gp{r} holds it)
