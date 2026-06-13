@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+
+from compiler.asm_templates._imm import load_large_int
 from compiler.asm_templates import preload_addr_reg_asm
 from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl
 from compiler.aten.isa_builder import IsaBuilder, addr as areg, gp
@@ -39,7 +42,7 @@ class IsaMatrixMixin:
         return [1, 2, 3] if gp_regs is None else gp_regs
 
     def _emit_hbm_prefetch_setup(self, asm: IsaBuilder, layout, gp_scale: int, gp_stride: int) -> None:
-        rows, cols = layout.full_shape
+        rows, cols = layout.physical_shape or layout.full_shape
         asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), rows * cols)
         asm.instr("C_SET_SCALE_REG", gp(gp_scale))
         asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), cols)
@@ -221,6 +224,7 @@ class IsaMatrixMixin:
         gp_regs: list[int],
         caller_name: str,
         unroll: bool | None = None,
+        row_loop_count: int | None = None,
     ) -> str:
         """Emit the shared projection loop after callers resolve operands."""
         do_unroll = self.unroll_loops if unroll is None else unroll
@@ -238,6 +242,7 @@ class IsaMatrixMixin:
             transposed=transposed,
             gp_regs=gp_regs,
             caller_name=caller_name,
+            row_loop_count=row_loop_count,
         )
 
     def vram_sub_projection_asm(
@@ -254,9 +259,7 @@ class IsaMatrixMixin:
     ) -> str:
         """Emit VRAM[row][:] @ MRAM[:][col] projection."""
         gp_regs = self._default_projection_gp_regs(gp_regs)
-        vram_layout, mram_layout, vram_row_blocks = self._projection_context(
-            vram_mat_name, vram_row_idx, mram_mat_name
-        )
+        vram_layout, mram_layout, vram_row_blocks = self._projection_context(vram_mat_name, vram_row_idx, mram_mat_name)
         mram_col_blocks = mram_layout.get_col_blocks(mram_col_idx)
         if k_block_count is not None:
             mram_col_blocks = mram_col_blocks[k_block_start : k_block_start + k_block_count]
@@ -268,7 +271,9 @@ class IsaMatrixMixin:
                 f"got {num_hidden_blocks}"
             )
 
-        full_batch = vram_layout.full_shape[0]
+        full_batch = (vram_layout.physical_shape or vram_layout.full_shape)[0]
+        valid_rows = vram_row_blocks[k_block_start].valid_shape[0] if vram_row_blocks[k_block_start].valid_shape else self.mlen
+        row_loop_count = max(1, math.ceil(valid_rows / self.blen))
         vram_row_start_addr = vram_row_blocks[k_block_start].vram_addr
         mram_col_start_addr = self._loaded_mram_start(
             mram_col_blocks,
@@ -294,6 +299,7 @@ class IsaMatrixMixin:
             gp_regs=gp_regs,
             caller_name="vram_sub_projection_asm",
             unroll=unroll,
+            row_loop_count=row_loop_count,
         )
 
     def vram_sub_projection_T_asm(
@@ -308,9 +314,7 @@ class IsaMatrixMixin:
     ) -> str:
         """Emit VRAM[row][:] @ MRAM[row][:]^T projection."""
         gp_regs = self._default_projection_gp_regs(gp_regs)
-        vram_layout, mram_layout, vram_row_blocks = self._projection_context(
-            vram_mat_name, vram_row_idx, mram_mat_name
-        )
+        vram_layout, mram_layout, vram_row_blocks = self._projection_context(vram_mat_name, vram_row_idx, mram_mat_name)
         mram_row_blocks = mram_layout.get_row_blocks(mram_row_idx)
 
         if len(vram_row_blocks) != len(mram_row_blocks):
@@ -319,7 +323,9 @@ class IsaMatrixMixin:
             )
 
         num_hidden_blocks = len(vram_row_blocks)
-        full_batch = vram_layout.full_shape[0]
+        full_batch = (vram_layout.physical_shape or vram_layout.full_shape)[0]
+        valid_rows = vram_row_blocks[0].valid_shape[0] if vram_row_blocks[0].valid_shape else self.mlen
+        row_loop_count = max(1, math.ceil(valid_rows / self.blen))
         vram_row_start_addr = vram_row_blocks[0].vram_addr
         mram_row_start_addr = self._loaded_mram_start(
             mram_row_blocks,
@@ -348,6 +354,7 @@ class IsaMatrixMixin:
             gp_regs=gp_regs,
             caller_name="vram_sub_projection_T_asm",
             unroll=unroll,
+            row_loop_count=row_loop_count,
         )
 
     def vram_block_add_asm(
@@ -389,14 +396,14 @@ class IsaMatrixMixin:
 
         if self.unroll_loops:
             for i in range(self.mlen):
-                lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {target_block.vram_addr + i * self.mlen}")
-                lines.append(f"S_ADDI_INT gp{gp_src1}, gp0, {src1_block.vram_addr + i * self.mlen}")
-                lines.append(f"S_ADDI_INT gp{gp_src2}, gp0, {src2_block.vram_addr + i * self.mlen}")
+                lines.extend(load_large_int(gp_dst, target_block.vram_addr + i * self.mlen))
+                lines.extend(load_large_int(gp_src1, src1_block.vram_addr + i * self.mlen))
+                lines.extend(load_large_int(gp_src2, src2_block.vram_addr + i * self.mlen))
                 lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_src1}, gp{gp_src2}, 0")
         else:
-            lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {target_block.vram_addr}")
-            lines.append(f"S_ADDI_INT gp{gp_src1}, gp0, {src1_block.vram_addr}")
-            lines.append(f"S_ADDI_INT gp{gp_src2}, gp0, {src2_block.vram_addr}")
+            lines.extend(load_large_int(gp_dst, target_block.vram_addr))
+            lines.extend(load_large_int(gp_src1, src1_block.vram_addr))
+            lines.extend(load_large_int(gp_src2, src2_block.vram_addr))
             lines.append(f"C_LOOP_START gp{gp_loop}, {self.mlen}")
             lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_src1}, gp{gp_src2}, 0")
             lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}")
@@ -474,14 +481,17 @@ class IsaMatrixMixin:
         rows: int,
         cols: int,
         strict: bool = True,
+        physical_shape: tuple[int, int] | None = None,
     ) -> int:
         """Allocate a VRAM matrix large enough to hold combined results of multiple sub-blocks. Returns the VRAM base address."""
-        size = rows * cols
+        physical_rows, physical_cols = physical_shape or (rows, cols)
+        size = physical_rows * physical_cols
         vram_addr = self.vram_allocator.allocate(size, name=name)
 
         self.add_vram_object(
             name=name,
             shape=(rows, cols),
+            physical_shape=(physical_rows, physical_cols),
             vram_addr=vram_addr,
             dtype="fp32",
             kind="VRAMMatrix",
@@ -489,7 +499,10 @@ class IsaMatrixMixin:
             strict=strict,
         )
 
-        isa_code = f"; Allocate VRAM Matrix {name}: ({rows}, {cols}) at VRAM[{vram_addr}]\n"
+        isa_code = (
+            f"; Allocate VRAM Matrix {name}: logical=({rows}, {cols}) "
+            f"physical=({physical_rows}, {physical_cols}) at VRAM[{vram_addr}]\n"
+        )
         self._emit(isa_code)
 
         return vram_addr
@@ -509,7 +522,9 @@ class IsaMatrixMixin:
             self.register_vram_matrix(
                 name=matrix_name,
                 shape=info.shape,
+                physical_shape=info.physical_shape,
                 vram_base_addr=info.vram_addr,
+                strict=False,
             )
 
     def vram_block_add_to(
@@ -577,6 +592,8 @@ class IsaMatrixMixin:
 
         dst_rows, dst_cols = dst_info.shape
         src_rows, src_cols = src_info.shape
+        dst_physical_rows, dst_physical_cols = dst_info.physical_shape
+        src_physical_rows, src_physical_cols = src_info.physical_shape
 
         if num_rows is None:
             num_rows = src_rows
@@ -599,8 +616,8 @@ class IsaMatrixMixin:
 
         # Prefer block add path so we can reuse the compact C_LOOP-based add kernel.
         block_aligned = (
-            dst_cols % self.mlen == 0
-            and src_cols % self.mlen == 0
+            dst_physical_cols % self.mlen == 0
+            and src_physical_cols % self.mlen == 0
             and dst_row_offset % self.mlen == 0
             and src_row_offset % self.mlen == 0
             and num_rows % self.mlen == 0
@@ -608,7 +625,7 @@ class IsaMatrixMixin:
 
         if block_aligned:
             num_row_blocks = num_rows // self.mlen
-            num_col_blocks = dst_cols // self.mlen
+            num_col_blocks = dst_physical_cols // self.mlen
             dst_row_block_base = dst_row_offset // self.mlen
             src_row_block_base = src_row_offset // self.mlen
             lines.append(f"; block add path: row_blocks={num_row_blocks}, col_blocks={num_col_blocks}")
@@ -636,7 +653,7 @@ class IsaMatrixMixin:
             gp_regs = self.register_allocator.allocate_gp(2)
             gp_dst = gp_regs[0]
             gp_src = gp_regs[1]
-            num_col_blocks = dst_cols // self.mlen
+            num_col_blocks = dst_physical_cols // self.mlen
             lines.append(f"; fallback row-wise path: num_rows={num_rows}, num_col_blocks={num_col_blocks}")
 
             for row in range(num_rows):
@@ -644,13 +661,76 @@ class IsaMatrixMixin:
                 src_actual_row = src_row_offset + row
 
                 for col_block in range(num_col_blocks):
-                    dst_block_addr = dst_addr + col_block * dst_rows * self.mlen + dst_actual_row * self.mlen
-                    src_block_addr = src_addr + col_block * src_rows * self.mlen + src_actual_row * self.mlen
+                    dst_block_addr = dst_addr + col_block * dst_physical_rows * self.mlen + dst_actual_row * self.mlen
+                    src_block_addr = src_addr + col_block * src_physical_rows * self.mlen + src_actual_row * self.mlen
 
-                    lines.append(f"S_ADDI_INT gp{gp_dst}, gp0, {dst_block_addr}")
-                    lines.append(f"S_ADDI_INT gp{gp_src}, gp0, {src_block_addr}")
+                    lines.extend(load_large_int(gp_dst, dst_block_addr))
+                    lines.extend(load_large_int(gp_src, src_block_addr))
                     lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_src}, 0")
             self.register_allocator.free_gp(gp_regs)
+
+        isa_code = "\n".join(lines) + "\n"
+        return self._emit(isa_code)
+
+    def vram_matrix_mul(
+        self,
+        dst_matrix: str,
+        src_matrix: str,
+        dst_row_offset: int = 0,
+        src_row_offset: int = 0,
+        num_rows: int | None = None,
+    ) -> str:
+        """General VRAM Matrix Multiplication: dst[row_offset:] *= src."""
+        dst_info = self[dst_matrix]
+        src_info = self[src_matrix]
+
+        self._ensure_vram_matrix_layout(dst_matrix)
+        self._ensure_vram_matrix_layout(src_matrix)
+
+        dst_addr = dst_info.vram_addr
+        src_addr = src_info.vram_addr
+
+        dst_rows, dst_cols = dst_info.shape
+        src_rows, src_cols = src_info.shape
+        dst_physical_rows, dst_physical_cols = dst_info.physical_shape
+        src_physical_rows, src_physical_cols = src_info.physical_shape
+
+        if num_rows is None:
+            num_rows = src_rows
+
+        assert dst_cols == src_cols, f"Column mismatch: dst={dst_cols}, src={src_cols}"
+        assert dst_row_offset + num_rows <= dst_rows, (
+            f"dst row range out of bounds: offset={dst_row_offset}, num_rows={num_rows}, dst_rows={dst_rows}"
+        )
+        assert src_row_offset + num_rows <= src_rows, (
+            f"src row range out of bounds: offset={src_row_offset}, num_rows={num_rows}, src_rows={src_rows}"
+        )
+
+        lines = [
+            f"; === VRAM Matrix Mul: "
+            f"{dst_matrix}[{dst_row_offset}:{dst_row_offset + num_rows}] *= "
+            f"{src_matrix}[{src_row_offset}:{src_row_offset + num_rows}] ===",
+            f"; dst shape: {dst_info.shape}, src shape: {src_info.shape}",
+        ]
+
+        gp_regs = self.register_allocator.allocate_gp(2)
+        gp_dst = gp_regs[0]
+        gp_src = gp_regs[1]
+        num_col_blocks = dst_physical_cols // self.mlen
+        lines.append(f"; row-wise path: num_rows={num_rows}, num_col_blocks={num_col_blocks}")
+
+        for row in range(num_rows):
+            dst_actual_row = dst_row_offset + row
+            src_actual_row = src_row_offset + row
+
+            for col_block in range(num_col_blocks):
+                dst_block_addr = dst_addr + col_block * dst_physical_rows * self.mlen + dst_actual_row * self.mlen
+                src_block_addr = src_addr + col_block * src_physical_rows * self.mlen + src_actual_row * self.mlen
+
+                lines.extend(load_large_int(gp_dst, dst_block_addr))
+                lines.extend(load_large_int(gp_src, src_block_addr))
+                lines.append(f"V_MUL_VV gp{gp_dst}, gp{gp_dst}, gp{gp_src}, 0")
+        self.register_allocator.free_gp(gp_regs)
 
         isa_code = "\n".join(lines) + "\n"
         return self._emit(isa_code)
@@ -660,7 +740,7 @@ class IsaMatrixMixin:
             raise KeyError(f"Target matrix '{target_matrix}' not found. Use allocate_vram_matrix first.")
 
         target_info = self[target_matrix]
-        target_rows, _target_cols = target_info.shape
+        target_rows, _target_cols = target_info.physical_shape
         target_base_addr = target_info.vram_addr
         result_vram_addr = (
             target_base_addr + target_col_idx * target_rows * self.mlen + target_row_idx * self.mlen * self.mlen

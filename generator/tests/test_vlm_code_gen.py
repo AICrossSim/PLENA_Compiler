@@ -49,7 +49,7 @@ def _make_smolvlm2_config():
         hidden_size=256,
         num_hidden_layers=1,
         num_attention_heads=4,
-        num_key_value_heads=1,   # MQA: ratio = 4 == BLEN
+        num_key_value_heads=1,  # MQA: ratio = 4 == BLEN
         intermediate_size=512,
         head_dim=64,
         vocab_size=49280,
@@ -146,12 +146,8 @@ def test_smolvlm2_codegen_no_m_mm_vv():
     graph, model_info, hw, sched = _build_text_graph_and_scheduler(seq_len=32)
     asm_output = code_gen_pass(graph, model_info, hw, sched)
 
-    assert isinstance(asm_output, str) and len(asm_output) > 0, (
-        "code_gen_pass returned empty output"
-    )
-    assert "M_MM_VV" not in asm_output, (
-        "ASM contains forbidden M_MM_VV instruction — fabricated opcode detected"
-    )
+    assert isinstance(asm_output, str) and len(asm_output) > 0, "code_gen_pass returned empty output"
+    assert "M_MM_VV" not in asm_output, "ASM contains forbidden M_MM_VV instruction — fabricated opcode detected"
     assert "M_BTMM" in asm_output or "M_TMM" in asm_output, (
         "ASM missing M_BTMM/M_TMM — flash attention path was not emitted"
     )
@@ -170,13 +166,9 @@ def test_smolvlm2_codegen_has_vision_nodes():
     text_graph, text_model_info, hw, text_sched = _build_text_graph_and_scheduler(seq_len=32)
     text_asm = code_gen_pass(text_graph, text_model_info, hw, text_sched)
 
-    assert "embed_tokens" in text_asm, (
-        "Text decoder ASM missing embed_tokens section"
-    )
+    assert "embed_tokens" in text_asm, "Text decoder ASM missing embed_tokens section"
     # code_gen wraps every node in '; === <name> (<type>) ==='
-    assert "(embedding)" in text_asm, (
-        "Text decoder ASM missing embedding operation marker"
-    )
+    assert "(embedding)" in text_asm, "Text decoder ASM missing embedding operation marker"
 
     # Vision encoder: must contain flash attention + GELU
     vgraph, vmodel_info, hw2, vsched = _build_vision_graph_and_scheduler()
@@ -185,13 +177,9 @@ def test_smolvlm2_codegen_has_vision_nodes():
     assert "M_BTMM" in vision_asm or "M_TMM" in vision_asm, (
         "Vision encoder ASM missing M_BTMM/M_TMM — flash attention not emitted"
     )
-    assert "Flash Attention" in vision_asm, (
-        "Vision encoder ASM missing '; Flash Attention' comment marker"
-    )
+    assert "Flash Attention" in vision_asm, "Vision encoder ASM missing '; Flash Attention' comment marker"
     # GELU is emitted as a comment header by _generate_ffn_code for vit arch
-    assert "gelu" in vision_asm.lower(), (
-        "Vision encoder ASM missing GELU activation body"
-    )
+    assert "gelu" in vision_asm.lower(), "Vision encoder ASM missing GELU activation body"
     print("test_smolvlm2_codegen_has_vision_nodes PASSED")
 
 
@@ -205,7 +193,7 @@ def test_smolvlm2_codegen_assembles():
     from assembler import AssemblyToBinary
 
     paths = _get_paths()
-    compiler_root = Path(__file__).resolve().parents[2]
+    Path(__file__).resolve().parents[2]
     asm_tool = AssemblyToBinary(paths["operation"], paths["hw_config"])
 
     for label, build_fn in [
@@ -225,9 +213,7 @@ def test_smolvlm2_codegen_assembles():
             assert mem_bytes > 0, f"{label}: assembled .mem is empty"
             print(f"  {label}: assembled OK ({mem_bytes} bytes)")
         except ValueError as exc:
-            raise AssertionError(
-                f"{label}: assembler raised ValueError (u32 overflow): {exc}"
-            ) from exc
+            raise AssertionError(f"{label}: assembler raised ValueError (u32 overflow): {exc}") from exc
         finally:
             if os.path.exists(asm_path):
                 os.unlink(asm_path)

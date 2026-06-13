@@ -10,6 +10,7 @@ import pytest
 
 # ---------- helpers ----------
 
+
 def _bf16(x):
     """Convert to bfloat16 and back (simulating emulator truncation)."""
     return x.to(torch.bfloat16).to(torch.float32)
@@ -18,18 +19,18 @@ def _bf16(x):
 def _silu_bf16(x: torch.Tensor) -> torch.Tensor:
     """SiLU entirely in bf16 arithmetic (emulator behaviour)."""
     x = x.to(torch.bfloat16)
-    neg_x = (torch.zeros_like(x) - x)           # -x
-    exp_neg_x = neg_x.exp()                      # exp(-x)
-    one_plus = exp_neg_x + torch.ones_like(x)    # 1 + exp(-x)
-    sigmoid = one_plus.reciprocal()               # 1 / (1 + exp(-x))
+    neg_x = torch.zeros_like(x) - x  # -x
+    exp_neg_x = neg_x.exp()  # exp(-x)
+    one_plus = exp_neg_x + torch.ones_like(x)  # 1 + exp(-x)
+    sigmoid = one_plus.reciprocal()  # 1 / (1 + exp(-x))
     return (x * sigmoid).to(torch.float32)
 
 
 def _silu_bf16_clamped(x: torch.Tensor, limit: float = 88.0) -> torch.Tensor:
     """SiLU in bf16 with exp input clamped (the fix)."""
     x = x.to(torch.bfloat16)
-    neg_x = (torch.zeros_like(x) - x)
-    neg_x = neg_x.clamp(-limit, limit)           # <-- THE FIX
+    neg_x = torch.zeros_like(x) - x
+    neg_x = neg_x.clamp(-limit, limit)  # <-- THE FIX
     exp_neg_x = neg_x.exp()
     one_plus = exp_neg_x + torch.ones_like(x)
     sigmoid = one_plus.reciprocal()
@@ -41,7 +42,7 @@ def _online_softmax_row_bf16(row: torch.Tensor) -> torch.Tensor:
     row = row.to(torch.bfloat16)
     m = row.max()
     shifted = row - m
-    p = shifted.exp()                             # V_EXP_V
+    p = shifted.exp()  # V_EXP_V
     return (p / p.sum()).to(torch.float32)
 
 
@@ -52,12 +53,13 @@ def _online_softmax_row_bf16_clamped(row: torch.Tensor, limit: float = 88.0) -> 
     row = row.clamp(-limit, limit)
     m = row.max()
     shifted = row - m
-    shifted = shifted.clamp(-limit, limit)        # <-- THE FIX
+    shifted = shifted.clamp(-limit, limit)  # <-- THE FIX
     p = shifted.exp()
     return (p / p.sum()).to(torch.float32)
 
 
 # ---------- tests ----------
+
 
 class TestBf16ExpOverflow:
     """exp() in bfloat16 overflows for inputs > ~88."""
@@ -92,15 +94,13 @@ class TestSiluNaNPropagation:
         """The exact NaN mechanism: x=-inf → exp(-(-inf))=exp(inf)=inf → 1+inf=inf → 1/inf=0 → (-inf)*0=NaN."""
         x = torch.tensor([-float("inf")], dtype=torch.bfloat16)
 
-        neg_x = -x                    # inf
-        exp_neg_x = neg_x.exp()       # exp(inf) = inf
-        one_plus = 1.0 + exp_neg_x    # 1 + inf = inf
+        neg_x = -x  # inf
+        exp_neg_x = neg_x.exp()  # exp(inf) = inf
+        one_plus = 1.0 + exp_neg_x  # 1 + inf = inf
         sigmoid = one_plus.reciprocal()  # 1/inf = 0
-        result = x * sigmoid           # (-inf) * 0 = NaN  ← IEEE 754
+        result = x * sigmoid  # (-inf) * 0 = NaN  ← IEEE 754
 
-        assert torch.isnan(result).all(), (
-            f"SiLU(-inf) should be NaN via (-inf)*0, got {result}"
-        )
+        assert torch.isnan(result).all(), f"SiLU(-inf) should be NaN via (-inf)*0, got {result}"
 
     def test_silu_nan_from_large_negative(self):
         """Finite * 0 = 0, but -inf * 0 = NaN. Show bf16 overflow path to -inf."""
@@ -114,9 +114,7 @@ class TestSiluNaNPropagation:
         # But -inf triggers NaN: exp(inf)=inf, 1+inf=inf, 1/inf=0, (-inf)*0=NaN
         x_inf = torch.tensor([-float("inf")], dtype=torch.bfloat16)
         result_inf = _silu_bf16(x_inf)
-        assert torch.isnan(result_inf).any(), (
-            f"SiLU(-inf) should be NaN via (-inf)*0, got {result_inf}"
-        )
+        assert torch.isnan(result_inf).any(), f"SiLU(-inf) should be NaN via (-inf)*0, got {result_inf}"
 
     def test_silu_clamped_no_nan(self):
         """Clamping exp inputs prevents NaN even for extreme values."""
@@ -124,18 +122,14 @@ class TestSiluNaNPropagation:
             [-float("inf"), -1e10, -1000, -100, 0, 100, 1000, 1e10, float("inf")],
         )
         result = _silu_bf16_clamped(extreme_values)
-        assert not torch.isnan(result).any(), (
-            f"Clamped SiLU should never produce NaN, got {result}"
-        )
+        assert not torch.isnan(result).any(), f"Clamped SiLU should never produce NaN, got {result}"
 
     def test_silu_clamped_preserves_normal_values(self):
         """Clamping doesn't change results for values in normal range."""
         x = torch.randn(64)
         original = _silu_bf16(x)
         clamped = _silu_bf16_clamped(x)
-        assert torch.allclose(original, clamped, atol=0, rtol=0), (
-            "Clamping should not affect normal-range values"
-        )
+        assert torch.allclose(original, clamped, atol=0, rtol=0), "Clamping should not affect normal-range values"
 
 
 class TestSoftmaxNaNPropagation:
@@ -145,14 +139,12 @@ class TestSoftmaxNaNPropagation:
         """If QKT scores contain inf (from bf16 matmul overflow), softmax produces NaN."""
         # Simulate QKT with overflow — possible after many bf16 layers
         scores = torch.tensor([float("inf"), 1.0, -1.0, 0.0], dtype=torch.bfloat16)
-        m = scores.max()          # inf
-        shifted = scores - m      # inf - inf = NaN for first element
-        p = shifted.exp()         # exp(NaN) = NaN
-        result = p / p.sum()      # NaN propagates
+        m = scores.max()  # inf
+        shifted = scores - m  # inf - inf = NaN for first element
+        p = shifted.exp()  # exp(NaN) = NaN
+        result = p / p.sum()  # NaN propagates
 
-        assert torch.isnan(result).any(), (
-            f"Softmax with inf scores should produce NaN, got {result}"
-        )
+        assert torch.isnan(result).any(), f"Softmax with inf scores should produce NaN, got {result}"
 
     def test_softmax_nan_accumulation_simulation(self):
         """Simulate how bf16 accumulation over 22 layers produces NaN."""
@@ -175,7 +167,7 @@ class TestSoftmaxNaNPropagation:
 
         # Even if this specific seed didn't overflow, demonstrate the mechanism
         # by showing that extreme values DO cause NaN
-        extreme = torch.tensor([100.0, 0.0, -50.0, 10.0])
+        torch.tensor([100.0, 0.0, -50.0, 10.0])
         # In online_softmax: shifted = [0, -100, -150, -90]
         # exp(-150) = 0 in bf16, that's fine — but if the max itself is inf:
         extreme_with_inf = torch.tensor([float("inf"), 0.0, -50.0, 10.0])
@@ -186,13 +178,9 @@ class TestSoftmaxNaNPropagation:
         """Clamped softmax never produces NaN for inf inputs (the real failure mode)."""
         # NaN inputs are not the concern — the clamp prevents NaN from being *generated*.
         # Real inputs are finite-or-inf from bf16 overflow, never NaN at entry.
-        extreme = torch.tensor(
-            [float("inf"), -float("inf"), 1e10, -1e10, 0.0, 5.0]
-        )
+        extreme = torch.tensor([float("inf"), -float("inf"), 1e10, -1e10, 0.0, 5.0])
         result = _online_softmax_row_bf16_clamped(extreme)
-        assert not torch.isnan(result).any(), (
-            f"Clamped softmax should never produce NaN, got {result}"
-        )
+        assert not torch.isnan(result).any(), f"Clamped softmax should never produce NaN, got {result}"
 
 
 class TestScalarExpOverflow:
@@ -206,9 +194,7 @@ class TestScalarExpOverflow:
         m_res = torch.tensor(190.0, dtype=torch.bfloat16)
         result = m_res.float().exp()
         result_bf16 = result.to(torch.bfloat16)
-        assert torch.isinf(result_bf16), (
-            f"exp(190) should overflow bf16, got {result_bf16}"
-        )
+        assert torch.isinf(result_bf16), f"exp(190) should overflow bf16, got {result_bf16}"
 
     def test_scalar_exp_clamped(self):
         """Clamping scalar exp input prevents overflow."""

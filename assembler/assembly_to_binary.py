@@ -3,6 +3,53 @@ from utils.load_config import load_svh_settings
 from .parser import load_isa_definitions, parse_asm_file
 
 
+# Opcode groups for binary encoding. Module-level frozensets so they are not rebuilt
+# (and scanned linearly) on every _convert_to_binary call — that runs once per emitted
+# instruction (millions of times for large programs). Membership is O(1) and identical
+# to the previous `opcode in [ ... ]` list literals.
+_RMASK_VECTOR_OPS = frozenset(
+    {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"}
+)
+_IMM_RS1_RD_OPS = frozenset(
+    {
+        "S_ADDI_INT",
+        "M_MM_WO",
+        "S_LD_FP",
+        "S_ST_FP",
+        "S_LD_INT",
+        "S_ST_INT",
+        "S_MAP_V_FP",
+        "V_RED_MAX",
+        "V_RECI_V",
+        "V_EXP_V",
+    }
+)
+_IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"})
+_RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"})
+_RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"})
+_FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})
+_RS2_RS1_RD_OPS = frozenset(
+    {
+        "S_ADD_INT",
+        "S_ADD_FP",
+        "S_SUB_INT",
+        "S_SUB_FP",
+        "S_MUL_INT",
+        "S_MUL_FP",
+        "S_MAX_FP",
+        "M_MM",
+        "M_MV",
+        "M_BMM",
+        "M_BMV",
+        "M_TMM",
+        "M_TMV",
+        "M_BTMM",
+        "M_BTMV",
+        "C_SET_ADDR_REG",
+    }
+)
+
+
 class AssemblyToBinary:
     def __init__(self, isa_definition_file: str, config_file: str):
         """
@@ -20,7 +67,7 @@ class AssemblyToBinary:
         self.instruction_length = config_settings.get("INSTRUCTION_LENGTH", 0)
         self.funct_width = config_settings.get("FUNCT_WIDTH", 0)
         self.funct_dist = self.instruction_length - 2 * self.funct_width
-        
+
     def _convert_to_binary(self, instruction):
         """
         Convert an instruction to its binary representation.
@@ -41,31 +88,24 @@ class AssemblyToBinary:
         ow = self.operands_width
         opw = self.opcode_width
 
-        if instruction.opcode in [
-            "S_ADDI_INT",
-            "M_MM_WO",
-            "S_LD_FP",
-            "S_ST_FP",
-            "S_LD_INT",
-            "S_ST_INT",
-            "S_MAP_V_FP",
-            "V_RED_MAX",
-            "V_RECI_V",
-            "V_EXP_V",
-        ]:
+        if instruction.opcode in _RMASK_VECTOR_OPS and rmask is None:
+            # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
+            rmask = 0
+
+        if instruction.opcode in _IMM_RS1_RD_OPS:
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
-        elif instruction.opcode in ["S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"]:
+        elif instruction.opcode in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
-        elif instruction.opcode in ["S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"]:
+        elif instruction.opcode in _RS1_RD_OPS:
             binary_instruction = (rs1 << (opw + ow)) + (rd << opw) + opcode
-        elif instruction.opcode in ["C_BREAK"]:
+        elif instruction.opcode == "C_BREAK":
             binary_instruction = opcode
-        elif instruction.opcode in ["C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"]:
+        elif instruction.opcode in _RD_ONLY_OPS:
             binary_instruction = (rd << opw) + opcode
-        elif instruction.opcode in ["C_LOOP_START"]:
+        elif instruction.opcode == "C_LOOP_START":
             # C_LOOP_START rd, imm - uses 22-bit immediate like S_LUI_INT
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
-        elif instruction.opcode in ["H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"]:
+        elif instruction.opcode in _FUNCT_RSTRIDE_OPS:
             binary_instruction = (
                 (funct1 << (opw + 4 * ow))
                 + (rstride << (opw + 3 * ow))
@@ -74,41 +114,11 @@ class AssemblyToBinary:
                 + (rd << opw)
                 + opcode
             )
-        elif instruction.opcode in [
-            "V_ADD_VV",
-            "V_ADD_VF",
-            "V_MUL_VV",
-            "V_SUB_VV",
-            "V_MUL_VF",
-            "V_EXP_V",
-            "V_RECI_V",
-            "V_RED_SUM",
-            "V_RED_MAX",
-        ]:
+        elif instruction.opcode in _RMASK_VECTOR_OPS:
             binary_instruction = (
                 (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
             )
-        elif instruction.opcode in [
-            # Scalar arithmetic (rd, rs1, rs2) — no rmask
-            "S_ADD_INT",
-            "S_ADD_FP",
-            "S_SUB_INT",
-            "S_SUB_FP",
-            "S_MUL_INT",
-            "S_MUL_FP",
-            "S_MAX_FP",
-            # Matrix ops without write-out (rd, rs1, rs2)
-            "M_MM",
-            "M_MV",
-            "M_BMM",
-            "M_BMV",
-            "M_TMM",
-            "M_TMV",
-            "M_BTMM",
-            "M_BTMV",
-            # CSR: addr reg destination + 2 GP sources (a{N}, gp{X}, gp{Y} → rd, rs1, rs2)
-            "C_SET_ADDR_REG",
-        ]:
+        elif instruction.opcode in _RS2_RS1_RD_OPS:
             binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         else:
             binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
@@ -139,5 +149,3 @@ class AssemblyToBinary:
         # Write the binary instructions to a file
         self.write_binary_to_file(binary_instructions, output_file)
         return binary_instructions
-
-

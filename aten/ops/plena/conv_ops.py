@@ -37,6 +37,8 @@ def conv2d_plena(
     W_padded: int | None = None,
     fp_one_reg: int = 1,
     use_shift: bool = False,
+    stride: int = 1,
+    return_im2col: bool = False,
 ):
     """
     PLENA backend: hardware im2col + systolic matmul.
@@ -60,6 +62,12 @@ def conv2d_plena(
             Padded HBM row width for 64-element alignment.
             Must satisfy W_padded % 64 == 0 and W_padded >= W.
             Defaults to next multiple of 64 >= W.
+        stride:
+            Spatial convolution stride.  Native ViT/SigLIP patch embedding
+            uses stride == K; legacy conv tests use the default stride 1.
+        return_im2col:
+            Debug/testing hook.  If true, return the generated im2col VRAM
+            matrix before the systolic projection.
 
     Returns:
         VRAMMatrixVar for the output, shape (M, C_out).
@@ -98,14 +106,22 @@ def conv2d_plena(
         # Single mask vector: [1*K, 0*(VLEN-K)] — host must preload before exec
         mask_mat = prog.alloc("im2col_mask", 1, vlen, strict=False)
     else:
-        # K basis vectors  (e_kc has 1.0 at position kc, zeros elsewhere)
-        basis_mat = prog.alloc("im2col_basis", K, vlen, strict=False)
+        # Basis vector for every intra-load position used by stride-aware
+        # extraction.  Stride-1 tests only need K rows; patch embedding with
+        # stride=K can need positions across the whole 64-element HBM load.
+        basis_positions = {
+            (ow * stride) % 64 + kc
+            for ow in range(OW)
+            for kc in range(K)
+        }
+        basis_mat = prog.alloc("im2col_basis", len(basis_positions), vlen, strict=False)
     # Scratch area for H_PREFETCH_V landing (needs PREFETCH_V_AMOUNT rows)
     scratch_mat = prog.alloc("im2col_scratch", PREFETCH_V_AMOUNT, vlen, strict=False)
     # Temp row for V_MUL_VV result (used by no_shift variant)
     temp_mat = prog.alloc("im2col_temp", 1, vlen, strict=False)
     # Output im2col matrix: M rows × K_col_padded cols (padded for tile alignment)
     output_mat = prog.alloc("im2col_out", M, K_col_padded, strict=False)
+    output_physical_rows = output_mat.physical_shape[0]
 
     # ------------------------------------------------------------------
     # Look up VRAM base addresses from the symbol table
@@ -164,8 +180,10 @@ def conv2d_plena(
             mask_vec_vram_addr=mask_vec_vram_addr,
             scratch_vram_addr=scratch_vram_addr,
             output_vram_base=output_vram_base,
+            output_physical_rows=output_physical_rows,
             W_padded=W_padded,
             fp_one_reg=fp_one_reg,
+            stride=stride,
         )
     else:
         asm_code = im2col_asm_no_shift(
@@ -184,13 +202,17 @@ def conv2d_plena(
             scratch_vram_addr=scratch_vram_addr,
             temp_vram_addr=temp_vram_addr,
             output_vram_base=output_vram_base,
+            output_physical_rows=output_physical_rows,
             W_padded=W_padded,
             fp_one_reg=fp_one_reg,  # f1 = 1.0 by default (must be in fp_preload[fp_one_reg])
             fp_ex_reg=2,  # f2 = V_RED_SUM accumulator
-        )
+            stride=stride,
+    )
     prog.emit(asm_code)
 
     # ------------------------------------------------------------------
     # Systolic matmul: im2col_out @ weight_2d  -> (M, C_out)
     # ------------------------------------------------------------------
+    if return_im2col:
+        return output_mat
     return prog.linear(output_mat, weight_2d_var)

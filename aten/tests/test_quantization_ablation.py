@@ -32,7 +32,10 @@ def _run_ablation(num_layers: int) -> dict[str, dict]:
 
     for mode in MODES:
         result = compile_native_hf_decoder(
-            model, seq_len=64, num_layers=num_layers, golden_precision=mode,
+            model,
+            seq_len=64,
+            num_layers=num_layers,
+            golden_precision=mode,
         )
         golden = result["golden_output"]
         hf_gt = result["hf_ground_truth"]
@@ -60,27 +63,21 @@ def test_mxfp8_is_sole_gap_source():
     fp = results["fp32"]["allclose"]
 
     # BF16 intermediates contribute nothing: hardware ≈ no_bf16
-    assert abs(hw - no_bf) < 2.0, (
-        f"BF16 should not matter: hardware={hw:.1f}% vs no_bf16={no_bf:.1f}%"
-    )
+    assert abs(hw - no_bf) < 2.0, f"BF16 should not matter: hardware={hw:.1f}% vs no_bf16={no_bf:.1f}%"
 
     # Removing MXFP8 closes the gap: no_weight_quant ≈ fp32 ≈ ~99%
     assert no_q > 95.0, f"no_weight_quant should be >95%: got {no_q:.1f}%"
     assert fp > 95.0, f"fp32 should be >95%: got {fp:.1f}%"
-    assert abs(no_q - fp) < 3.0, (
-        f"no_weight_quant ≈ fp32: {no_q:.1f}% vs {fp:.1f}%"
-    )
+    assert abs(no_q - fp) < 3.0, f"no_weight_quant ≈ fp32: {no_q:.1f}% vs {fp:.1f}%"
 
     # The gap is real: hardware should be meaningfully lower
-    assert hw < no_q - 10.0, (
-        f"MXFP8 should cause >10% gap: hardware={hw:.1f}% vs no_quant={no_q:.1f}%"
-    )
+    assert hw < no_q - 10.0, f"MXFP8 should cause >10% gap: hardware={hw:.1f}% vs no_quant={no_q:.1f}%"
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  QUANTIZATION ABLATION PROOF ({DEFAULT_LAYERS} layers)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  {'Mode':<20} {'allclose%':>12} {'MSE':>15}")
-    print(f"  {'-'*20} {'-'*12} {'-'*15}")
+    print(f"  {'-' * 20} {'-' * 12} {'-' * 15}")
     for mode in MODES:
         r = results[mode]
         print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
@@ -95,11 +92,11 @@ if __name__ == "__main__":
 
     results = _run_ablation(args.layers)
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  QUANTIZATION ABLATION ({args.layers} layers)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"  {'Mode':<20} {'allclose%':>12} {'MSE':>15}")
-    print(f"  {'-'*20} {'-'*12} {'-'*15}")
+    print(f"  {'-' * 20} {'-' * 12} {'-' * 15}")
     for mode in MODES:
         r = results[mode]
         print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")

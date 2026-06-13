@@ -31,6 +31,8 @@ is in 0..OW-1 and may not be 64-aligned.  This template requires that
 should route to ``im2col_asm_no_shift`` when this cannot be guaranteed.
 """
 
+from __future__ import annotations
+
 from ._imm import load_large_int as _load_large_int_list
 
 PREFETCH_V_AMOUNT = 4  # H_PREFETCH_V always loads this many VRAM rows
@@ -51,6 +53,7 @@ def im2col_asm(
     mask_vec_vram_addr: int,
     scratch_vram_addr: int,
     output_vram_base: int,
+    output_physical_rows: int | None = None,
     W_padded: int | None = None,
     fp_one_reg: int = 1,  # FP register holding 1.0 (must be in fp_preload[fp_one_reg])
     fp_sram_precious_slots: list | None = None,  # fp_sram slots to save before mask construction
@@ -86,6 +89,9 @@ def im2col_asm(
             elements = 4 * 64 = 256 slots).
         output_vram_base:
             VRAM base address for the M im2col output rows.
+        output_physical_rows:
+            Physical row stride for column-block-major output storage.  Defaults
+            to M for legacy direct callers.
         stride:
             Convolution stride (default 1).  Every ``ow * stride`` must be a
             multiple of 64 for HBM alignment.  When this cannot be guaranteed,
@@ -104,6 +110,10 @@ def im2col_asm(
 
     K_col = C_in * K * K  # number of columns in im2col output row
     num_tiles = (K_col + vlen - 1) // vlen
+    output_row_stride = M if output_physical_rows is None else output_physical_rows
+    assert output_row_stride >= M, (
+        f"output_physical_rows={output_row_stride} cannot be smaller than logical M={M}"
+    )
     if num_tiles > 1:
         assert vlen % K == 0, (
             f"multi-tile im2col with V_SHIFT_V requires K ({K}) | VLEN ({vlen}); "
@@ -115,13 +125,12 @@ def im2col_asm(
     if W_padded is None:
         W_padded = W
 
-    # Validate HBM alignment: every pixel column offset must be 64-aligned.
-    for ow in range(OW):
-        pixel_col = ow * stride
-        assert pixel_col % 64 == 0, (
-            f"im2col_asm: ow={ow}, pixel_col={pixel_col} is not 64-aligned. "
-            f"Use im2col_asm_no_shift for stride={stride} with non-64-aligned columns."
-        )
+    # HBM alignment: each H_PREFETCH_V load starts at the exact pixel_col, so the K
+    # patch elements land at [0:K] of the loaded vector and the mask+right-shift below
+    # places them. The emulator's HBM gather walks the byte range one 64-byte block at a
+    # time, clamping each read to a block boundary (dma::transfer_mx_from_hbm), so a
+    # non-64-aligned pixel_col (e.g. stride-16 patch embedding) is loaded correctly
+    # without any realignment. (The old 64-aligned-only assertion predated that gather.)
 
     # Compute save f_regs for precious fp_sram slots (mirrors im2col_asm_no_shift).
     # Mask construction zeroes fp_sram[0..VLEN-1] then writes mask values, corrupting
@@ -141,7 +150,10 @@ def im2col_asm(
     lines.append("; im2col (with V_SHIFT_V): NCHW input in HBM -> im2col matrix in VRAM")
     lines.append(f";   input shape : (1, {C_in}, {H}, {W})  in HBM (W_padded={W_padded})")
     lines.append(f";   kernel      : {K}x{K},  OH={OH}, OW={OW}, stride={stride}")
-    lines.append(f";   output      : ({M}, {K_col}) in VRAM starting at {output_vram_base}")
+    lines.append(
+        f";   output      : ({M}, {K_col}) in VRAM starting at {output_vram_base} "
+        f"(physical_rows={output_row_stride})"
+    )
     lines.append(f"; Requires: f0=0.0 (hw const), fp_preload[{fp_one_reg}]=1.0")
     lines.append("; ============================================================")
 
@@ -199,7 +211,7 @@ def im2col_asm(
 
     # ── main loop: iterate over tiles × M output positions ───────────
     # VRAM is column-block-major (matches no_shift template):
-    #   vram_addr(m, t) = output_vram_base + t*M*vlen + m*vlen
+    #   vram_addr(m, t) = output_vram_base + t*physical_rows*vlen + m*vlen
     for tile_t in range(num_tiles):
         tile_start = tile_t * vlen
         tile_end = min(tile_start + vlen, K_col)
@@ -210,7 +222,7 @@ def im2col_asm(
         for m in range(M):
             oh = m // OW
             ow = m % OW
-            out_vram_addr = output_vram_base + tile_t * M * vlen + m * vlen
+            out_vram_addr = output_vram_base + tile_t * output_row_stride * vlen + m * vlen
 
             # Stride-aware pixel column (guaranteed 64-aligned by assertion above).
             pixel_col = ow * stride

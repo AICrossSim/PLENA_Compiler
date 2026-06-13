@@ -30,7 +30,6 @@ from asm_templates import (
     projection_asm,
     rms_norm_asm,
 )
-from asm_templates._imm import load_large_int
 
 
 def _load_template(template_name: str) -> str:
@@ -134,7 +133,7 @@ def _generate_attention_code(
     attn_kind = "bidirectional (SigLIP/ViT)" if not causal_mask else "causal (decoder)"
     code = f"""
 ; Self-attention ({attn_kind}): hidden_size={hidden_size}, heads={num_heads}, head_dim={head_dim}
-; Q, K, V projections + attention.  RoPE={'off' if not causal_mask else 'on Q/K'}.
+; Q, K, V projections + attention.  RoPE={"off" if not causal_mask else "on Q/K"}.
 """
     mlen = hardware_config.get("MLEN", 64)
     blen = hardware_config.get("BLEN", 4)
@@ -375,8 +374,9 @@ def _generate_ffn_code(
         gate_weight_hbm_offset_reg=ffn_gate_reg,
         up_weight_hbm_offset_reg=ffn_up_reg,
         down_weight_hbm_offset_reg=ffn_down_reg,
-        const_one_fp_address=scheduler.get("memory_layout", {}).get("fp_sram", {}).get("silu_one",
-            scheduler.get("memory_layout", {}).get("fp_sram", {}).get("silu_e", 3)),
+        const_one_fp_address=scheduler.get("memory_layout", {})
+        .get("fp_sram", {})
+        .get("silu_one", scheduler.get("memory_layout", {}).get("fp_sram", {}).get("silu_e", 3)),
         activation_base_address=vsram.get("block1", 0),
         matrix_sram_size=hardware_config.get("MATRIX_SRAM_SIZE", 1024),
     )
@@ -472,9 +472,7 @@ def _generate_conv2d_code(
     mask_vec_vram_addr = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block3", 0)
     scratch_vram_addr = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block4", 0)
     output_vram_base = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0)
-    input_hbm_base_addr_reg = (
-        scheduler["register_assignment"].get("hbm_addr_reg", {}).get("token_table_offset", 1)
-    )
+    input_hbm_base_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {}).get("token_table_offset", 1)
 
     code = f"""
 ; === Conv2d patch embedding (lowered to im2col + matmul) ===
@@ -540,9 +538,7 @@ def _generate_conv2d_code(
 
     # Step 2: matmul against the Conv2d weight (C_out, K_col).
     # Reuse projection_asm with out_features=C_out.
-    w_base_hbm_offset_reg = (
-        scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
-    )
+    w_base_hbm_offset_reg = scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
     result_base_address = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block2", 0)
     code += "\n; -- Conv2d weight matmul: (num_patches, K_col) @ (K_col, out_channels) --\n"
     code += projection_asm(
@@ -580,9 +576,7 @@ def _generate_vision_projection_code(
     mlen = hardware_config.get("MLEN", 64)
     blen = hardware_config.get("BLEN", 4)
 
-    w_base_hbm_offset_reg = (
-        scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
-    )
+    w_base_hbm_offset_reg = scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
     activation_base_address = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block1", 0)
     result_base_address = scheduler["memory_layout"].get("vector_sram_addr", {}).get("block2", 0)
 
@@ -716,9 +710,7 @@ def _weight_hbm_bytes(rows: int, cols: int, hardware_config: dict) -> int:
     map_mx_data_to_hbm_for_behave_sim.
     """
     block_dim = hardware_config.get("block_dim", 4)
-    assert cols % block_dim == 0, (
-        f"cols ({cols}) must be a multiple of block_dim ({block_dim})"
-    )
+    assert cols % block_dim == 0, f"cols ({cols}) must be a multiple of block_dim ({block_dim})"
     wt_block_width = hardware_config.get("wt_block_width", 32)
     scale_width = hardware_config.get("scale_width", 8)
     return rows * (cols // block_dim) * ((wt_block_width // 8) + (scale_width // 8))
@@ -778,7 +770,7 @@ def _generate_addr_reg_init(
     code += f"; Total HBM weight footprint: {offset} bytes ({offset / 1024:.1f} KiB)\n"
     code += preload_addr_reg_asm(
         addr_reg_to_set=addr_regs_to_set,
-        available_registers=[9, 10, 11, 12, 13, 14, 15][:len(addr_regs_to_set)],
+        available_registers=[9, 10, 11, 12, 13, 14, 15][: len(addr_regs_to_set)],
         addr_reg_val=addr_reg_vals,
     )
     return code

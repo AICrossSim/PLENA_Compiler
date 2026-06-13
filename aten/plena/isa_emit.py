@@ -17,6 +17,24 @@ class IsaEmitMixin:
         """Shorthand for self.register_allocator (used by FPVar ISA helpers)."""
         return self.register_allocator
 
+    # ------------------------------------------------------------------
+    # Generated ISA buffer
+    #
+    # Backed by a list of rendered chunks rather than one growing string:
+    # ``self.generated_code += rendered`` per instruction is O(n) per call
+    # (it copies the whole buffer), i.e. O(n^2) overall, which runs away when
+    # the instruction count is large (e.g. mlen=16 vision attention tiles into
+    # 4 col-blocks). Appending to a list is amortised O(1); the getter joins
+    # on read, producing a byte-identical string. Callers still see a ``str``.
+    # ------------------------------------------------------------------
+    @property
+    def generated_code(self) -> str:
+        return "".join(getattr(self, "_code_chunks", ()))
+
+    @generated_code.setter
+    def generated_code(self, value: str) -> None:
+        self._code_chunks = [value] if value else []
+
     @property
     def _unroll(self) -> bool:
         """Shorthand for self.unroll_loops."""
@@ -25,7 +43,7 @@ class IsaEmitMixin:
     def _emit(self, isa_code: AsmInput) -> str:
         """Append ISA text to the output buffer and return it."""
         rendered = render_asm(isa_code)
-        self.generated_code += rendered
+        self._code_chunks.append(rendered)
         return rendered
 
     def emit(self, isa_code: AsmInput) -> str:

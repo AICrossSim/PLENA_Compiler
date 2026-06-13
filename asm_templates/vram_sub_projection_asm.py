@@ -28,6 +28,7 @@ def vram_sub_projection_asm_impl(
     transposed: bool,
     gp_regs: list[int],
     caller_name: str,
+    row_loop_count: int | None = None,
 ) -> str:
     """
     Shared implementation kernel for vram_sub_projection_asm and
@@ -42,7 +43,7 @@ def vram_sub_projection_asm_impl(
         vram_row_start_addr -- VRAM address of the first activation block
         mram_start_addr   -- MRAM address of the first weight block
         result_vram_addr  -- VRAM destination address for the (mlen, mlen) result
-        full_batch        -- full batch dimension of the activation VRAM matrix
+        full_batch        -- physical batch stride of the activation VRAM matrix
         num_hidden_blocks -- number of K-blocks to accumulate over
         mat_col_stride    -- MRAM outer-column stride (blen for M_MM, blen*mlen for M_TMM)
         transposed        -- True → emit M_TMM with (act, mat) operand order;
@@ -71,7 +72,10 @@ def vram_sub_projection_asm_impl(
     mram_hidden_block_stride = mlen * mlen
     output_row_stride = blen * mlen
     # Middle loop: for sub-mlen batch only iterate the real row groups.
-    row_loop_count = min(tiles_per_mlen, math.ceil(full_batch / blen))
+    if row_loop_count is None:
+        row_loop_count = min(tiles_per_mlen, math.ceil(full_batch / blen))
+    else:
+        row_loop_count = min(tiles_per_mlen, row_loop_count)
 
     do_unroll = unroll_loops
 

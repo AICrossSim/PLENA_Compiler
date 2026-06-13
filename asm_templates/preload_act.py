@@ -13,6 +13,7 @@ def preload_act_asm(
     activation_offset_reg: int,
     stride_size=None,
     vram_stride_mult: int = 1,
+    storage_precision: int = 1 # bytes per element
 ) -> str:
     """Preload activation from HBM to VRAM. Layout: (hidden//mlen, batch, mlen)."""
     generated_code = "; Preload Activation Generation \n"
@@ -25,7 +26,7 @@ def preload_act_asm(
     stride_len = vlen if stride_size is None else stride_size
 
     # Set scale offset
-    generated_code += _load_large_int(a_actual_register, hidden_size * batch)
+    generated_code += _load_large_int(a_actual_register, int(hidden_size * batch * storage_precision))
     generated_code += f"C_SET_SCALE_REG gp{a_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, 0 \n"
     generated_code += _load_large_int(result_register, act_vram_offset)
@@ -55,7 +56,7 @@ def preload_act_asm(
             f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len * vram_stride_mult} \n"
         )
         if batch > preload_len:
-            generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {hidden_size * preload_len} \n"
+            generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {int(hidden_size * preload_len * storage_precision)} \n"
             generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
         generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"

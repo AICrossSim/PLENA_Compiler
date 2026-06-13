@@ -192,7 +192,9 @@ def projection_asm(
                     )
                     lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} ")
                     lines.extend(
-                        _addi_large_int(w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register)
+                        _addi_large_int(
+                            w_hbm_offset_register, w_hbm_offset_register, mlen * out_features, w_temp_register
+                        )
                     )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
             else:
@@ -200,6 +202,7 @@ def projection_asm(
                 lines.append(
                     f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
                 )
+
             for act_col in range(batch // blen):
                 lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
@@ -207,10 +210,13 @@ def projection_asm(
                     lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
                     lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                     lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
+                    break
                 lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
                 lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")
+                break
             if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_features // blen - 1:
                 lines.append(f"S_ADDI_INT gp{result_reg}, gp{result_reg}, {mlen * batch} ")
+            break
     else:
         # K-split path
         chunks = _proj_k_chunks(num_k_tiles, MAX_K_TILES)
@@ -247,15 +253,11 @@ def projection_asm(
             )
 
             if not is_first:
-                lines.append(
-                    f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]"
-                )
+                lines.append(f" ; K-split accumulate: output[0..{output_elements}] += scratch[0..{output_elements}]")
                 lines.extend(_load_large_int(w_actual_register, result_base_address))
                 lines.extend(_load_large_int(w_temp_register, scratch_base_address))
                 for _ in range(per_vlen_adds):
-                    lines.append(
-                        f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 "
-                    )
+                    lines.append(f"V_ADD_VV gp{w_actual_register}, gp{w_actual_register}, gp{w_temp_register}, 0 ")
                     lines.append(f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {vlen} ")
                     lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {vlen} ")
 

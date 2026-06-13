@@ -152,16 +152,20 @@ def run():
         description="Generator runner: symbolic codegen and utilization analysis",
         prog="python -m generator.runner",
     )
-    parser.add_argument("mode", choices=["codegen", "utilization"],
-                        help="Execution mode: codegen (ASM generation), "
-                             "utilization (PE utilization report)")
+    parser.add_argument(
+        "mode",
+        choices=["codegen", "utilization"],
+        help="Execution mode: codegen (ASM generation), utilization (PE utilization report)",
+    )
     parser.add_argument("model_path", help="HuggingFace model ID (e.g. AICrossSim/clm-60m)")
-    parser.add_argument("output_file", nargs="?", default=None,
-                        help="Output .asm file (required for codegen; pass a dummy path for utilization)")
-    parser.add_argument("--seq-len", type=int, default=512,
-                        help="Sequence length (default: 512)")
-    parser.add_argument("--num-layers", type=int, default=None,
-                        help="Override num_hidden_layers in model config")
+    parser.add_argument(
+        "output_file",
+        nargs="?",
+        default=None,
+        help="Output .asm file (required for codegen; pass a dummy path for utilization)",
+    )
+    parser.add_argument("--seq-len", type=int, default=512, help="Sequence length (default: 512)")
+    parser.add_argument("--num-layers", type=int, default=None, help="Override num_hidden_layers in model config")
 
     args = parser.parse_args()
 

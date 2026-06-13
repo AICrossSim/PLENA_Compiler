@@ -25,12 +25,14 @@ class TensorVar:
         kind: str,
         shape: tuple[int, int],
         display_name: str | None = None,
+        physical_shape: tuple[int, int] | None = None,
     ):
         self._program = program
         self.internal_name = internal_name  # System internal name (with scope prefix), used by symbol table
         self.display_name = display_name if display_name is not None else internal_name  # User-visible name
         self.kind = kind  # "input", "batch", "matrix", "vram_matrix"
         self.shape = shape
+        self.physical_shape = physical_shape or shape
 
     @property
     def name(self) -> str:
@@ -66,8 +68,9 @@ class InputVar(TensorVar):
         hbm_size: int,
         display_name: str | None = None,
         prestaged_vram_addr: int | None = None,
+        physical_shape: tuple[int, int] | None = None,
     ):
-        super().__init__(program, name, "input", shape, display_name=display_name)
+        super().__init__(program, name, "input", shape, display_name=display_name, physical_shape=physical_shape)
         self.hbm_addr = hbm_addr
         self.hbm_size = hbm_size
         self.prestaged_vram_addr = prestaged_vram_addr
@@ -120,5 +123,19 @@ class VRAMMatrixVar(TensorVar):
     Supports sub-block indexed writes: `O[r][c] = ...`
     """
 
-    def __init__(self, program: PlenaCompiler, name: str, shape: tuple[int, int], display_name: str | None = None):
-        super().__init__(program, name, "vram_matrix", shape, display_name=display_name)
+    def __init__(
+        self,
+        program: PlenaCompiler,
+        name: str,
+        shape: tuple[int, int],
+        display_name: str | None = None,
+        physical_shape: tuple[int, int] | None = None,
+    ):
+        super().__init__(
+            program,
+            name,
+            "vram_matrix",
+            shape,
+            display_name=display_name,
+            physical_shape=physical_shape,
+        )

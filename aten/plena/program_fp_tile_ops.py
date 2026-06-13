@@ -85,11 +85,7 @@ class ProgramFPTileOpsMixin:
         base_offset: int = 0,
     ) -> list[tuple[int, int]]:
         resolved_rows = self._resolve_rows(row_idx=row_idx, rows=rows)
-        offsets = (
-            [single_offset]
-            if len(resolved_rows) == 1
-            else [base_offset + i for i in range(len(resolved_rows))]
-        )
+        offsets = [single_offset] if len(resolved_rows) == 1 else [base_offset + i for i in range(len(resolved_rows))]
         return [(row, self._resolve_fpram_addr(fpram_addr, offset)) for row, offset in zip(resolved_rows, offsets)]
 
     def _fp_count(self, vars_: Iterable[FPVar], count: int | None, *, default: int | None = None) -> int:
