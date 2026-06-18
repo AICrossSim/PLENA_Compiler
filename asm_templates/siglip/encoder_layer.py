@@ -2,12 +2,35 @@ from compiler.asm_templates.normalization_asm import layer_norm_asm
 from compiler.asm_templates.projection_asm import projection_asm
 from compiler.asm_templates.gelu_asm import gelu_asm
 from compiler.asm_templates.elementwise_add_vram_asm import elementwise_add_vram_asm
+from compiler.asm_templates.elementwise_add_vram_asm import elementwise_add_bias_vram_asm
+from compiler.asm_templates.elementwise_add_vram_asm import elementwise_mul_bias_vram_asm
 from compiler.asm_templates._imm import load_large_int_str
 from compiler.asm_templates._imm import addi_large_int_str
 from compiler.asm_templates.preload_addr_reg import preload_addr_reg_asm
 from compiler.asm_templates.reset_reg_asm import reset_reg_asm
 from compiler.asm_templates.flashattn.encoder_mha import flash_attn_encoder_mha_asm
 from compiler.asm_templates.flashattn.reset import reset_vssram_code
+
+
+def _emit_debug_snapshot_asm(*, vlen, hidden_size, s_q, dst_base, src_base):
+    """Emit reset + copy of a chunk-major [s_q, hidden] activation into a debug VRAM slot."""
+    asm = reset_vssram_code(
+        reset_start_address=dst_base,
+        vect_dim=vlen,
+        per_stride_dim=hidden_size // vlen,
+        reset_stride=hidden_size,
+        reset_amount=s_q,
+        alive_registers_int=[10, 11, 12],
+    )
+    asm += elementwise_add_vram_asm(
+        vlen=vlen,
+        num_vectors=(s_q * hidden_size) // vlen,
+        alive_registers=[10, 11],
+        dst_base_address=dst_base,
+        src_base_address=src_base,
+    )
+    asm += reset_reg_asm(alive_registers=[10, 11, 12])
+    return asm
 
 
 def build_mlp_block(
@@ -65,14 +88,15 @@ def build_mlp_block(
     asm += reset_reg_asm(alive_registers=[5, 6, 7, 8, 9, 10])
 
     if fc1_bias_base is not None:
-        asm += elementwise_add_vram_asm(
+        asm += elementwise_add_bias_vram_asm(
             vlen=vlen,
-            num_vectors=(batch * inter_dim) // vlen,
-            alive_registers=[10, 11],
+            num_hidden_vectors=inter_dim // vlen,
+            seq_len=batch,
+            alive_registers=[10, 11, 12, 13],
             dst_base_address=mlp_inter_base,
-            src_base_address=fc1_bias_base,
+            bias_base_address=fc1_bias_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11])
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
 
     if include_gelu:
         asm += gelu_asm(
@@ -104,73 +128,17 @@ def build_mlp_block(
     asm += reset_reg_asm(alive_registers=[5, 6, 7, 8, 9, 10])
 
     if fc2_bias_base is not None:
-        asm += elementwise_add_vram_asm(
+        asm += elementwise_add_bias_vram_asm(
             vlen=vlen,
-            num_vectors=(batch * hidden_size) // vlen,
-            alive_registers=[10, 11],
+            num_hidden_vectors=hidden_size // vlen,
+            seq_len=batch,
+            alive_registers=[10, 11, 12, 13],
             dst_base_address=mlp_out_base,
-            src_base_address=fc2_bias_base,
+            bias_base_address=fc2_bias_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11])
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
 
     return asm
-
-
-def _pack_seq_major_to_chunk_major(
-    *,
-    seq_len,
-    num_chunks,
-    chunk_size,
-    src_base,
-    dst_base,
-    comment,
-):
-    """Pack [seq_len, num_chunks, chunk_size] -> [num_chunks, seq_len, chunk_size]."""
-    asm = f"; {comment}\n"
-
-    asm += reset_vssram_code(
-        reset_start_address=dst_base,
-        vect_dim=chunk_size,
-        per_stride_dim=seq_len * num_chunks,
-        reset_stride=chunk_size,
-        reset_amount=1,
-        alive_registers_int=[10, 11, 12],
-    )
-
-    # Register map:
-    # - gp10/gp11: current dst/src vector pointers
-    # - gp12/gp13: chunk-base dst/src pointers for outer loop
-    # - gp14/gp15: outer/inner loop counters
-    # - gp9: temp register for large immediate adds
-    dst_reg = 10
-    src_reg = 11
-    dst_chunk_base_reg = 12
-    src_chunk_base_reg = 13
-    outer_loop_reg = 14
-    inner_loop_reg = 15
-    temp_reg = 9
-
-    asm += load_large_int_str(dst_chunk_base_reg, dst_base)
-    asm += load_large_int_str(src_chunk_base_reg, src_base)
-
-    if num_chunks > 0 and seq_len > 0:
-        asm += f"C_LOOP_START gp{outer_loop_reg}, {num_chunks}\n"
-        asm += f"S_ADDI_INT gp{dst_reg}, gp{dst_chunk_base_reg}, 0\n"
-        asm += f"S_ADDI_INT gp{src_reg}, gp{src_chunk_base_reg}, 0\n"
-
-        asm += f"C_LOOP_START gp{inner_loop_reg}, {seq_len}\n"
-        asm += f"V_ADD_VV gp{dst_reg}, gp{dst_reg}, gp{src_reg}, 0\n"
-        asm += addi_large_int_str(dst_reg, dst_reg, chunk_size, temp_reg)
-        asm += addi_large_int_str(src_reg, src_reg, num_chunks * chunk_size, temp_reg)
-        asm += f"C_LOOP_END gp{inner_loop_reg}\n"
-
-        asm += addi_large_int_str(dst_chunk_base_reg, dst_chunk_base_reg, seq_len * chunk_size, temp_reg)
-        asm += addi_large_int_str(src_chunk_base_reg, src_chunk_base_reg, chunk_size, temp_reg)
-        asm += f"C_LOOP_END gp{outer_loop_reg}\n"
-
-    asm += reset_reg_asm(alive_registers=[9, 10, 11, 12, 13, 14, 15])
-    return asm
-
 
 def build_encoder_layer_asm(
     *,
@@ -250,7 +218,6 @@ def build_encoder_layer_asm(
     # - HQ = hq
     # Memory layouts used in this block:
     # - chunk-major: [NB, S, V]  (flat index: ((b * S) + t) * V + j)
-    # - token-major: [S, NB, V]  (flat index: ((t * NB) + b) * V + j)
     # - head-major Q: [HQ, S, D] (flat index: ((h * S) + t) * D + j)
     # Stage outputs in execution order:
     # - Stage 0 input residual snapshot at residual_base: chunk-major [NB, S, V]
@@ -292,22 +259,13 @@ def build_encoder_layer_asm(
     )
 
     if debug_stage0_snapshot_base is not None:
-        asm += reset_vssram_code(
-            reset_start_address=debug_stage0_snapshot_base,
-            vect_dim=vlen,
-            per_stride_dim=hidden_size // vlen,
-            reset_stride=hidden_size,
-            reset_amount=s_q,
-            alive_registers_int=[10, 11, 12],
-        )
-        asm += elementwise_add_vram_asm(
+        asm += _emit_debug_snapshot_asm(
             vlen=vlen,
-            num_vectors=(s_q * hidden_size) // vlen,
-            alive_registers=[10, 11],
-            dst_base_address=debug_stage0_snapshot_base,
-            src_base_address=residual_base,
+            hidden_size=hidden_size,
+            s_q=s_q,
+            dst_base=debug_stage0_snapshot_base,
+            src_base=residual_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
     # Stage 1: LayerNorm1 in-place on X.
     # Shape after Stage 1 (x_base): chunk-major [NB, S, V].
@@ -320,28 +278,38 @@ def build_encoder_layer_asm(
         vlen=vlen,
         batch_size=s_q,
         hidden_dim=hidden_size,
-        affine_weight_base_address=ln1_affine_weight_base,
-        affine_bias_base_address=ln1_affine_bias_base,
     )
     asm += reset_reg_asm(alive_registers=[5, 6, 7])
 
-    if debug_ln1_snapshot_base is not None:
-        asm += reset_vssram_code(
-            reset_start_address=debug_ln1_snapshot_base,
-            vect_dim=vlen,
-            per_stride_dim=hidden_size // vlen,
-            reset_stride=hidden_size,
-            reset_amount=s_q,
-            alive_registers_int=[10, 11, 12],
-        )
-        asm += elementwise_add_vram_asm(
+    if ln1_affine_weight_base is not None:
+        asm += elementwise_mul_bias_vram_asm(
             vlen=vlen,
-            num_vectors=(s_q * hidden_size) // vlen,
-            alive_registers=[10, 11],
-            dst_base_address=debug_ln1_snapshot_base,
-            src_base_address=x_base,
+            num_hidden_vectors=hidden_size // vlen,
+            seq_len=s_q,
+            alive_registers=[10, 11, 12, 13],
+            dst_base_address=x_base,
+            bias_base_address=ln1_affine_weight_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11, 12])
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
+    if ln1_affine_bias_base is not None:
+        asm += elementwise_add_bias_vram_asm(
+            vlen=vlen,
+            num_hidden_vectors=hidden_size // vlen,
+            seq_len=s_q,
+            alive_registers=[10, 11, 12, 13],
+            dst_base_address=x_base,
+            bias_base_address=ln1_affine_bias_base,
+        )
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
+
+    if debug_ln1_snapshot_base is not None:
+        asm += _emit_debug_snapshot_asm(
+            vlen=vlen,
+            hidden_size=hidden_size,
+            s_q=s_q,
+            dst_base=debug_ln1_snapshot_base,
+            src_base=x_base,
+        )
 
     # Stage 2: Build flash-attn Q on-chip from LN1 output.
     # LN1 chunk-major X at x_base -> projection_asm with WQ -> q_base,
@@ -366,32 +334,24 @@ def build_encoder_layer_asm(
     asm += reset_reg_asm(alive_registers=[4, 5, 6, 7, 8, 9])
 
     if q_bias_base is not None:
-        asm += elementwise_add_vram_asm(
+        asm += elementwise_add_bias_vram_asm(
             vlen=vlen,
-            num_vectors=(s_q * hidden_size) // vlen,
-            alive_registers=[10, 11],
+            num_hidden_vectors=hidden_size // vlen,
+            seq_len=s_q,
+            alive_registers=[10, 11, 12, 13],
             dst_base_address=q_base,
-            src_base_address=q_bias_base,
+            bias_base_address=q_bias_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11])
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
 
     if debug_qproj_snapshot_base is not None:
-        asm += reset_vssram_code(
-            reset_start_address=debug_qproj_snapshot_base,
-            vect_dim=vlen,
-            per_stride_dim=hidden_size // vlen,
-            reset_stride=hidden_size,
-            reset_amount=s_q,
-            alive_registers_int=[10, 11, 12],
-        )
-        asm += elementwise_add_vram_asm(
+        asm += _emit_debug_snapshot_asm(
             vlen=vlen,
-            num_vectors=(s_q * hidden_size) // vlen,
-            alive_registers=[10, 11],
-            dst_base_address=debug_qproj_snapshot_base,
-            src_base_address=q_base,
+            hidden_size=hidden_size,
+            s_q=s_q,
+            dst_base=debug_qproj_snapshot_base,
+            src_base=q_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
     # Stage 3: Flash attention (encoder-focused MHA).
     # Shape after Stage 3 (attn_base/o_old_base): chunk-major [NB, S, V].
@@ -421,22 +381,13 @@ def build_encoder_layer_asm(
     )
 
     if debug_attn_snapshot_base is not None:
-        asm += reset_vssram_code(
-            reset_start_address=debug_attn_snapshot_base,
-            vect_dim=vlen,
-            per_stride_dim=hidden_size // vlen,
-            reset_stride=hidden_size,
-            reset_amount=s_q,
-            alive_registers_int=[10, 11, 12],
-        )
-        asm += elementwise_add_vram_asm(
+        asm += _emit_debug_snapshot_asm(
             vlen=vlen,
-            num_vectors=(s_q * hidden_size) // vlen,
-            alive_registers=[10, 11],
-            dst_base_address=debug_attn_snapshot_base,
-            src_base_address=attn_base,
+            hidden_size=hidden_size,
+            s_q=s_q,
+            dst_base=debug_attn_snapshot_base,
+            src_base=attn_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
     # Stage 4: Out projection on attention output before residual add.
     # flash-attn output is already chunk-major [NB, S, V], so projection can
@@ -462,14 +413,15 @@ def build_encoder_layer_asm(
     )
     asm += reset_reg_asm(alive_registers=[4, 5, 6, 7, 8, 9])
     if out_bias_base is not None:
-        asm += elementwise_add_vram_asm(
+        asm += elementwise_add_bias_vram_asm(
             vlen=vlen,
-            num_vectors=(s_q * hidden_size) // vlen,
-            alive_registers=[10, 11],
+            num_hidden_vectors=hidden_size // vlen,
+            seq_len=s_q,
+            alive_registers=[10, 11, 12, 13],
             dst_base_address=q_base,
-            src_base_address=out_bias_base,
+            bias_base_address=out_bias_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11])
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
     asm += elementwise_add_vram_asm(
         vlen=vlen,
         num_vectors=(s_q * hidden_size) // vlen,
@@ -480,22 +432,13 @@ def build_encoder_layer_asm(
     asm += reset_reg_asm(alive_registers=[10, 11])
 
     if debug_outproj_snapshot_base is not None:
-        asm += reset_vssram_code(
-            reset_start_address=debug_outproj_snapshot_base,
-            vect_dim=vlen,
-            per_stride_dim=hidden_size // vlen,
-            reset_stride=hidden_size,
-            reset_amount=s_q,
-            alive_registers_int=[10, 11, 12],
-        )
-        asm += elementwise_add_vram_asm(
+        asm += _emit_debug_snapshot_asm(
             vlen=vlen,
-            num_vectors=(s_q * hidden_size) // vlen,
-            alive_registers=[10, 11],
-            dst_base_address=debug_outproj_snapshot_base,
-            src_base_address=q_base,
+            hidden_size=hidden_size,
+            s_q=s_q,
+            dst_base=debug_outproj_snapshot_base,
+            src_base=q_base,
         )
-        asm += reset_reg_asm(alive_registers=[10, 11, 12])
 
     # Stage 5: Save the first residual output for the final MLP residual add.
     # Shape after Stage 5 (residual_base): chunk-major [NB, S, V].
@@ -527,10 +470,29 @@ def build_encoder_layer_asm(
         vlen=vlen,
         batch_size=s_q,
         hidden_dim=hidden_size,
-        affine_weight_base_address=ln2_affine_weight_base,
-        affine_bias_base_address=ln2_affine_bias_base,
     )
     asm += reset_reg_asm(alive_registers=[5, 6, 7])
+
+    if ln2_affine_weight_base is not None:
+        asm += elementwise_mul_bias_vram_asm(
+            vlen=vlen,
+            num_hidden_vectors=hidden_size // vlen,
+            seq_len=s_q,
+            alive_registers=[10, 11, 12, 13],
+            dst_base_address=q_base,
+            bias_base_address=ln2_affine_weight_base,
+        )
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
+    if ln2_affine_bias_base is not None:
+        asm += elementwise_add_bias_vram_asm(
+            vlen=vlen,
+            num_hidden_vectors=hidden_size // vlen,
+            seq_len=s_q,
+            alive_registers=[10, 11, 12, 13],
+            dst_base_address=q_base,
+            bias_base_address=ln2_affine_bias_base,
+        )
+        asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
 
     # Stage 7: MLP block.
     # Shape after Stage 7 (mlp_out_base): chunk-major [NB, S, V].

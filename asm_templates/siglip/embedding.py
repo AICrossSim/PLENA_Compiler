@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from compiler.asm_templates import (
+    elementwise_add_bias_vram_asm,
     elementwise_add_vram_asm,
     preload_addr_reg_asm,
     projection_asm,
@@ -61,14 +62,18 @@ def build_embedding_stage_asm(
     )
     asm += reset_reg_asm(alive_registers=[1, 2, 3, 4, 5, 6])
 
-    asm += elementwise_add_vram_asm(
+    if hidden_size % vlen != 0:
+        raise ValueError(f"hidden_size ({hidden_size}) must be divisible by vlen ({vlen}) for bias broadcast add")
+
+    asm += elementwise_add_bias_vram_asm(
         vlen=vlen,
-        num_vectors=(seq_len * hidden_size) // vlen,
-        alive_registers=[10, 11],
+        num_hidden_vectors=hidden_size // vlen,
+        seq_len=seq_len,
+        alive_registers=[10, 11, 12, 13],
         dst_base_address=embedding_output_base,
-        src_base_address=patch_bias_base,
+        bias_base_address=patch_bias_base,
     )
-    asm += reset_reg_asm(alive_registers=[10, 11])
+    asm += reset_reg_asm(alive_registers=[10, 11, 12, 13])
 
     asm += elementwise_add_vram_asm(
         vlen=vlen,

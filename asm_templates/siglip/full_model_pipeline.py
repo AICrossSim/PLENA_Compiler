@@ -5,33 +5,20 @@ multi-layer SigLIP encoder programs.
 """
 
 from .embedding import build_embedding_stage_asm
-from .encoder_layer import build_encoder_layer_asm
+from .full_model_common import (
+    align_up,
+    collect_bias_bases,
+    collect_layer_hbm_offsets,
+    compute_flash_vram_layout,
+    emit_encoder_layer,
+    resolve_model_geometry,
+)
 from ..elementwise_add_vram_asm import elementwise_add_vram_asm
+from ..elementwise_add_vram_asm import elementwise_add_bias_vram_asm
+from ..elementwise_add_vram_asm import elementwise_mul_bias_vram_asm
 from ..flashattn.reset import reset_vssram_code
 from ..reset_reg_asm import reset_reg_asm
 from compiler.asm_templates.normalization_asm import layer_norm_asm
-
-
-def _align_up(value: int, align: int) -> int:
-    return ((value + align - 1) // align) * align
-
-
-def _compute_vram_layout(mlen: int, blen: int, q_len: int, hq: int, hkv: int, d: int, vector_sram_base: int) -> dict:
-    """Compute flash-attn scratch layout for one encoder layer."""
-    q_size = q_len * hq * d
-    q_start = vector_sram_base
-    s_base = q_start + q_size
-    s_tile_count = blen if (hq // hkv == blen) else 1
-    pv_base = s_base + mlen * mlen * s_tile_count
-    o_old_base = pv_base + mlen * mlen * (hq // hkv)
-    return {
-        "q_base": q_start,
-        "s_base": s_base,
-        "pv_base": pv_base,
-        "o_old_base": o_old_base,
-        "q_size": q_size,
-        "s_tile_count": s_tile_count,
-    }
 
 
 def _compute_persistent_end(
@@ -65,24 +52,24 @@ def _compute_persistent_end(
     for layer_idx in range(num_layers):
         q_bias_base = q_bias_bases.get(layer_idx)
         if q_bias_base is not None:
-            persistent_end = max(persistent_end, int(q_bias_base) + seq_len * hidden_size)
+            persistent_end = max(persistent_end, int(q_bias_base) + hidden_size)
 
         for base_dict in (ln1_weight_bases, ln1_bias_bases, ln2_weight_bases, ln2_bias_bases):
             base = base_dict.get(layer_idx)
             if base is not None:
-                persistent_end = max(persistent_end, int(base) + seq_len * hidden_size)
+                persistent_end = max(persistent_end, int(base) + hidden_size)
 
         out_base = out_bias_bases.get(layer_idx)
         if out_base is not None:
-            persistent_end = max(persistent_end, int(out_base) + seq_len * hidden_size)
+            persistent_end = max(persistent_end, int(out_base) + hidden_size)
 
         fc1_base = fc1_bias_bases.get(layer_idx)
         if fc1_base is not None:
-            persistent_end = max(persistent_end, int(fc1_base) + seq_len * inter_size)
+            persistent_end = max(persistent_end, int(fc1_base) + inter_size)
 
         fc2_base = fc2_bias_bases.get(layer_idx)
         if fc2_base is not None:
-            persistent_end = max(persistent_end, int(fc2_base) + seq_len * hidden_size)
+            persistent_end = max(persistent_end, int(fc2_base) + hidden_size)
 
     return max(persistent_end, int(vram_layout.get("total_vram_elements", persistent_end)))
 
@@ -123,24 +110,17 @@ def build_full_model_asm(
     """Emit complete ASM code for SigLIP embedding + encoder layers."""
     hbm_layout_dict, _total_hbm = hbm_layout
 
-    seq_len = vram_layout["seq_len"]
-    seq_len_valid = int(config.get("seq_len_valid", seq_len))
-    hidden_size = config["hidden_size"]
-    inter_size = config["intermediate_size"]
-    num_heads = config["num_attention_heads"]
-    num_kv_heads = config["num_key_value_heads"]
-
-    hidden_padded = _align_up(hidden_size, mlen)
-    inter_padded = _align_up(inter_size, mlen)
-    head_dim = hidden_size // num_heads
-    d_padded = _align_up(head_dim, mlen)
-    attn_hidden_padded = num_heads * d_padded
-
-    if hidden_padded != attn_hidden_padded:
-        raise ValueError(
-            "Internal hidden geometry mismatch after runtime repack: "
-            f"hidden_padded={hidden_padded}, attn_hidden_padded={attn_hidden_padded}."
-        )
+    geo = resolve_model_geometry(config, vram_layout, mlen)
+    seq_len = geo["seq_len"]
+    seq_len_valid = geo["seq_len_valid"]
+    hidden_size = geo["hidden_size"]
+    inter_size = geo["inter_size"]
+    num_heads = geo["num_heads"]
+    num_kv_heads = geo["num_kv_heads"]
+    hidden_padded = geo["hidden_padded"]
+    inter_padded = geo["inter_padded"]
+    head_dim = geo["head_dim"]
+    d_padded = geo["d_padded"]
 
     asm_code = ""
     asm_code += "; ============================================================\n"
@@ -148,7 +128,6 @@ def build_full_model_asm(
     asm_code += f"; Hidden={hidden_size}, Heads={num_heads}, Inter={inter_size}\n"
     asm_code += f"; Sequence length={seq_len}, MLEN={mlen}, VLEN={vlen}\n"
     asm_code += "; ============================================================\n\n"
-
     if embedding_mode == "bypass":
         asm_code += "; --- STAGE 0: Embedding Preloaded (ASM bypass) ---\n"
     elif embedding_mode == "asm":
@@ -166,14 +145,7 @@ def build_full_model_asm(
     embedding_output_base = vram_layout["embedding_base"]
     num_layers_to_emit = min(max_layers, len(layer_weights_list))
 
-    q_bias_bases = vram_layout.get("q_bias_bases", {})
-    ln1_weight_bases = vram_layout.get("ln1_weight_bases", {})
-    ln1_bias_bases = vram_layout.get("ln1_bias_bases", {})
-    ln2_weight_bases = vram_layout.get("ln2_weight_bases", {})
-    ln2_bias_bases = vram_layout.get("ln2_bias_bases", {})
-    out_bias_bases = vram_layout.get("out_bias_bases", {})
-    fc1_bias_bases = vram_layout.get("fc1_bias_bases", {})
-    fc2_bias_bases = vram_layout.get("fc2_bias_bases", {})
+    bias_bases = collect_bias_bases(vram_layout)
 
     persistent_end = _compute_persistent_end(
         vram_layout=vram_layout,
@@ -195,7 +167,7 @@ def build_full_model_asm(
         persistent_end += 4 * probe_span
         vram_layout["layer0_probe_bases"] = dict(layer0_probe_bases)
 
-    workspace_base = _align_up(persistent_end, mlen)
+    workspace_base = align_up(persistent_end, mlen)
 
     for layer_idx in range(num_layers_to_emit):
         asm_code += f"\n; --- LAYER {layer_idx}: Encoder Layer ---\n"
@@ -203,72 +175,42 @@ def build_full_model_asm(
         layer_input_base = embedding_output_base if layer_idx == 0 else vram_layout["layer_bases"][layer_idx - 1]
         layer_output_base = vram_layout["layer_bases"][layer_idx]
 
-        layer_hbm = hbm_layout_dict.get("layers", {}).get(layer_idx, {})
-        wq_offset = layer_hbm.get("q_proj_weight", 0)
-        k_offset = layer_hbm.get("k_proj_weight", 0)
-        v_offset = layer_hbm.get("v_proj_weight", 0)
-        w1_offset = layer_hbm.get("fc1_weight", 0)
-        w2_offset = layer_hbm.get("fc2_weight", 0)
-        out_offset = layer_hbm.get("out_proj_weight", 0)
+        hbm_offsets = collect_layer_hbm_offsets(hbm_layout_dict, layer_idx)
 
         q_base = workspace_base
-        q_vram_base = q_base + seq_len * hidden_padded
-
-        flash_layout = _compute_vram_layout(
+        # Flash attention runs with vector_sram_base_address=q_base (see
+        # build_encoder_layer_asm), so the attention output (o_old) lands at
+        # o_old_base(q_base). Deriving attn_base from any other base would point
+        # out_proj and the attn snapshot at the wrong (zero) region.
+        flash_layout = compute_flash_vram_layout(
             mlen=mlen,
             blen=blen,
             q_len=seq_len,
             hq=num_heads,
             hkv=num_kv_heads,
             d=d_padded,
-            vector_sram_base=q_vram_base,
+            vector_sram_base=q_base,
         )
         attn_vram_base = flash_layout["o_old_base"]
         residual_vram_base = attn_vram_base + seq_len * hidden_padded
         mlp_inter_vram_base = residual_vram_base + seq_len * hidden_padded
-        scratch_base = _align_up(mlp_inter_vram_base + seq_len * inter_padded, mlen)
+        scratch_base = align_up(mlp_inter_vram_base + seq_len * inter_padded, mlen)
 
-        layer_asm = build_encoder_layer_asm(
+        layer_asm = emit_encoder_layer(
+            geo=geo,
             mlen=mlen,
             blen=blen,
             vlen=vlen,
-            batch=1,
-            s_q=seq_len,
-            s_kv=seq_len,
-            s_kv_valid=seq_len_valid,
-            hq=num_heads,
-            hkv=num_kv_heads,
-            h_qkv=d_padded,
-            hidden_size=hidden_padded,
-            inter_dim=inter_padded,
+            layer_idx=layer_idx,
             x_base=layer_input_base,
+            mlp_out_base=layer_output_base,
             q_base=q_base,
             attn_base=attn_vram_base,
             residual_base=residual_vram_base,
             mlp_inter_base=mlp_inter_vram_base,
-            mlp_out_base=layer_output_base,
             scratch_base=scratch_base,
-            k_hbm_offset=k_offset,
-            v_hbm_offset=v_offset,
-            out_hbm_offset=out_offset,
-            wq_hbm_offset=wq_offset,
-            w1_hbm_offset=w1_offset,
-            w2_hbm_offset=w2_offset,
-            ln_eps_fp_slot=2,
-            ln_reci_hid_fp_slot=3,
-            gelu_one_fp_slot=4,
-            gelu_1702_fp_slot=5,
-            attn_scale_fp_slot=1,
-            attn_ninf_fp_slot=6,
-            flash_temp_fp_start=64,
-            q_bias_base=q_bias_bases.get(layer_idx),
-            ln1_affine_weight_base=ln1_weight_bases.get(layer_idx),
-            ln1_affine_bias_base=ln1_bias_bases.get(layer_idx),
-            ln2_affine_weight_base=ln2_weight_bases.get(layer_idx),
-            ln2_affine_bias_base=ln2_bias_bases.get(layer_idx),
-            out_bias_base=out_bias_bases.get(layer_idx),
-            fc1_bias_base=fc1_bias_bases.get(layer_idx),
-            fc2_bias_base=fc2_bias_bases.get(layer_idx),
+            hbm_offsets=hbm_offsets,
+            bias_bases=bias_bases,
             debug_stage0_snapshot_base=(
                 layer0_probe_bases.get("input_chunk_major") if layer_idx == 0 else None
             ),
@@ -278,8 +220,6 @@ def build_full_model_asm(
             debug_outproj_snapshot_base=(
                 layer0_probe_bases.get("outproj_chunk_major") if layer_idx == 0 else None
             ),
-            include_final_residual=True,
-            include_gelu=True,
         )
 
         asm_code += layer_asm + "\n"
@@ -306,7 +246,7 @@ def build_full_model_asm(
         final_ln_bias_base = vram_layout.get("final_ln_bias_base")
         if final_ln_weight_base is None or final_ln_bias_base is None:
             raise ValueError("apply_post_layernorm=True requires final_ln_weight_base/final_ln_bias_base in vram_layout")
-        final_ln_scratch_base = _align_up(final_output_base + seq_len * hidden_padded, mlen)
+        final_ln_scratch_base = align_up(final_output_base + seq_len * hidden_padded, mlen)
         ln_activation_base = final_output_base
 
         asm_code += "\n; --- FINAL: Post-Encoder LayerNorm ---\n"
@@ -330,9 +270,28 @@ def build_full_model_asm(
             vlen=vlen,
             batch_size=seq_len,
             hidden_dim=hidden_padded,
-            affine_weight_base_address=final_ln_weight_base,
-            affine_bias_base_address=final_ln_bias_base,
         )
+        asm_code += reset_reg_asm(alive_registers=[5, 6, 7])
+
+        asm_code += elementwise_mul_bias_vram_asm(
+            vlen=vlen,
+            num_hidden_vectors=hidden_padded // vlen,
+            seq_len=seq_len,
+            alive_registers=[10, 11, 12, 13],
+            dst_base_address=ln_activation_base,
+            bias_base_address=int(final_ln_weight_base),
+        )
+        asm_code += reset_reg_asm(alive_registers=[10, 11, 12, 13])
+
+        asm_code += elementwise_add_bias_vram_asm(
+            vlen=vlen,
+            num_hidden_vectors=hidden_padded // vlen,
+            seq_len=seq_len,
+            alive_registers=[10, 11, 12, 13],
+            dst_base_address=ln_activation_base,
+            bias_base_address=int(final_ln_bias_base),
+        )
+        asm_code += reset_reg_asm(alive_registers=[10, 11, 12, 13])
         asm_code += "\n"
 
     asm_code += "\n; ============================================================\n"
