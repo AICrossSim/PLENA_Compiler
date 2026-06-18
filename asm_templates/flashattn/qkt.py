@@ -150,9 +150,11 @@ def _qkt_per_head_prefill(
     """Emit M_TMM triple loop for one head's QKT (prefill).
 
     Computes S[mlen, mlen] = Q[mlen, d] @ K^T[d, mlen] using:
-        outer  : mlen/blen  column blocks of S (= row-block indices of K^T)
-        middle : mlen/blen  row blocks of S    (= row-block indices of Q)
-        inner  : d/blen     accumulation over the key dimension
+        outer  : mlen/blen     column blocks of S (= row-block indices of K^T)
+        middle : mlen/blen     row blocks of S    (= row-block indices of Q)
+        inner  : ceil(d/mlen)  accumulation over head-dimension tiles (= 1 for
+                               every supported config, since one M_TMM already
+                               contracts a full mlen-wide slice of d)
 
     K is already prefetched to MSRAM at *k_msram_base* (typically 0).
     M_TMM transposes the MSRAM tile internally, so we pass K's address
@@ -170,7 +172,14 @@ def _qkt_per_head_prefill(
     gp_s_col_base = alive_registers[8]
 
     tiles_per_mlen = mlen // blen
-    num_k_blocks = d // blen if d >= blen else 1
+    # One M_TMM computes vec[blen, mlen] @ mat[mlen, blen] = [blen, blen],
+    # contracting a FULL mlen-wide slice of the head dimension d in a single
+    # instruction.  We therefore only accumulate over ceil(d / mlen) head-dim
+    # tiles, which is 1 for every supported config (d <= mlen).  The previous
+    # `d // blen` made this inner loop re-walk and SUM mlen/blen shifting
+    # key-blocks into each S tile (a suffix-sum over keys), which corrupted the
+    # attention logits for the per-head (ratio < blen) path.
+    num_d_tiles = (d + mlen - 1) // mlen
 
     # Strides:
     # Q rows advance by blen*mlen VRAM elements per row-block.
@@ -201,11 +210,15 @@ def _qkt_per_head_prefill(
     lines.append(f"S_ADDI_INT gp{gp_q}, gp{gp_q_row_base}, 0")
     lines.append(f"S_ADDI_INT gp{gp_k}, gp{gp_k_col_base}, 0")
 
-    # Inner loop: accumulate over K dimension (d // blen blocks)
-    lines.append(f"C_LOOP_START gp{gp_loop_inner}, {num_k_blocks}")
+    # Inner loop: accumulate over head-dimension tiles.  One M_TMM contracts a
+    # full mlen-wide slice of d, so this runs exactly once for d <= mlen and
+    # each (column-block, row-block) writes a single correct S tile.
+    lines.append(f"C_LOOP_START gp{gp_loop_inner}, {num_d_tiles}")
     lines.append(f"M_TMM 0, gp{gp_q}, gp{gp_k}")
-    # K advances to next blen-col block of K^T; Q stays (full-row read).
-    lines.append(f"S_ADDI_INT gp{gp_k}, gp{gp_k}, {blen * mlen}")
+    # Advance K and Q to the next mlen-wide head-dim tile.  No-op for the
+    # single-tile (d <= mlen) case since the loop runs once.
+    lines.append(f"S_ADDI_INT gp{gp_k}, gp{gp_k}, {mlen * mlen}")
+    lines.append(f"S_ADDI_INT gp{gp_q}, gp{gp_q}, {mlen}")
     lines.append(f"C_LOOP_END gp{gp_loop_inner}")
 
     # Write accumulated [blen, blen] S tile

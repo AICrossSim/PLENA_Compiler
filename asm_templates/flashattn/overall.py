@@ -132,78 +132,92 @@ def flash_attn_asm(
 
     # loop over kv heads
     for kv_head_index in range(hkv):
-        # loop over per kv head kv_len // MLEN
-        # NOTE: For head-major padded K/V in HBM, each H_PREFETCH_M call loads
-        # exactly one KV tile (kv_tile_size * d_padded = mlen*mlen elements).
-        # kv_seq_tile_idx tracks the KV-sequence tile within this head.
-        for kv_seq_tile_idx in range(k_seq_iteration_number):
-            print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in", "MHA" if hkv == hq else "GQA", "mode")
+        # Reset O_old with zeros once per kv_head.  For the per-head path only
+        # kv_head 0 zeroes the whole interleaved [hq, q_len, d_padded] buffer;
+        # for the batched path every kv_head zeroes its ratio-head region.
+        # (O accumulation now spans the inner KV loop for every query tile, so
+        # the buffer must be zeroed before that head's query tiles start.)
+        _reset_o = use_batched or kv_head_index == 0
+        if _reset_o:
+            generated_code += reset_vssram_code(
+                reset_start_address=o_old_base_address,
+                vect_dim=vlen,
+                per_stride_dim=(hq * d_padded if not use_batched else q_index_2_kv_index_ratio) * q_len // vlen,
+                reset_stride=vlen,
+                reset_amount=1,
+                alive_registers_int=alive_registers_int[0:3],
+            )
 
-            # HBM element offset for K (and V) for this (head, tile):
-            #   head-major: kv_head * kv_tile_size * d_padded + tile * kv_tile_size * d_padded
-            # With kv_tile_size=mlen, this simplifies to (kv_head*tiles + tile)*mlen*d_padded.
-            kv_hbm_offset = (kv_head_index * k_seq_iteration_number + kv_seq_tile_idx) * kv_tile_size * d_padded
-            valid_k_cols = max(0, min(kv_tile_size, kv_valid_total - kv_seq_tile_idx * kv_tile_size))
-            if trace_tiles:
-                print(
-                    "[flashattn tile] "
-                    f"kv_head={kv_head_index} "
-                    f"kv_tile={kv_seq_tile_idx}/{k_seq_iteration_number - 1} "
-                    f"kv_hbm_offset={kv_hbm_offset} "
-                    f"valid_k_cols={valid_k_cols}/{kv_tile_size} "
-                    f"use_batched={use_batched}"
-                )
+        # Query-tile OUTER / KV-tile INNER flash attention.
+        #
+        # Each query tile keeps its OWN running-softmax state (m_old, m_res,
+        # l_old) across the entire KV sequence and is normalized by 1/l exactly
+        # once, after its inner KV loop completes.  The previous structure
+        # iterated KV in the outer loop and shared a single m/l region across
+        # all query tiles (reset only at kv_tile==0), which is correct only for
+        # q_len <= mlen (a single query tile).  For q_len > mlen later query
+        # tiles inherited and were divided by the shared, still-growing l,
+        # degrading monotonically.  Iterating query tiles outermost reuses one
+        # ratio-wide m/l region per tile, so FP-SRAM usage is independent of
+        # the number of query tiles.
+        for q_seq_tile_idx in range(q_seq_iteration_number):
+            q_tile_start = q_seq_tile_idx * mlen
 
-            # Reset m_fp_sram_start_address for each iteration
-            m_fp_sram_start_address = fp_sram_start_address
+            # Reset running-softmax state fresh for THIS query tile:
+            #   m_old = -inf (one br-wide slot per q head in the kv group)
+            #   l_old = 0
+            # ``inf_fp_address`` is forwarded by the caller from
+            # ``scheduler["memory_layout"]["fp_sram"]["infinity"]`` (default 0
+            # per mem_layout_lib.json).  The previous hardcoded value 2 was the
+            # hid_reciprocal slot (~ 0.016 once seeded), which left the running-
+            # max init positive and broke flash-softmax accumulation.
+            generated_code += reset_fpsram_code(
+                reset_start_address=fp_sram_start_address,
+                per_stride_dim=br,
+                stride_dist=3 * br,
+                reset_amount=q_index_2_kv_index_ratio,
+                reset_val_address=inf_fp_address,
+                alive_registers_fp=alive_registers_fp[0:1],
+                alive_registers_int=alive_registers_int[0:4],
+            )
+            # Reset l_old to zero (use hardware f0, not FP SRAM slot 0 which is -inf)
+            generated_code += reset_fpsram_code(
+                reset_start_address=fp_sram_start_address + 2 * br,
+                per_stride_dim=br,
+                stride_dist=3 * br,
+                reset_amount=q_index_2_kv_index_ratio,
+                reset_val_address=0,
+                alive_registers_fp=alive_registers_fp[0:1],
+                alive_registers_int=alive_registers_int[0:4],
+                use_zero_reg=True,
+            )
 
-            if kv_seq_tile_idx == 0:
-                # Reset m old for every q_index_2_kv_index_ratio q heads with -inf.
-                # ``inf_fp_address`` is forwarded by the caller from
-                # ``scheduler["memory_layout"]["fp_sram"]["infinity"]`` (default 0
-                # per mem_layout_lib.json).  The previous hardcoded value 2 was
-                # the hid_reciprocal slot (~ 0.016 once seeded), which left the
-                # running-max init positive and broke flash-softmax accumulation.
-                generated_code += reset_fpsram_code(
-                    reset_start_address=m_fp_sram_start_address,
-                    per_stride_dim=br,
-                    stride_dist=3 * br,
-                    reset_amount=q_index_2_kv_index_ratio,
-                    reset_val_address=inf_fp_address,
-                    alive_registers_fp=alive_registers_fp[0:1],
-                    alive_registers_int=alive_registers_int[0:4],
-                )
+            # loop over this query tile's KV-sequence tiles.
+            # NOTE: For head-major padded K/V in HBM, each H_PREFETCH_M call
+            # loads exactly one KV tile (kv_tile_size * d_padded = mlen*mlen
+            # elements).  kv_seq_tile_idx tracks the KV-sequence tile within
+            # this head; K/V are re-prefetched for every query tile.
+            for kv_seq_tile_idx in range(k_seq_iteration_number):
+                print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in", "MHA" if hkv == hq else "GQA", "mode")
 
-                # Reset l_old to zero (use hardware f0, not FP SRAM slot 0 which is -inf)
-                generated_code += reset_fpsram_code(
-                    reset_start_address=m_fp_sram_start_address + 2 * br,
-                    per_stride_dim=br,
-                    stride_dist=3 * br,
-                    reset_amount=q_index_2_kv_index_ratio,
-                    reset_val_address=0,
-                    alive_registers_fp=alive_registers_fp[0:1],
-                    alive_registers_int=alive_registers_int[0:4],
-                    use_zero_reg=True,
-                )
+                # HBM element offset for K (and V) for this (head, tile):
+                #   head-major: kv_head * kv_tile_size * d_padded + tile * kv_tile_size * d_padded
+                # With kv_tile_size=mlen, this simplifies to (kv_head*tiles + tile)*mlen*d_padded.
+                kv_hbm_offset = (kv_head_index * k_seq_iteration_number + kv_seq_tile_idx) * kv_tile_size * d_padded
+                valid_k_cols = max(0, min(kv_tile_size, kv_valid_total - kv_seq_tile_idx * kv_tile_size))
+                if trace_tiles:
+                    print(
+                        "[flashattn tile] "
+                        f"kv_head={kv_head_index} "
+                        f"kv_tile={kv_seq_tile_idx}/{k_seq_iteration_number - 1} "
+                        f"kv_hbm_offset={kv_hbm_offset} "
+                        f"valid_k_cols={valid_k_cols}/{kv_tile_size} "
+                        f"use_batched={use_batched}"
+                    )
 
-            # Reset O_old with zeros (only on the first KV-sequence tile, and for per-head
-            # only on the first kv_head so the whole interleaved buffer is zeroed once).
-            _reset_o = kv_seq_tile_idx == 0 and (use_batched or kv_head_index == 0)
-            if _reset_o:
-                generated_code += reset_vssram_code(
-                    reset_start_address=o_old_base_address,
-                    vect_dim=vlen,
-                    per_stride_dim=(hq * d_padded if not use_batched else q_index_2_kv_index_ratio) * q_len // vlen,
-                    reset_stride=vlen,
-                    reset_amount=1,
-                    alive_registers_int=alive_registers_int[0:3],
-                )
-
-            # # loop over per q_index_2_kv_index_ratio q heads (q_len // MLEN), compute q_index_2_kv_index_ratio heads in parallel.
-            for q_seq_tile_idx in range(q_seq_iteration_number):
-                q_tile_start = q_seq_tile_idx * mlen
-                # Reuse the same FP SRAM scratch region for each Q tile.
-                # Accumulating this base across Q tiles can exceed FP SRAM bounds.
+                # FP-SRAM running-softmax region base (advanced per q head below).
+                # State persists across the inner KV loop (reset only above, once
+                # per query tile) so the online softmax accumulates correctly.
                 m_fp_sram_start_address = fp_sram_start_address
                 stored_m_fp_res_address = m_fp_sram_start_address + br
 
