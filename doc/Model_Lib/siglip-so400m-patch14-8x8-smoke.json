@@ -6,7 +6,7 @@
   "model_type": "siglip",
   "text_config": {
     "hidden_size": 256,
-    "intermediate_size": 128,
+    "intermediate_size": 512,
     "model_type": "siglip_text_model",
     "num_attention_heads": 4,
     "num_key_value_heads": 4,
@@ -16,12 +16,13 @@
   "transformers_version": "4.37.0.dev0",
   "vision_config": {
     "hidden_size": 256,
-    "image_size": 112,
-    "intermediate_size": 128,
+    "image_size": 128,
+    "intermediate_size": 512,
     "model_type": "siglip_vision_model",
     "num_attention_heads": 4,
     "num_key_value_heads": 4,
     "num_hidden_layers": 27,
-    "patch_size": 14
+    "patch_size": 16,
+    "hidden_act": "gelu_pytorch_tanh"
   }
 }
