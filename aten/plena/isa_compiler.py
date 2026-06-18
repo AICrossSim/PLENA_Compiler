@@ -276,12 +276,25 @@ class IsaCompiler(
         if mode not in ("rms", "layer"):
             raise ValueError(f"Unsupported normalization mode: {mode}. Expected 'rms' or 'layer'.")
 
-        gp_regs = self.register_allocator.allocate_gp(4)
+        # LayerNorm reduce-fusion: collapse the per-col-block V_RED_SUM pair into
+        # lane-wise V_ADD_VV accumulation + one final reduce each. Needs 2 extra GP
+        # regs and 2 extra scratch vectors, so only enabled when we auto-allocate the
+        # scratchpad (we control its size). Toggle off with PLENA_LN_FUSE=0.
+        import os as _os
+        ln_fuse = (
+            mode == "layer"
+            and scratchpad_vram_addr is None
+            and _os.environ.get("PLENA_LN_FUSE", "1") != "0"
+        )
+
+        gp_regs = self.register_allocator.allocate_gp(6 if ln_fuse else 4)
 
         temp_scratchpad_name = None
         if scratchpad_vram_addr is None:
             temp_scratchpad_name = f"__norm_scratch__{tensor_name}__{len(self.generated_code)}"
-            scratchpad_vram_addr = self.vram_allocator.allocate(vlen, name=temp_scratchpad_name)
+            scratchpad_vram_addr = self.vram_allocator.allocate(
+                vlen * (3 if ln_fuse else 1), name=temp_scratchpad_name
+            )
 
         try:
             isa_code = (
@@ -312,6 +325,7 @@ class IsaCompiler(
                     batch_size=batch_size,
                     hidden_dim=hidden_dim,
                     unroll=self._op_unroll("NORM"),
+                    fused_reduce=ln_fuse,
                 )
 
             return self._emit(isa_code)

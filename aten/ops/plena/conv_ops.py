@@ -80,6 +80,29 @@ def conv2d_plena(
     elif os.environ.get("CONV_USE_SHIFT") == "0":
         use_shift = False
 
+    # FYP: native CONV_2D engine instruction (DEFAULT-ON). When the shape matches
+    # the patch-embed signature (stride == K, C_in <= 4), replace the whole im2col
+    # + systolic-GEMM lowering with a CONV_2D latency stub (modeled cycles of a
+    # dedicated conv MAC engine). Latency-only -- no real conv is performed (the
+    # output tensor is left as-allocated; numerical correctness is out of scope).
+    # Toggle off with CONV_USE_CONV2D_INSTR=0 (-> im2col / im2col-shift below).
+    if os.environ.get("CONV_USE_CONV2D_INSTR", "1") != "0" and stride == K and C_in <= 4:
+        from compiler.asm_templates.conv2d_asm import conv2d_instr_asm
+
+        C_out = weight_2d_var.shape[1]
+        c_out_par = int(os.environ.get("CONV2D_C_OUT_PAR", "8"))
+        conv_out = prog.alloc("conv2d_out", M, C_out, strict=False)
+        out_addr = prog.get_vram_addr(conv_out.name)
+        asm_code, _modeled_cycles = conv2d_instr_asm(
+            M=M,
+            C_out=C_out,
+            c_out_par=c_out_par,
+            out_vram_addr=out_addr,
+            out_reg=1,
+        )
+        prog.emit(asm_code)
+        return conv_out
+
     # Lazy imports to avoid circular dependencies at module load time
     if use_shift:
         from compiler.asm_templates.im2col_asm import im2col_asm, PREFETCH_V_AMOUNT

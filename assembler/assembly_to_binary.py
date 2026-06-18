@@ -24,7 +24,7 @@ _IMM_RS1_RD_OPS = frozenset(
         "V_EXP_V",
     }
 )
-_IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"})
+_IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO", "CONV_2D"})
 _RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"})
 _RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"})
 _FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})

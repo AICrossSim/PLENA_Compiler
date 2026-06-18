@@ -96,9 +96,19 @@ def layer_norm_asm(
     batch_size: int,
     hidden_dim: int,
     unroll: bool = True,
+    fused_reduce: bool = False,
 ) -> str:
     """
     Generate assembly code for layer normalization.
+
+    When ``fused_reduce`` is set, the statistics loop replaces the per-col-block
+    pair of ``V_RED_SUM`` (one for sum(x), one for sum(x^2)) with lane-wise
+    ``V_ADD_VV`` into two VRAM accumulators, then a SINGLE ``V_RED_SUM`` each at
+    the end.  This collapses ``2 * (hidden_dim/vlen)`` 30-cyc reduces per row down
+    to 2, trading them for cheaper 9-cyc vector adds.  It is numerically
+    equivalent (only reorders an associative summation; ``V_RED_SUM`` cost is
+    content-independent).  The caller (``normalize()``) must then provide 6 alive
+    registers and a scratchpad of ``3 * vlen`` (scratch + acc_x + acc_x2).
     """
     act_addr = alive_registers[0]
     scratchpad_addr = alive_registers[1]
@@ -106,6 +116,7 @@ def layer_norm_asm(
     # Rolled path uses the spare 4th register (already allocated by normalize()) as the
     # C_LOOP counter. Only accessed when rolled, so unrolled callers may pass 3 registers.
     loop_addr = alive_registers[3] if not unroll else None
+    n_blocks = hidden_dim // vlen
 
     generated_code = "; Layer Norm generation \n"
     generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
@@ -116,6 +127,13 @@ def layer_norm_asm(
     generated_code += "S_ADD_FP f3, f0, f0 \n"  # sum(x^2) accumulator
     generated_code += f"S_LD_FP f4, gp0, {reci_hid_offset} \n"  # 1/hidden_dim
 
+    if fused_reduce:
+        # Two lane-wise VRAM accumulators live just past the scratchpad vector.
+        accx_addr = alive_registers[4]
+        accx2_addr = alive_registers[5]
+        generated_code += _load_large_int(accx_addr, scratchpad_base_address + vlen)
+        generated_code += _load_large_int(accx2_addr, scratchpad_base_address + 2 * vlen)
+
     for batch in range(batch_size):
         # Set act_addr to start of current batch
         generated_code += _load_large_int(act_addr, activation_base_address + vlen * batch)
@@ -123,8 +141,32 @@ def layer_norm_asm(
         generated_code += _load_large_int(stats_addr, activation_base_address + vlen * batch)
 
         # First loop: compute sum(x) and sum(x^2) using stats_addr
-        if unroll:
-            for i in range(hidden_dim // vlen):
+        if fused_reduce:
+            # Zero the lane accumulators safely: (real block-0 activation) * 0 = 0.
+            # Multiplying a loaded activation by f0 avoids reading uninitialised VRAM.
+            generated_code += f"V_MUL_VF gp{accx_addr}, gp{stats_addr}, f0, 0 \n"
+            generated_code += f"V_MUL_VF gp{accx2_addr}, gp{stats_addr}, f0, 0 \n"
+
+            # Accumulate x and x^2 lane-wise across all col-blocks (one reduce at the end).
+            if unroll:
+                for i in range(n_blocks):
+                    generated_code += f"V_ADD_VV gp{accx_addr}, gp{accx_addr}, gp{stats_addr}, 0 \n"
+                    generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+                    generated_code += f"V_ADD_VV gp{accx2_addr}, gp{accx2_addr}, gp{scratchpad_addr}, 0 \n"
+                    generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+            else:
+                generated_code += f"C_LOOP_START gp{loop_addr}, {n_blocks} \n"
+                generated_code += f"V_ADD_VV gp{accx_addr}, gp{accx_addr}, gp{stats_addr}, 0 \n"
+                generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
+                generated_code += f"V_ADD_VV gp{accx2_addr}, gp{accx2_addr}, gp{scratchpad_addr}, 0 \n"
+                generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
+                generated_code += f"C_LOOP_END gp{loop_addr} \n"
+
+            # f2 = sum(x), f3 = sum(x^2)   (f2,f3 are 0 here -> a single reduce each)
+            generated_code += f"V_RED_SUM f2, gp{accx_addr} \n"
+            generated_code += f"V_RED_SUM f3, gp{accx2_addr} \n"
+        elif unroll:
+            for i in range(n_blocks):
                 # sum(x)
                 generated_code += f"V_RED_SUM f2, gp{stats_addr} \n"
 
@@ -135,7 +177,7 @@ def layer_norm_asm(
                 # Move stats pointer to next vector
                 generated_code += f"S_ADDI_INT gp{stats_addr}, gp{stats_addr}, {vlen * batch_size} \n"
         else:
-            generated_code += f"C_LOOP_START gp{loop_addr}, {hidden_dim // vlen} \n"
+            generated_code += f"C_LOOP_START gp{loop_addr}, {n_blocks} \n"
             generated_code += f"V_RED_SUM f2, gp{stats_addr} \n"
             generated_code += f"V_MUL_VV gp{scratchpad_addr}, gp{stats_addr}, gp{stats_addr}, 0 \n"
             generated_code += f"V_RED_SUM f3, gp{scratchpad_addr} \n"

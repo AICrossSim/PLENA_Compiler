@@ -171,7 +171,11 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
 
     // Extensions
     V_SHIFT_V              = 6'h31,
-    C_BREAK                = 6'h32
+    C_BREAK                = 6'h32,
+
+    // FYP draft (local-only): native conv2d engine instruction (matches the RTL
+    // kev/fyp-experiment opcode 0x35). Latency-model stub for thesis numbers.
+    CONV_2D                = 6'h35
 } CUSTOM_ISA_OPCODE;
 
 
