@@ -626,8 +626,6 @@ class ProgramAttentionMixin:
                 f"packed Q group must fit in one physical MLEN row, "
                 f"got logical_width={q_width}, physical_width={q_physical_width}, MLEN={mlen}"
             )
-        if seq_len > mlen:
-            raise NotImplementedError("Packed attention currently supports one sequence tile.")
         if group_heads > broadcast_amount:
             raise ValueError(f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}")
         if broadcast_amount * head_slot_dim != mlen:
@@ -642,7 +640,16 @@ class ProgramAttentionMixin:
         self._ensure_hbm_sub_matrix_registered(V)
         self._ensure_vram_matrix_layout(Q_group.name)
 
-        rows = min(mlen, seq_len)
+        active_k_cols = valid_cols or seq_len
+        if active_k_cols <= 0:
+            raise ValueError(f"Packed attention requires positive active K columns, got {active_k_cols}")
+        if active_k_cols > K.shape[0]:
+            raise ValueError(f"valid_cols={active_k_cols} exceeds K rows {K.shape[0]}")
+        if active_k_cols > V.shape[0]:
+            raise ValueError(f"valid_cols={active_k_cols} exceeds V rows {V.shape[0]}")
+
+        num_q_blocks = math.ceil(seq_len / mlen)
+        num_k_blocks = math.ceil(active_k_cols / mlen)
         # M_BTMM applies the emulator's fixed bmm_scale (0.25). Compensate in
         # online softmax so the effective QK scale remains caller-provided.
         softmax_scale = scale / 0.25
@@ -657,74 +664,89 @@ class ProgramAttentionMixin:
             )
             for head in range(group_heads)
         ]
-        pv = self.alloc("_packed_PV", rows, head_slot_dim, strict=False, physical_shape=(mlen, mlen))
+        pv = self.alloc("_packed_PV", mlen, head_slot_dim, strict=False, physical_shape=(mlen, mlen))
         pack_scratch = self.alloc("_packed_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen))
         pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
 
-        self.emit(
-            self._reset_vram_asm(
-                start_address=output_base_address,
-                rows=rows,
-                cols=mlen,
-                total_rows=output_physical_rows,
-                mlen=mlen,
-            )
-        )
-        self._emit_packed_qkt_to_s(
-            Q_group=Q_group,
-            K=K,
-            q_idx=0,
-            k_idx=k_idx,
-            s_base_address=scratch_base_address,
-        )
+        valid_col_masks: dict[int, VRAMMatrixVar] = {}
+        for k_block in range(num_k_blocks):
+            block_cols = min(mlen, active_k_cols - k_block * mlen)
+            if self._needs_explicit_valid_col_mask(block_cols):
+                valid_col_masks[block_cols] = self._build_valid_col_mask(
+                    f"_packed_valid_col_mask_{block_cols}", block_cols
+                )
 
-        active_cols = valid_cols or seq_len
-        valid_col_mask = (
-            self._build_valid_col_mask(f"_packed_valid_col_mask_{active_cols}", active_cols)
-            if self._needs_explicit_valid_col_mask(active_cols)
-            else None
-        )
-        for head, s_head in enumerate(s_views):
-            o_head = self.alloc(
-                f"_packed_O_head{head}",
-                rows,
-                head_slot_dim,
-                strict=False,
-                physical_shape=(mlen, mlen),
+        for q_block in range(num_q_blocks):
+            rows = min(mlen, seq_len - q_block * mlen)
+            self.emit(
+                self._reset_vram_asm(
+                    start_address=output_base_address,
+                    rows=rows,
+                    cols=mlen,
+                    total_rows=output_physical_rows,
+                    mlen=mlen,
+                    row_offset=q_block * mlen,
+                )
             )
-            self.init_online_softmax(0, o_head, rows=rows)
-            if valid_col_mask is not None:
-                self.vram_add(s_head, valid_col_mask, num_rows=rows)
-            if isinstance(causal_mask, VRAMMatrixVar):
-                self.vram_add(s_head, causal_mask, num_rows=rows)
-            elif causal_mask is True:
-                self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
-            softmax_valid_cols = (
-                None
-                if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar)
-                else active_cols
-            )
-            self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
-            self.compute_pv(s_head, V, k_idx, pv, head_slot_dim, rows=rows)
-            self.scale_o_row(o_head, 0, rows=rows)
-            self.vram_add(o_head, pv, num_rows=rows)
-            self.final_scale_o(0, o_head, rows=rows)
-            output_head = output_head_base + head
-            output_col_block = (output_head * head_slot_dim) // mlen
-            output_lane = (output_head * head_slot_dim) % mlen // head_slot_dim
-            output_block_base = output_base_address + output_col_block * output_physical_rows * mlen
-            self._pack_o_head_to_output(
-                o_head=o_head,
-                output_base_address=output_block_base,
-                output_physical_rows=output_physical_rows,
-                head_slot=output_lane,
-                head_slot_dim=head_slot_dim,
-                rows=rows,
-                scratch_address=pack_scratch_addr,
-            )
-            self.free_tensor(o_head)
+            for head, s_head in enumerate(s_views):
+                o_head = self.alloc(
+                    f"_packed_O_q{q_block}_head{head}",
+                    rows,
+                    head_slot_dim,
+                    strict=False,
+                    physical_shape=(mlen, mlen),
+                )
+                self.init_online_softmax(0, o_head, rows=rows)
 
-        if valid_col_mask is not None:
+                for k_block in range(num_k_blocks):
+                    block_cols = min(mlen, active_k_cols - k_block * mlen)
+                    physical_k_idx = k_idx + k_block
+                    self._emit_packed_qkt_to_s(
+                        Q_group=Q_group,
+                        K=K,
+                        q_idx=q_block,
+                        k_idx=physical_k_idx,
+                        s_base_address=scratch_base_address,
+                    )
+
+                    valid_col_mask = valid_col_masks.get(block_cols)
+                    if valid_col_mask is not None:
+                        self.vram_add(s_head, valid_col_mask, num_rows=rows)
+                    if isinstance(causal_mask, VRAMMatrixVar):
+                        self.vram_add(s_head, causal_mask, num_rows=rows)
+                    elif causal_mask is True:
+                        self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
+                    softmax_valid_cols = (
+                        None
+                        if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar)
+                        else block_cols
+                    )
+                    self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
+                    self.compute_pv(s_head, V, physical_k_idx, pv, head_slot_dim, rows=rows)
+                    self.scale_o_row(o_head, 0, rows=rows)
+                    self.vram_add(o_head, pv, num_rows=rows)
+
+                self.final_scale_o(0, o_head, rows=rows)
+                output_head = output_head_base + head
+                output_col_block = (output_head * head_slot_dim) // mlen
+                output_lane = (output_head * head_slot_dim) % mlen // head_slot_dim
+                output_block_base = (
+                    output_base_address
+                    + output_col_block * output_physical_rows * mlen
+                    + q_block * mlen * mlen
+                )
+                self._pack_o_head_to_output(
+                    o_head=o_head,
+                    output_base_address=output_block_base,
+                    output_physical_rows=output_physical_rows,
+                    head_slot=output_lane,
+                    head_slot_dim=head_slot_dim,
+                    rows=rows,
+                    scratch_address=pack_scratch_addr,
+                )
+                self.free_tensor(o_head)
+
+        for valid_col_mask in valid_col_masks.values():
             self.free_tensor(valid_col_mask)
         self.free_tensor(pv)
         self.free_tensor(pack_scratch)
@@ -755,12 +777,40 @@ class ProgramAttentionMixin:
         mlen = self.mlen
         num_kv_heads = len(kv_pairs)
         q_physical_rows, q_physical_cols = Q_full.physical_shape
-        if seq_len > mlen:
-            raise NotImplementedError("KV-group looped packed attention currently supports one sequence tile.")
         if q_physical_cols < num_kv_heads * mlen:
             raise ValueError(
                 f"Q_full physical cols {q_physical_cols} cannot hold {num_kv_heads} MLEN-wide groups"
             )
+        if seq_len > mlen:
+            self.emit(
+                "; NOTE: seq_len exceeds MLEN; using packed GQA sequence-tiled codegen "
+                "with Python-expanded KV groups.\n"
+            )
+            q_group_stride = q_physical_rows * mlen
+            o_group_stride = q_physical_rows * mlen
+            q_base_addr = self.get_vram_addr(Q_full.name)
+            for kv_head, (K, V) in enumerate(kv_pairs):
+                Q_group = self.alloc_at(
+                    f"_packed_loop_tiled_Q_group{kv_head}",
+                    seq_len,
+                    mlen,
+                    q_base_addr + kv_head * q_group_stride,
+                    physical_shape=(q_physical_rows, mlen),
+                )
+                self._emit_packed_attention_group_internal(
+                    Q_group=Q_group,
+                    K=K,
+                    V=V,
+                    group_heads=group_heads,
+                    head_slot_dim=head_slot_dim,
+                    output_base_address=output_base_address + kv_head * o_group_stride,
+                    output_physical_rows=q_physical_rows,
+                    scratch_base_address=scratch_base_address,
+                    broadcast_amount=broadcast_amount,
+                    scale=scale or (1.0 / math.sqrt(head_slot_dim)),
+                    causal_mask=causal_mask,
+                )
+            return
         if group_heads > broadcast_amount:
             raise ValueError(f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}")
         if broadcast_amount * head_slot_dim != mlen:
