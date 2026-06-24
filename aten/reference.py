@@ -78,6 +78,7 @@ class ScheduledReferenceConfig:
     head_slot_dim: int | None = None
     broadcast_amount: int | None = None
     total_q_dim: int | None = None
+    chunks_per_kv: int = 1
     batch_size: int = 1
     rows_per_batch: int | None = None
 
@@ -335,9 +336,20 @@ def _packed_attention_scheduled_ref(
     rows = q_full.shape[0]
     group_width = config.packed_group_width
     head_slot_dim = config.head_slot_dim
+    broadcast_amount = config.broadcast_amount
+    chunks_per_kv = config.chunks_per_kv
     ratio = config.head_ratio
     scale = 1.0 / math.sqrt(config.head_dim)
     out = torch.zeros((rows, config.attention_width), dtype=q_full.dtype, device=q_full.device)
+    if chunks_per_kv <= 0:
+        raise ValueError(f"chunks_per_kv must be positive, got {chunks_per_kv}")
+    if broadcast_amount <= 0:
+        raise ValueError(f"broadcast_amount must be positive, got {broadcast_amount}")
+    if chunks_per_kv * broadcast_amount < ratio:
+        raise ValueError(
+            f"packed chunks cannot cover ratio={ratio}: "
+            f"chunks_per_kv={chunks_per_kv}, broadcast_amount={broadcast_amount}"
+        )
 
     rows_per_batch = config.physical_rows_per_batch
     if rows_per_batch < config.seq_len:
@@ -365,35 +377,40 @@ def _packed_attention_scheduled_ref(
         row_start = batch_idx * rows_per_batch
         row_end = row_start + config.seq_len
         for kv_h in range(config.num_kv_heads):
-            group_start = kv_h * group_width
-            q_group = q_full[row_start:row_end, group_start:group_start + group_width]
-            q_group = _rope_scheduled_ref(
-                q_group,
-                rope_matrix,
-                cos_table[row_start:row_end],
-                sin_table[row_start:row_end],
-                config,
-                precision,
-            )
             k_h = k_heads[kv_h][row_start:row_end]
             v_h = v_heads[kv_h][row_start:row_end]
 
-            for lane in range(ratio):
-                lane_start = lane * head_slot_dim
-                lane_end = lane_start + head_slot_dim
-                q_h = q_group[:, lane_start:lane_end]
-                k_lane = k_h[:, :head_slot_dim]
-                v_lane = v_h[:, :head_slot_dim]
-                o_h = _flash_attn_scheduled_ref(
-                    q_h,
-                    k_lane,
-                    v_lane,
-                    scale,
+            for chunk in range(chunks_per_kv):
+                group_idx = kv_h * chunks_per_kv + chunk
+                group_start = group_idx * group_width
+                q_group = q_full[row_start:row_end, group_start:group_start + group_width]
+                q_group = _rope_scheduled_ref(
+                    q_group,
+                    rope_matrix,
+                    cos_table[row_start:row_end],
+                    sin_table[row_start:row_end],
+                    config,
                     precision,
-                    causal=True,
-                    matmul_scale=0.25,
                 )
-                out[row_start:row_end, group_start + lane_start:group_start + lane_end] = o_h
+
+                chunk_head_start = chunk * broadcast_amount
+                chunk_heads = min(broadcast_amount, ratio - chunk_head_start)
+                for lane in range(chunk_heads):
+                    lane_start = lane * head_slot_dim
+                    lane_end = lane_start + head_slot_dim
+                    q_h = q_group[:, lane_start:lane_end]
+                    k_lane = k_h[:, :head_slot_dim]
+                    v_lane = v_h[:, :head_slot_dim]
+                    o_h = _flash_attn_scheduled_ref(
+                        q_h,
+                        k_lane,
+                        v_lane,
+                        scale,
+                        precision,
+                        causal=True,
+                        matmul_scale=0.25,
+                    )
+                    out[row_start:row_end, group_start + lane_start:group_start + lane_end] = o_h
 
     return _round(out, precision)
 

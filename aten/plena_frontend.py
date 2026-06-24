@@ -151,6 +151,7 @@ class AttentionHeadPacking:
     head_slot_dim: int
     group_width: int
     total_q_dim: int
+    chunks_per_kv: int = 1
 
 
 @dataclass
@@ -435,23 +436,45 @@ def _pad_q_weight_grouped_by_kv(
     padded_hidden: int,
     group_width: int,
     head_slot_dim: int,
+    chunks_per_kv: int = 1,
+    heads_per_chunk: int | None = None,
 ):
     """Pad Q weights into KV-group MLEN rows with HLEN-sized head slots."""
     hidden, _ = weight.shape
     if num_heads % num_kv_heads != 0:
         raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
     ratio = num_heads // num_kv_heads
-    if ratio * head_slot_dim > group_width:
+    if chunks_per_kv <= 0:
+        raise ValueError(f"chunks_per_kv must be positive, got {chunks_per_kv}")
+    if heads_per_chunk is None:
+        heads_per_chunk = group_width // head_slot_dim
+    if heads_per_chunk <= 0:
+        raise ValueError(f"heads_per_chunk must be positive, got {heads_per_chunk}")
+    if head_slot_dim > group_width:
+        raise ValueError(f"head_slot_dim={head_slot_dim} exceeds group_width={group_width}")
+    if heads_per_chunk * head_slot_dim > group_width:
         raise ValueError(
-            f"Q head slots do not fit one group: ratio={ratio}, "
+            f"Q head slots do not fit one chunk: heads_per_chunk={heads_per_chunk}, "
             f"head_slot_dim={head_slot_dim}, group_width={group_width}"
         )
-    out = torch.zeros((padded_hidden, num_kv_heads * group_width), dtype=weight.dtype, device=weight.device)
+    if chunks_per_kv * heads_per_chunk < ratio:
+        raise ValueError(
+            f"Q chunks cannot cover ratio={ratio}: chunks_per_kv={chunks_per_kv}, "
+            f"heads_per_chunk={heads_per_chunk}"
+        )
+    out = torch.zeros(
+        (padded_hidden, num_kv_heads * chunks_per_kv * group_width),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
     for h in range(num_heads):
         kv_h = h // ratio
-        lane = h % ratio
+        local_head = h % ratio
+        chunk = local_head // heads_per_chunk
+        lane = local_head % heads_per_chunk
         src_start = h * head_dim
-        dst_start = kv_h * group_width + lane * head_slot_dim
+        dst_group = kv_h * chunks_per_kv + chunk
+        dst_start = dst_group * group_width + lane * head_slot_dim
         out[:hidden, dst_start:dst_start + head_dim] = weight[:, src_start:src_start + head_dim]
     return out.contiguous()
 
@@ -464,23 +487,45 @@ def _pad_o_weight_grouped_by_kv(
     group_width: int,
     head_slot_dim: int,
     padded_hidden: int,
+    chunks_per_kv: int = 1,
+    heads_per_chunk: int | None = None,
 ):
     """Pad O weights from KV-group HLEN head slots into hidden projection."""
     _, hidden = weight.shape
     if num_heads % num_kv_heads != 0:
         raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
     ratio = num_heads // num_kv_heads
-    if ratio * head_slot_dim > group_width:
+    if chunks_per_kv <= 0:
+        raise ValueError(f"chunks_per_kv must be positive, got {chunks_per_kv}")
+    if heads_per_chunk is None:
+        heads_per_chunk = group_width // head_slot_dim
+    if heads_per_chunk <= 0:
+        raise ValueError(f"heads_per_chunk must be positive, got {heads_per_chunk}")
+    if head_slot_dim > group_width:
+        raise ValueError(f"head_slot_dim={head_slot_dim} exceeds group_width={group_width}")
+    if heads_per_chunk * head_slot_dim > group_width:
         raise ValueError(
-            f"O head slots do not fit one group: ratio={ratio}, "
+            f"O head slots do not fit one chunk: heads_per_chunk={heads_per_chunk}, "
             f"head_slot_dim={head_slot_dim}, group_width={group_width}"
         )
-    out = torch.zeros((num_kv_heads * group_width, padded_hidden), dtype=weight.dtype, device=weight.device)
+    if chunks_per_kv * heads_per_chunk < ratio:
+        raise ValueError(
+            f"O chunks cannot cover ratio={ratio}: chunks_per_kv={chunks_per_kv}, "
+            f"heads_per_chunk={heads_per_chunk}"
+        )
+    out = torch.zeros(
+        (num_kv_heads * chunks_per_kv * group_width, padded_hidden),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
     for h in range(num_heads):
         kv_h = h // ratio
-        lane = h % ratio
+        local_head = h % ratio
+        chunk = local_head // heads_per_chunk
+        lane = local_head % heads_per_chunk
         src_start = h * head_dim
-        dst_start = kv_h * group_width + lane * head_slot_dim
+        dst_group = kv_h * chunks_per_kv + chunk
+        dst_start = dst_group * group_width + lane * head_slot_dim
         out[dst_start:dst_start + head_dim, :hidden] = weight[src_start:src_start + head_dim, :]
     return out.contiguous()
 
@@ -507,6 +552,8 @@ def _pad_decoder_weights_for_tiles(
             padded_hidden,
             head_packing.group_width,
             head_packing.head_slot_dim,
+            chunks_per_kv=head_packing.chunks_per_kv,
+            heads_per_chunk=head_packing.broadcast_amount,
         )
         w_o = _pad_o_weight_grouped_by_kv(
             weights.w_o,
@@ -516,6 +563,8 @@ def _pad_decoder_weights_for_tiles(
             head_packing.group_width,
             head_packing.head_slot_dim,
             padded_hidden,
+            chunks_per_kv=head_packing.chunks_per_kv,
+            heads_per_chunk=head_packing.broadcast_amount,
         )
     else:
         w_q = _pad_q_weight_grouped(weights.w_q, num_heads, head_dim, padded_hidden, padded_head_dim)
@@ -660,10 +709,10 @@ def _pad_rope_inputs_for_head_slots(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build an MLEN-wide RoPE table repeated into each packed head lane."""
     head_dim = rope_matrix.shape[0]
-    if broadcast_amount * head_slot_dim != group_width:
+    if broadcast_amount * head_slot_dim > group_width:
         raise ValueError(
-            f"broadcast_amount*head_slot_dim must equal group_width "
-            f"({broadcast_amount}*{head_slot_dim} != {group_width})"
+            f"broadcast_amount*head_slot_dim must fit group_width "
+            f"({broadcast_amount}*{head_slot_dim} > {group_width})"
         )
     if head_dim > head_slot_dim:
         raise ValueError(f"head_dim {head_dim} exceeds head_slot_dim {head_slot_dim}")
@@ -919,47 +968,61 @@ def _emit_packed_attention_block(
     q_groups = []
     if batch_size == 1:
         for kv_h in range(num_kv_heads):
-            q_group_addr = q_full_addr + kv_h * q_group_stride
-            Q_group = prog.alloc_at(
-                f"Q_group{kv_h}_{layer_idx}",
-                seq_len,
-                prog.mlen,
-                q_group_addr,
-                physical_shape=(Q.physical_shape[0], prog.mlen),
-            )
-            _apply_rope_projection(
-                prog,
-                Q_group,
-                rope_matrix,
-                cos_var,
-                sin_var,
-                f"Q_rot_{layer_idx}_g{kv_h}",
-            )
-            q_groups.append(Q_group)
+            for chunk in range(head_packing.chunks_per_kv):
+                group_idx = kv_h * head_packing.chunks_per_kv + chunk
+                q_group_addr = q_full_addr + group_idx * q_group_stride
+                Q_group = prog.alloc_at(
+                    f"Q_group{kv_h}_c{chunk}_{layer_idx}",
+                    seq_len,
+                    prog.mlen,
+                    q_group_addr,
+                    physical_shape=(Q.physical_shape[0], prog.mlen),
+                )
+                _apply_rope_projection(
+                    prog,
+                    Q_group,
+                    rope_matrix,
+                    cos_var,
+                    sin_var,
+                    f"Q_rot_{layer_idx}_g{kv_h}_c{chunk}",
+                )
+                q_groups.append((kv_h, chunk, Q_group))
 
     roll_kv_groups = os.environ.get("PLENA_ROLL_KV_GROUPS", "1") != "0"
     if batch_size == 1 and roll_kv_groups and num_kv_heads > 1:
-        prog.flash_attention_packed_groups_looped(
-            Q,
-            kv_stored,
-            group_heads=ratio,
-            head_slot_dim=head_packing.head_slot_dim,
-            output_base_address=o_full_addr,
-            scratch_base_address=attn_scratch_addr,
-            broadcast_amount=head_packing.broadcast_amount,
-            scale=scale,
-            causal_mask=causal_mask,
-        )
+        for chunk in range(head_packing.chunks_per_kv):
+            chunk_start = chunk * head_packing.broadcast_amount
+            chunk_heads = min(head_packing.broadcast_amount, ratio - chunk_start)
+            if chunk_heads <= 0:
+                continue
+            prog.flash_attention_packed_groups_looped(
+                Q,
+                kv_stored,
+                group_heads=chunk_heads,
+                head_slot_dim=head_packing.head_slot_dim,
+                output_base_address=o_full_addr + chunk * o_group_stride,
+                scratch_base_address=attn_scratch_addr,
+                broadcast_amount=head_packing.broadcast_amount,
+                scale=scale,
+                causal_mask=causal_mask,
+                q_base_address=q_full_addr + chunk * q_group_stride,
+                group_stride_blocks=head_packing.chunks_per_kv,
+            )
     elif batch_size == 1:
-        for kv_h, Q_group in enumerate(q_groups):
+        for kv_h, chunk, Q_group in q_groups:
+            chunk_start = chunk * head_packing.broadcast_amount
+            chunk_heads = min(head_packing.broadcast_amount, ratio - chunk_start)
+            if chunk_heads <= 0:
+                continue
             K_stored, V_stored = kv_stored[kv_h]
+            group_idx = kv_h * head_packing.chunks_per_kv + chunk
             prog.flash_attention_packed_group(
                 Q_group,
                 K_stored,
                 V_stored,
-                group_heads=ratio,
+                group_heads=chunk_heads,
                 head_slot_dim=head_packing.head_slot_dim,
-                output_base_address=o_full_addr + kv_h * o_group_stride,
+                output_base_address=o_full_addr + group_idx * o_group_stride,
                 scratch_base_address=attn_scratch_addr,
                 broadcast_amount=head_packing.broadcast_amount,
                 scale=scale,
@@ -974,37 +1037,43 @@ def _emit_packed_attention_block(
         for batch_idx in range(batch_size):
             batch_row_offset = batch_idx * batch_vram_stride
             for kv_h in range(num_kv_heads):
-                q_group_addr = q_full_addr + kv_h * q_group_stride + batch_row_offset
-                Q_group = prog.alloc_at(
-                    f"Q_group{kv_h}_b{batch_idx}_{layer_idx}",
-                    active_seq_len_per_batch,
-                    prog.mlen,
-                    q_group_addr,
-                    physical_shape=(rows_per_batch, prog.mlen),
-                )
-                _apply_rope_projection(
-                    prog,
-                    Q_group,
-                    rope_matrix,
-                    cos_var,
-                    sin_var,
-                    f"Q_rot_{layer_idx}_g{kv_h}_b{batch_idx}",
-                )
-                K_stored, V_stored = kv_stored[kv_h]
-                prog.flash_attention_packed_group(
-                    Q_group,
-                    K_stored,
-                    V_stored,
-                    group_heads=ratio,
-                    head_slot_dim=head_packing.head_slot_dim,
-                    output_base_address=o_full_addr + kv_h * o_group_stride + batch_row_offset,
-                    scratch_base_address=attn_scratch_addr,
-                    broadcast_amount=head_packing.broadcast_amount,
-                    scale=scale,
-                    causal_mask=causal_mask,
-                    k_idx=batch_idx * row_block_stride,
-                    valid_cols=active_seq_len_per_batch,
-                )
+                for chunk in range(head_packing.chunks_per_kv):
+                    chunk_start = chunk * head_packing.broadcast_amount
+                    chunk_heads = min(head_packing.broadcast_amount, ratio - chunk_start)
+                    if chunk_heads <= 0:
+                        continue
+                    group_idx = kv_h * head_packing.chunks_per_kv + chunk
+                    q_group_addr = q_full_addr + group_idx * q_group_stride + batch_row_offset
+                    Q_group = prog.alloc_at(
+                        f"Q_group{kv_h}_c{chunk}_b{batch_idx}_{layer_idx}",
+                        active_seq_len_per_batch,
+                        prog.mlen,
+                        q_group_addr,
+                        physical_shape=(rows_per_batch, prog.mlen),
+                    )
+                    _apply_rope_projection(
+                        prog,
+                        Q_group,
+                        rope_matrix,
+                        cos_var,
+                        sin_var,
+                        f"Q_rot_{layer_idx}_g{kv_h}_c{chunk}_b{batch_idx}",
+                    )
+                    K_stored, V_stored = kv_stored[kv_h]
+                    prog.flash_attention_packed_group(
+                        Q_group,
+                        K_stored,
+                        V_stored,
+                        group_heads=chunk_heads,
+                        head_slot_dim=head_packing.head_slot_dim,
+                        output_base_address=o_full_addr + group_idx * o_group_stride + batch_row_offset,
+                        scratch_base_address=attn_scratch_addr,
+                        broadcast_amount=head_packing.broadcast_amount,
+                        scale=scale,
+                        causal_mask=causal_mask,
+                        k_idx=batch_idx * row_block_stride,
+                        valid_cols=active_seq_len_per_batch,
+                    )
     prog.free_tensor(attn_scratch)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
@@ -2976,22 +3045,25 @@ def compile_native_hf_decoder(
             raise ValueError("attention_head_packing requires hlen and broadcast_amount")
         if hlen <= 0 or broadcast_amount <= 0:
             raise ValueError(f"hlen and broadcast_amount must be positive, got {hlen}, {broadcast_amount}")
-        if broadcast_amount * hlen != mlen:
+        if hlen != head_dim:
             raise ValueError(
-                f"Packed attention requires broadcast_amount*hlen == mlen "
-                f"({broadcast_amount}*{hlen} != {mlen})"
+                f"Packed attention head chunking currently requires hlen == head_dim "
+                f"({hlen} != {head_dim})"
             )
-        if head_dim > hlen:
-            raise ValueError(f"head_dim={head_dim} exceeds hlen={hlen}; cannot head-pack")
-        if ratio > broadcast_amount:
-            raise ValueError(f"GQA ratio={ratio} exceeds broadcast_amount={broadcast_amount}")
+        if broadcast_amount * hlen > mlen:
+            raise ValueError(
+                f"Packed attention requires broadcast_amount*hlen <= mlen "
+                f"({broadcast_amount}*{hlen} > {mlen})"
+            )
+        chunks_per_kv = math.ceil(ratio / broadcast_amount)
         head_packing = AttentionHeadPacking(
             enabled=True,
             hlen=hlen,
             broadcast_amount=broadcast_amount,
             head_slot_dim=hlen,
             group_width=mlen,
-            total_q_dim=num_kv_heads * mlen,
+            total_q_dim=num_kv_heads * chunks_per_kv * mlen,
+            chunks_per_kv=chunks_per_kv,
         )
     else:
         head_packing = None
@@ -3042,7 +3114,8 @@ def compile_native_hf_decoder(
             f"head_dim={head_dim}, hlen={head_packing.hlen}, "
             f"broadcast_amount={head_packing.broadcast_amount}, "
             f"group_width={head_packing.group_width}, "
-            f"q_groups={num_kv_heads}"
+            f"chunks_per_kv={head_packing.chunks_per_kv}, "
+            f"q_groups={num_kv_heads * head_packing.chunks_per_kv}"
         )
     print("=" * 80)
 
@@ -3210,6 +3283,7 @@ def compile_native_hf_decoder(
             head_slot_dim=head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
             broadcast_amount=head_packing.broadcast_amount if head_packing is not None else None,
             total_q_dim=padded_total_q_dim,
+            chunks_per_kv=head_packing.chunks_per_kv if head_packing is not None else 1,
         )
         padded_golden_output = run_native_decoder_scheduled_reference(
             compile_token_embeds,
@@ -3537,6 +3611,7 @@ def compile_native_hf_decoder(
         "attention_head_slot_dim": head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
         "attention_kv_storage_head_dim": padded_head_dim,
         "attention_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
+        "attention_chunks_per_kv": head_packing.chunks_per_kv if head_packing is not None else 1,
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "mlen": mlen,

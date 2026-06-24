@@ -630,10 +630,10 @@ class ProgramAttentionMixin:
             )
         if group_heads > broadcast_amount:
             raise ValueError(f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}")
-        if broadcast_amount * head_slot_dim != mlen:
+        if broadcast_amount * head_slot_dim > mlen:
             raise ValueError(
-                f"broadcast_amount*head_slot_dim must equal MLEN "
-                f"({broadcast_amount}*{head_slot_dim} != {mlen})"
+                f"broadcast_amount*head_slot_dim must fit MLEN "
+                f"({broadcast_amount}*{head_slot_dim} > {mlen})"
             )
         if getattr(self, "hlen", head_slot_dim) != head_slot_dim:
             raise ValueError(f"Packed attention requires HLEN={head_slot_dim}, got {self.hlen}")
@@ -771,6 +771,8 @@ class ProgramAttentionMixin:
         broadcast_amount: int,
         scale: float,
         causal_mask: bool | VRAMMatrixVar | None,
+        q_base_address: int | None = None,
+        group_stride_blocks: int = 1,
     ) -> None:
         """Emit sequence-tiled packed GQA with a hardware loop over KV heads."""
         seq_len, _q_width = Q_full.shape
@@ -779,8 +781,11 @@ class ProgramAttentionMixin:
         q_physical_rows, _q_physical_cols = Q_full.physical_shape
         num_q_blocks = math.ceil(seq_len / mlen)
         num_k_blocks = math.ceil(seq_len / mlen)
-        q_group_stride = q_physical_rows * mlen
-        o_group_stride = q_physical_rows * mlen
+        if group_stride_blocks <= 0:
+            raise ValueError(f"group_stride_blocks must be positive, got {group_stride_blocks}")
+        q_base_address = self.get_vram_addr(Q_full.name) if q_base_address is None else q_base_address
+        q_group_stride = q_physical_rows * mlen * group_stride_blocks
+        o_group_stride = q_physical_rows * mlen * group_stride_blocks
         block_stride = mlen * mlen
         softmax_scale = scale / 0.25
 
@@ -844,7 +849,7 @@ class ProgramAttentionMixin:
                     )
                     setup_lines = [
                         f"; === Sequence-tiled packed GQA loop over KV groups (q_block={q_block}, head={head}) ===",
-                        *load_large_int(gp_q, self.get_vram_addr(Q_full.name)),
+                        *load_large_int(gp_q, q_base_address),
                         *add_large_int(gp_q, gp_q, q_block_offset, temp_reg=gp_tmp),
                         *load_large_int(gp_o, output_base_address),
                         *add_large_int(gp_o, gp_o, q_block_offset, temp_reg=gp_tmp),
@@ -942,6 +947,8 @@ class ProgramAttentionMixin:
         broadcast_amount: int,
         scale=None,
         causal_mask: bool | VRAMMatrixVar | None = True,
+        q_base_address: int | None = None,
+        group_stride_blocks: int = 1,
     ) -> None:
         """Emit packed GQA attention with one hardware loop over KV groups.
 
@@ -956,10 +963,13 @@ class ProgramAttentionMixin:
         mlen = self.mlen
         num_kv_heads = len(kv_pairs)
         q_physical_rows, q_physical_cols = Q_full.physical_shape
+        if group_stride_blocks <= 0:
+            raise ValueError(f"group_stride_blocks must be positive, got {group_stride_blocks}")
         if q_physical_cols < num_kv_heads * mlen:
             raise ValueError(
                 f"Q_full physical cols {q_physical_cols} cannot hold {num_kv_heads} MLEN-wide groups"
             )
+        q_base_addr = self.get_vram_addr(Q_full.name) if q_base_address is None else q_base_address
         if seq_len > mlen:
             if os.environ.get("PLENA_PACKED_GQA_PYTHON_EXPAND") != "1":
                 try:
@@ -973,6 +983,8 @@ class ProgramAttentionMixin:
                         broadcast_amount=broadcast_amount,
                         scale=scale or (1.0 / math.sqrt(head_slot_dim)),
                         causal_mask=causal_mask,
+                        q_base_address=q_base_addr,
+                        group_stride_blocks=group_stride_blocks,
                     )
                     return
                 except ValueError as exc:
@@ -984,9 +996,8 @@ class ProgramAttentionMixin:
                 "; NOTE: seq_len exceeds MLEN; using packed GQA sequence-tiled codegen "
                 "with Python-expanded KV groups.\n"
             )
-            q_group_stride = q_physical_rows * mlen
-            o_group_stride = q_physical_rows * mlen
-            q_base_addr = self.get_vram_addr(Q_full.name)
+            q_group_stride = q_physical_rows * mlen * group_stride_blocks
+            o_group_stride = q_physical_rows * mlen * group_stride_blocks
             for kv_head, (K, V) in enumerate(kv_pairs):
                 Q_group = self.alloc_at(
                     f"_packed_loop_tiled_Q_group{kv_head}",
@@ -1011,10 +1022,10 @@ class ProgramAttentionMixin:
             return
         if group_heads > broadcast_amount:
             raise ValueError(f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}")
-        if broadcast_amount * head_slot_dim != mlen:
+        if broadcast_amount * head_slot_dim > mlen:
             raise ValueError(
-                f"broadcast_amount*head_slot_dim must equal MLEN "
-                f"({broadcast_amount}*{head_slot_dim} != {mlen})"
+                f"broadcast_amount*head_slot_dim must fit MLEN "
+                f"({broadcast_amount}*{head_slot_dim} > {mlen})"
             )
         if getattr(self, "hlen", head_slot_dim) != head_slot_dim:
             raise ValueError(f"Packed attention requires HLEN={head_slot_dim}, got {self.hlen}")
@@ -1041,8 +1052,8 @@ class ProgramAttentionMixin:
             k_stride = 0
             v_stride = 0
 
-        q_group_stride = q_physical_rows * mlen
-        o_group_stride = q_physical_rows * mlen
+        q_group_stride = q_physical_rows * mlen * group_stride_blocks
+        o_group_stride = q_physical_rows * mlen * group_stride_blocks
         rows = min(mlen, seq_len)
         softmax_scale = scale / 0.25
         k_layout = self.get_hbm_layout(kv_pairs[0][0].name)
@@ -1071,7 +1082,7 @@ class ProgramAttentionMixin:
         try:
             setup_lines = [
                 "; === Packed GQA attention core loop over KV groups ===",
-                *load_large_int(gp_q, self.get_vram_addr(Q_full.name)),
+                *load_large_int(gp_q, q_base_addr),
                 *load_large_int(gp_o, output_base_address),
                 *load_large_int(gp_k, kv_pairs[0][0].hbm_addr),
                 *load_large_int(gp_v, kv_pairs[0][1].hbm_addr),
@@ -1179,10 +1190,10 @@ class ProgramAttentionMixin:
             raise ValueError(
                 f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}"
             )
-        if broadcast_amount * head_slot_dim != mlen:
+        if broadcast_amount * head_slot_dim > mlen:
             raise ValueError(
-                f"broadcast_amount*head_slot_dim must equal MLEN "
-                f"({broadcast_amount}*{head_slot_dim} != {mlen})"
+                f"broadcast_amount*head_slot_dim must fit MLEN "
+                f"({broadcast_amount}*{head_slot_dim} > {mlen})"
             )
         if scale is None:
             scale = 1.0 / math.sqrt(head_slot_dim)

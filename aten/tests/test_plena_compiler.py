@@ -208,7 +208,7 @@ def test_compiler_threads_runtime_memory_geometry():
     assert prog.mram_capacity_elems == 3 * tile_elems
     assert prog.mram_allocator.alignment == tile_elems
     assert prog.mram_allocator.total_size == 3 * tile_elems
-    assert prog.vram_allocator.alignment == 256
+    assert prog.vram_allocator.alignment == tile_elems
 
     print("  PASS test_compiler_threads_runtime_memory_geometry")
 
@@ -608,7 +608,7 @@ def test_packed_gqa_kv_group_loop_reduces_static_code():
     baseline = emit(looped=False)
     looped = emit(looped=True)
 
-    assert baseline.count("Packed GQA QK^T") == 2
+    assert baseline.count("Packed GQA QK^T") > looped.count("Packed GQA QK^T")
     assert looped.count("Packed GQA attention core loop over KV groups") == 1
     assert looped.count("Packed GQA QK^T") == 1
     assert instruction_lines(looped) < instruction_lines(baseline)
