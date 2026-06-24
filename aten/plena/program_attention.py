@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
@@ -498,6 +499,7 @@ class ProgramAttentionMixin:
         s_base_address: int,
         k_layout,
         k_head_offset: int = 0,
+        k_hbm_offset: int = 0,
     ) -> None:
         """Emit packed QK^T using loop-carried Q and K base registers."""
         gp_mram, gp_hbm, gp_s = self.register_allocator.allocate_gp(3)
@@ -509,7 +511,7 @@ class ProgramAttentionMixin:
             *load_large_int(gp_hbm, cols),
             f"C_SET_STRIDE_REG gp{gp_hbm}",
             f"S_ADDI_INT gp{gp_mram}, gp0, 0",
-            f"S_ADDI_INT gp{gp_hbm}, gp0, 0",
+            *load_large_int(gp_hbm, k_hbm_offset),
             f"H_PREFETCH_M gp{gp_mram}, gp{gp_hbm}, a{k_hbm_addr_reg}, 1, 0",
             f"M_BTMM {k_head_offset}, gp0, gp{q_base_gp}",
             *load_large_int(gp_s, s_base_address),
@@ -757,6 +759,177 @@ class ProgramAttentionMixin:
         self.free_tensor(pv)
         self.free_tensor(pack_scratch)
 
+    def _emit_packed_attention_groups_tiled_looped(
+        self,
+        *,
+        Q_full: VRAMMatrixVar,
+        kv_pairs: list[tuple[InputVar, InputVar]],
+        group_heads: int,
+        head_slot_dim: int,
+        output_base_address: int,
+        scratch_base_address: int,
+        broadcast_amount: int,
+        scale: float,
+        causal_mask: bool | VRAMMatrixVar | None,
+    ) -> None:
+        """Emit sequence-tiled packed GQA with a hardware loop over KV heads."""
+        seq_len, _q_width = Q_full.shape
+        mlen = self.mlen
+        num_kv_heads = len(kv_pairs)
+        q_physical_rows, _q_physical_cols = Q_full.physical_shape
+        num_q_blocks = math.ceil(seq_len / mlen)
+        num_k_blocks = math.ceil(seq_len / mlen)
+        q_group_stride = q_physical_rows * mlen
+        o_group_stride = q_physical_rows * mlen
+        block_stride = mlen * mlen
+        softmax_scale = scale / 0.25
+
+        for K, V in kv_pairs:
+            self._ensure_hbm_sub_matrix_registered(K)
+            self._ensure_hbm_sub_matrix_registered(V)
+            if K.physical_shape != kv_pairs[0][0].physical_shape:
+                raise ValueError("all looped K heads must share physical_shape")
+            if V.physical_shape != kv_pairs[0][1].physical_shape:
+                raise ValueError("all looped V heads must share physical_shape")
+
+        if num_kv_heads > 1:
+            k_stride = kv_pairs[1][0].hbm_addr - kv_pairs[0][0].hbm_addr
+            v_stride = kv_pairs[1][1].hbm_addr - kv_pairs[0][1].hbm_addr
+            for idx in range(1, num_kv_heads):
+                if kv_pairs[idx][0].hbm_addr != kv_pairs[0][0].hbm_addr + idx * k_stride:
+                    raise ValueError("K head HBM bases are not affine; cannot roll KV groups")
+                if kv_pairs[idx][1].hbm_addr != kv_pairs[0][1].hbm_addr + idx * v_stride:
+                    raise ValueError("V head HBM bases are not affine; cannot roll KV groups")
+        else:
+            k_stride = 0
+            v_stride = 0
+
+        k_layout = self.get_hbm_layout(kv_pairs[0][0].name)
+        s_views = [
+            self.alloc_at(
+                f"_packed_tiled_loop_S_h{head}",
+                mlen,
+                mlen,
+                scratch_base_address + head * mlen * mlen,
+                physical_shape=(mlen, mlen),
+            )
+            for head in range(group_heads)
+        ]
+        pv = self.alloc("_packed_tiled_loop_PV", mlen, head_slot_dim, strict=False, physical_shape=(mlen, mlen))
+        pack_scratch = self.alloc("_packed_tiled_loop_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen))
+        pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
+
+        valid_col_masks: dict[int, VRAMMatrixVar] = {}
+        for k_block in range(num_k_blocks):
+            block_cols = min(mlen, seq_len - k_block * mlen)
+            if self._needs_explicit_valid_col_mask(block_cols):
+                valid_col_masks[block_cols] = self._build_valid_col_mask(
+                    f"_packed_tiled_loop_valid_col_mask_{block_cols}", block_cols
+                )
+
+        gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop = self.register_allocator.allocate_gp(6)
+        k_addr_reg, v_addr_reg = self.register_allocator.allocate_addr(2)
+        try:
+            for q_block in range(num_q_blocks):
+                rows = min(mlen, seq_len - q_block * mlen)
+                q_block_offset = q_block * block_stride
+
+                for head, s_head in enumerate(s_views):
+                    o_head = self.alloc(
+                        f"_packed_tiled_loop_O_q{q_block}_head{head}",
+                        rows,
+                        head_slot_dim,
+                        strict=False,
+                        physical_shape=(mlen, mlen),
+                    )
+                    setup_lines = [
+                        f"; === Sequence-tiled packed GQA loop over KV groups (q_block={q_block}, head={head}) ===",
+                        *load_large_int(gp_q, self.get_vram_addr(Q_full.name)),
+                        *add_large_int(gp_q, gp_q, q_block_offset, temp_reg=gp_tmp),
+                        *load_large_int(gp_o, output_base_address),
+                        *add_large_int(gp_o, gp_o, q_block_offset, temp_reg=gp_tmp),
+                        *load_large_int(gp_k, kv_pairs[0][0].hbm_addr),
+                        *load_large_int(gp_v, kv_pairs[0][1].hbm_addr),
+                        f"C_LOOP_START gp{gp_kv_loop}, {num_kv_heads}",
+                        f"C_SET_ADDR_REG a{k_addr_reg}, gp0, gp{gp_k}",
+                        f"C_SET_ADDR_REG a{v_addr_reg}, gp0, gp{gp_v}",
+                    ]
+                    self.emit("\n".join(setup_lines) + "\n")
+                    if head == 0:
+                        self._reset_vram_from_gp(base_gp=gp_o, rows=rows)
+                    self.init_online_softmax(0, o_head, rows=rows)
+
+                    for k_block in range(num_k_blocks):
+                        if causal_mask is not None and k_block > q_block:
+                            self.emit(
+                                f"; Skip future packed-GQA K block q_block={q_block}, k_block={k_block}\n"
+                            )
+                            continue
+                        block_cols = min(mlen, seq_len - k_block * mlen)
+                        k_block_offset = k_block * block_stride
+                        self._emit_packed_qkt_to_s_dynamic(
+                            q_base_gp=gp_q,
+                            k_hbm_addr_reg=k_addr_reg,
+                            s_base_address=scratch_base_address,
+                            k_layout=k_layout,
+                            k_hbm_offset=k_block_offset,
+                        )
+
+                        valid_col_mask = valid_col_masks.get(block_cols)
+                        if valid_col_mask is not None:
+                            self.vram_add(s_head, valid_col_mask, num_rows=rows)
+                        apply_causal_mask = causal_mask is not None and k_block == q_block
+                        if isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask:
+                            self.vram_add(s_head, causal_mask, num_rows=rows)
+                        elif causal_mask is True and apply_causal_mask:
+                            self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
+                        softmax_valid_cols = (
+                            None
+                            if valid_col_mask is not None or (isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask)
+                            else block_cols
+                        )
+                        self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
+                        self.emit(
+                            self._pv_multiply_asm(
+                                mlen=mlen,
+                                blen=self.blen,
+                                head_dim=head_slot_dim,
+                                p_address=self.get_vram_addr(s_head.name),
+                                v_hbm_offset_reg=v_addr_reg,
+                                v_hbm_offset=k_block_offset,
+                                pv_address=self.get_vram_addr(pv.name),
+                                rows=rows,
+                            )
+                        )
+                        self.scale_o_row(o_head, 0, rows=rows)
+                        self.vram_add(o_head, pv, num_rows=rows)
+
+                    self.final_scale_o(0, o_head, rows=rows)
+                    self._pack_o_head_to_output_dynamic(
+                        o_head=o_head,
+                        output_base_gp=gp_o,
+                        head_slot=head,
+                        head_slot_dim=head_slot_dim,
+                        rows=rows,
+                        scratch_address=pack_scratch_addr,
+                    )
+                    self.free_tensor(o_head)
+
+                    update_lines = []
+                    update_lines.extend(add_large_int(gp_q, gp_q, q_group_stride, temp_reg=gp_tmp))
+                    update_lines.extend(add_large_int(gp_o, gp_o, o_group_stride, temp_reg=gp_tmp))
+                    update_lines.extend(add_large_int(gp_k, gp_k, k_stride, temp_reg=gp_tmp))
+                    update_lines.extend(add_large_int(gp_v, gp_v, v_stride, temp_reg=gp_tmp))
+                    update_lines.append(f"C_LOOP_END gp{gp_kv_loop}")
+                    self.emit("\n".join(update_lines) + "\n")
+        finally:
+            self.register_allocator.free_addr([k_addr_reg, v_addr_reg])
+            self.register_allocator.free_gp([gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop])
+            for valid_col_mask in valid_col_masks.values():
+                self.free_tensor(valid_col_mask)
+            self.free_tensor(pv)
+            self.free_tensor(pack_scratch)
+
     def flash_attention_packed_groups_looped(
         self,
         Q_full: VRAMMatrixVar,
@@ -788,6 +961,25 @@ class ProgramAttentionMixin:
                 f"Q_full physical cols {q_physical_cols} cannot hold {num_kv_heads} MLEN-wide groups"
             )
         if seq_len > mlen:
+            if os.environ.get("PLENA_PACKED_GQA_PYTHON_EXPAND") != "1":
+                try:
+                    self._emit_packed_attention_groups_tiled_looped(
+                        Q_full=Q_full,
+                        kv_pairs=kv_pairs,
+                        group_heads=group_heads,
+                        head_slot_dim=head_slot_dim,
+                        output_base_address=output_base_address,
+                        scratch_base_address=scratch_base_address,
+                        broadcast_amount=broadcast_amount,
+                        scale=scale or (1.0 / math.sqrt(head_slot_dim)),
+                        causal_mask=causal_mask,
+                    )
+                    return
+                except ValueError as exc:
+                    self.emit(
+                        "; NOTE: sequence-tiled packed GQA hardware loop unavailable "
+                        f"({exc}); falling back to Python-expanded KV groups.\n"
+                    )
             self.emit(
                 "; NOTE: seq_len exceeds MLEN; using packed GQA sequence-tiled codegen "
                 "with Python-expanded KV groups.\n"
