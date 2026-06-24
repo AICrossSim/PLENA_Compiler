@@ -434,7 +434,7 @@ class ProgramTensorMixin:
             const_one_fp_address=5,
             activation_base_address=activation_base_address,
             use_loop_instructions=use_loop_instructions,
-            matrix_sram_size=self.mram_capacity_elems,
+            matrix_sram_size=self.mram_tile_capacity * self.mlen,
             workspace_base_address=workspace_base_address,
         )
 

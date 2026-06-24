@@ -254,7 +254,7 @@ def extract_model_config(model: Any) -> ModelConfig:
         inter_dim=inter_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
-        head_dim=hidden // num_heads,
+        head_dim=int(getattr(config, "head_dim", hidden // num_heads)),
         eps=getattr(config, "rms_norm_eps", 1e-5),
         rope_theta=getattr(config, "rope_theta", 10000.0),
         vocab_size=getattr(config, "vocab_size", None),
