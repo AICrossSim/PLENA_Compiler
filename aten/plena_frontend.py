@@ -2931,9 +2931,14 @@ def compile_native_hf_decoder(
     head_dim = model_cfg.head_dim
     total_q_dim = model_cfg.total_q_dim
     ratio = model_cfg.head_ratio
+    uses_packed_attention = attention_head_packing
+    if uses_packed_attention is None:
+        uses_packed_attention = hlen is not None and broadcast_amount is not None and head_dim < mlen
+
     # Rows only need enough physical lanes for the matrix writeback group
-    # (BLEN), not a full MLEN block. Columns/K dimensions still use MLEN
-    # until the vector, norm, RoPE, and FFN templates learn true tail masks.
+    # (BLEN) in the generic path. Packed GQA, however, addresses KV-group
+    # Q/O slabs as MLEN-row sequence tiles, and the downstream O projection
+    # expects those slabs to be MLEN-aligned.
     #
     # Exception: when seq_len < MLEN the flash-attention kernel still requires
     # Q/K/V to occupy a full MLEN tile physically (it asserts physical rows per
@@ -2946,7 +2951,11 @@ def compile_native_hf_decoder(
     #
     # Also keep an opt-in compatibility path for reproducing older tile-scaling
     # reports that padded every sequence (even seq_len >= MLEN) up to MLEN.
-    pad_seq_to_mlen = os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1" or seq_len < mlen
+    pad_seq_to_mlen = (
+        os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1"
+        or seq_len < mlen
+        or uses_packed_attention
+    )
     seq_padding_multiple = mlen if pad_seq_to_mlen else blen
     padded_seq_len = _ceil_to_multiple(seq_len, seq_padding_multiple)
     rows_per_batch = (
@@ -2961,7 +2970,7 @@ def compile_native_hf_decoder(
     padded_inter = _ceil_to_multiple(inter, mlen)
     padded_head_dim = _ceil_to_multiple(head_dim, mlen)
     if attention_head_packing is None:
-        attention_head_packing = hlen is not None and broadcast_amount is not None and head_dim < mlen
+        attention_head_packing = uses_packed_attention
     if attention_head_packing:
         if hlen is None or broadcast_amount is None:
             raise ValueError("attention_head_packing requires hlen and broadcast_amount")

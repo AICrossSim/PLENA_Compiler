@@ -699,6 +699,11 @@ class ProgramAttentionMixin:
                 self.init_online_softmax(0, o_head, rows=rows)
 
                 for k_block in range(num_k_blocks):
+                    if causal_mask is not None and k_block > q_block:
+                        self.emit(
+                            f"; Skip future packed-GQA K block q_block={q_block}, k_block={k_block}\n"
+                        )
+                        continue
                     block_cols = min(mlen, active_k_cols - k_block * mlen)
                     physical_k_idx = k_idx + k_block
                     self._emit_packed_qkt_to_s(
@@ -712,13 +717,14 @@ class ProgramAttentionMixin:
                     valid_col_mask = valid_col_masks.get(block_cols)
                     if valid_col_mask is not None:
                         self.vram_add(s_head, valid_col_mask, num_rows=rows)
-                    if isinstance(causal_mask, VRAMMatrixVar):
+                    apply_causal_mask = causal_mask is not None and k_block == q_block
+                    if isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask:
                         self.vram_add(s_head, causal_mask, num_rows=rows)
-                    elif causal_mask is True:
+                    elif causal_mask is True and apply_causal_mask:
                         self.emit("; NOTE: packed attention received causal_mask=True without a VRAM mask; no mask applied.\n")
                     softmax_valid_cols = (
                         None
-                        if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar)
+                        if valid_col_mask is not None or (isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask)
                         else block_cols
                     )
                     self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
