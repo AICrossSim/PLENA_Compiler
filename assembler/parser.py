@@ -32,6 +32,12 @@ def load_isa_definitions(file_path: str) -> dict:
                     value = int(match.group(3), 16)
                     enum_dict[name] = value
 
+    # Mainline operation.svh currently names opcode 0x31 V_PS_V, while the
+    # compiler templates and transactional emulator still use V_SHIFT_V for the
+    # same vector-shift instruction.
+    if "V_SHIFT_V" not in enum_dict and "V_PS_V" in enum_dict:
+        enum_dict["V_SHIFT_V"] = enum_dict["V_PS_V"]
+
     return enum_dict
 
 
