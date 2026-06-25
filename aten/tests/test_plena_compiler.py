@@ -74,6 +74,24 @@ def test_fpvar_helper_uses_canonical_emit_path():
     print("  PASS test_fpvar_helper_uses_canonical_emit_path")
 
 
+def test_tile_row_minmax_fp_helpers_emit_vector_scalar_clamp_ops():
+    """GPT-OSS clamp helpers should lower to V_MIN_VF/V_MAX_VF."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=8, blen=2)
+    x = prog.alloc("X", 8, 8)
+    limit = prog.fp_var("limit", size=1)
+
+    prog.tile_row_min_fp(x, limit.address, rows=[0, 1])
+    prog.tile_row_max_fp(x, limit.address, rows=[0, 1])
+    code = prog.get_code()
+
+    assert "V_MIN_VF" in code
+    assert "V_MAX_VF" in code
+    assert "S_LD_FP" in code
+    print("  PASS test_tile_row_minmax_fp_helpers_emit_vector_scalar_clamp_ops")
+
+
 def test_hbm_load_helper_uses_typed_legalization():
     """Converted HBM load helpers should legalize typed large immediates."""
     from compiler.aten.plena import IsaCompiler
@@ -208,7 +226,7 @@ def test_compiler_threads_runtime_memory_geometry():
     assert prog.mram_capacity_elems == 3 * tile_elems
     assert prog.mram_allocator.alignment == tile_elems
     assert prog.mram_allocator.total_size == 3 * tile_elems
-    assert prog.vram_allocator.alignment == 256
+    assert prog.vram_allocator.alignment == tile_elems
 
     print("  PASS test_compiler_threads_runtime_memory_geometry")
 
@@ -233,6 +251,103 @@ def test_linear_projection_uses_runtime_mram_tile_capacity():
     assert "Y_temp" in code
 
     print("  PASS test_linear_projection_uses_runtime_mram_tile_capacity")
+
+
+def test_packed_skinny_stream_k_probe_compiles_cap8_under_cap4_mram():
+    """Packed-skinny router probe keeps eight K slices in one MRAM tile."""
+    from compiler.aten.plena import PlenaCompiler
+
+    mlen = 128
+    blen = 4
+    tiles_per_mlen = mlen // blen
+    hidden = 2048
+    num_k_tiles = hidden // mlen
+    max_k_tiles_per_packed_tile = 8
+    num_groups = num_k_tiles // max_k_tiles_per_packed_tile
+
+    prog = PlenaCompiler(mlen=mlen, blen=blen, mram_tile_capacity=4)
+    x_input = prog.input(
+        "X",
+        shape=(4, hidden),
+        physical_shape=(4, hidden),
+        real_data_ratio=1.0,
+    )
+    x = prog.load_batch(x_input, name="X")
+    packed_weight = prog.input(
+        "W_router_packed_skinny_probe",
+        shape=(num_groups * mlen, tiles_per_mlen * mlen),
+        physical_shape=(num_groups * mlen, tiles_per_mlen * mlen),
+        real_data_ratio=1.0,
+    )
+    logits = prog.alloc("router_logits", 4, 128, strict=False, physical_shape=(4, 128))
+
+    prog.vram_sub_projection_packed_skinny_stream_k_accum_to(
+        x,
+        0,
+        packed_weight,
+        0,
+        logits,
+        0,
+        0,
+        max_k_tiles_per_packed_tile=max_k_tiles_per_packed_tile,
+    )
+    code = prog.get_code()
+
+    # One HBM->MRAM tile per (micro-column, K group).  A non-packed cap8
+    # implementation would need eight full tiles live and overflow cap4 MRAM.
+    assert code.count("H_PREFETCH_M") == tiles_per_mlen * num_groups
+    assert code.count("M_MM 0,") == tiles_per_mlen * num_k_tiles
+    assert code.count("M_MM_WO") == tiles_per_mlen
+    assert "VRAM Sub Projection packed skinny microtile" in code
+    for offset in range(0, max_k_tiles_per_packed_tile * blen, blen):
+        assert f"S_ADDI_INT gp2, gp0, {offset}" in code
+
+    print("  PASS test_packed_skinny_stream_k_probe_compiles_cap8_under_cap4_mram")
+
+
+def test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts():
+    """Integrated Qwen packed-skinny router emits V_TOPK rowpacked logits."""
+    from compiler.aten.plena import PlenaCompiler
+
+    mlen = 64
+    blen = 4
+    rows = 4
+    hidden = 128
+    num_experts = 128
+    k_tiles_per_packed_tile = 8
+    num_k_tiles = hidden // mlen
+    num_groups = 1
+    output_blocks = num_experts // mlen
+    microcols = num_experts // blen
+
+    prog = PlenaCompiler(mlen=mlen, blen=blen, mram_tile_capacity=4)
+    x_input = prog.input("X", shape=(rows, hidden), physical_shape=(rows, hidden), real_data_ratio=1.0)
+    x = prog.load_batch(x_input, name="X")
+    packed_weight = prog.input(
+        "W_router_packed_skinny_qwen",
+        shape=(num_groups * mlen, microcols * mlen),
+        physical_shape=(num_groups * mlen, microcols * mlen),
+        real_data_ratio=1.0,
+    )
+
+    logits = prog.qwen3_router_logits_packed_skinny_bf16_rowpacked_v0(
+        x,
+        packed_weight,
+        rows=rows,
+        hidden=hidden,
+        num_experts=num_experts,
+        k_tiles_per_packed_tile=k_tiles_per_packed_tile,
+    )
+    code = prog.compile()
+
+    assert logits.shape == (rows * output_blocks, mlen)
+    assert code.count("H_PREFETCH_M") == microcols * num_groups
+    assert code.count("M_MM 0,") == microcols * num_k_tiles
+    assert code.count("M_MM_WO") == microcols
+    assert code.count("V_ADD_VF") >= rows * output_blocks
+    assert "Qwen router packed-skinny logits pack" in code
+
+    print("  PASS test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts")
 
 
 def test_vram_layout_tracks_logical_and_physical_shape():
@@ -812,6 +927,7 @@ if __name__ == "__main__":
         test_isa_builder_legalizes_large_absolute_immediates,
         test_isa_builder_legalizes_relative_large_immediates,
         test_fpvar_helper_uses_canonical_emit_path,
+        test_tile_row_minmax_fp_helpers_emit_vector_scalar_clamp_ops,
         test_hbm_load_helper_uses_typed_legalization,
         test_vram_fill_zero_all_column_blocks,
         test_vram_add_all_column_blocks,
@@ -820,6 +936,7 @@ if __name__ == "__main__":
         test_mram_allocator_scales_with_runtime_mlen,
         test_compiler_threads_runtime_memory_geometry,
         test_linear_projection_uses_runtime_mram_tile_capacity,
+        test_packed_skinny_stream_k_probe_compiles_cap8_under_cap4_mram,
         test_vram_layout_tracks_logical_and_physical_shape,
         test_partial_row_linear_uses_one_blen_row_group,
         test_ffn_workspace_uses_allocator_and_avoids_rope_tables,

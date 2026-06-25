@@ -94,6 +94,24 @@ class IsaTileRowMixin:
     ) -> str:
         return self._tile_row_single_matrix_op("tile_row_mul_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
 
+    def tile_row_max_fp(
+        self,
+        matrix_name: str,
+        row_map: list[tuple[int, int]],
+        tile_row_idx: int = 0,
+        tile_col_idx: int = 0,
+    ) -> str:
+        return self._tile_row_single_matrix_op("tile_row_max_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
+
+    def tile_row_min_fp(
+        self,
+        matrix_name: str,
+        row_map: list[tuple[int, int]],
+        tile_row_idx: int = 0,
+        tile_col_idx: int = 0,
+    ) -> str:
+        return self._tile_row_single_matrix_op("tile_row_min_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
+
     def tile_row_add_fp(
         self,
         matrix_name: str,
@@ -379,6 +397,12 @@ class IsaTileRowMixin:
 
     def tile_row_mul_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
         return self._emit_tile_row_fp_scalar("Mul", "V_MUL_VF", vram_addr, row_map, opcode_extra_args=(0,))
+
+    def tile_row_max_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
+        return self._emit_tile_row_fp_scalar("Max", "V_MAX_VF", vram_addr, row_map, opcode_extra_args=(0,))
+
+    def tile_row_min_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
+        return self._emit_tile_row_fp_scalar("Min", "V_MIN_VF", vram_addr, row_map, opcode_extra_args=(0,))
 
     def tile_row_add_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
         return self._emit_tile_row_fp_scalar("Add", "V_ADD_VF", vram_addr, row_map, opcode_extra_args=(0,))

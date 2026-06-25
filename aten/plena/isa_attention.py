@@ -21,6 +21,7 @@ class IsaAttentionMixin:
         rows: int | None = None,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        sink_address: int | None = None,
     ) -> str:
         """
         Online Softmax Computation.
@@ -45,6 +46,7 @@ class IsaAttentionMixin:
                 scale=scale,
                 valid_cols=valid_cols,
                 inline_normalize=inline_normalize,
+                sink_address=sink_address,
             )
 
         gp_regs = self.register_allocator.allocate_gp(5)
@@ -64,6 +66,8 @@ class IsaAttentionMixin:
         fp_sum_p = 4  # f4: sum(P)
         fp_scale = 5  # f5: scale factor
         fp_row_max = 6  # f6: current row max (temporary)
+        fp_sink = 7  # f7: GPT-OSS attention sink logit
+        fp_sink_exp = fp_row_max  # reuse f6 after row max is folded into m_curr
 
         lines = []
         lines.append("; === Online Softmax ===")
@@ -86,6 +90,8 @@ class IsaAttentionMixin:
         # scale factor is pre-loaded at FP SRAM addr 1 by the flash-attention driver.
         if scale != 1.0:
             lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+        if sink_address is not None:
+            lines.append(f"S_LD_FP f{fp_sink}, gp0, {sink_address}")
 
         loop_rows = mlen if rows is None else rows
         lines.append(f"C_LOOP_START gp{gp_loop}, {loop_rows}")
@@ -102,9 +108,14 @@ class IsaAttentionMixin:
 
         # m_curr = max(row_max, m_old) — online softmax must retain the running max.
         lines.append(f"S_MAX_FP f{fp_m_old}, f{fp_row_max}, f{fp_m_old}")
+        if sink_address is not None:
+            lines.append(f"S_MAX_FP f{fp_m_old}, f{fp_sink}, f{fp_m_old}")
 
         lines.append(f"S_SUB_FP f{fp_m_res}, f{fp_m_res}, f{fp_m_old}")
         lines.append(f"S_EXP_FP f{fp_m_res}, f{fp_m_res}, 0")
+        if sink_address is not None:
+            lines.append(f"S_SUB_FP f{fp_sink_exp}, f{fp_sink}, f{fp_m_old}")
+            lines.append(f"S_EXP_FP f{fp_sink_exp}, f{fp_sink_exp}, 0")
 
         lines.append(f"S_ST_FP f{fp_m_res}, gp{gp_m_res_addr}, 0")
         lines.append(f"S_ST_FP f{fp_m_old}, gp{gp_m_addr}, 0")
@@ -116,6 +127,10 @@ class IsaAttentionMixin:
             # Single-block fast path (parity with _online_softmax_asm_unrolled).
             lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
             lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+            if sink_address is not None:
+                # Fold the attention sink into the row denominator: for one KV block
+                # softmax(S)=exp(S-m)/(sum(exp(S-m))+exp(sink-m)).
+                lines.append(f"S_ADD_FP f{fp_sum_p}, f{fp_sum_p}, f{fp_sink_exp}")
             lines.append(f"S_RECI_FP f{fp_sum_p}, f{fp_sum_p}, 0")
             for _ in range(4):  # retire multi-cycle S_RECI_FP before V_MUL_VF reads it
                 lines.append("S_ADDI_INT gp0, gp0, 0")
@@ -128,6 +143,8 @@ class IsaAttentionMixin:
 
             lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
             lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
+            if sink_address is not None:
+                lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sink_exp}")
 
             lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, 0")
 
@@ -148,6 +165,7 @@ class IsaAttentionMixin:
         scale: float = 1.0,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        sink_address: int | None = None,
     ) -> str:
         """Legacy Python-unrolled online softmax emission, kept for A/B comparisons."""
         gp_regs = self.register_allocator.allocate_gp(5)
@@ -163,6 +181,8 @@ class IsaAttentionMixin:
         fp_sum_p = 4
         fp_scale = 5
         fp_row_max = 6
+        fp_sink = 7
+        fp_sink_exp = fp_row_max
 
         lines = []
         lines.append("; === Online Softmax ===")
@@ -173,6 +193,8 @@ class IsaAttentionMixin:
 
         if scale != 1.0:
             lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+        if sink_address is not None:
+            lines.append(f"S_LD_FP f{fp_sink}, gp0, {sink_address}")
 
         mask_en = 0
         if valid_cols is not None and valid_cols < mlen:
@@ -196,9 +218,14 @@ class IsaAttentionMixin:
 
             # m_curr = max(row_max, m_old) — online softmax must retain the running max.
             lines.append(f"S_MAX_FP f{fp_m_old}, f{fp_row_max}, f{fp_m_old}")
+            if sink_address is not None:
+                lines.append(f"S_MAX_FP f{fp_m_old}, f{fp_sink}, f{fp_m_old}")
 
             lines.append(f"S_SUB_FP f{fp_m_res}, f{fp_m_res}, f{fp_m_old}")
             lines.append(f"S_EXP_FP f{fp_m_res}, f{fp_m_res}, 0")
+            if sink_address is not None:
+                lines.append(f"S_SUB_FP f{fp_sink_exp}, f{fp_sink}, f{fp_m_old}")
+                lines.append(f"S_EXP_FP f{fp_sink_exp}, f{fp_sink_exp}, 0")
 
             lines.append(f"S_ST_FP f{fp_m_res}, gp{gp_m_res_addr}, {row}")
             lines.append(f"S_ST_FP f{fp_m_old}, gp{gp_m_addr}, {row}")
@@ -213,6 +240,9 @@ class IsaAttentionMixin:
                 # block this also gives correct attention O since (P/l)@V == (P@V)/l.
                 lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
                 lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+                if sink_address is not None:
+                    # Fold the attention sink into the row denominator (see rolled path).
+                    lines.append(f"S_ADD_FP f{fp_sum_p}, f{fp_sum_p}, f{fp_sink_exp}")
                 lines.append(f"S_RECI_FP f{fp_sum_p}, f{fp_sum_p}, 0")
                 for _ in range(4):  # retire multi-cycle S_RECI_FP before V_MUL_VF reads it
                     lines.append("S_ADDI_INT gp0, gp0, 0")
@@ -225,6 +255,8 @@ class IsaAttentionMixin:
 
                 lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
                 lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
+                if sink_address is not None:
+                    lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sink_exp}")
 
                 lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
 
@@ -244,6 +276,8 @@ class IsaAttentionMixin:
         pv_address: int,
         rows: int | None = None,
         pv_physical_rows: int | None = None,
+        v_hbm_row_stride: int | None = None,
+        v_hbm_element_bytes: int = 1,
     ) -> str:
         """
         Compute PV = P @ V via M_MM.
@@ -275,6 +309,8 @@ class IsaAttentionMixin:
                 v_hbm_offset=v_hbm_offset,
                 pv_address=pv_address,
                 pv_physical_rows=pv_physical_rows,
+                v_hbm_row_stride=v_hbm_row_stride,
+                v_hbm_element_bytes=v_hbm_element_bytes,
             )
 
         gp_regs = self.register_allocator.allocate_gp(8)
@@ -298,7 +334,13 @@ class IsaAttentionMixin:
         lines.append(f"; V split into {num_v_col_blocks} column blocks of width {mlen}")
         lines.append("; Storage layout: (batch, mlen, hidden/mlen), column-block major")
 
-        # STRIDE was set to mlen by the flash-attention driver — do not overwrite it here.
+        # H_PREFETCH_M stride is byte-based. MXFP8 is 1 byte/element; Plain
+        # BF16 KeyValue loads need 2 bytes/element.
+        if v_hbm_row_stride is None:
+            v_hbm_row_stride = mlen
+        lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, {v_hbm_row_stride * v_hbm_element_bytes}")
+        lines.append(f"C_SET_STRIDE_REG gp{gp_stride}")
+
         # M_MM_WO requires a nonzero stride reg (gp0=0 would be interpreted as stride=1).
         # With column-block-major storage, consecutive rows within a column block are
         # adjacent, so the writeback stride = 1.
@@ -312,7 +354,7 @@ class IsaAttentionMixin:
             # Prefetch V[:, v_col_block*mlen:(v_col_block+1)*mlen] (mlen × mlen) to MSRAM.
             # V is row-major in HBM: V[row, col] at offset row*head_dim + col, so the
             # column-block base offset = v_hbm_offset + v_col_block * mlen (elements).
-            v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
+            v_block_hbm_offset = (v_hbm_offset + v_col_block * mlen) * v_hbm_element_bytes
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
             # funct1=0 => PREFETCH_M_H (High Precision, m_controller_precision_select=0),
@@ -354,6 +396,8 @@ class IsaAttentionMixin:
         v_hbm_offset: int,
         pv_address: int,
         pv_physical_rows: int | None = None,
+        v_hbm_row_stride: int | None = None,
+        v_hbm_element_bytes: int = 1,
     ) -> str:
         """Legacy Python-unrolled P @ V emission, kept for A/B comparisons."""
         if pv_physical_rows is None:
@@ -373,13 +417,17 @@ class IsaAttentionMixin:
         lines.append("; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot")
         lines.append(f"; V split into {num_v_col_blocks} column blocks of width {mlen}")
         lines.append("; Storage layout: (batch, mlen, hidden/mlen), column-block major")
+        if v_hbm_row_stride is None:
+            v_hbm_row_stride = mlen
+        lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, {v_hbm_row_stride * v_hbm_element_bytes}")
+        lines.append(f"C_SET_STRIDE_REG gp{gp_stride}")
         lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, 1")
 
         for v_col_block in range(num_v_col_blocks):
             lines.append(
                 f"; --- V column block {v_col_block} (columns {v_col_block * mlen} to {(v_col_block + 1) * mlen - 1}) ---"
             )
-            v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
+            v_block_hbm_offset = (v_hbm_offset + v_col_block * mlen) * v_hbm_element_bytes
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
             # funct1=0 => PREFETCH_M_H (High Precision), matching V's HBM staging; _L
@@ -780,6 +828,7 @@ class IsaAttentionMixin:
         rows: int | None = None,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        sink_address: int | None = None,
     ) -> str:
         """
         Run Online Softmax on one S block.
@@ -805,6 +854,7 @@ class IsaAttentionMixin:
             rows=rows,
             valid_cols=valid_cols,
             inline_normalize=inline_normalize,
+            sink_address=sink_address,
         )
 
         return self._emit(isa_code)
@@ -817,6 +867,7 @@ class IsaAttentionMixin:
         pv_matrix: str,
         head_dim: int,
         rows: int | None = None,
+        v_hbm_element_bytes: int = 1,
     ) -> str:
         """
         Compute PV = P @ V[k_idx].
@@ -856,6 +907,8 @@ class IsaAttentionMixin:
             pv_address=pv_address,
             rows=rows,
             pv_physical_rows=pv_info.physical_shape[0],
+            v_hbm_row_stride=physical_head_dim,
+            v_hbm_element_bytes=v_hbm_element_bytes,
         )
 
         self.register_allocator.free_gp(gp_regs)

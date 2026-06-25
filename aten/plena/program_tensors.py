@@ -18,6 +18,7 @@ class ProgramTensorMixin:
         hbm_addr: int | None = None,
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
+        real_data_ratio: float | None = None,
     ) -> InputVar:
         """
         Declare an input tensor (in HBM).
@@ -35,6 +36,9 @@ class ProgramTensorMixin:
         Returns:
             InputVar proxy object
         """
+        if real_data_ratio is None:
+            real_data_ratio = self.real_data_ratio
+
         h, w = physical_shape or shape
         size = h * w
         hbm_size = self.hbm_tensor_size(size)
@@ -57,7 +61,7 @@ class ProgramTensorMixin:
             hbm_addr=hbm_addr,
             shape=shape,
             physical_shape=physical_shape,
-            real_data_ratio=self.real_data_ratio,
+            real_data_ratio=real_data_ratio,
         )
         return var
 
@@ -131,7 +135,15 @@ class ProgramTensorMixin:
     # Store Operations
     # ========================================================================
 
-    def store(self, tensor_var, name: str | None = None, hbm_addr: int | None = None) -> InputVar:
+    def store(
+        self,
+        tensor_var,
+        name: str | None = None,
+        hbm_addr: int | None = None,
+        precision: int = 0,
+        hbm_element_bytes: int = 1,
+        real_data_ratio: float | None = None,
+    ) -> InputVar:
         """
         Write tensor from VRAM back to HBM.
 
@@ -159,6 +171,9 @@ class ProgramTensorMixin:
             hbm_object_name=internal_name,
             vlen=self.mlen,
             store_amount=self.hbm_v_writeback_amount,
+            precision=precision,
+            hbm_element_bytes=hbm_element_bytes,
+            hbm_real_data_ratio=real_data_ratio,
         )
 
         var = InputVar(

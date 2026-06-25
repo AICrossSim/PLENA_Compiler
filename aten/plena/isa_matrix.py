@@ -41,11 +41,21 @@ class IsaMatrixMixin:
     def _default_hbm_gp_regs(self, gp_regs: list[int] | None) -> list[int]:
         return [1, 2, 3] if gp_regs is None else gp_regs
 
-    def _emit_hbm_prefetch_setup(self, asm: IsaBuilder, layout, gp_scale: int, gp_stride: int) -> None:
+    def _emit_hbm_prefetch_setup(
+        self,
+        asm: IsaBuilder,
+        layout,
+        gp_scale: int,
+        gp_stride: int,
+        *,
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
+    ) -> None:
         rows, cols = layout.physical_shape or layout.full_shape
-        asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), rows * cols)
-        asm.instr("C_SET_SCALE_REG", gp(gp_scale))
-        asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), cols)
+        if set_scale:
+            asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), rows * cols)
+            asm.instr("C_SET_SCALE_REG", gp(gp_scale))
+        asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), cols * hbm_element_bytes)
         asm.instr("C_SET_STRIDE_REG", gp(gp_stride))
 
     def _emit_hbm_subblock_prefetch(
@@ -59,15 +69,17 @@ class IsaMatrixMixin:
         gp_scale: int,
         gp_mram: int,
         comment: str | None = None,
+        precision: int = 0,
+        hbm_element_bytes: int = 1,
     ) -> None:
         sub_block = layout.get_sub_block(row_idx, col_idx)
-        hbm_offset = sub_block.hbm_offset
+        hbm_offset = sub_block.hbm_offset * hbm_element_bytes
         sub_block.mram_addr = mram_addr
 
         asm.comment(comment if comment is not None else f"SubBlock [{row_idx}][{col_idx}]: HBM offset = {hbm_offset}")
         asm.instr("S_ADDI_INT", gp(gp_mram), gp(0), mram_addr)
         asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), hbm_offset)
-        asm.instr("H_PREFETCH_M", gp(gp_mram), gp(gp_scale), areg(hbm_addr_reg), 1, 0)
+        asm.instr("H_PREFETCH_M", gp(gp_mram), gp(gp_scale), areg(hbm_addr_reg), 1, precision)
 
     def _emit_hbm_subblock_sequence(
         self,
@@ -78,6 +90,8 @@ class IsaMatrixMixin:
         hbm_addr_reg: int,
         gp_scale: int,
         gp_mram: int,
+        precision: int = 0,
+        hbm_element_bytes: int = 1,
     ) -> None:
         mram_addr = mram_start_addr
         block_size = self.mlen * self.mlen
@@ -91,6 +105,8 @@ class IsaMatrixMixin:
                 hbm_addr_reg,
                 gp_scale,
                 gp_mram,
+                precision=precision,
+                hbm_element_bytes=hbm_element_bytes,
             )
             mram_addr += block_size
 
@@ -102,6 +118,9 @@ class IsaMatrixMixin:
         mram_dest_addr: int,
         hbm_addr_reg: int = 1,
         gp_regs: list[int] | None = None,
+        precision: int = 0,
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
     ) -> str:
         """Emit HBM->MRAM prefetch for one mlen x mlen sub-block."""
         gp_regs = self._default_hbm_gp_regs(gp_regs)
@@ -112,7 +131,14 @@ class IsaMatrixMixin:
         gp_scale = gp_regs[0]
         gp_stride = gp_regs[1]
         gp_mram = gp_regs[2]
-        self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
+        self._emit_hbm_prefetch_setup(
+            asm,
+            layout,
+            gp_scale,
+            gp_stride,
+            set_scale=set_scale,
+            hbm_element_bytes=hbm_element_bytes,
+        )
         hbm_offset = layout.get_sub_block(row_idx, col_idx).hbm_offset
         self._emit_hbm_subblock_prefetch(
             asm,
@@ -124,6 +150,8 @@ class IsaMatrixMixin:
             gp_scale,
             gp_mram,
             comment=f"HBM offset: {hbm_offset} (precomputed)",
+            precision=precision,
+            hbm_element_bytes=hbm_element_bytes,
         )
 
         return asm.render()
@@ -135,6 +163,9 @@ class IsaMatrixMixin:
         mram_start_addr: int,
         hbm_addr_reg: int = 1,
         gp_regs: list[int] | None = None,
+        precision: int = 0,
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
     ) -> str:
         """Emit HBM->MRAM prefetches for one block row."""
         gp_regs = self._default_hbm_gp_regs(gp_regs)
@@ -146,7 +177,14 @@ class IsaMatrixMixin:
         gp_scale = gp_regs[0]
         gp_stride = gp_regs[1]
         gp_mram = gp_regs[2]
-        self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
+        self._emit_hbm_prefetch_setup(
+            asm,
+            layout,
+            gp_scale,
+            gp_stride,
+            set_scale=set_scale,
+            hbm_element_bytes=hbm_element_bytes,
+        )
 
         self._emit_hbm_subblock_sequence(
             asm,
@@ -156,6 +194,8 @@ class IsaMatrixMixin:
             hbm_addr_reg,
             gp_scale,
             gp_mram,
+            precision=precision,
+            hbm_element_bytes=hbm_element_bytes,
         )
 
         return asm.render()
@@ -169,6 +209,9 @@ class IsaMatrixMixin:
         gp_regs: list[int] | None = None,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        precision: int = 0,
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
     ) -> str:
         """Emit HBM->MRAM prefetches for one block column or K-split slice."""
         gp_regs = self._default_hbm_gp_regs(gp_regs)
@@ -181,7 +224,14 @@ class IsaMatrixMixin:
         gp_scale = gp_regs[0]
         gp_stride = gp_regs[1]
         gp_mram = gp_regs[2]
-        self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
+        self._emit_hbm_prefetch_setup(
+            asm,
+            layout,
+            gp_scale,
+            gp_stride,
+            set_scale=set_scale,
+            hbm_element_bytes=hbm_element_bytes,
+        )
 
         effective_count = k_block_count if k_block_count is not None else num_row_blocks
         self._emit_hbm_subblock_sequence(
@@ -192,6 +242,8 @@ class IsaMatrixMixin:
             hbm_addr_reg,
             gp_scale,
             gp_mram,
+            precision=precision,
+            hbm_element_bytes=hbm_element_bytes,
         )
 
         return asm.render()
@@ -306,6 +358,253 @@ class IsaMatrixMixin:
             unroll=unroll,
             row_loop_count=row_loop_count,
         )
+
+    def vram_sub_projection_microtile_accumulate_asm(
+        self,
+        vram_mat_name: str,
+        vram_row_idx: int,
+        mram_mat_name: str,
+        mram_col_idx: int,
+        result_vram_addr: int,
+        micro_row_idx: int,
+        micro_col_idx: int,
+        *,
+        k_block_start: int,
+        k_block_count: int,
+        write_out: bool,
+        gp_regs: list[int] | None = None,
+    ) -> str:
+        """Emit M_MM for one 4x4 microtile, optionally flushing with M_MM_WO.
+
+        This is used by the Qwen router precision path.  Wide routers cannot
+        fit the full K dimension in MRAM, and the old path flushed each K chunk
+        to BF16 VRAM before adding the next chunk.  Here the compiler keeps the
+        matrix-machine accumulator live for one output microtile across
+        multiple MRAM reloads, then writes it once after the final chunk.
+        """
+        gp_regs = [1, 2, 3] if gp_regs is None else gp_regs
+        if len(gp_regs) < 3:
+            raise ValueError(f"vram_sub_projection_microtile_accumulate_asm requires 3 gp regs, got {len(gp_regs)}")
+        gp_act, gp_mat, gp_result = gp_regs[:3]
+
+        vram_layout, mram_layout, vram_row_blocks = self._projection_context(
+            vram_mat_name, vram_row_idx, mram_mat_name
+        )
+        mram_col_blocks = mram_layout.get_col_blocks(mram_col_idx)[k_block_start : k_block_start + k_block_count]
+        if len(mram_col_blocks) != k_block_count:
+            raise ValueError(
+                f"Dimension mismatch: expected {k_block_count} MRAM blocks, got {len(mram_col_blocks)}"
+            )
+
+        tiles_per_mlen = self.mlen // self.blen
+        if micro_col_idx < 0 or micro_col_idx >= tiles_per_mlen:
+            raise ValueError(f"micro_col_idx={micro_col_idx} outside 0..{tiles_per_mlen - 1}")
+
+        full_batch = (vram_layout.physical_shape or vram_layout.full_shape)[0]
+        valid_rows = vram_row_blocks[k_block_start].valid_shape[0] if vram_row_blocks[k_block_start].valid_shape else self.mlen
+        row_loop_count = min(tiles_per_mlen, math.ceil(valid_rows / self.blen))
+        if micro_row_idx < 0 or micro_row_idx >= row_loop_count:
+            raise ValueError(f"micro_row_idx={micro_row_idx} outside 0..{row_loop_count - 1}")
+
+        vram_hidden_block_stride = full_batch * self.mlen
+        mram_hidden_block_stride = self.mlen * self.mlen
+        output_row_stride = self.blen * self.mlen
+        mat_col_stride = self.blen
+
+        vram_row_start_addr = vram_row_blocks[k_block_start].vram_addr + micro_row_idx * output_row_stride
+        mram_col_start_addr = self._loaded_mram_start(
+            mram_col_blocks,
+            lambda block: f"{mram_mat_name}[{block.row_idx}][{mram_col_idx}]",
+        ) + micro_col_idx * mat_col_stride
+        result_addr = result_vram_addr + micro_col_idx * self.blen + micro_row_idx * output_row_stride
+
+        lines = [
+            f"; VRAM Sub Projection microtile accumulate: {vram_mat_name}[{vram_row_idx}], "
+            f"{mram_mat_name}[:][{mram_col_idx}], row4={micro_row_idx}, col4={micro_col_idx}, "
+            f"k=[{k_block_start}, {k_block_start + k_block_count}), write_out={write_out}"
+        ]
+        for ih in range(k_block_count):
+            act_addr = vram_row_start_addr + ih * vram_hidden_block_stride
+            mat_addr = mram_col_start_addr + ih * mram_hidden_block_stride
+            lines.extend(load_large_int(gp_act, act_addr))
+            lines.extend(load_large_int(gp_mat, mat_addr))
+            lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
+
+        if write_out:
+            lines.extend(load_large_int(gp_result, result_addr))
+            lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
+
+        return "\n".join(lines) + "\n"
+
+    def vram_sub_projection_microtile_accumulate_to(
+        self,
+        vram_mat_name: str,
+        vram_row_idx: int,
+        mram_mat_name: str,
+        mram_col_idx: int,
+        target_matrix: str,
+        target_row_idx: int,
+        target_col_idx: int,
+        micro_row_idx: int,
+        micro_col_idx: int,
+        *,
+        k_block_start: int,
+        k_block_count: int,
+        write_out: bool,
+    ) -> str:
+        result_vram_addr, _target_base_addr, _target_rows = self._target_tile_addr(
+            target_matrix, target_row_idx, target_col_idx
+        )
+        gp_regs = self.register_allocator.allocate_gp(3)
+        try:
+            asm = self.vram_sub_projection_microtile_accumulate_asm(
+                vram_mat_name=vram_mat_name,
+                vram_row_idx=vram_row_idx,
+                mram_mat_name=mram_mat_name,
+                mram_col_idx=mram_col_idx,
+                result_vram_addr=result_vram_addr,
+                micro_row_idx=micro_row_idx,
+                micro_col_idx=micro_col_idx,
+                k_block_start=k_block_start,
+                k_block_count=k_block_count,
+                write_out=write_out,
+                gp_regs=gp_regs,
+            )
+        finally:
+            self.register_allocator.free_gp(gp_regs)
+        return self._emit(asm)
+
+    def vram_sub_projection_packed_skinny_microtile_accumulate_asm(
+        self,
+        vram_mat_name: str,
+        vram_row_idx: int,
+        packed_mram_mat_name: str,
+        packed_group_idx: int,
+        packed_col_idx: int,
+        result_vram_addr: int,
+        micro_row_idx: int,
+        micro_col_idx: int,
+        *,
+        k_block_start: int,
+        k_block_count: int,
+        write_out: bool,
+        gp_regs: list[int] | None = None,
+    ) -> str:
+        """Emit one 4x4 projection microtile from a packed-skinny MRAM tile.
+
+        The packed-skinny convention is intentionally narrow and opt-in: one
+        full ``mlen x mlen`` MRAM tile stores several skinny weight slices for a
+        single output micro-column.  Slice ``i`` lives in columns
+        ``i*blen:(i+1)*blen`` of that tile.  This lets a router probe keep up to
+        ``mlen / blen`` K-blocks in one MRAM cell without changing M_MM's
+        existing full-tile read contract.
+        """
+        gp_regs = [1, 2, 3] if gp_regs is None else gp_regs
+        if len(gp_regs) < 3:
+            raise ValueError(
+                "vram_sub_projection_packed_skinny_microtile_accumulate_asm "
+                f"requires 3 gp regs, got {len(gp_regs)}"
+            )
+        gp_act, gp_mat, gp_result = gp_regs[:3]
+        if k_block_count <= 0:
+            raise ValueError(f"k_block_count must be > 0, got {k_block_count}")
+
+        tiles_per_mlen = self.mlen // self.blen
+        if k_block_count > tiles_per_mlen:
+            raise ValueError(
+                f"packed skinny tile can hold at most {tiles_per_mlen} slices, got {k_block_count}"
+            )
+        if micro_col_idx < 0 or micro_col_idx >= tiles_per_mlen:
+            raise ValueError(f"micro_col_idx={micro_col_idx} outside 0..{tiles_per_mlen - 1}")
+
+        vram_layout, packed_layout, vram_row_blocks = self._projection_context(
+            vram_mat_name,
+            vram_row_idx,
+            packed_mram_mat_name,
+        )
+        if k_block_start < 0 or k_block_start + k_block_count > len(vram_row_blocks):
+            raise ValueError(
+                f"k range [{k_block_start}, {k_block_start + k_block_count}) outside "
+                f"VRAM hidden blocks 0..{len(vram_row_blocks)}"
+            )
+
+        packed_block = packed_layout.get_sub_block(packed_group_idx, packed_col_idx)
+        if packed_block.mram_addr is None:
+            raise RuntimeError(
+                f"Packed skinny block {packed_mram_mat_name}[{packed_group_idx}][{packed_col_idx}] "
+                "not loaded to MRAM"
+            )
+
+        full_batch = (vram_layout.physical_shape or vram_layout.full_shape)[0]
+        valid_rows = vram_row_blocks[k_block_start].valid_shape[0] if vram_row_blocks[k_block_start].valid_shape else self.mlen
+        row_loop_count = min(tiles_per_mlen, math.ceil(valid_rows / self.blen))
+        if micro_row_idx < 0 or micro_row_idx >= row_loop_count:
+            raise ValueError(f"micro_row_idx={micro_row_idx} outside 0..{row_loop_count - 1}")
+
+        vram_hidden_block_stride = full_batch * self.mlen
+        output_row_stride = self.blen * self.mlen
+        vram_row_start_addr = vram_row_blocks[k_block_start].vram_addr + micro_row_idx * output_row_stride
+        result_addr = result_vram_addr + micro_col_idx * self.blen + micro_row_idx * output_row_stride
+
+        lines = [
+            f"; VRAM Sub Projection packed skinny microtile: {vram_mat_name}[{vram_row_idx}], "
+            f"{packed_mram_mat_name}[{packed_group_idx}][{packed_col_idx}], "
+            f"row4={micro_row_idx}, col4={micro_col_idx}, "
+            f"k=[{k_block_start}, {k_block_start + k_block_count}), write_out={write_out}",
+            f"; Packed skinny convention: slice i is at MRAM tile columns i*{self.blen}..(i+1)*{self.blen}",
+        ]
+        for ih in range(k_block_count):
+            act_addr = vram_row_start_addr + ih * vram_hidden_block_stride
+            mat_addr = packed_block.mram_addr + ih * self.blen
+            lines.extend(load_large_int(gp_act, act_addr))
+            lines.extend(load_large_int(gp_mat, mat_addr))
+            lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
+
+        if write_out:
+            lines.extend(load_large_int(gp_result, result_addr))
+            lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
+
+        return "\n".join(lines) + "\n"
+
+    def vram_sub_projection_packed_skinny_microtile_accumulate_to(
+        self,
+        vram_mat_name: str,
+        vram_row_idx: int,
+        packed_mram_mat_name: str,
+        packed_group_idx: int,
+        packed_col_idx: int,
+        target_matrix: str,
+        target_row_idx: int,
+        target_col_idx: int,
+        micro_row_idx: int,
+        micro_col_idx: int,
+        *,
+        k_block_start: int,
+        k_block_count: int,
+        write_out: bool,
+    ) -> str:
+        result_vram_addr, _target_base_addr, _target_rows = self._target_tile_addr(
+            target_matrix, target_row_idx, target_col_idx
+        )
+        gp_regs = self.register_allocator.allocate_gp(3)
+        try:
+            asm = self.vram_sub_projection_packed_skinny_microtile_accumulate_asm(
+                vram_mat_name=vram_mat_name,
+                vram_row_idx=vram_row_idx,
+                packed_mram_mat_name=packed_mram_mat_name,
+                packed_group_idx=packed_group_idx,
+                packed_col_idx=packed_col_idx,
+                result_vram_addr=result_vram_addr,
+                micro_row_idx=micro_row_idx,
+                micro_col_idx=micro_col_idx,
+                k_block_start=k_block_start,
+                k_block_count=k_block_count,
+                write_out=write_out,
+                gp_regs=gp_regs,
+            )
+        finally:
+            self.register_allocator.free_gp(gp_regs)
+        return self._emit(asm)
 
     def vram_sub_projection_T_asm(
         self,
@@ -423,6 +722,9 @@ class IsaMatrixMixin:
         name: str,
         row_idx: int,
         mram_start_addr: int | None = None,
+        precision: int = 0,
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
     ) -> str:
         """Load entire row sub-blocks from HBM to MRAM: matrix[row_idx][:]."""
         layout = self.get_hbm_layout(name)
@@ -442,6 +744,42 @@ class IsaMatrixMixin:
                 mram_start_addr=mram_start_addr,
                 hbm_addr_reg=addr_reg,
                 gp_regs=gp_regs,
+                precision=precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
+            ),
+        )
+
+    def load_sub_matrix(
+        self,
+        name: str,
+        row_idx: int,
+        col_idx: int,
+        mram_dest_addr: int | None = None,
+        precision: int = 0,
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
+    ) -> str:
+        """Load one HBM sub-block into one MRAM tile."""
+        layout = self.get_hbm_layout(name)
+        block_size = self.mlen * self.mlen
+
+        if mram_dest_addr is None:
+            mram_dest_addr = self.mram_allocator.allocate(f"{name}[{row_idx}][{col_idx}]", block_size)
+
+        return self._emit_hbm_matrix_load(
+            layout,
+            3,
+            lambda addr_reg, gp_regs: self.load_sub_matrix_asm(
+                name=name,
+                row_idx=row_idx,
+                col_idx=col_idx,
+                mram_dest_addr=mram_dest_addr,
+                hbm_addr_reg=addr_reg,
+                gp_regs=gp_regs,
+                precision=precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
             ),
         )
 
@@ -452,6 +790,9 @@ class IsaMatrixMixin:
         mram_start_addr: int | None = None,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        precision: int = 0,
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
     ) -> str:
         """
         Load entire column sub-blocks from HBM to MRAM: matrix[:][col_idx].
@@ -477,6 +818,9 @@ class IsaMatrixMixin:
                 gp_regs=gp_regs,
                 k_block_start=k_block_start,
                 k_block_count=k_block_count,
+                precision=precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
             ),
         )
 

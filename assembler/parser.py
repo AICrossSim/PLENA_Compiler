@@ -96,7 +96,9 @@ _REG_PREFIXES = ("gp", "f", "a")
 # Hoisted to module scope: these were previously re-created for every line of the
 # .asm (millions of times for large programs), which dominated sim_env re-parse time.
 vector_masked_unary_or_reduction_ops = frozenset({"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"})
-vector_masked_binary_ops = frozenset({"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF"})
+vector_masked_binary_ops = frozenset(
+    {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_MAX_VF", "V_MIN_VF", "V_TOPK"}
+)
 
 
 def _parse_operand(operand):

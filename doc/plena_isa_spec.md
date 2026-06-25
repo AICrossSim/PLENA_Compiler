@@ -287,6 +287,48 @@ Similar to `V_ADD_VV`, but performs element-wise multiplication.
 
 Similar to `V_ADD_VF`, but performs element-wise multiplication.
 
+### V_MAX_VF
+
+**Format:** `V_MAX_VF rd, rs1, fp2, rmask`
+
+**Operation:** `Vector[gp_reg<rd>] = max(Vector[gp_reg<rs1>], Broadcast(fp_reg<fp2>))`
+
+**Description:**
+
+Element-wise maximum between a vector and a scalar. This is the lower-bound clamp primitive used by GPT-OSS expert activation, e.g. `max(up, -7.0)`.
+
+### V_MIN_VF
+
+**Format:** `V_MIN_VF rd, rs1, fp2, rmask`
+
+**Operation:** `Vector[gp_reg<rd>] = min(Vector[gp_reg<rs1>], Broadcast(fp_reg<fp2>))`
+
+**Description:**
+
+Element-wise minimum between a vector and a scalar. This is the upper-bound clamp primitive used by GPT-OSS expert activation, e.g. `min(gate, 7.0)` and `min(up, 7.0)`.
+
+### V_TOPK
+
+**Format:** `V_TOPK rd, rs1, rs2, rmask`
+
+**Operation:** Routed-MoE router top-k helper over one BF16 logits row.
+
+**Description:**
+
+`rs1` contains the Vector SRAM address of a router-logit row. The instruction
+scans logits in descending logit order and breaks exact ties by smaller expert
+index. `rmask` selects the routed-MoE policy:
+
+- `rmask=0`: scan 32 logits, select top-4, and write weights/indices to
+  `FP_MEM[gp_reg<rd> + 0..3]` / `INT_MEM[gp_reg<rs2> + 0..3]`.
+- `rmask=1`: scan 128 logits, select top-8, and write weights/indices to
+  `FP_MEM[gp_reg<rd> + 0..7]` / `INT_MEM[gp_reg<rs2> + 0..7]`.
+
+Weights are softmax-over-selected logits.
+
+This is a correctness-first v0 linear scan. Bitonic/performance top-k remains a
+future optimization.
+
 ### V_EXP_V
 
 **Format:** `V_EXP_V rd, rs1, rmask`
