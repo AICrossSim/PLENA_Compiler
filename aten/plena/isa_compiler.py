@@ -132,6 +132,8 @@ class IsaCompiler(
         vlen: int = 64,
         precision: int = 0,  # 0 = Activation, 1 = KeyValue
         store_amount: int | None = None,  # HBM_V_Writeback_Amount
+        hbm_element_bytes: int = 1,
+        hbm_real_data_ratio: float | None = None,
     ) -> str:
         """
         Write tensor from VRAM back to HBM.
@@ -195,13 +197,15 @@ class IsaCompiler(
                 hbm_addr_reg=hbm_addr_reg,
                 stride_size=hidden_size,
                 store_amount=store_amount,
+                precision=precision,
+                hbm_element_bytes=hbm_element_bytes,
             )
 
             if tensor_info.hbm_addr < 0 or tensor_info.hbm_addr != hbm_addr:
                 tensor_info.hbm_addr = hbm_addr
                 # HBM stores the MXFP-expanded size (logical size × real_data_ratio).
                 size = batch_size * hidden_size
-                tensor_info.hbm_size = int(size * self.real_data_ratio)
+                tensor_info.hbm_size = int(size * (hbm_real_data_ratio or self.real_data_ratio))
         finally:
             self.register_allocator.free_gp(gp_regs)
             if need_free_addr:
@@ -213,6 +217,7 @@ class IsaCompiler(
                 hbm_addr=hbm_addr,
                 shape=tensor_info.shape,
                 physical_shape=(batch_size, hidden_size),
+                real_data_ratio=hbm_real_data_ratio or self.real_data_ratio,
             )
 
         return self._emit(isa_code)

@@ -8,6 +8,7 @@ from pathlib import Path
 from compiler.aten.plena.isa_compiler import IsaCompiler
 from compiler.aten.plena.program_attention import ProgramAttentionMixin
 from compiler.aten.plena.program_fp_tile_ops import ProgramFPTileOpsMixin
+from compiler.aten.plena.program_gpt_oss_moe import ProgramGptOssMoeMixin
 from compiler.aten.plena.program_matrix_ops import ProgramMatrixOpsMixin
 from compiler.aten.plena.program_tensors import ProgramTensorMixin
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar
@@ -56,6 +57,7 @@ class PlenaCompiler(
     ProgramTensorMixin,
     ProgramFPTileOpsMixin,
     ProgramMatrixOpsMixin,
+    ProgramGptOssMoeMixin,
     ProgramAttentionMixin,
     IsaCompiler,
 ):
