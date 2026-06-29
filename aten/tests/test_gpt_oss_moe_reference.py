@@ -21,7 +21,7 @@ for _path in [
     if os.path.isdir(_path) and _path not in sys.path:
         sys.path.insert(0, _path)
 
-from aten.gpt_oss_moe import (
+from aten.models.gpt_oss.moe_reference import (
     assert_clamp_inactive,
     clamp_stats,
     gpt_oss_moe_fixed_routing_host_smoke,
