@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from aten.gpt_oss_moe import assert_compare_within, assert_gap_in_band, compare_stats
+from aten.models.gpt_oss.moe_reference import assert_compare_within, assert_gap_in_band, compare_stats
 
 
 def _reference_tensor() -> torch.Tensor:

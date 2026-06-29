@@ -13,7 +13,7 @@ ExpertWeights = tuple[InputVar, InputVar, InputVar]
 ExpertBiases = tuple[VRAMMatrixVar | None, VRAMMatrixVar | None, VRAMMatrixVar | None]
 
 
-class ProgramGptOssMoeMixin:
+class ProgramRoutedMoeMixin:
     """Routed-MoE v0 emit helpers used by GPT-OSS and Qwen bring-up.
 
     The helpers intentionally keep routing policy explicit: GPT-OSS uses
@@ -1809,4 +1809,4 @@ class ProgramGptOssMoeMixin:
         )
 
 
-__all__ = ["ProgramGptOssMoeMixin"]
+__all__ = ["ProgramRoutedMoeMixin"]
