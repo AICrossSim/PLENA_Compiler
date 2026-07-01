@@ -671,7 +671,7 @@ class ProgramAttentionMixin:
             # lookahead pins pc_reg there (C_BREAK never decodes -> hang). Unrolling
             # removes every pack loop, so no C_LOOP_END precedes the trailing C_BREAK.
             for i in range(rows):
-                lines.append(f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}")
+                lines.append(f"V_SHFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}")
                 lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0")
                 if i < rows - 1:
                     lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}")
@@ -679,7 +679,7 @@ class ProgramAttentionMixin:
         else:
             lines += [
                 f"C_LOOP_START gp{gp_loop}, {rows}",
-                f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
+                f"V_SHFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
                 f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0",
                 f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}",
                 f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
@@ -709,7 +709,7 @@ class ProgramAttentionMixin:
             *load_large_int(gp_scratch, scratch_address),
             *load_large_int(gp_shift, shift),
             f"C_LOOP_START gp{gp_loop}, {rows}",
-            f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
+            f"V_SHFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
             f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0",
             f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}",
             f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
