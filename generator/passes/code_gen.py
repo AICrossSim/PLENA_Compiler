@@ -484,7 +484,7 @@ def _generate_conv2d_code(
     conv_stride = dims.get("stride", patch_size)
 
     # Check whether every output column produces a 64-aligned HBM pixel
-    # offset.  When it does, the fast V_SHIFT_V template can be used;
+    # offset.  When it does, the fast V_SHFT_V template can be used;
     # otherwise fall back to the no-shift (basis-vector) template which
     # handles arbitrary alignment via per-element extraction.
     _all_cols_aligned = all((ow * conv_stride) % 64 == 0 for ow in range(OW))

@@ -752,9 +752,9 @@ End of a hardware loop. If the loop counter (in register `rd`) is greater than 0
 
 ## Extensions
 
-### V_SHIFT_V
+### V_SHFT_V
 
-**Format:** `V_SHIFT_V rd, rs1, rs2`
+**Format:** `V_SHFT_V rd, rs1, rs2`
 
 **Operation:** `Vector[gp_reg<rd>] = ElementShift(Vector[gp_reg<rs1>], gp_reg<rs2>)`
 
