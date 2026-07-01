@@ -198,7 +198,9 @@ def projection_asm(
                     )
                 lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
             else:
-                lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
+                # weight rows are 1 output-feature each in matrix SRAM (row-granular), so the
+                # within-group offset must be in rows: (wr % (mlen//blen)) * blen * mlen.
+                lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen * mlen} ")
                 lines.append(
                     f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
                 )
@@ -210,13 +212,10 @@ def projection_asm(
                     lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
                     lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                     lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
-                    break
                 lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
                 lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")
-                break
             if (weight_row + 1) % (mlen // blen) == 0 and weight_row != out_features // blen - 1:
                 lines.append(f"S_ADDI_INT gp{result_reg}, gp{result_reg}, {mlen * batch} ")
-            break
     else:
         # K-split path
         chunks = _proj_k_chunks(num_k_tiles, MAX_K_TILES)
