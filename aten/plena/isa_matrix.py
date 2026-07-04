@@ -294,7 +294,12 @@ class IsaMatrixMixin:
             result_vram_addr=result_vram_addr,
             full_batch=full_batch,
             num_hidden_blocks=num_hidden_blocks,
-            mat_col_stride=self.blen,
+            # Row-aligned column stride: the matrix SRAM read is row-granular
+            # (raddr >> log2(MLEN)), so successive BLEN-column output sub-tiles
+            # must be a full MLEN row apart, else they collapse onto the same
+            # MRAM rows and the output columns replicate ([a,b,c,d]x4). blen
+            # alone is sub-row and only works on an element-granular model.
+            mat_col_stride=self.blen * self.mlen,
             transposed=False,
             gp_regs=gp_regs,
             caller_name="vram_sub_projection_asm",
