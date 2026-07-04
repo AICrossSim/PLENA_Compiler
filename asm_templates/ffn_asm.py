@@ -556,8 +556,15 @@ def _emit_ffn_projection_chunk(
                 )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n")
         else:
+            # Sub-column tile within an MLEN block. The WEIGHT-read pointer must
+            # advance by blen*mlen (row-aligned) so each sub-column reads a DISTINCT
+            # MRAM row: the RTL matrix SRAM read is row-granular (raddr >> log2(MLEN)
+            # drops the low log2(MLEN) bits), so a plain +blen would collapse tiles
+            # 1..(mlen/blen-1) onto tile 0's row. The OUTPUT-write pointer stays at
+            # +blen (the low bits select the 4-wide column lane of the VLEN row).
+            # This matches the working projection_asm (_emit_projection_chunk).
             lines.append(
-                f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n"
+                f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen * mlen} \n"
             )
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_base_register}, {(weight_row % (mlen // blen)) * blen} \n"
