@@ -20,6 +20,7 @@ class IsaAttentionMixin:
         scale: float = 1.0,
         rows: int | None = None,
         valid_cols: int | None = None,
+        inline_normalize: bool = False,
     ) -> str:
         """
         Online Softmax Computation.
@@ -43,6 +44,7 @@ class IsaAttentionMixin:
                 m_start_address=m_start_address,
                 scale=scale,
                 valid_cols=valid_cols,
+                inline_normalize=inline_normalize,
             )
 
         gp_regs = self.register_allocator.allocate_gp(5)
@@ -136,6 +138,7 @@ class IsaAttentionMixin:
         m_start_address: int,
         scale: float = 1.0,
         valid_cols: int | None = None,
+        inline_normalize: bool = False,
     ) -> str:
         """Legacy Python-unrolled online softmax emission, kept for A/B comparisons."""
         gp_regs = self.register_allocator.allocate_gp(5)
@@ -194,15 +197,27 @@ class IsaAttentionMixin:
             lines.append(f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m_old}, {mask_en}, 0")
             lines.append(f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0")
 
-            lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
+            if inline_normalize:
+                # Single-block fast path: normalise P register-direct (no FP-SRAM l
+                # round-trip, whose per-row store is racy in the unrolled kernel and
+                # PC-pins when looped). softmax(S)=exp(S-m)/sum(exp(S-m)); for one KV
+                # block this also gives correct attention O since (P/l)@V == (P@V)/l.
+                lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+                lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+                lines.append(f"S_RECI_FP f{fp_sum_p}, f{fp_sum_p}, 0")
+                for _ in range(4):  # retire multi-cycle S_RECI_FP before V_MUL_VF reads it
+                    lines.append("S_ADDI_INT gp0, gp0, 0")
+                lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_sum_p}, {mask_en}")
+            else:
+                lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
 
-            lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
-            lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+                lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+                lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
 
-            lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
-            lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
+                lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
+                lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
 
-            lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
+                lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
 
             lines.append(f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}")
 
@@ -738,6 +753,7 @@ class IsaAttentionMixin:
         scale: float,
         rows: int | None = None,
         valid_cols: int | None = None,
+        inline_normalize: bool = False,
     ) -> str:
         """
         Run Online Softmax on one S block.
@@ -745,6 +761,8 @@ class IsaAttentionMixin:
           Output:  P (mlen × mlen) in-place in VRAM
           Updates: m_old, m_res, l in FP SRAM
           ``scale`` is the QK^T scaling factor (typically 1/sqrt(d)).
+          ``inline_normalize`` (single-block only): normalise P by its row-sum
+          register-direct here and skip the FP-SRAM l/final-scale path.
         """
         s_info = self[s_block_matrix]
         s_address = s_info.vram_addr
@@ -760,6 +778,7 @@ class IsaAttentionMixin:
             scale=scale,
             rows=rows,
             valid_cols=valid_cols,
+            inline_normalize=inline_normalize,
         )
 
         return self._emit(isa_code)
