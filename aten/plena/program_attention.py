@@ -724,6 +724,9 @@ class ProgramAttentionMixin:
             if self._needs_explicit_valid_col_mask(active_cols)
             else None
         )
+        # Warm V into MSRAM once so head 0's cold-start-reprimed first tile reads V
+        # (not the QK^T's stale K) on row 0 too — it lands during head 0's softmax.
+        self.warm_v_prefetch(V.name, k_idx)
         for head, s_head in enumerate(s_views):
             o_head = self.alloc(
                 f"_packed_O_head{head}",
