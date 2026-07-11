@@ -6,6 +6,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -46,6 +47,7 @@ from compiler.aten.reference import (
     run_decoder_reference,
     run_native_decoder_scheduled_reference,
 )
+from compiler.utils.load_config import load_toml_config
 
 __all__ = [
     "_fix_large_immediates",
@@ -58,6 +60,49 @@ __all__ = [
 ]
 
 _IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
+
+
+def _find_plena_settings_toml() -> Path | None:
+    env_path = os.environ.get("PLENA_SETTINGS_TOML")
+    if env_path:
+        return Path(env_path)
+
+    candidates = [Path.cwd(), *Path(__file__).resolve().parents]
+    for base in candidates:
+        path = base / "plena_settings.toml"
+        if path.exists():
+            return path
+    return None
+
+
+def _transactional_config_value(key: str) -> int | None:
+    settings_path = _find_plena_settings_toml()
+    if settings_path is None or not settings_path.exists():
+        return None
+    try:
+        config = load_toml_config(settings_path, "CONFIG", mode="TRANSACTIONAL")
+    except Exception:
+        return None
+
+    value = config.get(key)
+    if isinstance(value, dict):
+        value = value.get("value")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_native_decoder_vlen_matches_mlen(mlen: int) -> None:
+    vlen = _transactional_config_value("VLEN")
+    if vlen is None or vlen == mlen:
+        return
+    raise ValueError(
+        "compile_native_hf_decoder currently requires transactional VLEN to equal MLEN "
+        f"because native decoder matrix/projection templates lay out VRAM rows as MLEN-wide "
+        f"tiles. Got MLEN={mlen}, VLEN={vlen}. Use VLEN=MLEN for native decoder runs, "
+        "or update the compiler templates and Rust matrix machine to support mixed VLEN/MLEN."
+    )
 
 
 def _fix_large_immediates(isa_code: str) -> str:
@@ -151,7 +196,9 @@ class AttentionHeadPacking:
     head_slot_dim: int
     group_width: int
     total_q_dim: int
+    active_head_dim: int | None = None
     chunks_per_kv: int = 1
+    logical_broadcast_amount: int | None = None
 
 
 @dataclass
@@ -919,7 +966,6 @@ def _emit_packed_attention_block(
         f"Q_{layer_idx}",
         physical_shape=q_physical_shape,
     )
-    q_full_addr = prog.get_vram_addr(Q.name)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -938,7 +984,6 @@ def _emit_packed_attention_block(
         physical_shape=(total_physical_rows, head_packing.total_q_dim),
     )
     prog.vram_fill_zero(O_full)
-    o_full_addr = prog.get_vram_addr(O_full.name)
 
     kv_stored = _emit_kv_stores(
         prog,
@@ -950,7 +995,7 @@ def _emit_packed_attention_block(
         physical_rows=total_physical_rows,
         checkpoint_recorder=checkpoint_recorder,
         active_seq_len=active_seq_len,
-        active_head_dim=head_packing.head_slot_dim,
+        active_head_dim=head_packing.active_head_dim or head_dim,
     )
 
     scratch_rows = prog.mlen * (head_packing.broadcast_amount + ratio)
@@ -963,117 +1008,32 @@ def _emit_packed_attention_block(
     attn_scratch_addr = prog.get_vram_addr(attn_scratch.name)
 
     rope_matrix, cos_var, sin_var = rope_inputs
-    q_group_stride = Q.physical_shape[0] * prog.mlen
-    o_group_stride = O_full.physical_shape[0] * prog.mlen
-    q_groups = []
-    if batch_size == 1:
-        for kv_h in range(num_kv_heads):
-            for chunk in range(head_packing.chunks_per_kv):
-                group_idx = kv_h * head_packing.chunks_per_kv + chunk
-                q_group_addr = q_full_addr + group_idx * q_group_stride
-                Q_group = prog.alloc_at(
-                    f"Q_group{kv_h}_c{chunk}_{layer_idx}",
-                    seq_len,
-                    prog.mlen,
-                    q_group_addr,
-                    physical_shape=(Q.physical_shape[0], prog.mlen),
-                )
-                _apply_rope_projection(
-                    prog,
-                    Q_group,
-                    rope_matrix,
-                    cos_var,
-                    sin_var,
-                    f"Q_rot_{layer_idx}_g{kv_h}_c{chunk}",
-                )
-                q_groups.append((kv_h, chunk, Q_group))
+    prog.rope_packed_q(
+        Q,
+        rope_matrix,
+        cos_var,
+        sin_var,
+        slab_count=num_kv_heads * head_packing.chunks_per_kv * batch_size,
+        rows_per_slab=rows_per_batch,
+        active_rows=active_seq_len_per_batch,
+    )
 
-    roll_kv_groups = os.environ.get("PLENA_ROLL_KV_GROUPS", "1") != "0"
-    if batch_size == 1 and roll_kv_groups and num_kv_heads > 1:
-        for chunk in range(head_packing.chunks_per_kv):
-            chunk_start = chunk * head_packing.broadcast_amount
-            chunk_heads = min(head_packing.broadcast_amount, ratio - chunk_start)
-            if chunk_heads <= 0:
-                continue
-            prog.flash_attention_packed_groups_looped(
-                Q,
-                kv_stored,
-                group_heads=chunk_heads,
-                head_slot_dim=head_packing.head_slot_dim,
-                output_base_address=o_full_addr + chunk * o_group_stride,
-                scratch_base_address=attn_scratch_addr,
-                broadcast_amount=head_packing.broadcast_amount,
-                scale=scale,
-                causal_mask=causal_mask,
-                q_base_address=q_full_addr + chunk * q_group_stride,
-                group_stride_blocks=head_packing.chunks_per_kv,
-            )
-    elif batch_size == 1:
-        for kv_h, chunk, Q_group in q_groups:
-            chunk_start = chunk * head_packing.broadcast_amount
-            chunk_heads = min(head_packing.broadcast_amount, ratio - chunk_start)
-            if chunk_heads <= 0:
-                continue
-            K_stored, V_stored = kv_stored[kv_h]
-            group_idx = kv_h * head_packing.chunks_per_kv + chunk
-            prog.flash_attention_packed_group(
-                Q_group,
-                K_stored,
-                V_stored,
-                group_heads=chunk_heads,
-                head_slot_dim=head_packing.head_slot_dim,
-                output_base_address=o_full_addr + group_idx * o_group_stride,
-                scratch_base_address=attn_scratch_addr,
-                broadcast_amount=head_packing.broadcast_amount,
-                scale=scale,
-                causal_mask=causal_mask,
-                valid_cols=active_seq_len_per_batch,
-            )
-    else:
-        row_block_stride = rows_per_batch // prog.mlen
-        if rows_per_batch % prog.mlen != 0:
-            raise ValueError(f"rows_per_batch={rows_per_batch} must be a multiple of MLEN={prog.mlen}")
-        batch_vram_stride = rows_per_batch * prog.mlen
-        for batch_idx in range(batch_size):
-            batch_row_offset = batch_idx * batch_vram_stride
-            for kv_h in range(num_kv_heads):
-                for chunk in range(head_packing.chunks_per_kv):
-                    chunk_start = chunk * head_packing.broadcast_amount
-                    chunk_heads = min(head_packing.broadcast_amount, ratio - chunk_start)
-                    if chunk_heads <= 0:
-                        continue
-                    group_idx = kv_h * head_packing.chunks_per_kv + chunk
-                    q_group_addr = q_full_addr + group_idx * q_group_stride + batch_row_offset
-                    Q_group = prog.alloc_at(
-                        f"Q_group{kv_h}_c{chunk}_b{batch_idx}_{layer_idx}",
-                        active_seq_len_per_batch,
-                        prog.mlen,
-                        q_group_addr,
-                        physical_shape=(rows_per_batch, prog.mlen),
-                    )
-                    _apply_rope_projection(
-                        prog,
-                        Q_group,
-                        rope_matrix,
-                        cos_var,
-                        sin_var,
-                        f"Q_rot_{layer_idx}_g{kv_h}_c{chunk}_b{batch_idx}",
-                    )
-                    K_stored, V_stored = kv_stored[kv_h]
-                    prog.flash_attention_packed_group(
-                        Q_group,
-                        K_stored,
-                        V_stored,
-                        group_heads=chunk_heads,
-                        head_slot_dim=head_packing.head_slot_dim,
-                        output_base_address=o_full_addr + group_idx * o_group_stride + batch_row_offset,
-                        scratch_base_address=attn_scratch_addr,
-                        broadcast_amount=head_packing.broadcast_amount,
-                        scale=scale,
-                        causal_mask=causal_mask,
-                        k_idx=batch_idx * row_block_stride,
-                        valid_cols=active_seq_len_per_batch,
-                    )
+    schedule = prog.flash_attention_packed_gqa(
+        Q,
+        O_full,
+        kv_stored,
+        batch_size=batch_size,
+        seq_len=active_seq_len_per_batch,
+        kv_seq_len=active_seq_len_per_batch,
+        rows_per_batch=rows_per_batch,
+        gqa_ratio=ratio,
+        physical_broadcast=head_packing.broadcast_amount,
+        head_slot_dim=head_packing.head_slot_dim,
+        scratch_base_address=attn_scratch_addr,
+        scale=scale,
+        causal_mask=causal_mask,
+    )
+    prog._last_packed_gqa_schedule = schedule
     prog.free_tensor(attn_scratch)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
@@ -2975,6 +2935,8 @@ def compile_native_hf_decoder(
     if component not in {"decoder", "text", "text_decoder"}:
         raise ValueError("component must be 'decoder' or 'vision'")
 
+    _validate_native_decoder_vlen_matches_mlen(mlen)
+
     def _verbose(message: str = ""):
         if verbose:
             print(message)
@@ -3002,7 +2964,7 @@ def compile_native_hf_decoder(
     ratio = model_cfg.head_ratio
     uses_packed_attention = attention_head_packing
     if uses_packed_attention is None:
-        uses_packed_attention = hlen is not None and broadcast_amount is not None and head_dim < mlen
+        uses_packed_attention = hlen is not None and broadcast_amount is not None
 
     # Rows only need enough physical lanes for the matrix writeback group
     # (BLEN) in the generic path. Packed GQA, however, addresses KV-group
@@ -3045,24 +3007,34 @@ def compile_native_hf_decoder(
             raise ValueError("attention_head_packing requires hlen and broadcast_amount")
         if hlen <= 0 or broadcast_amount <= 0:
             raise ValueError(f"hlen and broadcast_amount must be positive, got {hlen}, {broadcast_amount}")
-        if hlen != head_dim:
+        if hlen < head_dim:
             raise ValueError(
-                f"Packed attention head chunking currently requires hlen == head_dim "
-                f"({hlen} != {head_dim})"
+                "Packed GQA does not support head-dimension tiling: "
+                f"HLEN={hlen} is smaller than head_dim={head_dim}. "
+                "Use HLEN >= head_dim."
             )
-        if broadcast_amount * hlen > mlen:
+        if mlen < hlen:
             raise ValueError(
-                f"Packed attention requires broadcast_amount*hlen <= mlen "
-                f"({broadcast_amount}*{hlen} > {mlen})"
+                f"Packed attention requires MLEN >= HLEN so at least one head fits "
+                f"({mlen} < {hlen})"
             )
-        chunks_per_kv = math.ceil(ratio / broadcast_amount)
+        logical_broadcast_amount = broadcast_amount
+        physical_broadcast_amount = min(logical_broadcast_amount, mlen // hlen)
+        if physical_broadcast_amount <= 0:
+            raise ValueError(
+                f"Packed attention cannot derive positive physical broadcast from "
+                f"MLEN={mlen}, HLEN={hlen}, logical_broadcast={logical_broadcast_amount}"
+            )
+        chunks_per_kv = math.ceil(ratio / physical_broadcast_amount)
         head_packing = AttentionHeadPacking(
             enabled=True,
             hlen=hlen,
-            broadcast_amount=broadcast_amount,
+            logical_broadcast_amount=logical_broadcast_amount,
+            broadcast_amount=physical_broadcast_amount,
             head_slot_dim=hlen,
             group_width=mlen,
             total_q_dim=num_kv_heads * chunks_per_kv * mlen,
+            active_head_dim=head_dim,
             chunks_per_kv=chunks_per_kv,
         )
     else:
@@ -3112,7 +3084,8 @@ def compile_native_hf_decoder(
         print(
             "  attention head packing: "
             f"head_dim={head_dim}, hlen={head_packing.hlen}, "
-            f"broadcast_amount={head_packing.broadcast_amount}, "
+            f"logical_broadcast_amount={head_packing.logical_broadcast_amount}, "
+            f"physical_broadcast_amount={head_packing.broadcast_amount}, "
             f"group_width={head_packing.group_width}, "
             f"chunks_per_kv={head_packing.chunks_per_kv}, "
             f"q_groups={num_kv_heads * head_packing.chunks_per_kv}"
@@ -3377,7 +3350,9 @@ def compile_native_hf_decoder(
     )
     if hlen is not None:
         prog.hlen = hlen
-    if broadcast_amount is not None:
+    if head_packing is not None:
+        prog.broadcast_amount = head_packing.broadcast_amount
+    elif broadcast_amount is not None:
         prog.broadcast_amount = broadcast_amount
     checkpoints = StageCheckpointRecorder(enabled=stage_checkpoints)
 
@@ -3592,6 +3567,7 @@ def compile_native_hf_decoder(
         "active_seq_per_batch": seq_len if batch_size > 1 else None,
     }
 
+    packed_schedule = getattr(prog, "_last_packed_gqa_schedule", None)
     info = {
         "model_type": model_cfg.model_type,
         "hidden_size": hidden,
@@ -3608,10 +3584,34 @@ def compile_native_hf_decoder(
         "head_dim": head_dim,
         "padded_head_dim": padded_head_dim,
         "attention_head_packing": head_packing is not None,
+        "attention_schedule": "logical_kv_group" if head_packing is not None else None,
+        "attention_active_head_dim": (
+            head_packing.active_head_dim if head_packing is not None else head_dim
+        ),
         "attention_head_slot_dim": head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
         "attention_kv_storage_head_dim": padded_head_dim,
+        "attention_logical_broadcast_amount": (
+            head_packing.logical_broadcast_amount if head_packing is not None else None
+        ),
         "attention_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
+        "attention_physical_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
         "attention_chunks_per_kv": head_packing.chunks_per_kv if head_packing is not None else 1,
+        "attention_kv_resident": (
+            packed_schedule.resident_kv if packed_schedule is not None else None
+        ),
+        "attention_resident_kv_tiles": (
+            packed_schedule.resident_kv_tiles if packed_schedule is not None else None
+        ),
+        "attention_looped_batch": bool(
+            head_packing is not None and getattr(prog, "_packed_gqa_looped_batch", False)
+        ),
+        "attention_looped_kv_heads": bool(
+            head_packing is not None and getattr(prog, "_packed_gqa_looped_kv_heads", False)
+        ),
+        "attention_looped_full_chunks": bool(
+            head_packing is not None
+            and getattr(prog, "_packed_gqa_looped_full_chunks", False)
+        ),
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "mlen": mlen,
@@ -3644,9 +3644,19 @@ def compile_native_hf_decoder(
             "head_dim",
             "padded_head_dim",
             "attention_head_packing",
+            "attention_schedule",
+            "attention_active_head_dim",
             "attention_head_slot_dim",
             "attention_kv_storage_head_dim",
+            "attention_logical_broadcast_amount",
             "attention_broadcast_amount",
+            "attention_physical_broadcast_amount",
+            "attention_chunks_per_kv",
+            "attention_kv_resident",
+            "attention_resident_kv_tiles",
+            "attention_looped_batch",
+            "attention_looped_kv_heads",
+            "attention_looped_full_chunks",
             "num_heads",
             "num_kv_heads",
             "mlen",

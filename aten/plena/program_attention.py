@@ -4,9 +4,87 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import dataclass
+
 from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
+
+
+@dataclass(frozen=True)
+class PackedGQASchedule:
+    """Compile-time schedule for one logical packed-GQA attention block."""
+
+    batch_size: int
+    seq_len: int
+    kv_seq_len: int
+    rows_per_batch: int
+    num_kv_heads: int
+    gqa_ratio: int
+    physical_broadcast: int
+    chunks_per_kv: int
+    full_chunks: int
+    tail_heads: int
+    q_blocks: int
+    k_blocks: int
+    resident_kv: bool
+    resident_kv_tiles: int
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int,
+        rows_per_batch: int,
+        num_kv_heads: int,
+        gqa_ratio: int,
+        physical_broadcast: int,
+        mlen: int,
+        mram_tile_capacity: int,
+    ) -> "PackedGQASchedule":
+        values = {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "kv_seq_len": kv_seq_len,
+            "rows_per_batch": rows_per_batch,
+            "num_kv_heads": num_kv_heads,
+            "gqa_ratio": gqa_ratio,
+            "physical_broadcast": physical_broadcast,
+            "mlen": mlen,
+            "mram_tile_capacity": mram_tile_capacity,
+        }
+        for name, value in values.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if rows_per_batch < max(seq_len, kv_seq_len):
+            raise ValueError(
+                f"rows_per_batch={rows_per_batch} cannot cover "
+                f"seq_len={seq_len}, kv_seq_len={kv_seq_len}"
+            )
+
+        chunks_per_kv = math.ceil(gqa_ratio / physical_broadcast)
+        full_chunks, tail_heads = divmod(gqa_ratio, physical_broadcast)
+        q_blocks = math.ceil(seq_len / mlen)
+        k_blocks = math.ceil(kv_seq_len / mlen)
+        resident_kv_tiles = 2 * k_blocks
+        return cls(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            kv_seq_len=kv_seq_len,
+            rows_per_batch=rows_per_batch,
+            num_kv_heads=num_kv_heads,
+            gqa_ratio=gqa_ratio,
+            physical_broadcast=physical_broadcast,
+            chunks_per_kv=chunks_per_kv,
+            full_chunks=full_chunks,
+            tail_heads=tail_heads,
+            q_blocks=q_blocks,
+            k_blocks=k_blocks,
+            resident_kv=resident_kv_tiles <= mram_tile_capacity,
+            resident_kv_tiles=resident_kv_tiles,
+        )
 
 
 class ProgramAttentionMixin:
@@ -58,6 +136,210 @@ class ProgramAttentionMixin:
         self.register_allocator.free_gp([gp_mask, gp_fp, gp_loop])
         self.emit("\n".join(lines) + "\n")
         return mask
+
+    def _get_valid_col_mask(self, valid_cols: int) -> VRAMMatrixVar:
+        """Return one program-lifetime mask for a partial K tile."""
+        if not self._needs_explicit_valid_col_mask(valid_cols):
+            raise ValueError(f"valid_cols={valid_cols} does not require an explicit mask")
+
+        cache = getattr(self, "_valid_col_mask_cache", None)
+        if cache is None:
+            cache = {}
+            self._valid_col_mask_cache = cache
+        key = (self.mlen, valid_cols)
+        cached = cache.get(key)
+        if cached is not None and cached.name in getattr(self, "_tensors", {}):
+            return cached
+
+        mask = self._build_valid_col_mask(f"_valid_col_mask_m{self.mlen}_c{valid_cols}", valid_cols)
+        cache[key] = mask
+        return mask
+
+    def rope_packed_q(
+        self,
+        Q_full: VRAMMatrixVar,
+        rope_matrix: InputVar,
+        cos_var: VRAMMatrixVar,
+        sin_var: VRAMMatrixVar,
+        *,
+        slab_count: int,
+        rows_per_slab: int,
+        active_rows: int,
+    ) -> None:
+        """Apply packed Q RoPE with one resident rotation tile and a slab loop."""
+        if slab_count <= 0:
+            raise ValueError(f"slab_count must be positive, got {slab_count}")
+        if active_rows <= 0 or active_rows > rows_per_slab:
+            raise ValueError(
+                f"active_rows must be in [1, rows_per_slab], got {active_rows}, {rows_per_slab}"
+            )
+        if rows_per_slab % self.mlen != 0:
+            raise ValueError(
+                f"rows_per_slab={rows_per_slab} must be a multiple of MLEN={self.mlen}"
+            )
+        if self.mlen % self.blen != 0:
+            raise ValueError(f"Packed Q RoPE requires MLEN % BLEN == 0, got {self.mlen} % {self.blen}")
+        expected_elements = slab_count * rows_per_slab * self.mlen
+        q_elements = Q_full.physical_shape[0] * Q_full.physical_shape[1]
+        if q_elements < expected_elements:
+            raise ValueError(
+                f"Q_full storage has {q_elements} elements but packed slabs require {expected_elements}"
+            )
+
+        self._ensure_hbm_sub_matrix_registered(rope_matrix)
+        rope_layout = self.get_hbm_layout(rope_matrix.name)
+        if rope_layout.num_row_blocks != 1 or rope_layout.num_col_blocks != 1:
+            raise ValueError(
+                "Packed Q RoPE requires one MLEN x MLEN rotation tile, got "
+                f"{rope_layout.num_row_blocks}x{rope_layout.num_col_blocks} tiles"
+            )
+        self.reset_mram()
+        self._emit_hbm_matrix_load(
+            rope_layout,
+            3,
+            lambda addr_reg, gp_regs: self.load_sub_matrix_asm(
+                name=rope_matrix.name,
+                row_idx=0,
+                col_idx=0,
+                mram_dest_addr=0,
+                hbm_addr_reg=addr_reg,
+                gp_regs=gp_regs,
+            ),
+        )
+
+        x_rot = self.alloc(
+            "_packed_q_rot_slab",
+            active_rows,
+            self.mlen,
+            strict=False,
+            physical_shape=(rows_per_slab, self.mlen),
+        )
+        vec_scratch = self.alloc(
+            "_packed_q_rope_vec_scratch",
+            1,
+            self.mlen,
+            strict=False,
+            physical_shape=(1, self.mlen),
+        )
+        q_base = self.get_vram_addr(Q_full.name)
+        x_rot_base = self.get_vram_addr(x_rot.name)
+        cos_base = self.get_vram_addr(cos_var.name)
+        sin_base = self.get_vram_addr(sin_var.name)
+        vec_scratch_base = self.get_vram_addr(vec_scratch.name)
+        slab_stride = rows_per_slab * self.mlen
+        tile_elems = self.mlen * self.mlen
+        col_groups = self.mlen // self.blen
+        q_blocks = math.ceil(active_rows / self.mlen)
+
+        (
+            gp_q_slab,
+            gp_act_row,
+            gp_act,
+            gp_mat,
+            gp_result,
+            gp_result_col,
+            gp_x,
+            gp_x_rot,
+            gp_cos,
+            gp_sin,
+            gp_vec_scratch,
+            gp_slab_loop,
+            gp_col_loop,
+            gp_row_loop,
+            gp_rope_loop,
+        ) = self.register_allocator.allocate_gp(15)
+        try:
+            lines = [
+                f"; === Packed Q RoPE: slabs={slab_count}, active_rows={active_rows} ===",
+                *load_large_int(gp_q_slab, q_base),
+            ]
+            if slab_count > 1:
+                lines.append(f"C_LOOP_START gp{gp_slab_loop}, {slab_count}")
+
+            for q_block in range(q_blocks):
+                rows = min(self.mlen, active_rows - q_block * self.mlen)
+                row_groups = math.ceil(rows / self.blen)
+                lines.extend(
+                    [
+                        f"; Packed Q rotate-half projection q_block={q_block}, rows={rows}",
+                        f"S_ADDI_INT gp{gp_act_row}, gp{gp_q_slab}, 0",
+                        *add_large_int(
+                            gp_act_row,
+                            gp_act_row,
+                            q_block * tile_elems,
+                            temp_reg=gp_rope_loop,
+                        ),
+                        f"S_ADDI_INT gp{gp_mat}, gp0, 0",
+                        *load_large_int(gp_result_col, x_rot_base + q_block * tile_elems),
+                        f"C_LOOP_START gp{gp_col_loop}, {col_groups}",
+                        f"S_ADDI_INT gp{gp_act}, gp{gp_act_row}, 0",
+                        f"S_ADDI_INT gp{gp_result}, gp{gp_result_col}, 0",
+                        f"C_LOOP_START gp{gp_row_loop}, {row_groups}",
+                        f"M_MM 0, gp{gp_mat}, gp{gp_act}",
+                        f"M_MM_WO gp{gp_result}, gp0, 0",
+                        f"S_ADDI_INT gp{gp_act}, gp{gp_act}, {self.blen * self.mlen}",
+                        f"S_ADDI_INT gp{gp_result}, gp{gp_result}, {self.blen * self.mlen}",
+                        f"C_LOOP_END gp{gp_row_loop}",
+                        f"S_ADDI_INT gp{gp_mat}, gp{gp_mat}, {self.blen}",
+                        f"S_ADDI_INT gp{gp_result_col}, gp{gp_result_col}, {self.blen}",
+                        f"C_LOOP_END gp{gp_col_loop}",
+                    ]
+                )
+
+            lines.extend(
+                [
+                    "; Packed Q RoPE vector phase",
+                    f"S_ADDI_INT gp{gp_x}, gp{gp_q_slab}, 0",
+                    *load_large_int(gp_x_rot, x_rot_base),
+                    *load_large_int(gp_cos, cos_base),
+                    *load_large_int(gp_sin, sin_base),
+                    *load_large_int(gp_vec_scratch, vec_scratch_base),
+                    f"C_LOOP_START gp{gp_rope_loop}, {active_rows}",
+                    f"V_MUL_VV gp{gp_vec_scratch}, gp{gp_x_rot}, gp{gp_sin}, 0",
+                    f"V_MUL_VV gp{gp_x}, gp{gp_x}, gp{gp_cos}, 0",
+                    f"V_ADD_VV gp{gp_x}, gp{gp_x}, gp{gp_vec_scratch}, 0",
+                    f"S_ADDI_INT gp{gp_x}, gp{gp_x}, {self.mlen}",
+                    f"S_ADDI_INT gp{gp_x_rot}, gp{gp_x_rot}, {self.mlen}",
+                    f"S_ADDI_INT gp{gp_cos}, gp{gp_cos}, {self.mlen}",
+                    f"S_ADDI_INT gp{gp_sin}, gp{gp_sin}, {self.mlen}",
+                    f"C_LOOP_END gp{gp_rope_loop}",
+                ]
+            )
+            if slab_count > 1:
+                lines.extend(
+                    [
+                        *add_large_int(
+                            gp_q_slab,
+                            gp_q_slab,
+                            slab_stride,
+                            temp_reg=gp_rope_loop,
+                        ),
+                        f"C_LOOP_END gp{gp_slab_loop}",
+                    ]
+                )
+            self.emit("\n".join(lines) + "\n")
+        finally:
+            self.register_allocator.free_gp(
+                [
+                    gp_q_slab,
+                    gp_act_row,
+                    gp_act,
+                    gp_mat,
+                    gp_result,
+                    gp_result_col,
+                    gp_x,
+                    gp_x_rot,
+                    gp_cos,
+                    gp_sin,
+                    gp_vec_scratch,
+                    gp_slab_loop,
+                    gp_col_loop,
+                    gp_row_loop,
+                    gp_rope_loop,
+                ]
+            )
+            self.free_tensor(x_rot)
+            self.free_tensor(vec_scratch)
 
     def flash_attention(
         self,
@@ -171,9 +453,7 @@ class ProgramAttentionMixin:
         for k_idx in range(num_k_blocks):
             block_cols = min(mlen, kv_seq_len - k_idx * mlen)
             if self._needs_explicit_valid_col_mask(block_cols):
-                valid_col_masks[block_cols] = self._build_valid_col_mask(
-                    f"_mha_valid_col_mask_{block_cols}", block_cols
-                )
+                valid_col_masks[block_cols] = self._get_valid_col_mask(block_cols)
 
         S_block = self.alloc("S", mlen, mlen)
         pv_rows = min(mlen, seq_len)
@@ -286,9 +566,6 @@ class ProgramAttentionMixin:
                     self.vram_add(O_batch, PV, dst_row_offset=q_idx * mlen, num_rows=block_rows)
 
                 self.final_scale_o(q_idx, O_batch, rows=block_rows)
-
-        for mask in valid_col_masks.values():
-            self.free_tensor(mask)
 
         return O
 
@@ -464,20 +741,7 @@ class ProgramAttentionMixin:
         k_head_offset: int = 0,
     ) -> None:
         """Emit packed QK^T with M_BTMM/M_BMM_WO into head-major S tiles."""
-        self._ensure_hbm_sub_matrix_registered(K)
-        k_layout = self.get_hbm_layout(K.name)
-        self._emit_hbm_matrix_load(
-            k_layout,
-            3,
-            lambda addr_reg, gp_regs: self.load_sub_matrix_asm(
-                name=K.name,
-                row_idx=k_idx,
-                col_idx=0,
-                mram_dest_addr=0,
-                hbm_addr_reg=addr_reg,
-                gp_regs=gp_regs,
-            ),
-        )
+        self._emit_packed_kv_prefetch(K, ((k_idx, 0),))
 
         q_base = self.get_vram_addr(Q_group.name) + q_idx * self.mlen * self.mlen
         gp_q, gp_s = self.register_allocator.allocate_gp(2)
@@ -490,6 +754,129 @@ class ProgramAttentionMixin:
         ]
         self.register_allocator.free_gp([gp_q, gp_s])
         self.emit("\n".join(lines) + "\n")
+
+    def _emit_packed_kv_prefetch(
+        self,
+        input_var: InputVar,
+        tiles: tuple[tuple[int, int], ...],
+    ) -> None:
+        """Prefetch packed K/V sequence tiles using KeyValue precision."""
+        self._ensure_hbm_sub_matrix_registered(input_var)
+        layout = self.get_hbm_layout(input_var.name)
+
+        def build_body(addr_reg, gp_regs):
+            gp_scale, gp_stride, gp_mram = gp_regs
+            rows, cols = layout.physical_shape or layout.full_shape
+            lines = [
+                *load_large_int(gp_scale, rows * cols),
+                f"C_SET_SCALE_REG gp{gp_scale}",
+                *load_large_int(gp_stride, cols),
+                f"C_SET_STRIDE_REG gp{gp_stride}",
+            ]
+            for row_idx, mram_dest in tiles:
+                hbm_offset = layout.get_sub_block(row_idx, 0).hbm_offset
+                lines.append(
+                    f"; Load SubMatrix {input_var.name}[{row_idx}][0] -> "
+                    f"MRAM[{mram_dest}] (KeyValue precision)"
+                )
+                lines.extend(load_large_int(gp_mram, mram_dest))
+                lines.extend(load_large_int(gp_scale, hbm_offset))
+                lines.append(
+                    f"H_PREFETCH_M gp{gp_mram}, gp{gp_scale}, a{addr_reg}, 1, 1"
+                )
+            return "\n".join(lines) + "\n"
+
+        self._emit_hbm_matrix_load(layout, 3, build_body)
+
+    def _emit_packed_qkt_from_mram(
+        self,
+        *,
+        Q_group: VRAMMatrixVar,
+        q_idx: int,
+        k_mram_address: int,
+        s_base_address: int,
+    ) -> None:
+        """Emit packed QK^T against a K tile already resident in MRAM."""
+        q_base = self.get_vram_addr(Q_group.name) + q_idx * self.mlen * self.mlen
+        gp_q, gp_k, gp_s = self.register_allocator.allocate_gp(3)
+        lines = [
+            "; === Packed GQA QK^T using resident K tile ===",
+            *load_large_int(gp_q, q_base),
+            *load_large_int(gp_k, k_mram_address),
+            f"M_BTMM 0, gp{gp_k}, gp{gp_q}",
+            *load_large_int(gp_s, s_base_address),
+            f"M_BMM_WO gp{gp_s}, 0",
+        ]
+        self.register_allocator.free_gp([gp_q, gp_k, gp_s])
+        self.emit("\n".join(lines) + "\n")
+
+    def _compute_pv_from_mram(
+        self,
+        *,
+        s_block: VRAMMatrixVar,
+        pv_matrix: VRAMMatrixVar,
+        v_mram_address: int,
+        head_slot_dim: int,
+        rows: int,
+    ) -> None:
+        """Emit PV using a V tile that is already resident in MRAM."""
+        gp_p, gp_v, gp_pv, gp_pv_col, gp_v_loop, gp_p_loop = (
+            self.register_allocator.allocate_gp(6)
+        )
+        p_address = self.get_vram_addr(s_block.name)
+        pv_address = self.get_vram_addr(pv_matrix.name)
+        v_col_groups = max(1, math.ceil(head_slot_dim / self.blen))
+        p_row_groups = max(1, math.ceil(rows / self.blen))
+        lines = [
+            "; === PV Multiply using resident V tile ===",
+            *load_large_int(gp_v, v_mram_address),
+            *load_large_int(gp_pv_col, pv_address),
+            f"C_LOOP_START gp{gp_v_loop}, {v_col_groups}",
+            *load_large_int(gp_p, p_address),
+            f"S_ADDI_INT gp{gp_pv}, gp{gp_pv_col}, 0",
+            f"C_LOOP_START gp{gp_p_loop}, {p_row_groups}",
+            f"M_MM 0, gp{gp_v}, gp{gp_p}",
+            f"M_MM_WO gp{gp_pv}, gp0, 0",
+            f"S_ADDI_INT gp{gp_p}, gp{gp_p}, {self.blen * self.mlen}",
+            f"S_ADDI_INT gp{gp_pv}, gp{gp_pv}, {self.blen * self.mlen}",
+            f"C_LOOP_END gp{gp_p_loop}",
+            f"S_ADDI_INT gp{gp_v}, gp{gp_v}, {self.blen}",
+            f"S_ADDI_INT gp{gp_pv_col}, gp{gp_pv_col}, {self.blen}",
+            f"C_LOOP_END gp{gp_v_loop}",
+        ]
+        self.register_allocator.free_gp(
+            [gp_p, gp_v, gp_pv, gp_pv_col, gp_v_loop, gp_p_loop]
+        )
+        self.emit("\n".join(lines) + "\n")
+
+    def _prefetch_packed_kv_resident(
+        self,
+        K: InputVar,
+        V: InputVar,
+        *,
+        first_k_idx: int,
+        num_k_blocks: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Load all K/V sequence tiles for one batch and logical KV head."""
+        self._ensure_hbm_sub_matrix_registered(K)
+        self._ensure_hbm_sub_matrix_registered(V)
+        tile_elems = self.mlen * self.mlen
+        k_addresses = tuple(block * tile_elems for block in range(num_k_blocks))
+        v_addresses = tuple((num_k_blocks + block) * tile_elems for block in range(num_k_blocks))
+
+        self.emit(
+            f"; === Resident packed GQA K/V preload: first_k_idx={first_k_idx}, "
+            f"tiles={2 * num_k_blocks} ===\n"
+        )
+        self._emit_packed_kv_prefetch(
+            K,
+            tuple((first_k_idx + block, k_addresses[block]) for block in range(num_k_blocks)),
+        )
+        self._emit_packed_kv_prefetch(
+            V,
+            tuple((first_k_idx + block, v_addresses[block]) for block in range(num_k_blocks)),
+        )
+        return k_addresses, v_addresses
 
     def _emit_packed_qkt_to_s_dynamic(
         self,
@@ -512,7 +899,7 @@ class ProgramAttentionMixin:
             f"C_SET_STRIDE_REG gp{gp_hbm}",
             f"S_ADDI_INT gp{gp_mram}, gp0, 0",
             *load_large_int(gp_hbm, k_hbm_offset),
-            f"H_PREFETCH_M gp{gp_mram}, gp{gp_hbm}, a{k_hbm_addr_reg}, 1, 0",
+            f"H_PREFETCH_M gp{gp_mram}, gp{gp_hbm}, a{k_hbm_addr_reg}, 1, 1",
             f"M_BTMM {k_head_offset}, gp0, gp{q_base_gp}",
             *load_large_int(gp_s, s_base_address),
             f"M_BMM_WO gp{gp_s}, 0",
@@ -538,6 +925,242 @@ class ProgramAttentionMixin:
         ]
         self.register_allocator.free_gp([gp_addr, gp_loop])
         self.emit("\n".join(lines) + "\n")
+
+    def _scale_direct_o_from_gp(self, *, output_base_gp: int, rows: int) -> None:
+        """Scale a loop-carried single-slot O block by online-softmax m_res."""
+        gp_m_res, gp_o, gp_loop = self.register_allocator.allocate_gp(3)
+        m_res_address = self._ONLINE_SOFTMAX_FPSRAM_BASE + self.mlen
+        lines = [
+            "; === Scale direct packed O by m_res ===",
+            *load_large_int(gp_m_res, m_res_address),
+            f"S_ADDI_INT gp{gp_o}, gp{output_base_gp}, 0",
+            f"C_LOOP_START gp{gp_loop}, {rows}",
+            f"S_LD_FP f1, gp{gp_m_res}, 0",
+            f"V_MUL_VF gp{gp_o}, gp{gp_o}, f1, 0",
+            f"S_ADDI_INT gp{gp_m_res}, gp{gp_m_res}, 1",
+            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {self.mlen}",
+            f"C_LOOP_END gp{gp_loop}",
+        ]
+        self.register_allocator.free_gp([gp_m_res, gp_o, gp_loop])
+        self.emit("\n".join(lines) + "\n")
+
+    def _add_pv_to_direct_o_from_gp(
+        self,
+        *,
+        output_base_gp: int,
+        pv: VRAMMatrixVar,
+        rows: int,
+    ) -> None:
+        """Accumulate a static PV tile into a loop-carried single-slot O block."""
+        gp_o, gp_pv, gp_loop = self.register_allocator.allocate_gp(3)
+        lines = [
+            "; === Add PV to direct packed O ===",
+            f"S_ADDI_INT gp{gp_o}, gp{output_base_gp}, 0",
+            *load_large_int(gp_pv, self.get_vram_addr(pv.name)),
+            f"C_LOOP_START gp{gp_loop}, {rows}",
+            f"V_ADD_VV gp{gp_o}, gp{gp_o}, gp{gp_pv}, 0",
+            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {self.mlen}",
+            f"S_ADDI_INT gp{gp_pv}, gp{gp_pv}, {self.mlen}",
+            f"C_LOOP_END gp{gp_loop}",
+        ]
+        self.register_allocator.free_gp([gp_o, gp_pv, gp_loop])
+        self.emit("\n".join(lines) + "\n")
+
+    def _final_scale_direct_o_from_gp(self, *, output_base_gp: int, rows: int) -> None:
+        """Apply the final online-softmax normalization to loop-carried O."""
+        gp_l, gp_o, gp_loop = self.register_allocator.allocate_gp(3)
+        l_address = self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * self.mlen
+        lines = [
+            "; === Final scale direct packed O ===",
+            *load_large_int(gp_l, l_address),
+            f"S_ADDI_INT gp{gp_o}, gp{output_base_gp}, 0",
+            f"C_LOOP_START gp{gp_loop}, {rows}",
+            f"S_LD_FP f1, gp{gp_l}, 0",
+            f"S_RECI_FP f1, f1, 0",
+            f"V_MUL_VF gp{gp_o}, gp{gp_o}, f1, 0",
+            f"S_ADDI_INT gp{gp_l}, gp{gp_l}, 1",
+            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {self.mlen}",
+            f"C_LOOP_END gp{gp_loop}",
+        ]
+        self.register_allocator.free_gp([gp_l, gp_o, gp_loop])
+        self.emit("\n".join(lines) + "\n")
+
+    def _emit_resident_single_head_chunks_looped(
+        self,
+        *,
+        q_base_address: int | None,
+        o_base_address: int | None,
+        group_stride: int,
+        chunk_count: int,
+        seq_len: int,
+        kv_seq_len: int,
+        head_slot_dim: int,
+        scratch_base_address: int,
+        scale: float,
+        causal_mask: bool | VRAMMatrixVar | None,
+        resident_k_mram: tuple[int, ...],
+        resident_v_mram: tuple[int, ...],
+        q_base_gp: int | None = None,
+        o_base_gp: int | None = None,
+        advance_base_pointers: bool = False,
+    ) -> None:
+        """Loop all single-head chunks while reusing resident K/V tiles."""
+        if chunk_count <= 0:
+            raise ValueError(f"chunk_count must be positive, got {chunk_count}")
+        num_q_blocks = math.ceil(seq_len / self.mlen)
+        num_k_blocks = math.ceil(kv_seq_len / self.mlen)
+        if len(resident_k_mram) != num_k_blocks or len(resident_v_mram) != num_k_blocks:
+            raise ValueError("resident K/V address lists do not match sequence K blocks")
+        softmax_scale = scale / 0.25
+        s_head = self.alloc_at(
+            "_resident_chunk_loop_S",
+            self.mlen,
+            self.mlen,
+            scratch_base_address,
+            physical_shape=(self.mlen, self.mlen),
+        )
+        pv = self.alloc(
+            "_resident_chunk_loop_PV",
+            self.mlen,
+            head_slot_dim,
+            strict=False,
+            physical_shape=(self.mlen, self.mlen),
+        )
+        valid_col_masks: dict[int, VRAMMatrixVar] = {}
+        for k_block in range(num_k_blocks):
+            block_cols = min(self.mlen, kv_seq_len - k_block * self.mlen)
+            if self._needs_explicit_valid_col_mask(block_cols):
+                valid_col_masks[block_cols] = self._get_valid_col_mask(block_cols)
+
+        if (q_base_gp is None) != (o_base_gp is None):
+            raise ValueError("q_base_gp and o_base_gp must be provided together")
+        if q_base_gp is None:
+            if q_base_address is None or o_base_address is None:
+                raise ValueError("static q/o base addresses are required when base GPs are absent")
+            local_regs = self.register_allocator.allocate_gp(6)
+            gp_q, gp_o, gp_q_block, gp_o_block, gp_chunk_loop, gp_tmp = local_regs
+        else:
+            local_regs = self.register_allocator.allocate_gp(4)
+            gp_q = q_base_gp
+            gp_o = o_base_gp
+            gp_q_block, gp_o_block, gp_chunk_loop, gp_tmp = local_regs
+        try:
+            setup = [
+                f"; === Resident packed GQA full-chunk loop: chunks={chunk_count} ===",
+            ]
+            if q_base_gp is None:
+                setup.extend(load_large_int(gp_q, q_base_address))
+                setup.extend(load_large_int(gp_o, o_base_address))
+            if chunk_count > 1:
+                setup.append(f"C_LOOP_START gp{gp_chunk_loop}, {chunk_count}")
+            self.emit("\n".join(setup) + "\n")
+
+            for q_block in range(num_q_blocks):
+                rows = min(self.mlen, seq_len - q_block * self.mlen)
+                q_block_offset = q_block * self.mlen * self.mlen
+                block_setup = [
+                    f"; Resident packed GQA q_block={q_block}, rows={rows}",
+                    f"S_ADDI_INT gp{gp_q_block}, gp{gp_q}, 0",
+                    *add_large_int(
+                        gp_q_block,
+                        gp_q_block,
+                        q_block_offset,
+                        temp_reg=gp_tmp,
+                    ),
+                    f"S_ADDI_INT gp{gp_o_block}, gp{gp_o}, 0",
+                    *add_large_int(
+                        gp_o_block,
+                        gp_o_block,
+                        q_block_offset,
+                        temp_reg=gp_tmp,
+                    ),
+                ]
+                self.emit("\n".join(block_setup) + "\n")
+                self.emit(
+                    self._reset_fpsram_asm(
+                        self._ONLINE_SOFTMAX_FPSRAM_BASE,
+                        self.mlen,
+                        2,
+                    )
+                )
+                self.emit(
+                    self._reset_fpsram_asm(
+                        self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * self.mlen,
+                        self.mlen,
+                        0,
+                    )
+                )
+
+                for k_block in range(num_k_blocks):
+                    if causal_mask is not None and k_block > q_block:
+                        self.emit(
+                            f"; Skip future packed-GQA K block q_block={q_block}, "
+                            f"k_block={k_block}\n"
+                        )
+                        continue
+                    self.emit(
+                        "\n".join(
+                            [
+                                "; === Packed GQA QK^T using resident K tile and loop-carried Q ===",
+                                *load_large_int(gp_tmp, resident_k_mram[k_block]),
+                                f"M_BTMM 0, gp{gp_tmp}, gp{gp_q_block}",
+                                *load_large_int(gp_tmp, scratch_base_address),
+                                f"M_BMM_WO gp{gp_tmp}, 0",
+                            ]
+                        )
+                        + "\n"
+                    )
+                    block_cols = min(self.mlen, kv_seq_len - k_block * self.mlen)
+                    valid_col_mask = valid_col_masks.get(block_cols)
+                    if valid_col_mask is not None:
+                        self.vram_add(s_head, valid_col_mask, num_rows=rows)
+                    apply_causal_mask = causal_mask is not None and k_block == q_block
+                    if isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask:
+                        self.vram_add(s_head, causal_mask, num_rows=rows)
+                    elif causal_mask is True and apply_causal_mask:
+                        self.emit(
+                            "; NOTE: packed attention received causal_mask=True without a VRAM mask; "
+                            "no mask applied.\n"
+                        )
+                    softmax_valid_cols = (
+                        None
+                        if valid_col_mask is not None
+                        or (isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask)
+                        else block_cols
+                    )
+                    self.online_softmax_block(
+                        s_head,
+                        softmax_scale,
+                        rows=rows,
+                        valid_cols=softmax_valid_cols,
+                    )
+                    self._compute_pv_from_mram(
+                        s_block=s_head,
+                        pv_matrix=pv,
+                        v_mram_address=resident_v_mram[k_block],
+                        head_slot_dim=head_slot_dim,
+                        rows=rows,
+                    )
+                    self._scale_direct_o_from_gp(output_base_gp=gp_o_block, rows=rows)
+                    self._add_pv_to_direct_o_from_gp(
+                        output_base_gp=gp_o_block,
+                        pv=pv,
+                        rows=rows,
+                    )
+                self._final_scale_direct_o_from_gp(output_base_gp=gp_o_block, rows=rows)
+
+            if chunk_count > 1 or advance_base_pointers:
+                update = [
+                    *add_large_int(gp_q, gp_q, group_stride, temp_reg=gp_tmp),
+                    *add_large_int(gp_o, gp_o, group_stride, temp_reg=gp_tmp),
+                ]
+                if chunk_count > 1:
+                    update.append(f"C_LOOP_END gp{gp_chunk_loop}")
+                self.emit("\n".join(update) + "\n")
+        finally:
+            self.register_allocator.free_gp(local_regs)
+            self.free_tensor(s_head)
+            self.free_tensor(pv)
 
     def _pack_o_head_to_output(
         self,
@@ -618,6 +1241,10 @@ class ProgramAttentionMixin:
         output_head_base: int = 0,
         k_idx: int = 0,
         valid_cols: int | None = None,
+        resident_k_mram: tuple[int, ...] | None = None,
+        resident_v_mram: tuple[int, ...] | None = None,
+        output_precleared: bool = False,
+        direct_output: bool = False,
     ) -> None:
         """Compiler-owned packed-head flash attention for one KV group."""
         seq_len, q_width = Q_group.shape
@@ -652,6 +1279,19 @@ class ProgramAttentionMixin:
 
         num_q_blocks = math.ceil(seq_len / mlen)
         num_k_blocks = math.ceil(active_k_cols / mlen)
+        if (resident_k_mram is None) != (resident_v_mram is None):
+            raise ValueError("resident K and V MRAM address lists must be provided together")
+        if resident_k_mram is not None:
+            if len(resident_k_mram) != num_k_blocks or len(resident_v_mram) != num_k_blocks:
+                raise ValueError(
+                    f"resident K/V tile count must equal k_blocks={num_k_blocks}, got "
+                    f"{len(resident_k_mram)} and {len(resident_v_mram)}"
+                )
+        if direct_output and (group_heads != 1 or broadcast_amount != 1 or output_head_base != 0):
+            raise ValueError(
+                "direct packed-GQA output requires one active head, physical broadcast 1, "
+                "and output_head_base 0"
+            )
         # M_BTMM applies the emulator's fixed bmm_scale (0.25). Compensate in
         # online softmax so the effective QK scale remains caller-provided.
         softmax_scale = scale / 0.25
@@ -667,37 +1307,58 @@ class ProgramAttentionMixin:
             for head in range(group_heads)
         ]
         pv = self.alloc("_packed_PV", mlen, head_slot_dim, strict=False, physical_shape=(mlen, mlen))
-        pack_scratch = self.alloc("_packed_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen))
-        pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
+        pack_scratch = None
+        pack_scratch_addr = None
+        if not direct_output:
+            pack_scratch = self.alloc(
+                "_packed_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen)
+            )
+            pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
 
         valid_col_masks: dict[int, VRAMMatrixVar] = {}
         for k_block in range(num_k_blocks):
             block_cols = min(mlen, active_k_cols - k_block * mlen)
             if self._needs_explicit_valid_col_mask(block_cols):
-                valid_col_masks[block_cols] = self._build_valid_col_mask(
-                    f"_packed_valid_col_mask_{block_cols}", block_cols
-                )
+                valid_col_masks[block_cols] = self._get_valid_col_mask(block_cols)
 
         for q_block in range(num_q_blocks):
             rows = min(mlen, seq_len - q_block * mlen)
-            self.emit(
-                self._reset_vram_asm(
-                    start_address=output_base_address,
-                    rows=rows,
-                    cols=mlen,
-                    total_rows=output_physical_rows,
-                    mlen=mlen,
-                    row_offset=q_block * mlen,
+            if not output_precleared:
+                self.emit(
+                    self._reset_vram_asm(
+                        start_address=output_base_address,
+                        rows=rows,
+                        cols=mlen,
+                        total_rows=output_physical_rows,
+                        mlen=mlen,
+                        row_offset=q_block * mlen,
+                    )
                 )
-            )
             for head, s_head in enumerate(s_views):
-                o_head = self.alloc(
-                    f"_packed_O_q{q_block}_head{head}",
-                    rows,
-                    head_slot_dim,
-                    strict=False,
-                    physical_shape=(mlen, mlen),
+                output_head = output_head_base + head
+                output_col_block = (output_head * head_slot_dim) // mlen
+                output_lane = (output_head * head_slot_dim) % mlen // head_slot_dim
+                output_block_base = (
+                    output_base_address
+                    + output_col_block * output_physical_rows * mlen
+                    + q_block * mlen * mlen
                 )
+                if direct_output:
+                    o_head = self.alloc_at(
+                        f"_packed_direct_O_q{q_block}",
+                        rows,
+                        head_slot_dim,
+                        output_block_base,
+                        physical_shape=(output_physical_rows, mlen),
+                    )
+                else:
+                    o_head = self.alloc(
+                        f"_packed_O_q{q_block}_head{head}",
+                        rows,
+                        head_slot_dim,
+                        strict=False,
+                        physical_shape=(mlen, mlen),
+                    )
                 self.init_online_softmax(0, o_head, rows=rows)
 
                 for k_block in range(num_k_blocks):
@@ -708,13 +1369,21 @@ class ProgramAttentionMixin:
                         continue
                     block_cols = min(mlen, active_k_cols - k_block * mlen)
                     physical_k_idx = k_idx + k_block
-                    self._emit_packed_qkt_to_s(
-                        Q_group=Q_group,
-                        K=K,
-                        q_idx=q_block,
-                        k_idx=physical_k_idx,
-                        s_base_address=scratch_base_address,
-                    )
+                    if resident_k_mram is None:
+                        self._emit_packed_qkt_to_s(
+                            Q_group=Q_group,
+                            K=K,
+                            q_idx=q_block,
+                            k_idx=physical_k_idx,
+                            s_base_address=scratch_base_address,
+                        )
+                    else:
+                        self._emit_packed_qkt_from_mram(
+                            Q_group=Q_group,
+                            q_idx=q_block,
+                            k_mram_address=resident_k_mram[k_block],
+                            s_base_address=scratch_base_address,
+                        )
 
                     valid_col_mask = valid_col_masks.get(block_cols)
                     if valid_col_mask is not None:
@@ -730,34 +1399,203 @@ class ProgramAttentionMixin:
                         else block_cols
                     )
                     self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
-                    self.compute_pv(s_head, V, physical_k_idx, pv, head_slot_dim, rows=rows)
+                    if resident_v_mram is None:
+                        self.compute_pv(s_head, V, physical_k_idx, pv, head_slot_dim, rows=rows)
+                    else:
+                        self._compute_pv_from_mram(
+                            s_block=s_head,
+                            pv_matrix=pv,
+                            v_mram_address=resident_v_mram[k_block],
+                            head_slot_dim=head_slot_dim,
+                            rows=rows,
+                        )
                     self.scale_o_row(o_head, 0, rows=rows)
                     self.vram_add(o_head, pv, num_rows=rows)
 
                 self.final_scale_o(0, o_head, rows=rows)
-                output_head = output_head_base + head
-                output_col_block = (output_head * head_slot_dim) // mlen
-                output_lane = (output_head * head_slot_dim) % mlen // head_slot_dim
-                output_block_base = (
-                    output_base_address
-                    + output_col_block * output_physical_rows * mlen
-                    + q_block * mlen * mlen
-                )
-                self._pack_o_head_to_output(
-                    o_head=o_head,
-                    output_base_address=output_block_base,
-                    output_physical_rows=output_physical_rows,
-                    head_slot=output_lane,
-                    head_slot_dim=head_slot_dim,
-                    rows=rows,
-                    scratch_address=pack_scratch_addr,
-                )
+                if not direct_output:
+                    self._pack_o_head_to_output(
+                        o_head=o_head,
+                        output_base_address=output_block_base,
+                        output_physical_rows=output_physical_rows,
+                        head_slot=output_lane,
+                        head_slot_dim=head_slot_dim,
+                        rows=rows,
+                        scratch_address=pack_scratch_addr,
+                    )
                 self.free_tensor(o_head)
 
-        for valid_col_mask in valid_col_masks.values():
-            self.free_tensor(valid_col_mask)
         self.free_tensor(pv)
-        self.free_tensor(pack_scratch)
+        if pack_scratch is not None:
+            self.free_tensor(pack_scratch)
+
+    def flash_attention_packed_gqa(
+        self,
+        Q_full: VRAMMatrixVar,
+        O_full: VRAMMatrixVar,
+        kv_pairs: list[tuple[InputVar, InputVar]],
+        *,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int | None = None,
+        rows_per_batch: int,
+        gqa_ratio: int,
+        physical_broadcast: int,
+        head_slot_dim: int,
+        scratch_base_address: int,
+        scale: float | None = None,
+        causal_mask: bool | VRAMMatrixVar | None = True,
+    ) -> PackedGQASchedule:
+        """Canonical packed-GQA lowering scheduled by logical KV group."""
+        if kv_seq_len is None:
+            kv_seq_len = seq_len
+        schedule = PackedGQASchedule.build(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            kv_seq_len=kv_seq_len,
+            rows_per_batch=rows_per_batch,
+            num_kv_heads=len(kv_pairs),
+            gqa_ratio=gqa_ratio,
+            physical_broadcast=physical_broadcast,
+            mlen=self.mlen,
+            mram_tile_capacity=self.mram_tile_capacity,
+        )
+        if not hasattr(self, "_packed_gqa_looped_batch"):
+            self._packed_gqa_looped_batch = False
+            self._packed_gqa_looped_kv_heads = False
+            self._packed_gqa_looped_full_chunks = False
+        if not kv_pairs:
+            raise ValueError("kv_pairs must not be empty")
+        if self.mlen % self.blen != 0:
+            raise ValueError(f"Packed GQA requires MLEN % BLEN == 0, got {self.mlen} % {self.blen}")
+        if head_slot_dim > self.mlen:
+            raise ValueError(
+                f"Packed GQA head_slot_dim={head_slot_dim} exceeds MLEN={self.mlen}"
+            )
+        if physical_broadcast * head_slot_dim > self.mlen:
+            raise ValueError(
+                "physical_broadcast*head_slot_dim must fit MLEN "
+                f"({physical_broadcast}*{head_slot_dim} > {self.mlen})"
+            )
+        if rows_per_batch % self.mlen != 0:
+            raise ValueError(
+                f"rows_per_batch={rows_per_batch} must be a multiple of MLEN={self.mlen}"
+            )
+        if Q_full.physical_shape[0] < batch_size * rows_per_batch:
+            raise ValueError(
+                f"Q_full physical rows {Q_full.physical_shape[0]} cannot cover "
+                f"batch_size*rows_per_batch={batch_size * rows_per_batch}"
+            )
+        if O_full.physical_shape[0] < batch_size * rows_per_batch:
+            raise ValueError(
+                f"O_full physical rows {O_full.physical_shape[0]} cannot cover "
+                f"batch_size*rows_per_batch={batch_size * rows_per_batch}"
+            )
+
+        group_count = len(kv_pairs) * schedule.chunks_per_kv
+        required_width = group_count * self.mlen
+        if Q_full.physical_shape[1] < required_width:
+            raise ValueError(
+                f"Q_full physical width {Q_full.physical_shape[1]} cannot hold "
+                f"{group_count} packed groups ({required_width} columns)"
+            )
+        if O_full.physical_shape[1] < required_width:
+            raise ValueError(
+                f"O_full physical width {O_full.physical_shape[1]} cannot hold "
+                f"{group_count} packed groups ({required_width} columns)"
+            )
+        if scale is None:
+            scale = 1.0 / math.sqrt(head_slot_dim)
+
+        q_base = self.get_vram_addr(Q_full.name)
+        o_base = self.get_vram_addr(O_full.name)
+        total_physical_rows = Q_full.physical_shape[0]
+        q_group_stride = total_physical_rows * self.mlen
+        o_group_stride = O_full.physical_shape[0] * self.mlen
+        batch_row_stride = rows_per_batch * self.mlen
+        row_blocks_per_batch = rows_per_batch // self.mlen
+
+        self.emit(
+            "; === Canonical packed GQA schedule: logical KV groups, "
+            f"resident={int(schedule.resident_kv)} ===\n"
+        )
+        for batch_idx in range(batch_size):
+            first_k_idx = batch_idx * row_blocks_per_batch
+            batch_offset = batch_idx * batch_row_stride
+            for kv_head, (K, V) in enumerate(kv_pairs):
+                resident_k = resident_v = None
+                if schedule.resident_kv:
+                    resident_k, resident_v = self._prefetch_packed_kv_resident(
+                        K,
+                        V,
+                        first_k_idx=first_k_idx,
+                        num_k_blocks=schedule.k_blocks,
+                    )
+                if (
+                    schedule.resident_kv
+                    and physical_broadcast == 1
+                    and q_group_stride == o_group_stride
+                ):
+                    first_group = kv_head * schedule.chunks_per_kv
+                    self._emit_resident_single_head_chunks_looped(
+                        q_base_address=(
+                            q_base + first_group * q_group_stride + batch_offset
+                        ),
+                        o_base_address=(
+                            o_base + first_group * o_group_stride + batch_offset
+                        ),
+                        group_stride=q_group_stride,
+                        chunk_count=schedule.chunks_per_kv,
+                        seq_len=seq_len,
+                        kv_seq_len=kv_seq_len,
+                        head_slot_dim=head_slot_dim,
+                        scratch_base_address=scratch_base_address,
+                        scale=scale,
+                        causal_mask=causal_mask,
+                        resident_k_mram=resident_k,
+                        resident_v_mram=resident_v,
+                    )
+                    self._packed_gqa_looped_full_chunks = (
+                        self._packed_gqa_looped_full_chunks
+                        or schedule.chunks_per_kv > 1
+                    )
+                    continue
+                for chunk in range(schedule.chunks_per_kv):
+                    chunk_start = chunk * physical_broadcast
+                    group_heads = min(physical_broadcast, gqa_ratio - chunk_start)
+                    if group_heads <= 0:
+                        continue
+                    group_idx = kv_head * schedule.chunks_per_kv + chunk
+                    q_group = self.alloc_at(
+                        f"_canonical_Q_b{batch_idx}_kv{kv_head}_c{chunk}",
+                        seq_len,
+                        self.mlen,
+                        q_base + group_idx * q_group_stride + batch_offset,
+                        physical_shape=(rows_per_batch, self.mlen),
+                    )
+                    self._emit_packed_attention_group_internal(
+                        Q_group=q_group,
+                        K=K,
+                        V=V,
+                        group_heads=group_heads,
+                        head_slot_dim=head_slot_dim,
+                        output_base_address=(
+                            o_base + group_idx * o_group_stride + batch_offset
+                        ),
+                        output_physical_rows=rows_per_batch,
+                        scratch_base_address=scratch_base_address,
+                        broadcast_amount=physical_broadcast,
+                        scale=scale,
+                        causal_mask=causal_mask,
+                        k_idx=first_k_idx,
+                        valid_cols=kv_seq_len,
+                        resident_k_mram=resident_k,
+                        resident_v_mram=resident_v,
+                        output_precleared=True,
+                        direct_output=physical_broadcast == 1,
+                    )
+                    self.free_tensor(q_group)
+        return schedule
 
     def _emit_packed_attention_groups_tiled_looped(
         self,
@@ -828,9 +1666,7 @@ class ProgramAttentionMixin:
         for k_block in range(num_k_blocks):
             block_cols = min(mlen, seq_len - k_block * mlen)
             if self._needs_explicit_valid_col_mask(block_cols):
-                valid_col_masks[block_cols] = self._build_valid_col_mask(
-                    f"_packed_tiled_loop_valid_col_mask_{block_cols}", block_cols
-                )
+                valid_col_masks[block_cols] = self._get_valid_col_mask(block_cols)
 
         gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop = self.register_allocator.allocate_gp(6)
         k_addr_reg, v_addr_reg = self.register_allocator.allocate_addr(2)
@@ -930,8 +1766,6 @@ class ProgramAttentionMixin:
         finally:
             self.register_allocator.free_addr([k_addr_reg, v_addr_reg])
             self.register_allocator.free_gp([gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop])
-            for valid_col_mask in valid_col_masks.values():
-                self.free_tensor(valid_col_mask)
             self.free_tensor(pv)
             self.free_tensor(pack_scratch)
 
@@ -1072,7 +1906,7 @@ class ProgramAttentionMixin:
         pack_scratch = self.alloc("_packed_loop_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen))
         pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
         valid_col_mask = (
-            self._build_valid_col_mask(f"_packed_loop_valid_col_mask_{seq_len}", seq_len)
+            self._get_valid_col_mask(seq_len)
             if self._needs_explicit_valid_col_mask(seq_len)
             else None
         )
@@ -1157,8 +1991,6 @@ class ProgramAttentionMixin:
             self.register_allocator.free_addr([k_addr_reg, v_addr_reg])
             self.register_allocator.free_gp([gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop])
             self.free_tensor(pv)
-            if valid_col_mask is not None:
-                self.free_tensor(valid_col_mask)
             self.free_tensor(pack_scratch)
 
     def flash_attention_packed_group(

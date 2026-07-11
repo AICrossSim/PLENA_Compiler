@@ -655,6 +655,137 @@ def test_packed_gqa_fused_accepts_batch_slabs():
     print("  PASS test_packed_gqa_fused_accepts_batch_slabs")
 
 
+def test_packed_gqa_schedule_covers_chunks_tails_and_mram_modes():
+    """Logical GQA scheduling should separate ratio, physical lanes, and MRAM policy."""
+    from compiler.aten.plena.program_attention import PackedGQASchedule
+
+    def build(ratio, physical_broadcast, capacity=8):
+        return PackedGQASchedule.build(
+            batch_size=2,
+            seq_len=129,
+            kv_seq_len=129,
+            rows_per_batch=192,
+            num_kv_heads=3,
+            gqa_ratio=ratio,
+            physical_broadcast=physical_broadcast,
+            mlen=64,
+            mram_tile_capacity=capacity,
+        )
+
+    single_lane = build(8, 1)
+    assert single_lane.chunks_per_kv == 8
+    assert single_lane.full_chunks == 8
+    assert single_lane.tail_heads == 0
+    assert single_lane.q_blocks == 3
+    assert single_lane.k_blocks == 3
+    assert single_lane.resident_kv_tiles == 6
+    assert single_lane.resident_kv is True
+
+    four_lanes = build(8, 4)
+    assert four_lanes.chunks_per_kv == 2
+    assert four_lanes.full_chunks == 2
+    assert four_lanes.tail_heads == 0
+
+    tail = build(6, 4, capacity=5)
+    assert tail.chunks_per_kv == 2
+    assert tail.full_chunks == 1
+    assert tail.tail_heads == 2
+    assert tail.resident_kv is False
+
+    print("  PASS test_packed_gqa_schedule_covers_chunks_tails_and_mram_modes")
+
+
+def test_canonical_packed_gqa_codegen_reuses_resident_kv_and_direct_o():
+    """Resident single-lane GQA should cache K/V, loop chunks, and avoid O packing."""
+    from compiler.aten.plena import PlenaCompiler
+
+    def emit(capacity):
+        prog = PlenaCompiler(mlen=8, blen=2, mram_tile_capacity=capacity)
+        prog.hlen = 8
+        prog.broadcast_amount = 1
+        q = prog.alloc("Q", 18, 48, strict=False, physical_shape=(32, 48))
+        o = prog.alloc("O", 18, 48, strict=False, physical_shape=(32, 48))
+        prog.vram_fill_zero(o)
+        kv_pairs = [
+            (
+                prog.input(f"K{head}", shape=(18, 8), physical_shape=(32, 8)),
+                prog.input(f"V{head}", shape=(18, 8), physical_shape=(32, 8)),
+            )
+            for head in range(2)
+        ]
+        scratch = prog.alloc("S", 32, 8, strict=True)
+        schedule = prog.flash_attention_packed_gqa(
+            q,
+            o,
+            kv_pairs,
+            batch_size=2,
+            seq_len=9,
+            rows_per_batch=16,
+            gqa_ratio=3,
+            physical_broadcast=1,
+            head_slot_dim=8,
+            scratch_base_address=prog.get_vram_addr(scratch.name),
+            causal_mask=None,
+        )
+        return schedule, prog.compile()
+
+    resident_schedule, resident = emit(4)
+    streaming_schedule, streaming = emit(3)
+
+    assert resident_schedule.resident_kv is True
+    assert streaming_schedule.resident_kv is False
+    assert resident.count("H_PREFETCH_M") == 16
+    assert streaming.count("H_PREFETCH_M") == 96
+    assert resident.count("Resident packed GQA full-chunk loop: chunks=3") == 4
+    assert "Resident packed GQA full-chunk loop" not in streaming
+    assert resident.count("S_MAP_V_FP") == 1
+    assert streaming.count("S_MAP_V_FP") == 1
+    assert "V_SHIFT_V" not in resident
+    assert "V_SHIFT_V" not in streaming
+    for asm in (resident, streaming):
+        assert all(line.rstrip().endswith("1, 1") for line in asm.splitlines() if "H_PREFETCH_M" in line)
+
+    print("  PASS test_canonical_packed_gqa_codegen_reuses_resident_kv_and_direct_o")
+
+
+def test_canonical_packed_gqa_codegen_emits_nondivisible_tail():
+    """A non-divisible ratio should emit only valid heads in the final chunk."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=8, blen=2, mram_tile_capacity=2)
+    prog.hlen = 2
+    prog.broadcast_amount = 3
+    q = prog.alloc("Q", 7, 16, strict=False, physical_shape=(8, 16))
+    o = prog.alloc("O", 7, 16, strict=False, physical_shape=(8, 16))
+    prog.vram_fill_zero(o)
+    k = prog.input("K", shape=(7, 2), physical_shape=(8, 8))
+    v = prog.input("V", shape=(7, 2), physical_shape=(8, 8))
+    scratch = prog.alloc("S", 64, 8, strict=True)
+    schedule = prog.flash_attention_packed_gqa(
+        q,
+        o,
+        [(k, v)],
+        batch_size=1,
+        seq_len=7,
+        rows_per_batch=8,
+        gqa_ratio=5,
+        physical_broadcast=3,
+        head_slot_dim=2,
+        scratch_base_address=prog.get_vram_addr(scratch.name),
+        causal_mask=None,
+    )
+    asm = prog.compile()
+
+    assert schedule.chunks_per_kv == 2
+    assert schedule.full_chunks == 1
+    assert schedule.tail_heads == 2
+    assert asm.count("Pack O head lane") == 5
+    assert "Pack O head lane 2" in asm
+    assert asm.count("Pack O head lane 2") == 1
+
+    print("  PASS test_canonical_packed_gqa_codegen_emits_nondivisible_tail")
+
+
 def test_mha_accepts_batch_slabs():
     """MHA should isolate true B>1 slabs instead of flattening into one sequence."""
     from compiler.aten.plena import PlenaCompiler
@@ -731,6 +862,179 @@ def test_mha_causal_skips_future_tiles_and_masks_only_diagonal():
     assert asm.count("+= CAUSAL_MASK") == 2
 
     print("  PASS test_mha_causal_skips_future_tiles_and_masks_only_diagonal")
+
+
+def test_native_packed_gqa_logical_broadcast_exceeds_mlen():
+    """Native packed GQA should split logical broadcast across physical chunks."""
+    import tempfile
+    from types import SimpleNamespace
+
+    from compiler.aten.plena_frontend import compile_native_hf_decoder
+
+    hidden = 128
+    inter = 128
+    head_dim = 128
+    num_heads = 8
+    num_kv_heads = 1
+
+    class TinyQwenStyleModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                hidden_size=hidden,
+                intermediate_size=inter,
+                num_attention_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
+                head_dim=head_dim,
+                rms_norm_eps=1e-6,
+                rope_theta=1000000.0,
+                vocab_size=32000,
+                model_type="tiny-qwen-style",
+            )
+            layer = torch.nn.Module()
+            layer.input_layernorm = SimpleNamespace(eps=1e-6)
+            layer.self_attn = torch.nn.Module()
+            layer.self_attn.q_proj = torch.nn.Linear(hidden, num_heads * head_dim, bias=False)
+            layer.self_attn.k_proj = torch.nn.Linear(hidden, num_kv_heads * head_dim, bias=False)
+            layer.self_attn.v_proj = torch.nn.Linear(hidden, num_kv_heads * head_dim, bias=False)
+            layer.self_attn.o_proj = torch.nn.Linear(num_heads * head_dim, hidden, bias=False)
+            layer.mlp = torch.nn.Module()
+            layer.mlp.gate_proj = torch.nn.Linear(hidden, inter, bias=False)
+            layer.mlp.up_proj = torch.nn.Linear(hidden, inter, bias=False)
+            layer.mlp.down_proj = torch.nn.Linear(inter, hidden, bias=False)
+            self.model = SimpleNamespace(layers=torch.nn.ModuleList([layer]))
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[TRANSACTIONAL.CONFIG.VLEN]\nvalue = 128\n")
+        settings_path = f.name
+
+    old_settings = os.environ.get("PLENA_SETTINGS_TOML")
+    os.environ["PLENA_SETTINGS_TOML"] = settings_path
+    try:
+        result = compile_native_hf_decoder(
+            TinyQwenStyleModel(),
+            seq_len=4,
+            num_layers=1,
+            mlen=128,
+            blen=8,
+            hlen=128,
+            broadcast_amount=8,
+            attention_head_packing=True,
+            mram_tile_capacity=16,
+            golden_precision="fp32",
+        )
+    finally:
+        if old_settings is None:
+            os.environ.pop("PLENA_SETTINGS_TOML", None)
+        else:
+            os.environ["PLENA_SETTINGS_TOML"] = old_settings
+        os.unlink(settings_path)
+
+    info = result["info"]
+    assert info["attention_head_packing"] is True
+    assert info["attention_logical_broadcast_amount"] == 8
+    assert info["attention_broadcast_amount"] == 1
+    assert info["attention_physical_broadcast_amount"] == 1
+    assert info["attention_chunks_per_kv"] == 8
+    assert info["attention_schedule"] == "logical_kv_group"
+    assert info["attention_active_head_dim"] == 128
+    assert info["attention_head_slot_dim"] == 128
+    assert info["attention_kv_resident"] is True
+    assert info["attention_resident_kv_tiles"] == 2
+    assert info["attention_looped_full_chunks"] is True
+    assert info["num_heads"] * info["head_dim"] == 8 * 128
+
+    print("  PASS test_native_packed_gqa_logical_broadcast_exceeds_mlen")
+
+
+def test_native_packed_gqa_supports_head_padding_and_rejects_dimension_tiling():
+    """Native packed GQA should pad D<HLEN and reject HLEN<D with a clear error."""
+    import tempfile
+    from types import SimpleNamespace
+
+    from compiler.aten.plena_frontend import compile_native_hf_decoder
+
+    class TinyHeadPaddingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                hidden_size=8,
+                intermediate_size=8,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=4,
+                rms_norm_eps=1e-6,
+                rope_theta=10000.0,
+                vocab_size=32,
+                model_type="tiny-head-padding",
+            )
+            layer = torch.nn.Module()
+            layer.input_layernorm = SimpleNamespace(eps=1e-6)
+            layer.self_attn = torch.nn.Module()
+            layer.self_attn.q_proj = torch.nn.Linear(8, 8, bias=False)
+            layer.self_attn.k_proj = torch.nn.Linear(8, 4, bias=False)
+            layer.self_attn.v_proj = torch.nn.Linear(8, 4, bias=False)
+            layer.self_attn.o_proj = torch.nn.Linear(8, 8, bias=False)
+            layer.mlp = torch.nn.Module()
+            layer.mlp.gate_proj = torch.nn.Linear(8, 8, bias=False)
+            layer.mlp.up_proj = torch.nn.Linear(8, 8, bias=False)
+            layer.mlp.down_proj = torch.nn.Linear(8, 8, bias=False)
+            self.model = SimpleNamespace(layers=torch.nn.ModuleList([layer]))
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[TRANSACTIONAL.CONFIG.VLEN]\nvalue = 8\n")
+        settings_path = f.name
+
+    old_settings = os.environ.get("PLENA_SETTINGS_TOML")
+    os.environ["PLENA_SETTINGS_TOML"] = settings_path
+    try:
+        result = compile_native_hf_decoder(
+            TinyHeadPaddingModel(),
+            seq_len=4,
+            num_layers=1,
+            mlen=8,
+            blen=2,
+            hlen=8,
+            broadcast_amount=2,
+            attention_head_packing=True,
+            mram_tile_capacity=2,
+            golden_precision="fp32",
+        )
+        try:
+            compile_native_hf_decoder(
+                TinyHeadPaddingModel(),
+                seq_len=4,
+                num_layers=1,
+                mlen=8,
+                blen=2,
+                hlen=2,
+                broadcast_amount=1,
+                attention_head_packing=True,
+                golden_precision="fp32",
+            )
+        except ValueError as exc:
+            message = str(exc)
+            assert "does not support head-dimension tiling" in message
+            assert "HLEN=2" in message
+            assert "head_dim=4" in message
+        else:
+            raise AssertionError("HLEN < head_dim should have been rejected")
+    finally:
+        if old_settings is None:
+            os.environ.pop("PLENA_SETTINGS_TOML", None)
+        else:
+            os.environ["PLENA_SETTINGS_TOML"] = old_settings
+        os.unlink(settings_path)
+
+    info = result["info"]
+    assert info["attention_active_head_dim"] == 4
+    assert info["attention_head_slot_dim"] == 8
+    assert info["attention_logical_broadcast_amount"] == 2
+    assert info["attention_physical_broadcast_amount"] == 1
+    assert info["attention_chunks_per_kv"] == 2
+    assert "Packed Q RoPE: slabs=2" in result["isa"]
+
+    print("  PASS test_native_packed_gqa_supports_head_padding_and_rejects_dimension_tiling")
 
 
 def test_compile_native_hf_decoder_golden_vs_hf():
@@ -831,7 +1135,12 @@ if __name__ == "__main__":
         test_packed_kv_weights_keep_compact_logical_width_with_physical_storage,
         test_packed_gqa_kv_group_loop_reduces_static_code,
         test_packed_gqa_fused_accepts_batch_slabs,
+        test_packed_gqa_schedule_covers_chunks_tails_and_mram_modes,
+        test_canonical_packed_gqa_codegen_reuses_resident_kv_and_direct_o,
+        test_canonical_packed_gqa_codegen_emits_nondivisible_tail,
         test_mha_accepts_batch_slabs,
+        test_native_packed_gqa_logical_broadcast_exceeds_mlen,
+        test_native_packed_gqa_supports_head_padding_and_rejects_dimension_tiling,
         test_compile_native_hf_decoder_golden_vs_hf,
         test_native_compile_assembles,
     ]
