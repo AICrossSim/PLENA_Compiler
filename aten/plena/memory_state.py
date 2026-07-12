@@ -213,7 +213,6 @@ class MemoryStateMixin:
         strict: bool = True,
     ) -> MatrixBlockLayout:
         """Register an HBM matrix and derive its mlen block layout."""
-        rows, cols = shape
         physical_rows, physical_cols = physical_shape or shape
 
         if strict:
@@ -232,6 +231,7 @@ class MemoryStateMixin:
             block_size=self.mlen,
             hbm_base_addr=hbm_base_addr,
             hbm_size=hbm_size,
+            materialize_blocks=getattr(self, "_emission_mode", "asm") != "cost",
         )
 
         self.hbm_matrices[name] = layout
@@ -260,7 +260,6 @@ class MemoryStateMixin:
         Returns:
             VRAMMatrixBlockLayout object
         """
-        batch, hidden = shape
         physical_batch, physical_hidden = physical_shape or shape
 
         if strict:
@@ -279,6 +278,7 @@ class MemoryStateMixin:
             physical_shape=(physical_batch, physical_hidden),
             vram_base_addr=vram_base_addr,
             block_size=self.mlen,
+            materialize_blocks=getattr(self, "_emission_mode", "asm") != "cost",
         )
 
         self.vram_matrices[name] = layout

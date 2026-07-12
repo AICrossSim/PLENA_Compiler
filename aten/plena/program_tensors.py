@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from compiler.asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
+from compiler.aten.plena.cost_kernels import ffn_unrolled_cost_counts
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -419,6 +420,34 @@ class ProgramTensorMixin:
             addr_reg_val=[w_gate.hbm_addr, w_up.hbm_addr, w_down.hbm_addr],
         )
         isa_code += reset_reg_asm(alive_registers=[1, 2, 3])
+
+        def cost_summary():
+            return ffn_unrolled_cost_counts(
+                mlen=mlen,
+                vlen=mlen,
+                blen=blen,
+                batch_rows=batch_size,
+                hidden_size=hidden_size,
+                intermediate_size=inter_dim,
+                activation_base_address=activation_base_address,
+                workspace_base_address=workspace_base_address,
+                matrix_sram_size=self.mram_tile_capacity * self.mlen,
+                gate_weight_hbm_base=w_gate.hbm_addr,
+                up_weight_hbm_base=w_up.hbm_addr,
+                down_weight_hbm_base=w_down.hbm_addr,
+                hbm_prefetch_amount=self.hbm_m_prefetch_amount,
+            )
+
+        if getattr(self, "_emission_mode", "asm") == "cost" and not use_loop_instructions:
+            self.emit(isa_code)
+            counts = cost_summary()
+            self.emit_cost_counts(
+                static_opcodes=counts.static,
+                dynamic_opcodes=counts.dynamic,
+                memory_streams=counts.memory_streams,
+            )
+            self.free_tensor(workspace)
+            return input_var
         isa_code += ffn_asm(
             mlen=mlen,
             vlen=mlen,
@@ -439,6 +468,13 @@ class ProgramTensorMixin:
         )
 
         self.emit(isa_code)
+        if getattr(self, "_cost_sink", None) is not None:
+            for stream in cost_summary().memory_streams:
+                self.record_dma_stream(
+                    stream.transfer,
+                    multiplicity=stream.multiplicity,
+                    axes=stream.axes,
+                )
         self.free_tensor(workspace)
         return input_var
 

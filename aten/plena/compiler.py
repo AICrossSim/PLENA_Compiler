@@ -75,6 +75,8 @@ class PlenaCompiler(
         mram_tile_capacity: int = 4,
         hbm_v_prefetch_amount: int | None = None,
         hbm_v_writeback_amount: int | None = None,
+        emission_mode: str = "asm",
+        cost_strict_raw: bool = False,
     ):
         """
         Args:
@@ -103,6 +105,8 @@ class PlenaCompiler(
             real_data_ratio=real_data_ratio,
             unroll_loops=unroll_loops,
             mram_tile_capacity=mram_tile_capacity,
+            emission_mode=emission_mode,
+            cost_strict_raw=cost_strict_raw,
         )
         if hbm_v_prefetch_amount is None:
             hbm_v_prefetch_amount = _behavior_config_value("HBM_V_Prefetch_Amount", 4)
@@ -135,6 +139,10 @@ class PlenaCompiler(
     def compile(self) -> str:
         """Get generated ISA code string."""
         return super().get_code()
+
+    def compile_cost_trace(self):
+        """Return the algebraic trace collected in cost/both emission mode."""
+        return super().get_cost_trace()
 
     @property
     def _compiler(self) -> PlenaCompiler:

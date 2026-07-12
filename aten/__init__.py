@@ -11,12 +11,24 @@ NATIVE_OPS_YAML = PLENA_PKG_DIR / "native_ops.yaml"
 
 from compiler.aten.isa_builder import (  # noqa: E402, F401
     Comment,
+    CompileTimeRepeat,
+    DmaTransfer,
+    HardwareLoop,
     Instr,
     IsaBuilder,
     Register,
+    RepeatAxis,
+    Sequence,
+    Stage,
     addr,
     fp,
     gp,
+)
+from compiler.aten.cost_emitter import (  # noqa: E402, F401
+    AsmSink,
+    CompositeSink,
+    CostSink,
+    CostTrace,
 )
 from compiler.aten.plena import (  # noqa: E402, F401
     FPVar,

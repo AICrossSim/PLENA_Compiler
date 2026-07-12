@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 
+from compiler.aten.plena.cost_kernels import (
+    linear_projection_cost_counts,
+)
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -134,7 +137,7 @@ class ProgramMatrixOpsMixin:
         """Emit tiled PLENA linear projection, including K-split accumulation."""
         mlen = self.mlen
 
-        rows, k_total = input_var.shape
+        rows, _ = input_var.shape
         _, out_features = weight_var.shape
         if physical_shape is None:
             physical_rows = max(input_var.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
@@ -161,6 +164,53 @@ class ProgramMatrixOpsMixin:
             strict=False,
             physical_shape=(physical_rows, physical_out_features),
         )
+
+        if getattr(self, "_emission_mode", "asm") == "cost":
+            chunks = list(_iter_k_chunks(num_k_tiles, max_k_tiles))
+            temp = self.alloc(f"{name}_temp", mlen, mlen) if len(chunks) > 1 else None
+            input_layout = self.get_vram_layout(input_var.name)
+            weight_layout = self.get_hbm_layout(weight_var.name)
+            output_layout = self.get_vram_layout(output.name)
+            weight_rows, weight_cols = weight_layout.physical_shape or weight_layout.full_shape
+            row_loop_counts = []
+            for row_idx in range(num_row_blocks):
+                block = input_layout.get_row_blocks(row_idx)[0]
+                valid_rows = block.valid_shape[0] if block.valid_shape else mlen
+                row_loop_counts.append(max(1, math.ceil(valid_rows / self.blen)))
+            hbm_offsets = [
+                [block.hbm_offset for block in weight_layout.get_col_blocks(col_idx)]
+                for col_idx in range(num_col_blocks)
+            ]
+            counts = linear_projection_cost_counts(
+                mlen=mlen,
+                blen=self.blen,
+                full_batch=input_layout.physical_shape[0],
+                hbm_base_addr=weight_layout.hbm_base_addr,
+                hbm_rows=weight_rows,
+                hbm_cols=weight_cols,
+                input_base_addr=input_layout.vram_base_addr,
+                input_physical_rows=input_layout.physical_shape[0],
+                output_base_addr=output_layout.vram_base_addr,
+                output_physical_rows=output_layout.physical_shape[0],
+                temp_base_addr=(
+                    self.get_vram_layout(temp.name).vram_base_addr if temp is not None else None
+                ),
+                num_row_blocks=num_row_blocks,
+                num_col_blocks=num_col_blocks,
+                chunks=chunks,
+                row_loop_counts=row_loop_counts,
+                hbm_offsets=hbm_offsets,
+                hbm_prefetch_amount=self.hbm_m_prefetch_amount,
+                source=f"linear_projection:{weight_var.name}",
+            )
+            self.emit_cost_counts(
+                static_opcodes=counts.static,
+                dynamic_opcodes=counts.dynamic,
+                memory_streams=counts.memory_streams,
+            )
+            if temp is not None:
+                self.free_tensor(temp)
+            return output
 
         def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split):
             self.vram_sub_projection_to(

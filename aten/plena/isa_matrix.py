@@ -8,6 +8,7 @@ from compiler.asm_templates._imm import load_large_int
 from compiler.asm_templates import preload_addr_reg_asm
 from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl
 from compiler.aten.isa_builder import IsaBuilder, addr as areg, gp
+from compiler.aten.plena.cost_kernels import vram_matrix_binary_cost_counts
 
 
 class IsaMatrixMixin:
@@ -623,6 +624,23 @@ class IsaMatrixMixin:
             and num_rows % self.mlen == 0
         )
 
+        if getattr(self, "_emission_mode", "asm") == "cost":
+            counts = vram_matrix_binary_cost_counts(
+                opcode="V_ADD_VV",
+                mlen=self.mlen,
+                dst_base=dst_addr,
+                src_base=src_addr,
+                dst_physical_rows=dst_physical_rows,
+                src_physical_rows=src_physical_rows,
+                physical_cols=dst_physical_cols,
+                dst_row_offset=dst_row_offset,
+                src_row_offset=src_row_offset,
+                num_rows=num_rows,
+                block_aligned=block_aligned,
+            )
+            self.emit_cost_counts(static_opcodes=counts.static, dynamic_opcodes=counts.dynamic)
+            return ""
+
         if block_aligned:
             num_row_blocks = num_rows // self.mlen
             num_col_blocks = dst_physical_cols // self.mlen
@@ -693,7 +711,7 @@ class IsaMatrixMixin:
         dst_rows, dst_cols = dst_info.shape
         src_rows, src_cols = src_info.shape
         dst_physical_rows, dst_physical_cols = dst_info.physical_shape
-        src_physical_rows, src_physical_cols = src_info.physical_shape
+        src_physical_rows, _ = src_info.physical_shape
 
         if num_rows is None:
             num_rows = src_rows
@@ -705,6 +723,23 @@ class IsaMatrixMixin:
         assert src_row_offset + num_rows <= src_rows, (
             f"src row range out of bounds: offset={src_row_offset}, num_rows={num_rows}, src_rows={src_rows}"
         )
+
+        if getattr(self, "_emission_mode", "asm") == "cost":
+            counts = vram_matrix_binary_cost_counts(
+                opcode="V_MUL_VV",
+                mlen=self.mlen,
+                dst_base=dst_addr,
+                src_base=src_addr,
+                dst_physical_rows=dst_physical_rows,
+                src_physical_rows=src_physical_rows,
+                physical_cols=dst_physical_cols,
+                dst_row_offset=dst_row_offset,
+                src_row_offset=src_row_offset,
+                num_rows=num_rows,
+                block_aligned=False,
+            )
+            self.emit_cost_counts(static_opcodes=counts.static, dynamic_opcodes=counts.dynamic)
+            return ""
 
         lines = [
             f"; === VRAM Matrix Mul: "

@@ -162,6 +162,7 @@ class MatrixBlockLayout:
     full_shape: tuple[int, int]  # Logical matrix shape (rows, cols)
     block_size: int = MLEN  # Sub-block size (default 64)
     physical_shape: tuple[int, int] | None = None  # Backing storage shape, if padded
+    materialize_blocks: bool = True
 
     num_row_blocks: int = 0
     num_col_blocks: int = 0
@@ -185,38 +186,43 @@ class MatrixBlockLayout:
         self.num_row_blocks = math.ceil(physical_rows / self.block_size)
         self.num_col_blocks = math.ceil(physical_cols / self.block_size)
 
-        # Create information for all sub-blocks (pre-calculate addresses)
-        for r in range(self.num_row_blocks):
-            for c in range(self.num_col_blocks):
-                # HBM offset (row-major): sub-block (r,c) starts at r*block_size*cols + c*block_size
-                hbm_offset = r * self.block_size * physical_cols + c * self.block_size
-                valid_rows = max(0, min(self.block_size, rows - r * self.block_size))
-                valid_cols = max(0, min(self.block_size, cols - c * self.block_size))
+        if self.materialize_blocks:
+            for r in range(self.num_row_blocks):
+                for c in range(self.num_col_blocks):
+                    self.sub_blocks[(r, c)] = self._make_sub_block(r, c)
 
-                sub_info = SubMatrixInfo(
-                    parent_name=self.name,
-                    row_idx=r,
-                    col_idx=c,
-                    shape=(self.block_size, self.block_size),
-                    valid_shape=(valid_rows, valid_cols),
-                    hbm_offset=hbm_offset,
-                    mram_addr=None,
-                )
-                self.sub_blocks[(r, c)] = sub_info
+    def _make_sub_block(self, row_idx: int, col_idx: int) -> SubMatrixInfo:
+        rows, cols = self.full_shape
+        _, physical_cols = self.physical_shape or self.full_shape
+        return SubMatrixInfo(
+            parent_name=self.name,
+            row_idx=row_idx,
+            col_idx=col_idx,
+            shape=(self.block_size, self.block_size),
+            valid_shape=(
+                max(0, min(self.block_size, rows - row_idx * self.block_size)),
+                max(0, min(self.block_size, cols - col_idx * self.block_size)),
+            ),
+            hbm_offset=row_idx * self.block_size * physical_cols + col_idx * self.block_size,
+            mram_addr=None,
+        )
 
     def get_sub_block(self, row_idx: int, col_idx: int) -> SubMatrixInfo:
         """Get specified sub-block"""
-        if (row_idx, col_idx) not in self.sub_blocks:
+        if not (0 <= row_idx < self.num_row_blocks and 0 <= col_idx < self.num_col_blocks):
             raise IndexError(f"Sub block [{row_idx}][{col_idx}] out of range")
-        return self.sub_blocks[(row_idx, col_idx)]
+        key = (row_idx, col_idx)
+        if key not in self.sub_blocks:
+            self.sub_blocks[key] = self._make_sub_block(row_idx, col_idx)
+        return self.sub_blocks[key]
 
     def get_row_blocks(self, row_idx: int) -> list[SubMatrixInfo]:
         """Get all sub-blocks in a row"""
-        return [self.sub_blocks[(row_idx, c)] for c in range(self.num_col_blocks)]
+        return [self.get_sub_block(row_idx, c) for c in range(self.num_col_blocks)]
 
     def get_col_blocks(self, col_idx: int) -> list[SubMatrixInfo]:
         """Get all sub-blocks in a column"""
-        return [self.sub_blocks[(r, col_idx)] for r in range(self.num_row_blocks)]
+        return [self.get_sub_block(r, col_idx) for r in range(self.num_row_blocks)]
 
 
 # ==============================================================================
@@ -256,6 +262,7 @@ class VRAMMatrixBlockLayout:
     vram_base_addr: int  # VRAM base address
     block_size: int = MLEN  # Sub-block size (default 64)
     physical_shape: tuple[int, int] | None = None  # Backing storage shape, if padded
+    materialize_blocks: bool = True
 
     num_row_blocks: int = 0  # Number of blocks in batch dimension
     num_col_blocks: int = 0  # Number of blocks in hidden dimension
@@ -275,40 +282,46 @@ class VRAMMatrixBlockLayout:
         self.num_row_blocks = math.ceil(physical_batch / self.block_size)
         self.num_col_blocks = math.ceil(physical_hidden / self.block_size)
 
-        # VRAM column-block major address calculation:
-        # col block c base = vram_base + c * physical_batch * mlen
-        # row sub-block r offset within column block = r * mlen * mlen
-        for r in range(self.num_row_blocks):
-            for c in range(self.num_col_blocks):
-                col_block_base = self.vram_base_addr + c * physical_batch * self.block_size
-                row_offset = r * self.block_size * self.block_size
-                vram_addr = col_block_base + row_offset
-                valid_rows = max(0, min(self.block_size, batch - r * self.block_size))
-                valid_cols = max(0, min(self.block_size, hidden - c * self.block_size))
+        if self.materialize_blocks:
+            for r in range(self.num_row_blocks):
+                for c in range(self.num_col_blocks):
+                    self.sub_blocks[(r, c)] = self._make_sub_block(r, c)
 
-                sub_info = VRAMSubMatrixInfo(
-                    parent_name=self.name,
-                    row_idx=r,
-                    col_idx=c,
-                    shape=(self.block_size, self.block_size),
-                    valid_shape=(valid_rows, valid_cols),
-                    vram_addr=vram_addr,
-                )
-                self.sub_blocks[(r, c)] = sub_info
+    def _make_sub_block(self, row_idx: int, col_idx: int) -> VRAMSubMatrixInfo:
+        batch, hidden = self.full_shape
+        physical_batch, _ = self.physical_shape or self.full_shape
+        return VRAMSubMatrixInfo(
+            parent_name=self.name,
+            row_idx=row_idx,
+            col_idx=col_idx,
+            shape=(self.block_size, self.block_size),
+            valid_shape=(
+                max(0, min(self.block_size, batch - row_idx * self.block_size)),
+                max(0, min(self.block_size, hidden - col_idx * self.block_size)),
+            ),
+            vram_addr=(
+                self.vram_base_addr
+                + col_idx * physical_batch * self.block_size
+                + row_idx * self.block_size * self.block_size
+            ),
+        )
 
     def get_sub_block(self, row_idx: int, col_idx: int) -> VRAMSubMatrixInfo:
         """Get specified sub-block"""
-        if (row_idx, col_idx) not in self.sub_blocks:
+        if not (0 <= row_idx < self.num_row_blocks and 0 <= col_idx < self.num_col_blocks):
             raise IndexError(f"VRAM sub block [{row_idx}][{col_idx}] out of range")
-        return self.sub_blocks[(row_idx, col_idx)]
+        key = (row_idx, col_idx)
+        if key not in self.sub_blocks:
+            self.sub_blocks[key] = self._make_sub_block(row_idx, col_idx)
+        return self.sub_blocks[key]
 
     def get_row_blocks(self, row_idx: int) -> list[VRAMSubMatrixInfo]:
         """Get all sub-blocks in a row (A[row_idx][:])"""
-        return [self.sub_blocks[(row_idx, c)] for c in range(self.num_col_blocks)]
+        return [self.get_sub_block(row_idx, c) for c in range(self.num_col_blocks)]
 
     def get_col_blocks(self, col_idx: int) -> list[VRAMSubMatrixInfo]:
         """Get all sub-blocks in a column"""
-        return [self.sub_blocks[(r, col_idx)] for r in range(self.num_row_blocks)]
+        return [self.get_sub_block(r, col_idx) for r in range(self.num_row_blocks)]
 
 
 # ==============================================================================

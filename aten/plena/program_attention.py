@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
+from compiler.aten.isa_builder import RepeatAxis
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
 
 
@@ -206,6 +207,22 @@ class ProgramAttentionMixin:
                 gp_regs=gp_regs,
             ),
         )
+        if getattr(self, "_cost_sink", None) is not None:
+            rope_rows, rope_cols = rope_layout.physical_shape or rope_layout.full_shape
+            self.record_dma_stream(
+                self.make_exact_mx_dma_transfer(
+                    opcode="H_PREFETCH_M",
+                    precision="weight",
+                    hbm_base=rope_layout.hbm_base_addr,
+                    total_elements=rope_rows * rope_cols,
+                    element_offset=0,
+                    dim=self.mlen,
+                    amount=self.hbm_m_prefetch_amount,
+                    stride=rope_cols,
+                    rstride=1,
+                    source=f"packed_q_rope:{rope_matrix.name}",
+                )
+            )
 
         x_rot = self.alloc(
             "_packed_q_rot_slab",
@@ -787,6 +804,25 @@ class ProgramAttentionMixin:
             return "\n".join(lines) + "\n"
 
         self._emit_hbm_matrix_load(layout, 3, build_body)
+        if getattr(self, "_cost_sink", None) is not None:
+            rows, cols = layout.physical_shape or layout.full_shape
+            total_elements = rows * cols
+            for row_idx, _ in tiles:
+                hbm_offset = layout.get_sub_block(row_idx, 0).hbm_offset
+                self.record_dma_stream(
+                    self.make_exact_mx_dma_transfer(
+                        opcode="H_PREFETCH_M",
+                        precision="matrix_kv",
+                        hbm_base=layout.hbm_base_addr,
+                        total_elements=total_elements,
+                        element_offset=hbm_offset,
+                        dim=self.mlen,
+                        amount=self.hbm_m_prefetch_amount,
+                        stride=cols,
+                        rstride=1,
+                        source=f"packed_kv:{input_var.name}:tile{row_idx}",
+                    )
+                )
 
     def _emit_packed_qkt_from_mram(
         self,
@@ -2100,6 +2136,35 @@ class ProgramAttentionMixin:
             head_dim=head_dim,
             rows=rows,
         )
+        if getattr(self, "_cost_sink", None) is not None:
+            layout = self.get_hbm_layout(v_input.name)
+            physical_rows, physical_head_dim = layout.physical_shape or layout.full_shape
+            col_blocks = max(1, math.ceil(head_dim / self.mlen))
+            element_offset = k_idx * self.mlen * physical_head_dim
+            axes = (
+                RepeatAxis(
+                    "v_column_tile",
+                    col_blocks,
+                    element_base_delta=self.mlen,
+                    scale_base_delta=self.mlen // 8,
+                ),
+            ) if col_blocks > 1 else ()
+            self.record_dma_stream(
+                self.make_exact_mx_dma_transfer(
+                    opcode="H_PREFETCH_M",
+                    precision="matrix_kv",
+                    hbm_base=layout.hbm_base_addr,
+                    total_elements=physical_rows * physical_head_dim,
+                    element_offset=element_offset,
+                    dim=self.mlen,
+                    amount=self.hbm_m_prefetch_amount,
+                    stride=physical_head_dim,
+                    rstride=1,
+                    source=f"packed_pv:{v_input.name}:tile{k_idx}",
+                ),
+                multiplicity=col_blocks,
+                axes=axes,
+            )
 
     def scale_o_row(self, o_matrix: VRAMMatrixVar, q_idx: int, rows: int | None = None):
         """Scale current row block of O by m_res"""

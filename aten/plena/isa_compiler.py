@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from compiler.asm_templates import (
     layer_norm_asm,
     preload_act_asm,
@@ -18,6 +20,9 @@ from compiler.aten.plena.isa_matrix import IsaMatrixMixin
 from compiler.aten.plena.isa_tile_rows import IsaTileRowMixin
 from compiler.aten.plena.memory_state import MemoryStateMixin
 from compiler.aten.plena.registers import RegisterAllocator
+from compiler.aten.cost_emitter import CostSink, CostTrace
+from compiler.aten.isa_builder import RepeatAxis
+from compiler.aten.plena.cost_kernels import rms_norm_cost_counts
 
 
 class IsaCompiler(
@@ -43,7 +48,11 @@ class IsaCompiler(
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
         mram_tile_capacity: int = 4,
+        emission_mode: str = "asm",
+        cost_strict_raw: bool = False,
     ):
+        if emission_mode not in {"asm", "cost", "both"}:
+            raise ValueError(f"emission_mode must be 'asm', 'cost', or 'both', got {emission_mode!r}")
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
         super().__init__(
             mlen=mlen,
@@ -53,8 +62,16 @@ class IsaCompiler(
         )
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
+        self._emission_mode = emission_mode
+        self._cost_sink = CostSink(strict_raw=cost_strict_raw) if emission_mode in {"cost", "both"} else None
+        self._active_cost_stage: str | None = None
         self.generated_code = ""
         self.unroll_attention = unroll_loops
+
+    def get_cost_trace(self) -> CostTrace:
+        if self._cost_sink is None:
+            raise RuntimeError("cost trace requested from an assembler-only compiler")
+        return self._cost_sink.finish()
 
     def load_batch(
         self,
@@ -121,7 +138,54 @@ class IsaCompiler(
         self.register_allocator.free_gp(gp_regs_for_preload)
         self.register_allocator.free_addr([addr_reg])
 
-        return self._emit(isa_code)
+        rendered = self._emit(isa_code)
+        if h == 1:
+            stream_count = math.ceil(w / (vlen * preload_len))
+            axes = (
+                RepeatAxis(
+                    "hidden_prefetch",
+                    stream_count,
+                    element_base_delta=vlen * preload_len,
+                    scale_base_delta=vlen * preload_len // 8,
+                ),
+            )
+            rstride = 0
+        else:
+            hidden_blocks = math.ceil(w / vlen)
+            batch_blocks = math.ceil(h / preload_len)
+            axes = (
+                RepeatAxis(
+                    "hidden_block",
+                    hidden_blocks,
+                    element_base_delta=vlen,
+                    scale_base_delta=vlen // 8,
+                ),
+                RepeatAxis(
+                    "batch_block",
+                    batch_blocks,
+                    element_base_delta=w * preload_len,
+                    scale_base_delta=w * preload_len // 8,
+                ),
+            )
+            stream_count = hidden_blocks * batch_blocks
+            rstride = 1
+        self.record_dma_stream(
+            self.make_exact_mx_dma_transfer(
+                opcode="H_PREFETCH_V",
+                precision="activation",
+                hbm_base=hbm_addr,
+                total_elements=size,
+                element_offset=0,
+                dim=vlen,
+                amount=preload_len,
+                stride=w,
+                rstride=rstride,
+                source=f"load_batch:{hbm_object_name}",
+            ),
+            multiplicity=stream_count,
+            axes=axes,
+        )
+        return rendered
 
     def store_to_hbm(
         self,
@@ -215,7 +279,55 @@ class IsaCompiler(
                 physical_shape=(batch_size, hidden_size),
             )
 
-        return self._emit(isa_code)
+        rendered = self._emit(isa_code)
+        total_elements = batch_size * hidden_size
+        if batch_size == 1:
+            stream_count = math.ceil(hidden_size / (vlen * store_amount))
+            axes = (
+                RepeatAxis(
+                    "hidden_store",
+                    stream_count,
+                    element_base_delta=vlen * store_amount,
+                    scale_base_delta=vlen * store_amount // 8,
+                ),
+            )
+            rstride = 0
+        else:
+            hidden_blocks = math.ceil(hidden_size / vlen)
+            batch_blocks = math.ceil(batch_size / store_amount)
+            axes = (
+                RepeatAxis(
+                    "hidden_block",
+                    hidden_blocks,
+                    element_base_delta=vlen,
+                    scale_base_delta=vlen // 8,
+                ),
+                RepeatAxis(
+                    "batch_block",
+                    batch_blocks,
+                    element_base_delta=hidden_size * store_amount,
+                    scale_base_delta=hidden_size * store_amount // 8,
+                ),
+            )
+            stream_count = hidden_blocks * batch_blocks
+            rstride = 1
+        self.record_dma_stream(
+            self.make_exact_mx_dma_transfer(
+                opcode="H_STORE_V",
+                precision="activation" if precision == 0 else "vector_kv",
+                hbm_base=hbm_addr,
+                total_elements=total_elements,
+                element_offset=0,
+                dim=vlen,
+                amount=store_amount,
+                stride=hidden_size,
+                rstride=rstride,
+                source=f"store_to_hbm:{tensor_name}",
+            ),
+            multiplicity=stream_count,
+            axes=axes,
+        )
+        return rendered
 
     def normalize(
         self,
@@ -269,6 +381,17 @@ class IsaCompiler(
             scratchpad_vram_addr = self.vram_allocator.allocate(vlen, name=temp_scratchpad_name)
 
         try:
+            if getattr(self, "_emission_mode", "asm") == "cost" and mode == "rms":
+                counts = rms_norm_cost_counts(
+                    activation_base_address=tensor_info.vram_addr,
+                    scratchpad_base_address=scratchpad_vram_addr,
+                    vlen=vlen,
+                    batch_size=batch_size,
+                    hidden_dim=hidden_dim,
+                    unroll=self._unroll,
+                )
+                self.emit_cost_counts(static_opcodes=counts.static, dynamic_opcodes=counts.dynamic)
+                return ""
             isa_code = (
                 f"; Normalize ({mode}) {tensor_name}, "
                 f"logical=({logical_batch_size}, {logical_hidden_dim}) "
