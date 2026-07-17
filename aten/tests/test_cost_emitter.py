@@ -5,7 +5,12 @@ from collections import Counter
 
 import pytest
 
-from compiler.aten.cost_emitter import CompositeSink, CostSink, RawAsmCostError
+from compiler.aten.cost_emitter import (
+    CompositeSink,
+    CostSink,
+    RawAsmCostError,
+    ScheduleRepeat,
+)
 from compiler.aten.isa_builder import DmaTransfer, IsaBuilder, RepeatAxis, gp
 from compiler.aten.plena import PlenaCompiler
 
@@ -108,7 +113,8 @@ def test_dma_metadata_inherits_stage_and_repeat() -> None:
     assert event.enclosing_axes[0].name == "column"
     assert event.stream_index == 0
     serialized = sink.trace.to_dict()
-    assert serialized["schema_version"] == 3
+    assert serialized["schema_version"] == 4
+    assert serialized["schedule_fidelity"] == "ordered_compressed"
     assert serialized["compressed_memory_events"][0]["geometry_fidelity"] == "exact"
     assert serialized["compressed_memory_events"][0]["stream_instruction_count"] == 8
     assert serialized["compressed_memory_events"][0]["precision_role"] == "weight"
@@ -117,6 +123,45 @@ def test_dma_metadata_inherits_stage_and_repeat() -> None:
     assert serialized["compressed_memory_events"][0]["repeat_axes"][0][
         "logical_element_delta"
     ] == 16_384
+
+
+def test_dma_event_can_bind_multiple_ordered_schedule_sites() -> None:
+    """One compressed stream may cover several statically unrolled sites."""
+    instruction = IsaBuilder().instr(
+        "H_PREFETCH_M", gp(1), gp(2), "a1", 1, 0
+    )
+    program = IsaBuilder().stage(
+        "layer/ffn",
+        IsaBuilder()
+        .repeat(3, instruction, axis=RepeatAxis("k_tile_a", 3))
+        .repeat(3, instruction, axis=RepeatAxis("k_tile_b", 3)),
+    )
+    transfer = DmaTransfer(
+        opcode="H_PREFETCH_M",
+        direction="read",
+        precision="weight",
+        element_base=0,
+        scale_base=4_096,
+        dim=64,
+        amount=64,
+        stride=64,
+    )
+    sink = CostSink()
+    sink.emit(program)
+    stream_index = sink.add_memory_event(
+        transfer=transfer,
+        multiplicity=6,
+        stage="layer/ffn",
+        axes=(RepeatAxis("all_k_tiles", 6),),
+    )
+
+    trace = sink.finish()
+    first, second = trace.schedule.children
+    assert isinstance(first, ScheduleRepeat)
+    assert isinstance(second, ScheduleRepeat)
+    assert first.body.children[0].memory_stream_index == stream_index
+    assert second.body.children[0].memory_stream_index == stream_index
+    assert trace.dynamic_opcodes["H_PREFETCH_M"] == 6
 
 
 def test_cost_sink_rejects_incomplete_dma_repeat_axes() -> None:
@@ -169,6 +214,68 @@ def test_composite_sink_renders_and_counts_same_program() -> None:
     assert rendered == "S_ADD_FP f1, f2, f3\n"
     assert sink.asm.getvalue() == rendered
     assert sink.cost.trace.dynamic_opcodes == {"S_ADD_FP": 1}
+
+
+def test_schedule_ir_preserves_nested_repeat_order() -> None:
+    body = IsaBuilder().instr("V_ADD_VV", gp(1), gp(2), gp(3), 0)
+    program = IsaBuilder().repeat(3, body, axis=RepeatAxis("vector", 3))
+    sink = CostSink()
+    sink.emit(program)
+
+    serialized = sink.finish().to_dict()["compressed_schedule"]
+    repeat = serialized["children"][0]
+    assert repeat["type"] == "repeat"
+    assert repeat["name"] == "vector"
+    assert repeat["count"] == 3
+    assert repeat["body"]["children"][0]["opcode"] == "V_ADD_VV"
+
+
+def test_schedule_ir_recovers_typed_hardware_loop_markers() -> None:
+    program = IsaBuilder()
+    program.instr("C_LOOP_START", gp(7), 3)
+    program.instr("V_ADD_VV", gp(1), gp(2), gp(3), 0)
+    program.instr("C_LOOP_END", gp(7))
+    sink = CostSink()
+    sink.emit(program)
+
+    trace = sink.finish()
+    serialized = trace.to_dict()
+    assert serialized["schedule_fidelity"] == "ordered_compressed"
+    assert trace.dynamic_opcodes == {
+        "C_LOOP_START": 1,
+        "V_ADD_VV": 3,
+        "C_LOOP_END": 3,
+    }
+    start, repeat = serialized["compressed_schedule"]["children"]
+    assert start["opcode"] == "C_LOOP_START"
+    assert repeat["type"] == "repeat"
+    assert repeat["repeat_kind"] == "hardware_loop"
+    assert repeat["count"] == 3
+    assert [child["opcode"] for child in repeat["body"]["children"]] == [
+        "V_ADD_VV",
+        "C_LOOP_END",
+    ]
+
+
+def test_counts_only_summary_marks_schedule_unavailable() -> None:
+    sink = CostSink()
+    sink.add_counts(
+        static_opcodes={"M_MM": 1},
+        dynamic_opcodes={"M_MM": 64},
+        stage="layer/ffn",
+    )
+
+    trace = sink.finish().to_dict()
+    assert trace["schedule_fidelity"] == "unavailable"
+    assert trace["schedule_unavailable_reasons"] == {
+        "counts_only_kernel_summary": 1
+    }
+    assert trace["schedule_coverage"] == {
+        "ordered_dynamic_instructions": 0,
+        "unavailable_dynamic_instructions": 64,
+        "ordered_fraction": 0.0,
+        "unavailable_by_reason": {"counts_only_kernel_summary": 64},
+    }
 
 
 def test_both_mode_preserves_regular_asm_and_matches_asm_histogram() -> None:

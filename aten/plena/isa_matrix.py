@@ -8,7 +8,10 @@ from compiler.asm_templates._imm import load_large_int
 from compiler.asm_templates import preload_addr_reg_asm
 from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl
 from compiler.aten.isa_builder import IsaBuilder, addr as areg, gp
-from compiler.aten.plena.cost_kernels import vram_matrix_binary_cost_counts
+from compiler.aten.plena.cost_kernels import (
+    vram_matrix_binary_cost_counts,
+    vram_matrix_binary_cost_schedule,
+)
 
 
 class IsaMatrixMixin:
@@ -638,7 +641,29 @@ class IsaMatrixMixin:
                 num_rows=num_rows,
                 block_aligned=block_aligned,
             )
-            self.emit_cost_counts(static_opcodes=counts.static, dynamic_opcodes=counts.dynamic)
+            gp_regs = self.register_allocator.allocate_gp(4)
+            try:
+                schedule = vram_matrix_binary_cost_schedule(
+                    opcode="V_ADD_VV",
+                    mlen=self.mlen,
+                    dst_base=dst_addr,
+                    src_base=src_addr,
+                    dst_physical_rows=dst_physical_rows,
+                    src_physical_rows=src_physical_rows,
+                    physical_cols=dst_physical_cols,
+                    dst_row_offset=dst_row_offset,
+                    src_row_offset=src_row_offset,
+                    num_rows=num_rows,
+                    block_aligned=block_aligned,
+                    gp_regs=gp_regs,
+                )
+                self.emit_cost_schedule(
+                    static_opcodes=counts.static,
+                    dynamic_opcodes=counts.dynamic,
+                    schedule=schedule,
+                )
+            finally:
+                self.register_allocator.free_gp(gp_regs)
             return ""
 
         if block_aligned:
@@ -738,7 +763,29 @@ class IsaMatrixMixin:
                 num_rows=num_rows,
                 block_aligned=False,
             )
-            self.emit_cost_counts(static_opcodes=counts.static, dynamic_opcodes=counts.dynamic)
+            gp_regs = self.register_allocator.allocate_gp(4)
+            try:
+                schedule = vram_matrix_binary_cost_schedule(
+                    opcode="V_MUL_VV",
+                    mlen=self.mlen,
+                    dst_base=dst_addr,
+                    src_base=src_addr,
+                    dst_physical_rows=dst_physical_rows,
+                    src_physical_rows=src_physical_rows,
+                    physical_cols=dst_physical_cols,
+                    dst_row_offset=dst_row_offset,
+                    src_row_offset=src_row_offset,
+                    num_rows=num_rows,
+                    block_aligned=False,
+                    gp_regs=gp_regs,
+                )
+                self.emit_cost_schedule(
+                    static_opcodes=counts.static,
+                    dynamic_opcodes=counts.dynamic,
+                    schedule=schedule,
+                )
+            finally:
+                self.register_allocator.free_gp(gp_regs)
             return ""
 
         lines = [

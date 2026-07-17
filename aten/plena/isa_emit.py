@@ -129,7 +129,14 @@ class IsaEmitMixin:
         """Append one assembly comment line."""
         return self._emit(IsaBuilder().comment(text))
 
-    def emit_cost_counts(self, *, static_opcodes, dynamic_opcodes, memory_streams=()) -> None:
+    def emit_cost_counts(
+        self,
+        *,
+        static_opcodes,
+        dynamic_opcodes,
+        memory_streams=(),
+        schedule_reason="counts_only_kernel_summary",
+    ) -> None:
         cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
         if cost_sink is None:
             raise RuntimeError("emit_cost_counts requires cost or both emission mode")
@@ -138,6 +145,7 @@ class IsaEmitMixin:
             static_opcodes=static_opcodes,
             dynamic_opcodes=dynamic_opcodes,
             stage=stage,
+            schedule_reason=schedule_reason,
         )
         for stream in memory_streams:
             cost_sink.add_memory_event(
@@ -146,6 +154,36 @@ class IsaEmitMixin:
                 stage=stage,
                 axes=stream.axes,
             )
+
+    def emit_cost_schedule(
+        self,
+        *,
+        static_opcodes,
+        dynamic_opcodes,
+        schedule,
+        memory_streams=(),
+    ) -> None:
+        """Emit a compact ordered kernel schedule plus algebraic counts."""
+        cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
+        if cost_sink is None:
+            raise RuntimeError("emit_cost_schedule requires cost or both emission mode")
+        stage = getattr(self, "_active_cost_stage", None) or "global"
+        stream_indices = tuple(
+            cost_sink.add_memory_event(
+                transfer=stream.transfer,
+                multiplicity=stream.multiplicity,
+                stage=stage,
+                axes=stream.axes,
+            )
+            for stream in memory_streams
+        )
+        cost_sink.add_ordered_schedule(
+            static_opcodes=static_opcodes,
+            dynamic_opcodes=dynamic_opcodes,
+            schedule=schedule,
+            stage=stage,
+            memory_stream_indices=stream_indices,
+        )
 
     def record_dma_stream(self, transfer, *, multiplicity=1, axes=()) -> None:
         """Attach exact DMA metadata without changing rendered assembly."""

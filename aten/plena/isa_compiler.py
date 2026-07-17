@@ -22,7 +22,10 @@ from compiler.aten.plena.memory_state import MemoryStateMixin
 from compiler.aten.plena.registers import RegisterAllocator
 from compiler.aten.cost_emitter import CostSink, CostTrace
 from compiler.aten.isa_builder import RepeatAxis
-from compiler.aten.plena.cost_kernels import rms_norm_cost_counts
+from compiler.aten.plena.cost_kernels import (
+    rms_norm_cost_counts,
+    rms_norm_cost_schedule,
+)
 
 
 class IsaCompiler(
@@ -390,7 +393,23 @@ class IsaCompiler(
                     hidden_dim=hidden_dim,
                     unroll=self._unroll,
                 )
-                self.emit_cost_counts(static_opcodes=counts.static, dynamic_opcodes=counts.dynamic)
+                schedule = rms_norm_cost_schedule(
+                    activation_base_address=tensor_info.vram_addr,
+                    scratchpad_base_address=scratchpad_vram_addr,
+                    vlen=vlen,
+                    batch_size=batch_size,
+                    hidden_dim=hidden_dim,
+                    unroll=self._unroll,
+                    alive_registers=gp_regs,
+                    eps_offset=eps_offset,
+                    reci_hid_offset=reci_hid_offset,
+                    key_prefix=f"rms:{tensor_name}:{scratchpad_vram_addr}",
+                )
+                self.emit_cost_schedule(
+                    static_opcodes=counts.static,
+                    dynamic_opcodes=counts.dynamic,
+                    schedule=schedule,
+                )
                 return ""
             isa_code = (
                 f"; Normalize ({mode}) {tensor_name}, "

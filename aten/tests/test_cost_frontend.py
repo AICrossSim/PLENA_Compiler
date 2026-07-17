@@ -6,9 +6,12 @@ import pytest
 
 from compiler.aten.cost_frontend import (
     CompilerCostHardware,
+    _scale_trace,
     clear_cost_trace_cache,
     compile_native_decoder_cost_trace,
 )
+from compiler.aten.cost_emitter import CostSink, ScheduleRepeat
+from compiler.aten.isa_builder import IsaBuilder, gp
 from compiler.aten.model_extract import ModelConfig
 
 
@@ -68,6 +71,31 @@ def _small_hardware(*, hlen: int, mram_tile_capacity: int) -> CompilerCostHardwa
         hbm_v_writeback_amount=128,
         hbm_channels=32,
     )
+
+
+def test_scale_trace_repeats_complete_decoder_layer_in_program_order() -> None:
+    program = IsaBuilder()
+    program.stage("global/setup", IsaBuilder().instr("S_ADD_INT", gp(1), gp(2), gp(3)))
+    program.stage("layer/attention", IsaBuilder().instr("M_MM", gp(1), gp(2)))
+    program.stage("layer/ffn", IsaBuilder().instr("V_ADD_VV", gp(1), gp(2), gp(3), 0))
+    program.stage("global/final", IsaBuilder().instr("S_SUB_INT", gp(1), gp(2), gp(3)))
+    sink = CostSink()
+    sink.emit(program)
+
+    scaled = _scale_trace(sink.finish(), 3)
+
+    assert scaled.dynamic_opcodes == {
+        "S_ADD_INT": 1,
+        "M_MM": 3,
+        "V_ADD_VV": 3,
+        "S_SUB_INT": 1,
+    }
+    assert len(scaled.schedule.children) == 3
+    layer_repeat = scaled.schedule.children[1]
+    assert isinstance(layer_repeat, ScheduleRepeat)
+    assert layer_repeat.name == "decoder_layer"
+    assert layer_repeat.count == 3
+    assert [child.opcode for child in layer_repeat.body.children] == ["M_MM", "V_ADD_VV"]
 
 
 def test_qwen3_target_cost_trace_matches_transactional_instruction_profile() -> None:

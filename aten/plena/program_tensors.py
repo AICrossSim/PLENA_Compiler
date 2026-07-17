@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from compiler.asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
-from compiler.aten.plena.cost_kernels import ffn_unrolled_cost_counts
+from compiler.aten.plena.cost_kernels import (
+    ffn_unrolled_cost_counts,
+    ffn_unrolled_cost_schedule,
+)
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -132,7 +135,13 @@ class ProgramTensorMixin:
     # Store Operations
     # ========================================================================
 
-    def store(self, tensor_var, name: str | None = None, hbm_addr: int | None = None) -> InputVar:
+    def store(
+        self,
+        tensor_var,
+        name: str | None = None,
+        hbm_addr: int | None = None,
+        precision: int = 0,
+    ) -> InputVar:
         """
         Write tensor from VRAM back to HBM.
 
@@ -159,6 +168,7 @@ class ProgramTensorMixin:
             hbm_addr=hbm_addr,
             hbm_object_name=internal_name,
             vlen=self.mlen,
+            precision=precision,
             store_amount=self.hbm_v_writeback_amount,
         )
 
@@ -441,9 +451,21 @@ class ProgramTensorMixin:
         if getattr(self, "_emission_mode", "asm") == "cost" and not use_loop_instructions:
             self.emit(isa_code)
             counts = cost_summary()
-            self.emit_cost_counts(
+            schedule = ffn_unrolled_cost_schedule(
+                mlen=mlen,
+                vlen=mlen,
+                blen=blen,
+                batch_rows=batch_size,
+                hidden_size=hidden_size,
+                intermediate_size=inter_dim,
+                activation_base_address=activation_base_address,
+                workspace_base_address=workspace_base_address,
+                matrix_sram_size=self.mram_tile_capacity * self.mlen,
+            )
+            self.emit_cost_schedule(
                 static_opcodes=counts.static,
                 dynamic_opcodes=counts.dynamic,
+                schedule=schedule,
                 memory_streams=counts.memory_streams,
             )
             self.free_tensor(workspace)

@@ -6,6 +6,7 @@ import math
 
 from compiler.aten.plena.cost_kernels import (
     linear_projection_cost_counts,
+    linear_projection_cost_schedule,
 )
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
@@ -203,9 +204,32 @@ class ProgramMatrixOpsMixin:
                 hbm_prefetch_amount=self.hbm_m_prefetch_amount,
                 source=f"linear_projection:{weight_var.name}",
             )
-            self.emit_cost_counts(
+            schedule = linear_projection_cost_schedule(
+                mlen=mlen,
+                blen=self.blen,
+                full_batch=input_layout.physical_shape[0],
+                hbm_base_addr=weight_layout.hbm_base_addr,
+                hbm_rows=weight_rows,
+                hbm_cols=weight_cols,
+                input_base_addr=input_layout.vram_base_addr,
+                input_physical_rows=input_layout.physical_shape[0],
+                output_base_addr=output_layout.vram_base_addr,
+                output_physical_rows=output_layout.physical_shape[0],
+                temp_base_addr=(
+                    self.get_vram_layout(temp.name).vram_base_addr
+                    if temp is not None
+                    else None
+                ),
+                num_row_blocks=num_row_blocks,
+                num_col_blocks=num_col_blocks,
+                chunks=chunks,
+                row_loop_counts=row_loop_counts,
+                hbm_offsets=hbm_offsets,
+            )
+            self.emit_cost_schedule(
                 static_opcodes=counts.static,
                 dynamic_opcodes=counts.dynamic,
+                schedule=schedule,
                 memory_streams=counts.memory_streams,
             )
             if temp is not None:

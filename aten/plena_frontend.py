@@ -895,8 +895,8 @@ def _emit_kv_stores(
                 semantic=f"K projection for KV head {kv_h} after RoPE",
             )
 
-        K_stored = prog.store(K_h, name=f"K_stored_{layer_idx}_h{kv_h}")
-        V_stored = prog.store(V_h, name=f"V_stored_{layer_idx}_h{kv_h}")
+        K_stored = prog.store(K_h, name=f"K_stored_{layer_idx}_h{kv_h}", precision=1)
+        V_stored = prog.store(V_h, name=f"V_stored_{layer_idx}_h{kv_h}", precision=1)
         kv_stored.append((K_stored, V_stored))
 
         prog.free_tensor(K_h)

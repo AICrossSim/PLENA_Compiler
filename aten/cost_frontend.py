@@ -13,7 +13,17 @@ from pathlib import Path
 from typing import Any
 
 import compiler.aten.ops as ops
-from compiler.aten.cost_emitter import CostTrace, MemoryEvent
+from compiler.aten.cost_emitter import (
+    CostTrace,
+    MemoryEvent,
+    ScheduleAffineAdd,
+    ScheduleAffineLoad,
+    ScheduleInstruction,
+    ScheduleNode,
+    ScheduleRepeat,
+    ScheduleSequence,
+    ScheduleUnavailable,
+)
 from compiler.aten.isa_builder import RepeatAxis
 from compiler.aten.model_extract import ModelConfig
 from compiler.aten.ops.registry import Backend, OpRegistry
@@ -193,6 +203,57 @@ def _register_shape_layer_inputs(
     )
 
 
+def _schedule_stages(node: ScheduleNode) -> set[str]:
+    """Return every compiler stage represented by a compressed schedule node."""
+    if isinstance(
+        node,
+        (ScheduleInstruction, ScheduleAffineLoad, ScheduleAffineAdd, ScheduleUnavailable),
+    ):
+        return {node.stage}
+    if isinstance(node, ScheduleSequence):
+        stages: set[str] = set()
+        for child in node.children:
+            stages.update(_schedule_stages(child))
+        return stages
+    if isinstance(node, ScheduleRepeat):
+        return _schedule_stages(node.body)
+    raise TypeError(type(node).__name__)
+
+
+def _scale_schedule(one_layer: CostTrace, num_layers: int) -> tuple[ScheduleSequence, str | None]:
+    """Repeat one contiguous attention-plus-FFN region in program order."""
+    if num_layers == 1:
+        return one_layer.schedule, None
+
+    classifications: list[str] = []
+    for child in one_layer.schedule.children:
+        stages = _schedule_stages(child)
+        has_layer = any(stage.startswith("layer/") for stage in stages)
+        has_global = any(not stage.startswith("layer/") for stage in stages)
+        if has_layer and has_global:
+            return one_layer.schedule, "mixed_global_layer_schedule_node"
+        classifications.append("layer" if has_layer else "global")
+
+    layer_indices = [index for index, kind in enumerate(classifications) if kind == "layer"]
+    if not layer_indices:
+        return one_layer.schedule, "decoder_layer_schedule_missing"
+    first, last = layer_indices[0], layer_indices[-1]
+    if any(kind != "layer" for kind in classifications[first : last + 1]):
+        return one_layer.schedule, "noncontiguous_decoder_layer_schedule"
+
+    children: list[ScheduleNode] = list(one_layer.schedule.children[:first])
+    children.append(
+        ScheduleRepeat(
+            count=num_layers,
+            body=ScheduleSequence(one_layer.schedule.children[first : last + 1]),
+            name="decoder_layer",
+            repeat_kind="model_layer",
+        )
+    )
+    children.extend(one_layer.schedule.children[last + 1 :])
+    return ScheduleSequence(tuple(children)), None
+
+
 def _scale_trace(one_layer: CostTrace, num_layers: int, *, layer_hbm_stride: int = 0) -> CostTrace:
     result = CostTrace(metadata=dict(one_layer.metadata))
     result.metadata["num_layers"] = num_layers
@@ -229,6 +290,10 @@ def _scale_trace(one_layer: CostTrace, num_layers: int, *, layer_hbm_stride: int
                 stream_index=stream_index,
             )
         )
+    result.schedule, schedule_error = _scale_schedule(one_layer, num_layers)
+    result.schedule_unavailable_reasons.update(one_layer.schedule_unavailable_reasons)
+    if schedule_error is not None:
+        result.schedule_unavailable_reasons[schedule_error] += 1
     return result
 
 
