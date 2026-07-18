@@ -37,7 +37,7 @@ class ProgramTensorMixin:
         """
         h, w = physical_shape or shape
         size = h * w
-        hbm_size = int(size * self.real_data_ratio)
+        hbm_size = self.hbm_tensor_size(size)
 
         if hbm_addr is None:
             hbm_addr = self._allocate_hbm(hbm_size)
@@ -147,11 +147,11 @@ class ProgramTensorMixin:
         if hbm_addr is None:
             h, w = tensor_var.physical_shape
             size = h * w
-            hbm_size = int(size * self.real_data_ratio)
+            hbm_size = self.hbm_tensor_size(size)
             hbm_addr = self._allocate_hbm(hbm_size)
         else:
             h, w = tensor_var.physical_shape
-            hbm_size = int(h * w * self.real_data_ratio)
+            hbm_size = self.hbm_tensor_size(h * w)
 
         super().store_to_hbm(
             tensor_name=tensor_var.name,  # internal name for symbol table lookup

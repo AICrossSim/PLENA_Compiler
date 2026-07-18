@@ -24,6 +24,10 @@ class MemoryStateMixin:
         blen: int = BLEN,
         unroll_loops: bool = False,
         mram_tile_capacity: int = 4,
+        hbm_row_width: int = 256,
+        hbm_element_width: int = 8,
+        hbm_block_size: int = 8,
+        hbm_scale_width: int = 8,
     ):
         if mlen <= 0:
             raise ValueError(f"mlen must be > 0, got {mlen}")
@@ -36,6 +40,13 @@ class MemoryStateMixin:
         self.mram_tile_capacity = mram_tile_capacity
         self.mram_tile_elems = mlen * mlen
         self.mram_capacity_elems = self.mram_tile_capacity * self.mram_tile_elems
+
+        # HBM row-aligned layout params (MXINT8/256b defaults). Must match the stager
+        # (create_mem_for_sim / calculate_instr_storage_offset_from_shapes).
+        self.hbm_row_width = hbm_row_width
+        self.hbm_element_width = hbm_element_width
+        self.hbm_block_size = hbm_block_size
+        self.hbm_scale_width = hbm_scale_width
 
         # Layout tables
         self.hbm_matrices: dict[str, MatrixBlockLayout] = {}
@@ -203,6 +214,23 @@ class MemoryStateMixin:
         self.fpram_matrices.pop(name, None)
         return info
 
+    def hbm_tensor_size(self, num_elements: int) -> int:
+        """Row-aligned HBM byte footprint of one tensor: element rows + scale rows,
+        each padded up to hbm_row_width, matching the stager (create_mem_for_sim /
+        plena_utils.calculate_instr_storage_offset_from_shapes). Replaces the packed
+        `int(size * real_data_ratio)` estimate, which ignored per-tensor row padding
+        and mislaid every following tensor whenever a region was not naturally
+        row-aligned (weights/K/V read zeros; common at small MLEN)."""
+        row_bits = self.hbm_row_width
+        ew, bs, sw = self.hbm_element_width, self.hbm_block_size, self.hbm_scale_width
+        bytes_per_row = row_bits // 8
+        elements_per_row = (row_bits // (ew * bs)) * bs
+        element_rows = -(-num_elements // elements_per_row) if elements_per_row > 0 else 0
+        num_scales = num_elements // bs
+        scales_per_row = row_bits // sw if sw > 0 else 1
+        scale_rows = -(-num_scales // scales_per_row) if scales_per_row > 0 else 0
+        return (element_rows + scale_rows) * bytes_per_row
+
     def register_matrix(
         self,
         name: str,
@@ -213,6 +241,7 @@ class MemoryStateMixin:
         strict: bool = True,
     ) -> MatrixBlockLayout:
         """Register an HBM matrix and derive its mlen block layout."""
+        del real_data_ratio  # HBM size is now row-aligned (see hbm_tensor_size)
         rows, cols = shape
         physical_rows, physical_cols = physical_shape or shape
 
@@ -223,7 +252,7 @@ class MemoryStateMixin:
                 raise ValueError(f"Matrix physical cols ({physical_cols}) must be multiple of mlen ({self.mlen})")
 
         size = physical_rows * physical_cols
-        hbm_size = int(size * real_data_ratio)
+        hbm_size = self.hbm_tensor_size(size)
 
         layout = MatrixBlockLayout(
             name=name,
