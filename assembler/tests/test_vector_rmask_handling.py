@@ -23,6 +23,34 @@ class TestVectorRmaskHandling(unittest.TestCase):
 
         self.assertEqual(self.asm._convert_to_binary(missing_mask), self.asm._convert_to_binary(explicit_mask))
 
+    def test_vector_scalar_minmax_encode_like_masked_vector_ops(self):
+        # Distinct rd/rs1/rs2 and a non-zero rmask so an operand-swap or a
+        # dropped rmask lane would change the encoding and fail the test.
+        max_instr = Instruction("V_MAX_VF", 1, 2, 3, 1, None, None, None)
+        min_instr = Instruction("V_MIN_VF", 1, 2, 3, 1, None, None, None)
+
+        max_binary = self.asm._convert_to_binary(max_instr)
+        min_binary = self.asm._convert_to_binary(min_instr)
+
+        for binary, name in ((max_binary, "V_MAX_VF"), (min_binary, "V_MIN_VF")):
+            self.assertEqual(binary & 0x3F, self.asm.isa_definitions[name])
+            self.assertEqual((binary >> 6) & 0xF, 1)   # rd
+            self.assertEqual((binary >> 10) & 0xF, 2)  # rs1
+            self.assertEqual((binary >> 14) & 0xF, 3)  # rs2
+            self.assertEqual((binary >> 18) & 0xF, 1)  # rmask
+
+    def test_v_topk_encodes_like_masked_vector_op(self):
+        # Non-zero rmask so the rmask-lane assertion actually exercises the field
+        # (with rmask=0 it would pass even if the encoder dropped the lane).
+        instr = Instruction("V_TOPK", 1, 2, 3, 1, None, None, None)
+        binary = self.asm._convert_to_binary(instr)
+
+        self.assertEqual(binary & 0x3F, self.asm.isa_definitions["V_TOPK"])
+        self.assertEqual((binary >> 6) & 0xF, 1)   # rd
+        self.assertEqual((binary >> 10) & 0xF, 2)  # rs1
+        self.assertEqual((binary >> 14) & 0xF, 3)  # rs2
+        self.assertEqual((binary >> 18) & 0xF, 1)  # rmask
+
 
 if __name__ == "__main__":
     unittest.main()

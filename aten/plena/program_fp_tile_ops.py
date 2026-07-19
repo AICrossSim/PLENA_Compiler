@@ -162,15 +162,17 @@ class ProgramFPTileOpsMixin:
         source: VRAMMatrixVar,
         row_idx: int | None = None,
         rows: Iterable[int] | None = None,
+        tile_col_idx: int = 0,
     ):
-        super().tile_row_exp(source.name, self._resolve_rows(row_idx=row_idx, rows=rows))
+        super().tile_row_exp(source.name, self._resolve_rows(row_idx=row_idx, rows=rows), tile_col_idx=tile_col_idx)
 
     def tile_row_reci(
         self,
         source: VRAMMatrixVar,
         rows: Iterable[int] | None = None,
+        tile_col_idx: int = 0,
     ):
-        super().tile_row_reci(source.name, self._default_rows(rows))
+        super().tile_row_reci(source.name, self._default_rows(rows), tile_col_idx=tile_col_idx)
 
     def tile_row_sub_fp(
         self,
@@ -180,9 +182,10 @@ class ProgramFPTileOpsMixin:
         rows: Iterable[int] | None = None,
         fpram_offset: int = 0,
         fpram_base_offset: int = 0,
+        tile_col_idx: int = 0,
     ):
         return self._tile_row_fp_scalar(
-            "tile_row_sub_fp", source, fpram_addr, row_idx, rows, fpram_offset, fpram_base_offset
+            "tile_row_sub_fp", source, fpram_addr, row_idx, rows, fpram_offset, fpram_base_offset, tile_col_idx
         )
 
     def tile_row_mul_fp(
@@ -193,9 +196,38 @@ class ProgramFPTileOpsMixin:
         rows: Iterable[int] | None = None,
         fpram_offset: int = 0,
         fpram_base_offset: int = 0,
+        tile_col_idx: int = 0,
     ):
         return self._tile_row_fp_scalar(
-            "tile_row_mul_fp", source, fpram_addr, row_idx, rows, fpram_offset, fpram_base_offset
+            "tile_row_mul_fp", source, fpram_addr, row_idx, rows, fpram_offset, fpram_base_offset, tile_col_idx
+        )
+
+    def tile_row_max_fp(
+        self,
+        source: VRAMMatrixVar,
+        fpram_addr: int | FPVar,
+        row_idx: int | None = None,
+        rows: Iterable[int] | None = None,
+        fpram_offset: int = 0,
+        fpram_base_offset: int = 0,
+        tile_col_idx: int = 0,
+    ):
+        return self._tile_row_fp_scalar(
+            "tile_row_max_fp", source, fpram_addr, row_idx, rows, fpram_offset, fpram_base_offset, tile_col_idx
+        )
+
+    def tile_row_min_fp(
+        self,
+        source: VRAMMatrixVar,
+        fpram_addr: int | FPVar,
+        row_idx: int | None = None,
+        rows: Iterable[int] | None = None,
+        fpram_offset: int = 0,
+        fpram_base_offset: int = 0,
+        tile_col_idx: int = 0,
+    ):
+        return self._tile_row_fp_scalar(
+            "tile_row_min_fp", source, fpram_addr, row_idx, rows, fpram_offset, fpram_base_offset, tile_col_idx
         )
 
     def tile_row_add_fp(
@@ -203,9 +235,10 @@ class ProgramFPTileOpsMixin:
         source: VRAMMatrixVar,
         fp_var: FPVar,
         rows: Iterable[int] | None = None,
+        tile_col_idx: int = 0,
     ):
         resolved_rows = self._default_rows(rows)
-        super().tile_row_add_fp(source.name, [(row, fp_var[row]) for row in resolved_rows])
+        super().tile_row_add_fp(source.name, [(row, fp_var[row]) for row in resolved_rows], tile_col_idx=tile_col_idx)
 
     def _tile_row_binary(self, isa_method: str, dst: VRAMMatrixVar, src: VRAMMatrixVar, rows: Iterable[int] | None):
         return getattr(super(), isa_method)(dst.name, src.name, self._default_rows(rows))
@@ -219,6 +252,7 @@ class ProgramFPTileOpsMixin:
         rows: Iterable[int] | None,
         fpram_offset: int,
         fpram_base_offset: int,
+        tile_col_idx: int = 0,
     ):
         return getattr(super(), isa_method)(
             source.name,
@@ -229,6 +263,7 @@ class ProgramFPTileOpsMixin:
                 single_offset=fpram_offset,
                 base_offset=fpram_base_offset,
             ),
+            tile_col_idx=tile_col_idx,
         )
 
     def tile_row_add(

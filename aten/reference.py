@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from compiler.aten.model_extract import LayerWeights, ModelConfig
-from quant.quantizer.hardware_quantizer.mxfp import _mx_fp_quantize_hardware
+from plena_quant.quantizer.hardware_quantizer.mxfp import _mx_fp_quantize_hardware
 
 
 _HW_MAX_K_TILES = 4

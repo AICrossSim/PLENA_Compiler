@@ -5,8 +5,8 @@ Two im2col paths:
   (H_PREFETCH_V + V_MUL_VV + V_RED_SUM + S_ST_FP + S_MAP_V_FP).  Slower
   because each patch element is extracted scalar-by-scalar through FP_SRAM.
 - Opt-in (use_shift=True, or CONV_USE_SHIFT=1 env var): uses the
-  V_SHIFT_V opcode for vector-level patch placement.  Faster for long
-  patches.  Requires the emulator to support V_SHIFT_V (opcode 0x31,
+  V_SHFT_V opcode for vector-level patch placement.  Faster for long
+  patches.  Requires the emulator to support V_SHFT_V (opcode 0x32,
   LSB-first right-shift per main.rs fix by George Wu, commit 24eb011).
 
 After im2col the systolic matmul uses the compiler's standard linear path.
@@ -42,7 +42,7 @@ def conv2d_plena(
 ):
     """
     PLENA backend: hardware im2col + systolic matmul.
-    Default path avoids V_SHIFT_V; use_shift=True opts into the vector-shift path.
+    Default path avoids V_SHFT_V; use_shift=True opts into the vector-shift path.
 
     Args:
         prog:           PlenaCompiler instance.

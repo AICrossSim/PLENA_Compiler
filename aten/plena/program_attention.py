@@ -58,6 +58,78 @@ class ProgramAttentionMixin:
         self.emit("\n".join(lines) + "\n")
         return mask
 
+    def _build_causal_score_mask(self, name: str) -> VRAMMatrixVar:
+        """Materialize an MLEN x MLEN causal score mask.
+
+        The mask is 0 on and below the diagonal and -inf above it. This is the
+        same single-tile triangular mask that the MHA path uses when callers pass
+        an explicit VRAM mask. Multi-sequence-tile causal geometry remains owned
+        by the existing MHA tile-skipping logic; packed GQA still rejects
+        seq_len > MLEN.
+        """
+        mask = self.alloc(name, self.mlen, self.mlen)
+        mask_addr = self.get_vram_addr(mask.name)
+        fp_scratch_base = self._ONLINE_SOFTMAX_FPSRAM_BASE
+        gp_mask, gp_fp = self.register_allocator.allocate_gp(2)
+
+        lines = [
+            f"; === Build causal score mask: MLEN={self.mlen} ===",
+            f"S_ADDI_INT gp{gp_fp}, gp0, {fp_scratch_base}",
+            "S_LD_FP f7, gp0, 2",
+        ]
+        lines.extend(load_large_int(gp_mask, mask_addr))
+        for row in range(self.mlen):
+            for col in range(self.mlen):
+                value_reg = "f0" if col <= row else "f7"
+                lines.append(f"S_ST_FP {value_reg}, gp{gp_fp}, {col}")
+            lines.extend(
+                [
+                    f"S_MAP_V_FP gp{gp_mask}, gp{gp_fp}, 0",
+                    f"S_ADDI_INT gp{gp_mask}, gp{gp_mask}, {self.mlen}",
+                ]
+            )
+
+        self.register_allocator.free_gp([gp_mask, gp_fp])
+        self.emit("\n".join(lines) + "\n")
+        return mask
+
+    def _build_sliding_causal_score_mask(self, name: str, sliding_window: int) -> VRAMMatrixVar:
+        """Materialize a single-tile GPT-OSS sliding causal score mask.
+
+        Visible columns satisfy ``col <= row`` and ``col > row - sliding_window``.
+        This is only the short-sequence/single-tile mask. Multi-tile sliding
+        remains part of the existing sequence-tile debt.
+        """
+        if sliding_window <= 0:
+            raise ValueError(f"sliding_window must be positive, got {sliding_window}")
+        mask = self.alloc(name, self.mlen, self.mlen)
+        mask_addr = self.get_vram_addr(mask.name)
+        fp_scratch_base = self._ONLINE_SOFTMAX_FPSRAM_BASE
+        gp_mask, gp_fp = self.register_allocator.allocate_gp(2)
+
+        lines = [
+            f"; === Build sliding causal score mask: MLEN={self.mlen}, window={sliding_window} ===",
+            f"S_ADDI_INT gp{gp_fp}, gp0, {fp_scratch_base}",
+            "S_LD_FP f7, gp0, 2",
+        ]
+        lines.extend(load_large_int(gp_mask, mask_addr))
+        for row in range(self.mlen):
+            min_visible_col = row - sliding_window + 1
+            for col in range(self.mlen):
+                visible = col <= row and col >= min_visible_col
+                value_reg = "f0" if visible else "f7"
+                lines.append(f"S_ST_FP {value_reg}, gp{gp_fp}, {col}")
+            lines.extend(
+                [
+                    f"S_MAP_V_FP gp{gp_mask}, gp{gp_fp}, 0",
+                    f"S_ADDI_INT gp{gp_mask}, gp{gp_mask}, {self.mlen}",
+                ]
+            )
+
+        self.register_allocator.free_gp([gp_mask, gp_fp])
+        self.emit("\n".join(lines) + "\n")
+        return mask
+
     def flash_attention(
         self,
         Q,
@@ -87,8 +159,6 @@ class ProgramAttentionMixin:
 
         if h_qkv is None:
             raise ValueError("GQA mode requires h_qkv to be specified")
-        if causal_mask is not None:
-            raise NotImplementedError("causal_mask is not yet supported for GQA flash attention")
         return self._flash_attention_gqa_fused(
             Q,
             K,
@@ -97,6 +167,7 @@ class ProgramAttentionMixin:
             hq,
             hkv,
             h_qkv,
+            causal_mask=causal_mask,
             batch_size=batch_size,
             seq_len=seq_len,
             kv_seq_len=kv_seq_len,
@@ -162,6 +233,8 @@ class ProgramAttentionMixin:
 
         if scale is None:
             scale = 1.0 / math.sqrt(head_dim)
+        if causal_mask is True:
+            causal_mask = self._build_causal_score_mask("_mha_causal_mask")
 
         num_q_blocks = math.ceil(seq_len / mlen)
         num_k_blocks = math.ceil(kv_seq_len / mlen)
@@ -301,6 +374,7 @@ class ProgramAttentionMixin:
         hkv,
         h_qkv,
         *,
+        causal_mask=None,
         batch_size: int = 1,
         seq_len: int | None = None,
         kv_seq_len: int | None = None,
@@ -358,6 +432,8 @@ class ProgramAttentionMixin:
 
         if scale is None:
             scale = 1.0 / math.sqrt(h_qkv)
+        if causal_mask is True:
+            causal_mask = self._build_causal_score_mask("_gqa_causal_mask")
 
         if s_q > mlen or s_kv > mlen:
             raise NotImplementedError("Packed GQA lowering currently supports one sequence tile.")
@@ -435,7 +511,7 @@ class ProgramAttentionMixin:
                 scratch_base_address=scratch_addr,
                 broadcast_amount=broadcast_amount,
                 scale=scale,
-                causal_mask=None,
+                causal_mask=causal_mask,
                 output_head_base=0,
                 k_idx=batch_idx * k_row_blocks_per_batch,
                 valid_cols=s_kv,
@@ -463,6 +539,9 @@ class ProgramAttentionMixin:
         k_head_offset: int = 0,
         q_rows: int | None = None,
         kv_cols: int | None = None,
+        k_matrix_precision: str | int = "weights",
+        k_set_scale: bool = True,
+        k_hbm_element_bytes: int = 1,
     ) -> None:
         """Emit packed QK^T with M_BTMM/M_BMM_WO into head-major S tiles.
 
@@ -486,6 +565,9 @@ class ProgramAttentionMixin:
                 mram_dest_addr=0,
                 hbm_addr_reg=addr_reg,
                 gp_regs=gp_regs,
+                precision=0 if k_matrix_precision in ("weights", "weight", 0) else 1,
+                set_scale=k_set_scale,
+                hbm_element_bytes=k_hbm_element_bytes,
             ),
         )
 
@@ -589,7 +671,7 @@ class ProgramAttentionMixin:
             # lookahead pins pc_reg there (C_BREAK never decodes -> hang). Unrolling
             # removes every pack loop, so no C_LOOP_END precedes the trailing C_BREAK.
             for i in range(rows):
-                lines.append(f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}")
+                lines.append(f"V_SHFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}")
                 lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0")
                 if i < rows - 1:
                     lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}")
@@ -597,7 +679,7 @@ class ProgramAttentionMixin:
         else:
             lines += [
                 f"C_LOOP_START gp{gp_loop}, {rows}",
-                f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
+                f"V_SHFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
                 f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0",
                 f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}",
                 f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
@@ -627,7 +709,7 @@ class ProgramAttentionMixin:
             *load_large_int(gp_scratch, scratch_address),
             *load_large_int(gp_shift, shift),
             f"C_LOOP_START gp{gp_loop}, {rows}",
-            f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
+            f"V_SHFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
             f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0",
             f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}",
             f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
@@ -653,6 +735,11 @@ class ProgramAttentionMixin:
         output_head_base: int = 0,
         k_idx: int = 0,
         valid_cols: int | None = None,
+        sink_base_address: int | None = None,
+        k_matrix_precision: str | int = "weights",
+        k_set_scale: bool = True,
+        k_hbm_element_bytes: int = 1,
+        v_hbm_element_bytes: int = 1,
     ) -> None:
         """Compiler-owned packed-head flash attention for one KV group."""
         seq_len, q_width = Q_group.shape
@@ -716,6 +803,9 @@ class ProgramAttentionMixin:
             s_base_address=scratch_base_address,
             q_rows=rows,
             kv_cols=(valid_cols if valid_cols is not None else seq_len),
+            k_matrix_precision=k_matrix_precision,
+            k_set_scale=k_set_scale,
+            k_hbm_element_bytes=k_hbm_element_bytes,
         )
 
         active_cols = valid_cols or seq_len
@@ -726,7 +816,7 @@ class ProgramAttentionMixin:
         )
         # Warm V into MSRAM once so head 0's cold-start-reprimed first tile reads V
         # (not the QK^T's stale K) on row 0 too — it lands during head 0's softmax.
-        self.warm_v_prefetch(V.name, k_idx)
+        self.warm_v_prefetch(V.name, k_idx, v_hbm_element_bytes=v_hbm_element_bytes)
         for head, s_head in enumerate(s_views):
             o_head = self.alloc(
                 f"_packed_O_head{head}",
@@ -752,9 +842,27 @@ class ProgramAttentionMixin:
             # l/m_res round-trip used by scale_o_row/final_scale_o, whose per-row store
             # is racy on this RTL (drops -> O saturates to FP12 max; see online_softmax.py).
             # o_head was zeroed by init_online_softmax, so vram_add copies pv into O.
-            self.online_softmax_block(s_head, softmax_scale, rows=rows,
-                                      valid_cols=softmax_valid_cols, inline_normalize=True)
-            self.compute_pv(s_head, V, k_idx, pv, head_slot_dim, rows=rows)
+            # When attention sinks are enabled the inline-normalize path folds the sink
+            # exp into the row denominator (see _online_softmax_asm), so pv is already
+            # the sink-normalised O and no scale_o_row is needed.
+            sink_address = None if sink_base_address is None else sink_base_address + output_head_base + head
+            self.online_softmax_block(
+                s_head,
+                softmax_scale,
+                rows=rows,
+                valid_cols=softmax_valid_cols,
+                inline_normalize=True,
+                sink_address=sink_address,
+            )
+            self.compute_pv(
+                s_head,
+                V,
+                k_idx,
+                pv,
+                head_slot_dim,
+                rows=rows,
+                v_hbm_element_bytes=v_hbm_element_bytes,
+            )
             self.vram_add(o_head, pv, num_rows=rows)
             output_head = output_head_base + head
             output_col_block = (output_head * head_slot_dim) // mlen
@@ -819,6 +927,8 @@ class ProgramAttentionMixin:
             raise ValueError(f"Packed attention requires HLEN={head_slot_dim}, got {self.hlen}")
         if scale is None:
             scale = 1.0 / math.sqrt(head_slot_dim)
+        if causal_mask is True:
+            causal_mask = self._build_causal_score_mask("_packed_loop_causal_mask")
 
         for K, V in kv_pairs:
             self._ensure_hbm_sub_matrix_registered(K)
@@ -964,6 +1074,12 @@ class ProgramAttentionMixin:
         causal_mask: bool | VRAMMatrixVar | None = True,
         k_idx: int = 0,
         valid_cols: int | None = None,
+        sink_base_address: int | None = None,
+        output_head_base: int = 0,
+        k_matrix_precision: str | int = "weights",
+        k_set_scale: bool = True,
+        k_hbm_element_bytes: int = 1,
+        v_hbm_element_bytes: int = 1,
     ) -> None:
         """Emit one KV group's packed-head flash-attention body.
 
@@ -985,6 +1101,8 @@ class ProgramAttentionMixin:
             )
         if scale is None:
             scale = 1.0 / math.sqrt(head_slot_dim)
+        if causal_mask is True:
+            causal_mask = self._build_causal_score_mask("_packed_group_causal_mask")
 
         self._emit_packed_attention_group_internal(
             Q_group=Q_group,
@@ -998,8 +1116,14 @@ class ProgramAttentionMixin:
             broadcast_amount=broadcast_amount,
             scale=scale,
             causal_mask=causal_mask,
+            output_head_base=output_head_base,
             k_idx=k_idx,
             valid_cols=valid_cols,
+            sink_base_address=sink_base_address,
+            k_matrix_precision=k_matrix_precision,
+            k_set_scale=k_set_scale,
+            k_hbm_element_bytes=k_hbm_element_bytes,
+            v_hbm_element_bytes=v_hbm_element_bytes,
         )
 
     def init_online_softmax(self, q_idx: int, o_matrix: VRAMMatrixVar, rows: int | None = None):
@@ -1022,6 +1146,7 @@ class ProgramAttentionMixin:
         rows: int | None = None,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        sink_address: int | None = None,
     ):
         """Perform Online Softmax on S block"""
         super().online_softmax_block(
@@ -1030,6 +1155,7 @@ class ProgramAttentionMixin:
             rows=rows,
             valid_cols=valid_cols,
             inline_normalize=inline_normalize,
+            sink_address=sink_address,
         )
 
     def compute_pv(
@@ -1040,6 +1166,7 @@ class ProgramAttentionMixin:
         pv_matrix: VRAMMatrixVar,
         head_dim: int,
         rows: int | None = None,
+        v_hbm_element_bytes: int = 1,
     ):
         """Compute PV = P @ V[k_idx] where P is stored in s_block."""
         if not isinstance(s_block, VRAMMatrixVar):
@@ -1057,6 +1184,7 @@ class ProgramAttentionMixin:
             pv_matrix=pv_matrix.name,
             head_dim=head_dim,
             rows=rows,
+            v_hbm_element_bytes=v_hbm_element_bytes,
         )
 
     def scale_o_row(self, o_matrix: VRAMMatrixVar, q_idx: int, rows: int | None = None):
