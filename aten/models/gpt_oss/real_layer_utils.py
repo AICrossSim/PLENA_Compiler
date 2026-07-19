@@ -118,6 +118,14 @@ def rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, eps: float) -> t
 
 
 def load_layer_tensors(layer_index: int) -> dict[str, torch.Tensor]:
+    """Load one GPT-OSS layer's MoE tensors in raw HuggingFace orientation.
+
+    ``router_weight`` is returned as HF ``[num_experts, hidden]`` — the layout
+    ``build_hf_mlp`` copies straight into ``mlp.router.weight``. Note that
+    ``gpt_oss_moe_golden_a`` (moe_reference.py) instead expects the transposed
+    PLENA layout ``[hidden, experts]`` for its ``x @ router_weight``; a caller
+    feeding this dict into Golden A must pass ``router_weight.t()``.
+    """
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 
     prefix = f"model.layers.{layer_index}"

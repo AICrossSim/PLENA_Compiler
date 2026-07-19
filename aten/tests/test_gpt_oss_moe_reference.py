@@ -137,12 +137,15 @@ def test_golden_a_matches_hf_gpt_oss_mlp_tiny():
         hf_mlp.experts.down_proj.copy_(down_w)
         hf_mlp.experts.down_proj_bias.copy_(down_b)
 
-        hf_router_logits = torch.nn.functional.linear(x, hf_mlp.router.weight, hf_mlp.router.bias)
-        hf_scores, hf_indices = hf_mlp.router(x)
-        hf_selected_scores = hf_scores.gather(1, hf_indices)
-        hf_expert_out = hf_mlp.experts(x.unsqueeze(0), hf_indices, hf_scores).squeeze(0)
+        # transformers 5.1.0 GptOssTopKRouter.forward returns
+        # (router_logits, router_scores, router_indices); router_scores and
+        # router_indices are already the (tokens, top_k) softmaxed top-k, so the
+        # old gather against a full-width score row is gone. GptOssExperts.forward
+        # takes a 2D (tokens, hidden) input and indexes routing_weights as
+        # [token, top_k_pos], i.e. the (tokens, top_k) scores directly.
+        hf_router_logits, hf_scores, hf_indices = hf_mlp.router(x)
+        hf_expert_out = hf_mlp.experts(x, hf_indices, hf_scores)
         hf_mlp_out, hf_mlp_scores = hf_mlp(x.unsqueeze(0))
-        hf_mlp_selected_scores = hf_mlp_scores.gather(1, hf_indices)
 
     golden = gpt_oss_moe_golden_a(
         *args,
@@ -152,8 +155,8 @@ def test_golden_a_matches_hf_gpt_oss_mlp_tiny():
 
     assert torch.equal(golden.topk_indices, hf_indices)
     assert torch.allclose(golden.router_logits, hf_router_logits, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(golden.topk_weights, hf_selected_scores, atol=1e-6, rtol=1e-6)
-    assert torch.allclose(golden.topk_weights, hf_mlp_selected_scores, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(golden.topk_weights, hf_scores, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(golden.topk_weights, hf_mlp_scores, atol=1e-6, rtol=1e-6)
     assert torch.allclose(golden.output, hf_expert_out, atol=1e-6, rtol=1e-6)
     assert torch.allclose(golden.output, hf_mlp_out.squeeze(0), atol=1e-6, rtol=1e-6)
 

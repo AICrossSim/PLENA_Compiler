@@ -409,7 +409,13 @@ class IsaMatrixMixin:
         vram_hidden_block_stride = full_batch * self.mlen
         mram_hidden_block_stride = self.mlen * self.mlen
         output_row_stride = self.blen * self.mlen
-        mat_col_stride = self.blen
+        # Row-aligned column stride: the matrix SRAM read is row-granular
+        # (raddr >> log2(MLEN)), so each successive BLEN-wide output micro-column
+        # must be a full MLEN row apart in MRAM. Using bare `blen` here keeps
+        # every micro_col_idx inside column-block 0, replicating the output
+        # columns ([a,b,c,d]x4) — the same bug guarded by vram_sub_projection_asm.
+        # The result address still advances by `blen` (VRAM output is packed).
+        mat_col_stride = self.blen * self.mlen
 
         vram_row_start_addr = vram_row_blocks[k_block_start].vram_addr + micro_row_idx * output_row_stride
         mram_col_start_addr = self._loaded_mram_start(
