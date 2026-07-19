@@ -106,16 +106,20 @@ class ProgramRoutedMoeMixin:
                 f"GPT-OSS router BF16 vector-dot logits: rows={rows}, hidden={hidden}, experts={num_experts}"
             )
             asm.instr("S_ADDI_INT", gp(gp_scratch), gp(0), scratch_addr)
+            fp_base = fp_scratch.address
+
+            # Clear the FPRAM logits scratch once: positions [0, num_experts) are
+            # overwritten by every token's per-expert S_ST_FP, and the padding
+            # positions [num_experts, expert_blocks*mlen) are never written, so a
+            # single clear before the token loop keeps them zero for all tokens.
+            asm.comment("Clear FPRAM logits scratch (once, loop-invariant across tokens)")
+            asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_base)
+            asm.instr("C_LOOP_START", gp(gp_loop), expert_blocks * self.mlen)
+            asm.instr("S_ST_FP", fp(0), gp(gp_fp), 0)
+            asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), 1)
+            asm.instr("C_LOOP_END", gp(gp_loop))
+
             for token_idx in range(rows):
-                fp_base = fp_scratch.address
-
-                asm.comment(f"Router token {token_idx}: clear FPRAM logits scratch")
-                asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_base)
-                asm.instr("C_LOOP_START", gp(gp_loop), expert_blocks * self.mlen)
-                asm.instr("S_ST_FP", fp(0), gp(gp_fp), 0)
-                asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), 1)
-                asm.instr("C_LOOP_END", gp(gp_loop))
-
                 for expert_idx in range(num_experts):
                     x_addr = self._vram_matrix_row_addr(x, token_idx, 0)
                     w_addr = self._vram_matrix_row_addr(router_weight_rows, expert_idx, 0)
@@ -148,6 +152,56 @@ class ProgramRoutedMoeMixin:
             self._reg.free_gp([gp_x, gp_w, gp_scratch, gp_fp, gp_out, gp_loop])
 
         return logits
+
+    def _pack_router_logits_token_major(
+        self,
+        matrix_logits: VRAMMatrixVar,
+        *,
+        rows: int,
+        num_experts: int,
+        expert_blocks: int,
+        logical_logit_rows: int,
+        physical_logit_rows: int,
+        name: str,
+        label: str,
+    ) -> VRAMMatrixVar:
+        """Pack a ``[rows, experts]`` logits tensor into the token-major V_TOPK ABI.
+
+        Row layout: ``token0/block0, token0/block1, ..., token1/block0, ...``.
+        When ``expert_blocks == 1`` the matrix tensor already matches the ABI and
+        is returned unchanged; otherwise a new packed tensor is emitted and the
+        source ``matrix_logits`` is freed. ``label`` only tags the emitted comment.
+        """
+        if expert_blocks == 1:
+            return matrix_logits
+
+        packed_logits = self.alloc(
+            name,
+            rows=logical_logit_rows,
+            cols=self.mlen,
+            strict=False,
+            physical_shape=(physical_logit_rows, self.mlen),
+        )
+
+        gp_dst, gp_src = self._reg.allocate_gp(2)
+        try:
+            asm = IsaBuilder().comment(
+                f"Qwen router {label} logits pack: rows={rows}, experts={num_experts}, blocks={expert_blocks}"
+            )
+            for token_idx in range(rows):
+                for expert_block in range(expert_blocks):
+                    src_addr = self._vram_matrix_row_addr(matrix_logits, token_idx, expert_block)
+                    dst_row = token_idx * expert_blocks + expert_block
+                    dst_addr = self._vram_matrix_row_addr(packed_logits, dst_row, 0)
+                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
+                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr)
+                    asm.instr("V_ADD_VF", gp(gp_dst), gp(gp_src), fp(0), 0)
+            self._emit(asm)
+        finally:
+            self._reg.free_gp([gp_dst, gp_src])
+
+        self.free_tensor(matrix_logits)
+        return packed_logits
 
     def qwen3_router_logits_matrix_bf16_rowpacked_v0(
         self,
@@ -210,36 +264,16 @@ class ProgramRoutedMoeMixin:
         finally:
             self.mram_tile_capacity = old_capacity
 
-        if expert_blocks == 1:
-            return matrix_logits
-
-        packed_logits = self.alloc(
-            name,
-            rows=logical_logit_rows,
-            cols=self.mlen,
-            strict=False,
-            physical_shape=(physical_logit_rows, self.mlen),
+        return self._pack_router_logits_token_major(
+            matrix_logits,
+            rows=rows,
+            num_experts=num_experts,
+            expert_blocks=expert_blocks,
+            logical_logit_rows=logical_logit_rows,
+            physical_logit_rows=physical_logit_rows,
+            name=name,
+            label="matrix",
         )
-
-        gp_dst, gp_src = self._reg.allocate_gp(2)
-        try:
-            asm = IsaBuilder().comment(
-                f"Qwen router matrix logits pack: rows={rows}, experts={num_experts}, blocks={expert_blocks}"
-            )
-            for token_idx in range(rows):
-                for expert_block in range(expert_blocks):
-                    src_addr = self._vram_matrix_row_addr(matrix_logits, token_idx, expert_block)
-                    dst_row = token_idx * expert_blocks + expert_block
-                    dst_addr = self._vram_matrix_row_addr(packed_logits, dst_row, 0)
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr)
-                    asm.instr("V_ADD_VF", gp(gp_dst), gp(gp_src), fp(0), 0)
-            self._emit(asm)
-        finally:
-            self._reg.free_gp([gp_dst, gp_src])
-
-        self.free_tensor(matrix_logits)
-        return packed_logits
 
     def qwen3_router_logits_packed_skinny_bf16_rowpacked_v0(
         self,
@@ -310,36 +344,16 @@ class ProgramRoutedMoeMixin:
                 hbm_element_bytes=2,
             )
 
-        if expert_blocks == 1:
-            return matrix_logits
-
-        packed_logits = self.alloc(
-            name,
-            rows=logical_logit_rows,
-            cols=self.mlen,
-            strict=False,
-            physical_shape=(physical_logit_rows, self.mlen),
+        return self._pack_router_logits_token_major(
+            matrix_logits,
+            rows=rows,
+            num_experts=num_experts,
+            expert_blocks=expert_blocks,
+            logical_logit_rows=logical_logit_rows,
+            physical_logit_rows=physical_logit_rows,
+            name=name,
+            label="packed-skinny",
         )
-
-        gp_dst, gp_src = self._reg.allocate_gp(2)
-        try:
-            asm = IsaBuilder().comment(
-                f"Qwen router packed-skinny logits pack: rows={rows}, experts={num_experts}, blocks={expert_blocks}"
-            )
-            for token_idx in range(rows):
-                for expert_block in range(expert_blocks):
-                    src_addr = self._vram_matrix_row_addr(matrix_logits, token_idx, expert_block)
-                    dst_row = token_idx * expert_blocks + expert_block
-                    dst_addr = self._vram_matrix_row_addr(packed_logits, dst_row, 0)
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr)
-                    asm.instr("V_ADD_VF", gp(gp_dst), gp(gp_src), fp(0), 0)
-            self._emit(asm)
-        finally:
-            self._reg.free_gp([gp_dst, gp_src])
-
-        self.free_tensor(matrix_logits)
-        return packed_logits
 
     def gpt_oss_router_topk_softmax_v0(
         self,
@@ -771,8 +785,10 @@ class ProgramRoutedMoeMixin:
         fp_scratch = fp_scratch or self.fp_var(f"{name}_fp_row", size=self.mlen)
         gp_dst, gp_fp = self._reg.allocate_gp(2)
         try:
+            # The scalar route weight depends only on pair_idx, so broadcast it into
+            # fp_scratch once; S_MAP_V_FP only reads fp_scratch and never mutates it.
+            self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
             for col_block in range(hidden // self.mlen):
-                self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
                 asm = IsaBuilder().comment(
                     f"GPT-OSS materialize route weight pair={pair_idx}, col_block={col_block}"
                 )
@@ -823,8 +839,9 @@ class ProgramRoutedMoeMixin:
         gp_dst, gp_fp = self._reg.allocate_gp(2)
         try:
             for pair_idx, active_row in zip(pair_list, active_list, strict=True):
+                # Fill depends only on pair_idx (not col_block); broadcast once per pair.
+                self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
                 for col_block in range(hidden // self.mlen):
-                    self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
                     asm = IsaBuilder().comment(
                         f"GPT-OSS materialize route weight pair={pair_idx}, active_row={active_row}, col_block={col_block}"
                     )
@@ -1025,24 +1042,14 @@ class ProgramRoutedMoeMixin:
             for pad_idx in range(1, self.blen)
         ]
         if padding_rows:
-            fp_zero_row = zero_row or self.fp_var(f"{name}_zero_row", size=self.mlen)
-            gp_fp, gp_dst, gp_loop = self._reg.allocate_gp(3)
-            try:
-                asm = IsaBuilder().comment(f"Clear gather padding rows with true FP zero rows: {padding_rows}")
-                asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_zero_row.address)
-                asm.instr("C_LOOP_START", gp(gp_loop), self.mlen)
-                asm.instr("S_ST_FP", fp(0), gp(gp_fp), 0)
-                asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), 1)
-                asm.instr("C_LOOP_END", gp(gp_loop))
-                for row_idx in padding_rows:
-                    for col_block in range(num_col_blocks):
-                        dst_addr = self._vram_matrix_row_addr(gathered, row_idx, col_block)
-                        asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
-                        asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_zero_row.address)
-                        asm.instr("S_MAP_V_FP", gp(gp_dst), gp(gp_fp), 0)
-                self._emit(asm)
-            finally:
-                self._reg.free_gp([gp_fp, gp_dst, gp_loop])
+            # Same true-FP-zero clear used by the VRAM gather path; keep it in one place.
+            self.gpt_oss_true_zero_vram_rows_v0(
+                gathered,
+                rows=padding_rows,
+                hidden=hidden,
+                zero_row=zero_row,
+                name=f"{name}_pad_zero",
+            )
 
         return gathered
 
@@ -1151,11 +1158,13 @@ class ProgramRoutedMoeMixin:
             asm.instr("S_ST_FP", fp(0), gp(gp_fp), 0)
             asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), 1)
             asm.instr("C_LOOP_END", gp(gp_loop))
+            # The clear loop leaves gp_fp at address+mlen; reset it once here. The
+            # map loop below never mutates gp_fp, so no per-iteration reset is needed.
+            asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_zero_row.address)
             for row_idx in row_list:
                 for col_block in range(num_col_blocks):
                     dst_addr = self._vram_matrix_row_addr(matrix, row_idx, col_block)
                     asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
-                    asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_zero_row.address)
                     asm.instr("S_MAP_V_FP", gp(gp_dst), gp(gp_fp), 0)
             self._emit(asm)
         finally:
@@ -1393,323 +1402,6 @@ class ProgramRoutedMoeMixin:
         assert acc is not None
         return acc
 
-    def _require_moe_policy_v0(self, policy_name: str, *, helper: str) -> None:
-        """Guard generic MoE wrappers with implemented router/expert semantics."""
-        supported = {"gpt_oss", "qwen3_moe"}
-        if policy_name not in supported:
-            raise NotImplementedError(
-                f"{helper} currently supports policy_name in {sorted(supported)}, got {policy_name!r}"
-            )
-
-    def _require_routed_moe_substrate_policy_v0(self, policy_name: str, *, helper: str) -> None:
-        """Guard wrappers that are substrate movement primitives, not router semantics."""
-        supported = {"gpt_oss", "qwen3_moe", "deepseek_v3"}
-        if policy_name not in supported:
-            raise NotImplementedError(
-                f"{helper} supports only routed MoE substrate policies {sorted(supported)}, got {policy_name!r}"
-            )
-
-    def moe_router_logits_bf16_v0(
-        self,
-        x: VRAMMatrixVar,
-        router_weight_rows: VRAMMatrixVar,
-        *,
-        rows: int,
-        hidden: int,
-        num_experts: int,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_router_logits",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for high-precision router logits.
-
-        GPT-OSS and Qwen3-MoE both use a high-precision BF16 router matmul in
-        the current PLENA substrate.  DeepSeek is intentionally not enabled here
-        because its shared/routed expert split needs a separate adapter.
-        """
-        self._require_moe_policy_v0(policy_name, helper="moe_router_logits_bf16_v0")
-        return self.gpt_oss_router_logits_bf16_v0(
-            x,
-            router_weight_rows,
-            rows=rows,
-            hidden=hidden,
-            num_experts=num_experts,
-            name=name,
-        )
-
-    def moe_router_select_v0(
-        self,
-        logits: VRAMMatrixVar,
-        *,
-        token_idx: int,
-        weights_fp_base: int,
-        indices_int_base: int,
-        policy_name: str = "gpt_oss",
-        num_experts: int = 32,
-        top_k: int = 4,
-        name: str = "gpt_oss_router_topk",
-    ) -> None:
-        """Generic substrate wrapper for router selection and selected weights."""
-        self._require_moe_policy_v0(policy_name, helper="moe_router_select_v0")
-        self.gpt_oss_router_topk_softmax_v0(
-            logits,
-            token_idx=token_idx,
-            weights_fp_base=weights_fp_base,
-            indices_int_base=indices_int_base,
-            num_experts=num_experts,
-            top_k=top_k,
-            name=name,
-        )
-
-    def moe_expert_id_to_weight_base_v0(
-        self,
-        *,
-        expert_indices_int_base: int,
-        pair_idx: int,
-        table_base: int,
-        per_expert_stride: int,
-        addr_reg: int,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_expert_id_to_weight_base",
-    ) -> None:
-        """Generic substrate wrapper for true expert-id to HBM base address."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_expert_id_to_weight_base_v0")
-        self.gpt_oss_expert_id_to_weight_base_v0(
-            expert_indices_int_base=expert_indices_int_base,
-            pair_idx=pair_idx,
-            table_base=table_base,
-            per_expert_stride=per_expert_stride,
-            addr_reg=addr_reg,
-            name=name,
-        )
-
-    def moe_dynamic_linear_projection_v0(
-        self,
-        input_var: VRAMMatrixVar,
-        weight_template: InputVar,
-        *,
-        expert_indices_int_base: int,
-        pair_idx: int,
-        table_base: int,
-        per_expert_stride: int,
-        expert_base_table_int_base: int | None = None,
-        name: str,
-        physical_shape: tuple[int, int] | None = None,
-        policy_name: str = "gpt_oss",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for runtime expert-selected projection."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_dynamic_linear_projection_v0")
-        return self.gpt_oss_dynamic_linear_projection_v0(
-            input_var,
-            weight_template,
-            expert_indices_int_base=expert_indices_int_base,
-            pair_idx=pair_idx,
-            table_base=table_base,
-            per_expert_stride=per_expert_stride,
-            expert_base_table_int_base=expert_base_table_int_base,
-            name=name,
-            physical_shape=physical_shape,
-        )
-
-    def moe_add_dynamic_expert_bias_v0(
-        self,
-        dst: VRAMMatrixVar,
-        bias_table: VRAMMatrixVar,
-        *,
-        expert_indices_int_base: int,
-        pair_idx: int,
-        rows: int,
-        width: int,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_dynamic_bias",
-    ) -> None:
-        """Generic substrate wrapper for runtime expert-selected bias add."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_add_dynamic_expert_bias_v0")
-        self.gpt_oss_add_dynamic_expert_bias_v0(
-            dst,
-            bias_table,
-            expert_indices_int_base=expert_indices_int_base,
-            pair_idx=pair_idx,
-            rows=rows,
-            width=width,
-            name=name,
-        )
-
-    def moe_materialize_route_weight_v0(
-        self,
-        *,
-        weights_fp_base: int,
-        pair_idx: int,
-        rows: int,
-        hidden: int,
-        zero_row: FPVar | None = None,
-        fp_scratch: FPVar | None = None,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_device_route_weight",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for selected route-weight materialization."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_materialize_route_weight_v0")
-        return self.gpt_oss_materialize_topk_route_weight_v0(
-            weights_fp_base=weights_fp_base,
-            pair_idx=pair_idx,
-            rows=rows,
-            hidden=hidden,
-            zero_row=zero_row,
-            fp_scratch=fp_scratch,
-            name=name,
-        )
-
-    def moe_materialize_route_weights_for_active_rows_v0(
-        self,
-        *,
-        weights_fp_base: int,
-        pair_indices: Sequence[int],
-        active_rows: Sequence[int],
-        rows: int,
-        hidden: int,
-        zero_row: FPVar | None = None,
-        fp_scratch: FPVar | None = None,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_device_route_weights_grouped",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for selected route weights in grouped active rows."""
-        self._require_routed_moe_substrate_policy_v0(
-            policy_name, helper="moe_materialize_route_weights_for_active_rows_v0"
-        )
-        return self.gpt_oss_materialize_route_weights_for_active_rows_v0(
-            weights_fp_base=weights_fp_base,
-            pair_indices=pair_indices,
-            active_rows=active_rows,
-            rows=rows,
-            hidden=hidden,
-            zero_row=zero_row,
-            fp_scratch=fp_scratch,
-            name=name,
-        )
-
-    def moe_dynamic_expert_pair_v0(
-        self,
-        x: VRAMMatrixVar,
-        weights: ExpertWeights,
-        *,
-        weight_table_bases: tuple[int, int, int],
-        weight_table_strides: tuple[int, int, int],
-        expert_indices_int_base: int,
-        weights_fp_base: int,
-        pair_idx: int,
-        bias_tables: ExpertBiases | None,
-        rows: int,
-        intermediate: int,
-        constants: GptOssFPConstants,
-        zero_row: FPVar | None = None,
-        route_fp_scratch: FPVar | None = None,
-        policy_name: str = "gpt_oss",
-        activation_policy: str = "gpt_oss_clamp_gated",
-        name: str = "gpt_oss_dynamic_expert_pair",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for one routed expert pair."""
-        self._require_moe_policy_v0(policy_name, helper="moe_dynamic_expert_pair_v0")
-        if activation_policy not in {"gpt_oss_clamp_gated", "standard_swiglu"}:
-            raise NotImplementedError(
-                "moe_dynamic_expert_pair_v0 supports activation_policy in "
-                "{'gpt_oss_clamp_gated', 'standard_swiglu'}, got "
-                f"{activation_policy!r}"
-            )
-        return self.gpt_oss_dynamic_expert_pair_v0(
-            x,
-            weights,
-            weight_table_bases=weight_table_bases,
-            weight_table_strides=weight_table_strides,
-            expert_indices_int_base=expert_indices_int_base,
-            weights_fp_base=weights_fp_base,
-            pair_idx=pair_idx,
-            bias_tables=bias_tables,
-            rows=rows,
-            intermediate=intermediate,
-            constants=constants,
-            zero_row=zero_row,
-            route_fp_scratch=route_fp_scratch,
-            activation_policy=activation_policy,
-            name=name,
-        )
-
-    def moe_gather_token_rows_from_hbm_v0(
-        self,
-        x_input: InputVar,
-        *,
-        token_offsets_int_base: int,
-        pair_count: int,
-        hidden: int,
-        zero_row: FPVar | None = None,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_gathered_x",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for HBM token gather into routed slots."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_gather_token_rows_from_hbm_v0")
-        return self.gpt_oss_gather_token_rows_from_hbm_v0(
-            x_input,
-            token_offsets_int_base=token_offsets_int_base,
-            pair_count=pair_count,
-            hidden=hidden,
-            zero_row=zero_row,
-            name=name,
-        )
-
-    def moe_gather_token_rows_from_vram_v0(
-        self,
-        x: VRAMMatrixVar,
-        *,
-        token_indices: Sequence[int],
-        hidden: int,
-        zero_row: FPVar | None = None,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_gathered_x_vram",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for VRAM-resident token rows into routed slots."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_gather_token_rows_from_vram_v0")
-        return self.gpt_oss_gather_token_rows_from_vram_v0(
-            x,
-            token_indices=token_indices,
-            hidden=hidden,
-            zero_row=zero_row,
-            name=name,
-        )
-
-    def moe_true_zero_vram_rows_v0(
-        self,
-        matrix: VRAMMatrixVar,
-        *,
-        rows: Sequence[int],
-        hidden: int,
-        zero_row: FPVar | None = None,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_zero_rows",
-    ) -> None:
-        """Generic substrate wrapper for true-zeroing routed slot rows."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_true_zero_vram_rows_v0")
-        self.gpt_oss_true_zero_vram_rows_v0(matrix, rows=rows, hidden=hidden, zero_row=zero_row, name=name)
-
-    def moe_scatter_add_active_rows_v0(
-        self,
-        dst: VRAMMatrixVar,
-        src: VRAMMatrixVar,
-        *,
-        token_indices: Sequence[int],
-        active_rows: Sequence[int],
-        hidden: int,
-        policy_name: str = "gpt_oss",
-        name: str = "gpt_oss_scatter_add",
-    ) -> None:
-        """Generic substrate wrapper for routed-slot scatter-add."""
-        self._require_routed_moe_substrate_policy_v0(policy_name, helper="moe_scatter_add_active_rows_v0")
-        self.gpt_oss_scatter_add_active_rows_v0(
-            dst,
-            src,
-            token_indices=token_indices,
-            active_rows=active_rows,
-            hidden=hidden,
-            name=name,
-        )
-
     def moe_expert_activation_v0(
         self,
         gate: VRAMMatrixVar,
@@ -1744,68 +1436,6 @@ class ProgramRoutedMoeMixin:
             "moe_expert_activation_v0 supports activation_policy in "
             "{'gpt_oss_clamp_gated', 'standard_swiglu'}, got "
             f"{activation_policy!r}"
-        )
-
-    def moe_expert_v0(
-        self,
-        x: VRAMMatrixVar,
-        weights: ExpertWeights,
-        *,
-        biases: ExpertBiases | None = None,
-        rows: int,
-        intermediate: int,
-        constants: GptOssFPConstants,
-        policy_name: str = "gpt_oss",
-        activation_policy: str = "gpt_oss_clamp_gated",
-        name: str,
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for one statically selected expert."""
-        self._require_moe_policy_v0(policy_name, helper="moe_expert_v0")
-        if activation_policy != "gpt_oss_clamp_gated":
-            raise NotImplementedError(
-                "moe_expert_v0 currently supports only activation_policy='gpt_oss_clamp_gated', "
-                f"got {activation_policy!r}"
-            )
-        return self.gpt_oss_expert_v0(
-            x,
-            weights,
-            biases=biases,
-            rows=rows,
-            intermediate=intermediate,
-            constants=constants,
-            name=name,
-        )
-
-    def moe_fixed_routing_v0(
-        self,
-        x: VRAMMatrixVar,
-        experts: Sequence[ExpertWeights],
-        route_weights: Sequence[VRAMMatrixVar],
-        *,
-        expert_biases: Sequence[ExpertBiases | None] | None = None,
-        rows: int,
-        intermediate: int,
-        constants: GptOssFPConstants,
-        policy_name: str = "gpt_oss",
-        activation_policy: str = "gpt_oss_clamp_gated",
-        name: str = "gpt_oss_moe",
-    ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for fixed-routing MoE combine."""
-        self._require_moe_policy_v0(policy_name, helper="moe_fixed_routing_v0")
-        if activation_policy != "gpt_oss_clamp_gated":
-            raise NotImplementedError(
-                "moe_fixed_routing_v0 currently supports only "
-                f"activation_policy='gpt_oss_clamp_gated', got {activation_policy!r}"
-            )
-        return self.gpt_oss_moe_fixed_routing_v0(
-            x,
-            experts,
-            route_weights,
-            expert_biases=expert_biases,
-            rows=rows,
-            intermediate=intermediate,
-            constants=constants,
-            name=name,
         )
 
 

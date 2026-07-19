@@ -916,16 +916,21 @@ class IsaAttentionMixin:
 
         return self._emit(isa_code)
 
-    def warm_v_prefetch(self, v_sub_matrix: str, k_idx: int) -> str:
+    def warm_v_prefetch(self, v_sub_matrix: str, k_idx: int, v_hbm_element_bytes: int = 1) -> str:
         """Prefetch V[k_idx] into MSRAM ONCE (High precision) before the per-head P@V
         loop so it has fully landed by head 0's first tile. Paired with the RTL
         cold-start re-prime at the M_BTMM->M_MM boundary: the re-prime re-warms the
         weight-read pipe, but its ~20-cycle spin can outrun head 0's own (late) per-head
         prefetch, leaving row 0 reading stale K. Landing V here (during head 0's softmax)
-        guarantees the spin reads V for row 0 too."""
+        guarantees the spin reads V for row 0 too.
+
+        Addressing must match ``_pv_multiply_asm``: H_PREFETCH_M offsets and its row
+        stride are byte-based, so scale both by ``v_hbm_element_bytes`` (1 for MXFP8,
+        2 for plain BF16 V). Warming with the element-based offset/stride would stage
+        a different V region than compute_pv reads whenever element_bytes != 1."""
         v_layout = self.get_hbm_layout(v_sub_matrix)
         physical_head_dim = (v_layout.physical_shape or v_layout.full_shape)[1]
-        v_hbm_offset = k_idx * self.mlen * physical_head_dim
+        v_hbm_offset = k_idx * self.mlen * physical_head_dim * v_hbm_element_bytes
         addr_regs = self.register_allocator.allocate_addr(1)
         v_hbm_reg = addr_regs[0]
         gp_regs = self.register_allocator.allocate_gp(2)
@@ -936,6 +941,9 @@ class IsaAttentionMixin:
         isa_code += preload_addr_reg_asm(
             addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
         )
+        # Byte-based row stride, mirroring _pv_multiply_asm's V prefetch.
+        isa_code += f"S_ADDI_INT gp{gp_regs[0]}, gp0, {physical_head_dim * v_hbm_element_bytes}\n"
+        isa_code += f"C_SET_STRIDE_REG gp{gp_regs[0]}\n"
         isa_code += f"S_ADDI_INT gp{gp_regs[0]}, gp0, 0\n"
         isa_code += "\n".join(load_large_int(gp_regs[1], v_hbm_offset)) + "\n"
         isa_code += f"H_PREFETCH_M gp{gp_regs[0]}, gp{gp_regs[1]}, a{v_hbm_reg}, 1, 0\n"

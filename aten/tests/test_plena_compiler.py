@@ -350,6 +350,62 @@ def test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts():
     print("  PASS test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts")
 
 
+def _build_dynamic_expert_projection(hidden, out_features=64, mlen=64, blen=4):
+    """Compile one runtime-expert-id linear projection and return (code, output)."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=mlen, blen=blen, mram_tile_capacity=4)
+    x_input = prog.input("X", shape=(blen, hidden), physical_shape=(blen, hidden), real_data_ratio=1.0)
+    x = prog.load_batch(x_input, name="X")
+    weight = prog.input(
+        "W_expert",
+        shape=(hidden, out_features),
+        physical_shape=(hidden, out_features),
+        real_data_ratio=1.0,
+    )
+    output = prog.gpt_oss_dynamic_linear_projection_v0(
+        x,
+        weight,
+        expert_indices_int_base=0,
+        pair_idx=0,
+        table_base=0,
+        per_expert_stride=hidden * out_features,
+        name="proj",
+    )
+    return prog.get_code(), output
+
+
+def test_gpt_oss_dynamic_linear_projection_single_k_group_compiles():
+    """Runtime-expert projection with num_k_tiles <= MRAM capacity: single-shot, no K-split."""
+    # hidden=256 -> 4 K-tiles == mram_tile_capacity, so the non-split branch is taken.
+    code, output = _build_dynamic_expert_projection(hidden=256)
+    assert output.shape == (4, 64)
+    # Runtime expert id is read from int SRAM and drives the dynamic weight load.
+    assert "S_LD_INT" in code
+    assert code.count("M_MM 0,") == 1
+    assert code.count("M_MM_WO") == 1
+    # No K-split -> no temp accumulator and no block-add.
+    assert "proj_temp" not in code
+    assert code.count("V_ADD_VV") == 0
+    print("  PASS test_gpt_oss_dynamic_linear_projection_single_k_group_compiles")
+
+
+def test_gpt_oss_dynamic_linear_projection_k_split_compiles():
+    """Runtime-expert projection with num_k_tiles > MRAM capacity exercises the K-split
+    accumulation branch — the live path at real GPT-OSS dims (hidden=2880 -> 45 K-tiles)."""
+    # hidden=320 -> 5 K-tiles > mram_tile_capacity=4, so K-split into chunks [4, 1].
+    code, output = _build_dynamic_expert_projection(hidden=320)
+    assert output.shape == (4, 64)
+    assert "S_LD_INT" in code
+    # Two K-chunks: chunk 0 writes the output tile, chunk 1 writes a temp tile that is
+    # block-added into the output accumulator.
+    assert code.count("M_MM 0,") == 2
+    assert code.count("M_MM_WO") == 2
+    assert "proj_temp" in code
+    assert code.count("V_ADD_VV") >= 1
+    print("  PASS test_gpt_oss_dynamic_linear_projection_k_split_compiles")
+
+
 def test_vram_layout_tracks_logical_and_physical_shape():
     """Layouts should keep native logical rows while allocating physical BLEN row storage."""
     from compiler.aten.plena import PlenaCompiler
@@ -937,6 +993,8 @@ if __name__ == "__main__":
         test_compiler_threads_runtime_memory_geometry,
         test_linear_projection_uses_runtime_mram_tile_capacity,
         test_packed_skinny_stream_k_probe_compiles_cap8_under_cap4_mram,
+        test_gpt_oss_dynamic_linear_projection_single_k_group_compiles,
+        test_gpt_oss_dynamic_linear_projection_k_split_compiles,
         test_vram_layout_tracks_logical_and_physical_shape,
         test_partial_row_linear_uses_one_blen_row_group,
         test_ffn_workspace_uses_allocator_and_avoids_rope_tables,
