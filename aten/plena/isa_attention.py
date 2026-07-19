@@ -209,6 +209,84 @@ class IsaAttentionMixin:
         self.register_allocator.free_gp(gp_regs)
         return "\n".join(lines) + "\n"
 
+    def _online_softmax_first_block_asm(
+        self,
+        mlen: int,
+        s_address: int,
+        m_start_address: int,
+        scale: float = 1.0,
+        rows: int | None = None,
+        valid_cols: int | None = None,
+    ) -> str:
+        """Initialize online-softmax state from the first valid K block.
+
+        The generic recurrence starts from ``m=-inf`` and ``l=0``.  For the
+        first block those values make ``m_res`` exactly zero, so loading and
+        updating the old state cannot affect the result.  This form writes the
+        same running ``m`` and ``l`` state needed by later K blocks while
+        avoiding the redundant scalar recurrence and FP-SRAM initialization.
+        """
+
+        gp_s, gp_m_addr, gp_l_addr, gp_loop = self.register_allocator.allocate_gp(4)
+        fp_m = 1
+        fp_l = 3
+        fp_sum_p = 4
+        fp_scale = 5
+        fp_row_max = 6
+
+        lines = [
+            "; === Online Softmax First Block ===",
+            *load_large_int(gp_s, s_address),
+            *load_large_int(gp_m_addr, m_start_address),
+            f"S_ADDI_INT gp{gp_l_addr}, gp{gp_m_addr}, {2 * mlen}",
+        ]
+
+        mask_en = 0
+        if valid_cols is not None and valid_cols < mlen:
+            mask_unit = getattr(self, "hlen", mlen)
+            valid_lanes = max(1, math.ceil(valid_cols / mask_unit))
+            mask_bits = (1 << valid_lanes) - 1
+            lines.extend(
+                [
+                    f"S_ADDI_INT gp{gp_loop}, gp0, {mask_bits}",
+                    f"C_SET_V_MASK_REG gp{gp_loop}",
+                ]
+            )
+            mask_en = 1
+
+        if scale != 1.0:
+            lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+
+        loop_rows = mlen if rows is None else rows
+        lines.append(f"C_LOOP_START gp{gp_loop}, {loop_rows}")
+        if scale != 1.0:
+            lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}")
+
+        lines.extend(
+            [
+                f"S_LD_FP f{fp_row_max}, gp0, 2",
+                f"V_RED_MAX f{fp_row_max}, gp{gp_s}, {mask_en}",
+                # Preserve the scalar-copy rounding of the generic path while
+                # replacing max(row_max, -inf) with its exact result.
+                f"S_ADD_FP f{fp_m}, f{fp_row_max}, f0",
+                f"S_ST_FP f{fp_m}, gp{gp_m_addr}, 0",
+                f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m}, {mask_en}, 0",
+                f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0",
+                f"S_ADD_FP f{fp_sum_p}, f0, f0",
+                f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0",
+                # The generic first update computes 0 * 0 + sum(P).  Keep a
+                # scalar ALU copy so the destination format/rounding is equal.
+                f"S_ADD_FP f{fp_l}, f{fp_sum_p}, f0",
+                f"S_ST_FP f{fp_l}, gp{gp_l_addr}, 0",
+                f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}",
+                f"S_ADDI_INT gp{gp_m_addr}, gp{gp_m_addr}, 1",
+                f"S_ADDI_INT gp{gp_l_addr}, gp{gp_l_addr}, 1",
+                f"C_LOOP_END gp{gp_loop}",
+            ]
+        )
+        self.register_allocator.free_gp([gp_s, gp_m_addr, gp_l_addr, gp_loop])
+        return "\n".join(lines) + "\n"
+
     def _pv_multiply_asm(
         self,
         mlen: int,
@@ -703,6 +781,8 @@ class IsaAttentionMixin:
         seq_len: int,
         head_dim: int,
         rows: int | None = None,
+        reset_state: bool = True,
+        reset_output: bool = True,
     ) -> str:
         """
         Initialize Online Softmax state for Q block q_idx:
@@ -719,17 +799,40 @@ class IsaAttentionMixin:
 
         isa_code = f"; === Init Online Softmax for Q block {q_idx} ===\n"
 
-        isa_code += self._reset_fpsram_asm(m_old_addr, self.mlen, 2)  # slot 2 = -inf
-        isa_code += self._reset_fpsram_asm(l_addr, self.mlen, 0)  # slot 0 = 0.0
-        isa_code += self._reset_vram_asm(
-            start_address=o_vram_addr,
-            rows=self.mlen if rows is None else rows,
-            cols=head_dim,
-            total_rows=physical_seq_len,
-            mlen=self.mlen,
-            row_offset=row_offset,
-        )
+        if reset_state:
+            isa_code += self._reset_fpsram_asm(m_old_addr, self.mlen, 2)  # slot 2 = -inf
+            isa_code += self._reset_fpsram_asm(l_addr, self.mlen, 0)  # slot 0 = 0.0
+        if reset_output:
+            isa_code += self._reset_vram_asm(
+                start_address=o_vram_addr,
+                rows=self.mlen if rows is None else rows,
+                cols=head_dim,
+                total_rows=physical_seq_len,
+                mlen=self.mlen,
+                row_offset=row_offset,
+            )
 
+        return self._emit(isa_code)
+
+    def online_softmax_first_block(
+        self,
+        s_block_matrix: str,
+        scale: float,
+        rows: int | None = None,
+        valid_cols: int | None = None,
+    ) -> str:
+        """Create running online-softmax state from the first K block."""
+
+        s_info = self[s_block_matrix]
+        isa_code = f"; === Online Softmax First Block {s_block_matrix} ===\n"
+        isa_code += self._online_softmax_first_block_asm(
+            mlen=self.mlen,
+            s_address=s_info.vram_addr,
+            m_start_address=self._ONLINE_SOFTMAX_FPSRAM_BASE,
+            scale=scale,
+            rows=rows,
+            valid_cols=valid_cols,
+        )
         return self._emit(isa_code)
 
     def online_softmax_block(

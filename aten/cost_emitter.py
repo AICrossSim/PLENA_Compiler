@@ -8,6 +8,7 @@ whose physical ISA contains tens of millions of instructions stays compact.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, ClassVar, TypeAlias
@@ -978,6 +979,67 @@ class CostSink:
                     # applies its multiplicity exactly once during traversal.
                     dynamic_instruction_count=dynamic_instruction_count,
                 )
+            )
+
+    @contextmanager
+    def repeated_region(
+        self, count: int, *, name: str, repeat_kind: str = "compile_time"
+    ):
+        """Emit one ordered body and account for ``count`` identical copies.
+
+        This is a cost-only equivalent of compiler unrolling.  It is intended
+        for latency summaries whose dynamic addresses do not change opcode or
+        DMA geometry.  DMA inside the region is rejected so every physical
+        memory stream remains represented explicitly by ``MemoryEvent``.
+        """
+        if count <= 0:
+            raise ValueError(f"repeated-region count must be positive, got {count}")
+        before_schedule = len(self._schedule_children)
+        before_streams = len(self.trace.memory_events)
+        before_static = Counter(self.trace.static_opcodes)
+        before_dynamic = Counter(self.trace.dynamic_opcodes)
+        before_stages = {
+            stage: (Counter(cost.static_opcodes), Counter(cost.dynamic_opcodes))
+            for stage, cost in self.trace.stages.items()
+        }
+        yield
+        if len(self.trace.memory_events) != before_streams:
+            raise ValueError("repeated cost regions cannot contain DMA events")
+        body = tuple(self._schedule_children[before_schedule:])
+        del self._schedule_children[before_schedule:]
+        self._schedule_children.append(
+            ScheduleRepeat(
+                count=count,
+                body=ScheduleSequence(body),
+                name=name,
+                repeat_kind=repeat_kind,
+            )
+        )
+        if count == 1:
+            return
+        static_delta = self.trace.static_opcodes - before_static
+        dynamic_delta = self.trace.dynamic_opcodes - before_dynamic
+        self.trace.static_opcodes.update(
+            {opcode: value * (count - 1) for opcode, value in static_delta.items()}
+        )
+        self.trace.dynamic_opcodes.update(
+            {opcode: value * (count - 1) for opcode, value in dynamic_delta.items()}
+        )
+        for stage, cost in self.trace.stages.items():
+            old_static, old_dynamic = before_stages.get(stage, (Counter(), Counter()))
+            stage_static_delta = cost.static_opcodes - old_static
+            stage_dynamic_delta = cost.dynamic_opcodes - old_dynamic
+            cost.static_opcodes.update(
+                {
+                    opcode: value * (count - 1)
+                    for opcode, value in stage_static_delta.items()
+                }
+            )
+            cost.dynamic_opcodes.update(
+                {
+                    opcode: value * (count - 1)
+                    for opcode, value in stage_dynamic_delta.items()
+                }
             )
 
     def add_ordered_schedule(

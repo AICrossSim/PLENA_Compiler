@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, Protocol, TypeAlias
 
 import torch
 
@@ -21,6 +21,13 @@ class ModelConfig:
     rope_theta: float
     vocab_size: int | None
     model_type: str
+    dense_inter_dim: int | None = None
+    moe_inter_dim: int | None = None
+    num_experts: int = 0
+    experts_per_token: int = 0
+    norm_topk_prob: bool = False
+    decoder_sparse_step: int = 1
+    mlp_only_layers: tuple[int, ...] = ()
 
     @property
     def total_q_dim(self) -> int:
@@ -29,6 +36,12 @@ class ModelConfig:
     @property
     def head_ratio(self) -> int:
         return self.num_heads // self.num_kv_heads
+
+    def is_moe_layer(self, layer_idx: int) -> bool:
+        """Return the Qwen3 hybrid-layer classification from config metadata."""
+        if self.num_experts <= 0 or layer_idx in self.mlp_only_layers:
+            return False
+        return (layer_idx + 1) % max(1, self.decoder_sparse_step) == 0
 
 
 @dataclass(frozen=True)
@@ -43,6 +56,10 @@ class LayerWeights:
     w_up: torch.Tensor
     w_down: torch.Tensor
     eps: float
+    input_norm_weight: torch.Tensor | None = None
+    post_attn_norm_weight: torch.Tensor | None = None
+    q_norm_weight: torch.Tensor | None = None
+    k_norm_weight: torch.Tensor | None = None
 
     def tensor_entries(self, layer_idx: int) -> list[tuple[str, torch.Tensor]]:
         entries = [
@@ -67,7 +84,174 @@ class LayerWeights:
                 (f"W_down_{layer_idx}", self.w_down),
             ]
         )
+        for suffix, tensor in (
+            ("input_norm", self.input_norm_weight),
+            ("post_attn_norm", self.post_attn_norm_weight),
+            ("q_norm", self.q_norm_weight),
+            ("k_norm", self.k_norm_weight),
+        ):
+            if tensor is not None:
+                entries.append((f"W_{suffix}_{layer_idx}", tensor))
         return entries
+
+
+@dataclass(frozen=True)
+class MoeExpertWeights:
+    """One Qwen3-MoE expert in PLENA's ``(input, output)`` layout."""
+
+    w_gate: torch.Tensor
+    w_up: torch.Tensor
+    w_down: torch.Tensor
+
+
+class MoeExpertProvider(Protocol):
+    """Lazy source for expert weights.
+
+    Implementations may reference an already loaded fused tensor or read a
+    single expert slice from a safetensors shard.  The compiler only asks for
+    experts selected by the static routing plan.
+    """
+
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+
+    def materialize(self, expert_id: int) -> MoeExpertWeights:
+        """Return one expert without materializing the remaining experts."""
+
+
+@dataclass
+class TensorMoeExpertProvider:
+    """Lazy view over Qwen3's fused gate/up and down expert tensors."""
+
+    gate_up_proj: torch.Tensor
+    down_proj: torch.Tensor
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+
+    def materialize(self, expert_id: int) -> MoeExpertWeights:
+        if not 0 <= expert_id < self.num_experts:
+            raise IndexError(
+                f"expert_id={expert_id} outside [0, {self.num_experts})"
+            )
+        fused = self.gate_up_proj[expert_id]
+        down = self.down_proj[expert_id]
+        expected_fused = (2 * self.intermediate_size, self.hidden_size)
+        expected_down = (self.hidden_size, self.intermediate_size)
+        if tuple(fused.shape) != expected_fused:
+            raise ValueError(
+                f"gate_up_proj[{expert_id}] has shape {tuple(fused.shape)}, "
+                f"expected {expected_fused}"
+            )
+        if tuple(down.shape) != expected_down:
+            raise ValueError(
+                f"down_proj[{expert_id}] has shape {tuple(down.shape)}, "
+                f"expected {expected_down}"
+            )
+        gate, up = fused.split(self.intermediate_size, dim=0)
+        return MoeExpertWeights(
+            w_gate=gate.detach().T.contiguous(),
+            w_up=up.detach().T.contiguous(),
+            w_down=down.detach().T.contiguous(),
+        )
+
+
+@dataclass
+class ModuleListMoeExpertProvider:
+    """Adapter for Transformers variants exposing one module per expert."""
+
+    experts: Any
+    num_experts: int
+    hidden_size: int
+    intermediate_size: int
+
+    def materialize(self, expert_id: int) -> MoeExpertWeights:
+        if not 0 <= expert_id < self.num_experts:
+            raise IndexError(
+                f"expert_id={expert_id} outside [0, {self.num_experts})"
+            )
+        expert = self.experts[expert_id]
+        return MoeExpertWeights(
+            w_gate=_linear_weight(
+                expert.gate_proj, self.hidden_size, self.intermediate_size
+            ),
+            w_up=_linear_weight(
+                expert.up_proj, self.hidden_size, self.intermediate_size
+            ),
+            w_down=_linear_weight(
+                expert.down_proj, self.intermediate_size, self.hidden_size
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class MoeLayerWeights:
+    """Common attention/router weights plus lazily selected MoE experts."""
+
+    w_q: torch.Tensor
+    w_o: torch.Tensor
+    w_k_heads: list[torch.Tensor]
+    w_v_heads: list[torch.Tensor]
+    w_router: torch.Tensor
+    expert_provider: MoeExpertProvider
+    eps: float
+    input_norm_weight: torch.Tensor | None = None
+    post_attn_norm_weight: torch.Tensor | None = None
+    q_norm_weight: torch.Tensor | None = None
+    k_norm_weight: torch.Tensor | None = None
+    active_experts: dict[int, MoeExpertWeights] | None = None
+
+    def with_active_experts(self, expert_ids: set[int]) -> "MoeLayerWeights":
+        experts = {
+            expert_id: self.expert_provider.materialize(expert_id)
+            for expert_id in sorted(expert_ids)
+        }
+        return replace(self, active_experts=experts)
+
+    def tensor_entries(self, layer_idx: int) -> list[tuple[str, torch.Tensor]]:
+        entries = [
+            (f"W_q_{layer_idx}", self.w_q),
+            (f"W_o_{layer_idx}", self.w_o),
+        ]
+        if len(self.w_k_heads) != len(self.w_v_heads):
+            raise ValueError(
+                f"w_k_heads/w_v_heads length mismatch: "
+                f"{len(self.w_k_heads)} != {len(self.w_v_heads)}"
+            )
+        for kv_h, (w_k, w_v) in enumerate(zip(self.w_k_heads, self.w_v_heads)):
+            entries.extend(
+                [
+                    (f"W_k_{layer_idx}_h{kv_h}", w_k),
+                    (f"W_v_{layer_idx}_h{kv_h}", w_v),
+                ]
+            )
+        entries.append((f"W_router_{layer_idx}", self.w_router))
+        for suffix, tensor in (
+            ("input_norm", self.input_norm_weight),
+            ("post_attn_norm", self.post_attn_norm_weight),
+            ("q_norm", self.q_norm_weight),
+            ("k_norm", self.k_norm_weight),
+        ):
+            if tensor is not None:
+                entries.append((f"W_{suffix}_{layer_idx}", tensor))
+        if self.active_experts is None:
+            raise ValueError(
+                "MoE tensor_entries requires active experts; derive a static "
+                "routing plan and call with_active_experts() first"
+            )
+        for expert_id, expert in sorted(self.active_experts.items()):
+            entries.extend(
+                [
+                    (f"W_expert_gate_{layer_idx}_e{expert_id}", expert.w_gate),
+                    (f"W_expert_up_{layer_idx}_e{expert_id}", expert.w_up),
+                    (f"W_expert_down_{layer_idx}_e{expert_id}", expert.w_down),
+                ]
+            )
+        return entries
+
+
+DecoderLayerWeights: TypeAlias = LayerWeights | MoeLayerWeights
 
 
 @dataclass(frozen=True)
@@ -241,11 +425,20 @@ def extract_model_config(model: Any) -> ModelConfig:
     config = getattr(cfg, "text_config", cfg)
     hidden = config.hidden_size
     num_heads = config.num_attention_heads
-    inter_dim = getattr(config, "intermediate_size", None)
-    if inter_dim is None:
-        inter_dim = getattr(config, "mlp_hidden_size", None)
+    dense_inter_dim = getattr(config, "intermediate_size", None)
+    if dense_inter_dim is None:
+        dense_inter_dim = getattr(config, "mlp_hidden_size", None)
+    moe_inter_dim = getattr(config, "moe_intermediate_size", None)
+    num_experts = int(getattr(config, "num_experts", 0) or 0)
+    # ``inter_dim`` remains the active per-layer FFN width for compatibility
+    # with the existing compiler.  Qwen3-MoE layers use the smaller expert
+    # intermediate width; hybrid dense layers retain ``dense_inter_dim`` in
+    # the explicit metadata below.
+    inter_dim = moe_inter_dim if num_experts and moe_inter_dim is not None else dense_inter_dim
     if inter_dim is None:
         inter_dim = 4 * hidden
+    if dense_inter_dim is None:
+        dense_inter_dim = inter_dim
     num_kv_heads = getattr(config, "num_key_value_heads", None)
     if num_kv_heads is None:
         num_kv_heads = getattr(config, "n_kv_heads", num_heads)
@@ -259,6 +452,13 @@ def extract_model_config(model: Any) -> ModelConfig:
         rope_theta=getattr(config, "rope_theta", 10000.0),
         vocab_size=getattr(config, "vocab_size", None),
         model_type=getattr(config, "model_type", "unknown"),
+        dense_inter_dim=int(dense_inter_dim),
+        moe_inter_dim=None if moe_inter_dim is None else int(moe_inter_dim),
+        num_experts=num_experts,
+        experts_per_token=int(getattr(config, "num_experts_per_tok", 0) or 0),
+        norm_topk_prob=bool(getattr(config, "norm_topk_prob", False)),
+        decoder_sparse_step=int(getattr(config, "decoder_sparse_step", 1) or 1),
+        mlp_only_layers=tuple(int(i) for i in (getattr(config, "mlp_only_layers", None) or ())),
     )
 
 
@@ -287,12 +487,15 @@ def extract_vision_config(model: Any) -> VisionConfig:
     )
 
 
-def extract_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
+def extract_layer_weights(layer: Any, config: ModelConfig) -> DecoderLayerWeights:
     """Extract one decoder layer in PLENA's (in, out) convention.
 
     Supports both standard Llama/Qwen layers (with self_attn and mlp) and
     LLaDA-style layers (with direct projections).
     """
+    if is_qwen3_moe_layer(layer):
+        return _extract_qwen3_moe_layer_weights(layer, config)
+
     # Detect layer type
     is_llada = hasattr(layer, "q_proj") and not hasattr(layer, "self_attn")
 
@@ -397,6 +600,11 @@ def extract_vision_connector_weights(
 def _extract_llama_layer_weights(layer: Any, config: ModelConfig) -> LayerWeights:
     """Extract standard Llama/Qwen layer weights."""
     hidden = config.hidden_size
+    # In hybrid Qwen3-MoE checkpoints the model-level ``inter_dim`` defaults
+    # to the expert width, while structurally dense layers retain the ordinary
+    # ``intermediate_size``.  Keep the extractor correct even when it is used
+    # independently of the compiler's selected-layer config adjustment.
+    inter_dim = config.dense_inter_dim or config.inter_dim
     total_kv_dim = config.num_kv_heads * config.head_dim
     w_k_full = _linear_weight(layer.self_attn.k_proj, hidden, total_kv_dim)
     w_v_full = _linear_weight(layer.self_attn.v_proj, hidden, total_kv_dim)
@@ -407,10 +615,88 @@ def _extract_llama_layer_weights(layer: Any, config: ModelConfig) -> LayerWeight
         w_o=_linear_weight(layer.self_attn.o_proj, config.total_q_dim, hidden),
         w_k_heads=_split_heads(w_k_full, config.head_dim, config.num_kv_heads),
         w_v_heads=_split_heads(w_v_full, config.head_dim, config.num_kv_heads),
-        w_gate=_linear_weight(layer.mlp.gate_proj, hidden, config.inter_dim),
-        w_up=_linear_weight(layer.mlp.up_proj, hidden, config.inter_dim),
-        w_down=_linear_weight(layer.mlp.down_proj, config.inter_dim, hidden),
+        w_gate=_linear_weight(layer.mlp.gate_proj, hidden, inter_dim),
+        w_up=_linear_weight(layer.mlp.up_proj, hidden, inter_dim),
+        w_down=_linear_weight(layer.mlp.down_proj, inter_dim, hidden),
         eps=getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-5)),
+        input_norm_weight=_norm_weight(getattr(layer, "input_layernorm", None), hidden),
+        post_attn_norm_weight=_norm_weight(
+            getattr(layer, "post_attention_layernorm", None), hidden
+        ),
+        q_norm_weight=_norm_weight(getattr(layer.self_attn, "q_norm", None), config.head_dim),
+        k_norm_weight=_norm_weight(getattr(layer.self_attn, "k_norm", None), config.head_dim),
+    )
+
+
+def is_qwen3_moe_layer(layer: Any) -> bool:
+    """Return whether ``layer`` exposes the Qwen3-MoE expert structure.
+
+    Config metadata alone is insufficient for hybrid models because
+    ``mlp_only_layers`` may select ordinary dense FFNs.  The compiler uses
+    this structural check for the concrete layer being compiled and uses the
+    config rule only as metadata validation.
+    """
+    mlp = getattr(layer, "mlp", None)
+    experts = getattr(mlp, "experts", None)
+    return mlp is not None and (
+        hasattr(mlp, "gate")
+        and experts is not None
+        and (
+            hasattr(experts, "gate_up_proj")
+            or hasattr(experts, "_plena_expert_provider")
+            or hasattr(experts, "experts")
+        )
+    )
+
+
+def _extract_qwen3_moe_layer_weights(
+    layer: Any, config: ModelConfig
+) -> MoeLayerWeights:
+    """Extract one Qwen3-MoE layer without copying all fused experts."""
+    if config.num_experts <= 0 or config.moe_inter_dim is None:
+        raise ValueError(
+            "Qwen3-MoE layer detected but config is missing num_experts or "
+            "moe_intermediate_size"
+        )
+
+    hidden = config.hidden_size
+    total_kv_dim = config.num_kv_heads * config.head_dim
+    attn = layer.self_attn
+    mlp = layer.mlp
+    experts = mlp.experts
+    provider = getattr(experts, "_plena_expert_provider", None)
+    if provider is None and hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
+        provider = TensorMoeExpertProvider(
+            gate_up_proj=experts.gate_up_proj,
+            down_proj=experts.down_proj,
+            num_experts=config.num_experts,
+            hidden_size=hidden,
+            intermediate_size=config.moe_inter_dim,
+        )
+    if provider is None:
+        # Some Transformers versions expose a ModuleList of unfused experts.
+        provider = ModuleListMoeExpertProvider(
+            experts=experts.experts,
+            num_experts=config.num_experts,
+            hidden_size=hidden,
+            intermediate_size=config.moe_inter_dim,
+        )
+
+    w_k_full = _linear_weight(attn.k_proj, hidden, total_kv_dim)
+    w_v_full = _linear_weight(attn.v_proj, hidden, total_kv_dim)
+    norm = layer.input_layernorm
+    return MoeLayerWeights(
+        w_q=_linear_weight(attn.q_proj, hidden, config.total_q_dim),
+        w_o=_linear_weight(attn.o_proj, config.total_q_dim, hidden),
+        w_k_heads=_split_heads(w_k_full, config.head_dim, config.num_kv_heads),
+        w_v_heads=_split_heads(w_v_full, config.head_dim, config.num_kv_heads),
+        w_router=_linear_weight(mlp.gate, hidden, config.num_experts),
+        expert_provider=provider,
+        eps=float(getattr(norm, "variance_epsilon", getattr(norm, "eps", config.eps))),
+        input_norm_weight=_norm_weight(layer.input_layernorm, hidden),
+        post_attn_norm_weight=_norm_weight(layer.post_attention_layernorm, hidden),
+        q_norm_weight=_norm_weight(getattr(attn, "q_norm", None), config.head_dim),
+        k_norm_weight=_norm_weight(getattr(attn, "k_norm", None), config.head_dim),
     )
 
 
@@ -448,6 +734,24 @@ def _extract_llada_layer_weights(layer: Any, config: ModelConfig) -> LayerWeight
 def _linear_weight(module: Any, rows: int, cols: int) -> torch.Tensor:
     """HF Linear stores (out, in); PLENA uses (in, out)."""
     return module.weight.detach().T.contiguous()[:rows, :cols]
+
+
+def _norm_weight(module: Any | None, width: int) -> torch.Tensor | None:
+    """Extract a learned norm weight when the model defines one."""
+    weight = getattr(module, "weight", None) if module is not None else None
+    if weight is None:
+        return None
+    flat = weight.detach().reshape(-1)
+    if flat.numel() < width:
+        raise ValueError(
+            f"Norm weight has {flat.numel()} elements, expected at least {width}"
+        )
+    return flat[:width].contiguous()
+
+
+def extract_final_norm_weight(model: Any, config: ModelConfig) -> torch.Tensor | None:
+    """Return the decoder backbone's learned final RMSNorm weight."""
+    return _norm_weight(getattr(find_model_root(model), "norm", None), config.hidden_size)
 
 
 def _linear_bias(module: Any, cols: int) -> torch.Tensor:

@@ -135,7 +135,18 @@ class ProgramAttentionMixin:
         )
 
         self.register_allocator.free_gp([gp_mask, gp_fp, gp_loop])
-        self.emit("\n".join(lines) + "\n")
+        previous_stage = getattr(self, "_active_cost_stage", None)
+        if (
+            getattr(self, "_cost_sink", None) is not None
+            and getattr(self, "vector_scalar_schedule", "legacy") == "compiler-v1"
+        ):
+            self._active_cost_stage = "global/valid_col_mask"
+        try:
+            self.emit("\n".join(lines) + "\n")
+        finally:
+            self._active_cost_stage = previous_stage
+        if hasattr(self, "record_vector_scalar_stats"):
+            self.record_vector_scalar_stats({"valid_mask_build_count": 1})
         return mask
 
     def _get_valid_col_mask(self, valid_cols: int) -> VRAMMatrixVar:
@@ -155,6 +166,31 @@ class ProgramAttentionMixin:
         mask = self._build_valid_col_mask(f"_valid_col_mask_m{self.mlen}_c{valid_cols}", valid_cols)
         cache[key] = mask
         return mask
+
+    def _valid_col_mask_for_tile(
+        self,
+        valid_cols: int,
+        *,
+        causal_mask: bool | VRAMMatrixVar | None,
+        apply_causal_mask: bool,
+        causal_mask_covers_padding: bool,
+    ) -> VRAMMatrixVar | None:
+        """Lazily return a padding mask only when the causal mask is insufficient."""
+
+        if not self._needs_explicit_valid_col_mask(valid_cols):
+            return None
+        if (
+            getattr(self, "vector_scalar_schedule", "legacy") == "compiler-v1"
+            and isinstance(causal_mask, VRAMMatrixVar)
+            and apply_causal_mask
+            and causal_mask_covers_padding
+        ):
+            if hasattr(self, "record_vector_scalar_stats"):
+                self.record_vector_scalar_stats(
+                    {"redundant_valid_masks_elided": 1}
+                )
+            return None
+        return self._get_valid_col_mask(valid_cols)
 
     def rope_packed_q(
         self,
@@ -1048,6 +1084,10 @@ class ProgramAttentionMixin:
         if len(resident_k_mram) != num_k_blocks or len(resident_v_mram) != num_k_blocks:
             raise ValueError("resident K/V address lists do not match sequence K blocks")
         softmax_scale = scale / 0.25
+        optimized_schedule = (
+            getattr(self, "packed_attention_schedule", "legacy")
+            == "direct-first-block-v1"
+        )
         s_head = self.alloc_at(
             "_resident_chunk_loop_S",
             self.mlen,
@@ -1062,12 +1102,6 @@ class ProgramAttentionMixin:
             strict=False,
             physical_shape=(self.mlen, self.mlen),
         )
-        valid_col_masks: dict[int, VRAMMatrixVar] = {}
-        for k_block in range(num_k_blocks):
-            block_cols = min(self.mlen, kv_seq_len - k_block * self.mlen)
-            if self._needs_explicit_valid_col_mask(block_cols):
-                valid_col_masks[block_cols] = self._get_valid_col_mask(block_cols)
-
         if (q_base_gp is None) != (o_base_gp is None):
             raise ValueError("q_base_gp and o_base_gp must be provided together")
         if q_base_gp is None:
@@ -1112,21 +1146,33 @@ class ProgramAttentionMixin:
                     ),
                 ]
                 self.emit("\n".join(block_setup) + "\n")
-                self.emit(
-                    self._reset_fpsram_asm(
-                        self._ONLINE_SOFTMAX_FPSRAM_BASE,
-                        self.mlen,
-                        2,
+                if optimized_schedule:
+                    self._packed_attention_stats[
+                        "softmax_state_initializations_elided"
+                    ] += chunk_count
+                    self._packed_attention_stats[
+                        "softmax_state_initialization_rows_elided"
+                    ] += rows * chunk_count
+                    self._packed_attention_stats[
+                        "temporary_o_matrices_elided"
+                    ] += chunk_count
+                else:
+                    self.emit(
+                        self._reset_fpsram_asm(
+                            self._ONLINE_SOFTMAX_FPSRAM_BASE,
+                            self.mlen,
+                            2,
+                        )
                     )
-                )
-                self.emit(
-                    self._reset_fpsram_asm(
-                        self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * self.mlen,
-                        self.mlen,
-                        0,
+                    self.emit(
+                        self._reset_fpsram_asm(
+                            self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * self.mlen,
+                            self.mlen,
+                            0,
+                        )
                     )
-                )
 
+                first_processed_k_block = True
                 for k_block in range(num_k_blocks):
                     if causal_mask is not None and k_block > q_block:
                         self.emit(
@@ -1146,11 +1192,22 @@ class ProgramAttentionMixin:
                         )
                         + "\n"
                     )
+                    self._packed_attention_stats["qk_compute_count"] += chunk_count
+                    self._packed_attention_stats[
+                        "ideal_qk_compute_count"
+                    ] += chunk_count
                     block_cols = min(self.mlen, kv_seq_len - k_block * self.mlen)
-                    valid_col_mask = valid_col_masks.get(block_cols)
+                    apply_causal_mask = causal_mask is not None and k_block == q_block
+                    valid_col_mask = self._valid_col_mask_for_tile(
+                        block_cols,
+                        causal_mask=causal_mask,
+                        apply_causal_mask=apply_causal_mask,
+                        causal_mask_covers_padding=(
+                            seq_len <= self.mlen and kv_seq_len <= self.mlen
+                        ),
+                    )
                     if valid_col_mask is not None:
                         self.vram_add(s_head, valid_col_mask, num_rows=rows)
-                    apply_causal_mask = causal_mask is not None and k_block == q_block
                     if isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask:
                         self.vram_add(s_head, causal_mask, num_rows=rows)
                     elif causal_mask is True and apply_causal_mask:
@@ -1164,12 +1221,26 @@ class ProgramAttentionMixin:
                         or (isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask)
                         else block_cols
                     )
-                    self.online_softmax_block(
-                        s_head,
-                        softmax_scale,
-                        rows=rows,
-                        valid_cols=softmax_valid_cols,
-                    )
+                    if optimized_schedule and first_processed_k_block:
+                        self.online_softmax_first_block(
+                            s_head,
+                            softmax_scale,
+                            rows=rows,
+                            valid_cols=softmax_valid_cols,
+                        )
+                        self._packed_attention_stats[
+                            "softmax_first_block_specialized_count"
+                        ] += chunk_count
+                        self._packed_attention_stats[
+                            "softmax_first_block_specialized_rows"
+                        ] += rows * chunk_count
+                    else:
+                        self.online_softmax_block(
+                            s_head,
+                            softmax_scale,
+                            rows=rows,
+                            valid_cols=softmax_valid_cols,
+                        )
                     self._compute_pv_from_mram(
                         s_block=s_head,
                         pv_matrix=pv,
@@ -1177,12 +1248,21 @@ class ProgramAttentionMixin:
                         head_slot_dim=head_slot_dim,
                         rows=rows,
                     )
-                    self._scale_direct_o_from_gp(output_base_gp=gp_o_block, rows=rows)
+                    self._packed_attention_stats["pv_compute_count"] += chunk_count
+                    if not optimized_schedule or not first_processed_k_block:
+                        self._scale_direct_o_from_gp(
+                            output_base_gp=gp_o_block, rows=rows
+                        )
                     self._add_pv_to_direct_o_from_gp(
                         output_base_gp=gp_o_block,
                         pv=pv,
                         rows=rows,
                     )
+                    if optimized_schedule:
+                        self._packed_attention_stats[
+                            "direct_o_lane_updates"
+                        ] += rows * chunk_count
+                    first_processed_k_block = False
                 self._final_scale_direct_o_from_gp(output_base_gp=gp_o_block, rows=rows)
 
             if chunk_count > 1 or advance_base_pointers:
@@ -1260,6 +1340,98 @@ class ProgramAttentionMixin:
         self.register_allocator.free_gp([gp_src, gp_dst, gp_scratch, gp_shift, gp_loop])
         self.emit("\n".join(lines) + "\n")
 
+    def _scale_packed_o_lane(
+        self,
+        *,
+        output_base_address: int,
+        head_slot: int,
+        rows: int,
+    ) -> None:
+        """Scale one packed output lane by the current online-softmax m_res."""
+
+        gp_m_res, gp_o, gp_loop = self.register_allocator.allocate_gp(3)
+        mask = 1 << head_slot
+        lines = [
+            f"; === Scale packed O lane {head_slot} by m_res ===",
+            *load_large_int(gp_m_res, self._ONLINE_SOFTMAX_FPSRAM_BASE + self.mlen),
+            *load_large_int(gp_o, output_base_address),
+            f"S_ADDI_INT gp{gp_loop}, gp0, {mask}",
+            f"C_SET_V_MASK_REG gp{gp_loop}",
+            f"C_LOOP_START gp{gp_loop}, {rows}",
+            f"S_LD_FP f1, gp{gp_m_res}, 0",
+            f"V_MUL_VF gp{gp_o}, gp{gp_o}, f1, 1",
+            f"S_ADDI_INT gp{gp_m_res}, gp{gp_m_res}, 1",
+            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {self.mlen}",
+            f"C_LOOP_END gp{gp_loop}",
+        ]
+        self.register_allocator.free_gp([gp_m_res, gp_o, gp_loop])
+        self.emit("\n".join(lines) + "\n")
+
+    def _add_pv_to_packed_o_lane(
+        self,
+        *,
+        output_base_address: int,
+        pv: VRAMMatrixVar,
+        head_slot: int,
+        head_slot_dim: int,
+        rows: int,
+        scratch_address: int,
+    ) -> None:
+        """Shift one PV head into its packed lane and accumulate it in place."""
+
+        gp_src, gp_dst, gp_scratch, gp_shift, gp_loop = (
+            self.register_allocator.allocate_gp(5)
+        )
+        shift = head_slot * head_slot_dim
+        mask = 1 << head_slot
+        lines = [
+            f"; === Add PV directly to packed O lane {head_slot} ===",
+            *load_large_int(gp_src, self.get_vram_addr(pv.name)),
+            *load_large_int(gp_dst, output_base_address),
+            *load_large_int(gp_scratch, scratch_address),
+            *load_large_int(gp_shift, shift),
+            f"S_ADDI_INT gp{gp_loop}, gp0, {mask}",
+            f"C_SET_V_MASK_REG gp{gp_loop}",
+            f"C_LOOP_START gp{gp_loop}, {rows}",
+            f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
+            f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 1",
+            f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}",
+            f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
+            f"C_LOOP_END gp{gp_loop}",
+        ]
+        self.register_allocator.free_gp(
+            [gp_src, gp_dst, gp_scratch, gp_shift, gp_loop]
+        )
+        self.emit("\n".join(lines) + "\n")
+
+    def _final_scale_packed_o_lane(
+        self,
+        *,
+        output_base_address: int,
+        head_slot: int,
+        rows: int,
+    ) -> None:
+        """Apply the final online-softmax normalization to one packed lane."""
+
+        gp_l, gp_o, gp_loop = self.register_allocator.allocate_gp(3)
+        mask = 1 << head_slot
+        lines = [
+            f"; === Final scale packed O lane {head_slot} ===",
+            *load_large_int(gp_l, self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * self.mlen),
+            *load_large_int(gp_o, output_base_address),
+            f"S_ADDI_INT gp{gp_loop}, gp0, {mask}",
+            f"C_SET_V_MASK_REG gp{gp_loop}",
+            f"C_LOOP_START gp{gp_loop}, {rows}",
+            f"S_LD_FP f1, gp{gp_l}, 0",
+            f"S_RECI_FP f1, f1, 0",
+            f"V_MUL_VF gp{gp_o}, gp{gp_o}, f1, 1",
+            f"S_ADDI_INT gp{gp_l}, gp{gp_l}, 1",
+            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {self.mlen}",
+            f"C_LOOP_END gp{gp_loop}",
+        ]
+        self.register_allocator.free_gp([gp_l, gp_o, gp_loop])
+        self.emit("\n".join(lines) + "\n")
+
     def _emit_packed_attention_group_internal(
         self,
         *,
@@ -1281,6 +1453,7 @@ class ProgramAttentionMixin:
         resident_v_mram: tuple[int, ...] | None = None,
         output_precleared: bool = False,
         direct_output: bool = False,
+        q_lane_base: int = 0,
     ) -> None:
         """Compiler-owned packed-head flash attention for one KV group."""
         seq_len, q_width = Q_group.shape
@@ -1293,6 +1466,11 @@ class ProgramAttentionMixin:
             )
         if group_heads > broadcast_amount:
             raise ValueError(f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}")
+        if q_lane_base < 0 or q_lane_base + group_heads > broadcast_amount:
+            raise ValueError(
+                f"Q lane range [{q_lane_base}, {q_lane_base + group_heads}) "
+                f"exceeds hardware broadcast lanes={broadcast_amount}"
+            )
         if broadcast_amount * head_slot_dim > mlen:
             raise ValueError(
                 f"broadcast_amount*head_slot_dim must fit MLEN "
@@ -1337,25 +1515,24 @@ class ProgramAttentionMixin:
                 f"_packed_S_h{head}",
                 mlen,
                 mlen,
-                scratch_base_address + head * mlen * mlen,
+                scratch_base_address + (q_lane_base + head) * mlen * mlen,
                 physical_shape=(mlen, mlen),
             )
             for head in range(group_heads)
         ]
         pv = self.alloc("_packed_PV", mlen, head_slot_dim, strict=False, physical_shape=(mlen, mlen))
+        optimized_schedule = (
+            getattr(self, "packed_attention_schedule", "legacy")
+            == "direct-first-block-v1"
+        )
+        optimized_direct_output = optimized_schedule and output_precleared
         pack_scratch = None
         pack_scratch_addr = None
-        if not direct_output:
+        if not direct_output or optimized_direct_output:
             pack_scratch = self.alloc(
                 "_packed_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen)
             )
             pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
-
-        valid_col_masks: dict[int, VRAMMatrixVar] = {}
-        for k_block in range(num_k_blocks):
-            block_cols = min(mlen, active_k_cols - k_block * mlen)
-            if self._needs_explicit_valid_col_mask(block_cols):
-                valid_col_masks[block_cols] = self._get_valid_col_mask(block_cols)
 
         for q_block in range(num_q_blocks):
             rows = min(mlen, seq_len - q_block * mlen)
@@ -1379,9 +1556,10 @@ class ProgramAttentionMixin:
                     + output_col_block * output_physical_rows * mlen
                     + q_block * mlen * mlen
                 )
-                if direct_output:
+                use_direct_output = direct_output or optimized_direct_output
+                if use_direct_output:
                     o_head = self.alloc_at(
-                        f"_packed_direct_O_q{q_block}",
+                        f"_packed_direct_O_q{q_block}_head{head}",
                         rows,
                         head_slot_dim,
                         output_block_base,
@@ -1395,8 +1573,25 @@ class ProgramAttentionMixin:
                         strict=False,
                         physical_shape=(mlen, mlen),
                     )
-                self.init_online_softmax(0, o_head, rows=rows)
+                self.init_online_softmax(
+                    0,
+                    o_head,
+                    rows=rows,
+                    reset_state=not optimized_schedule,
+                    # The first-block recurrence removes the zero-output
+                    # rescale, but a fallback scratch O still needs a known
+                    # zero value.  Only the direct path may rely on the
+                    # caller's one-time O_full clear.
+                    reset_output=not optimized_direct_output,
+                )
+                if optimized_schedule:
+                    stats = self._packed_attention_stats
+                    stats["softmax_state_initializations_elided"] += 1
+                    stats["softmax_state_initialization_rows_elided"] += rows
+                    if optimized_direct_output:
+                        stats["temporary_o_matrices_elided"] += 1
 
+                first_processed_k_block = True
                 for k_block in range(num_k_blocks):
                     if causal_mask is not None and k_block > q_block:
                         self.emit(
@@ -1420,11 +1615,30 @@ class ProgramAttentionMixin:
                             k_mram_address=resident_k_mram[k_block],
                             s_base_address=scratch_base_address,
                         )
+                    stats = self._packed_attention_stats
+                    stats["qk_compute_count"] += 1
+                    if head == 0:
+                        stats["ideal_qk_compute_count"] += 1
+                    if resident_k_mram is None:
+                        stats["kv_tile_load_count"] += 2
+                        if head == 0:
+                            stats["ideal_kv_tile_load_count"] += 2
 
-                    valid_col_mask = valid_col_masks.get(block_cols)
+                    apply_causal_mask = causal_mask is not None and k_block == q_block
+                    valid_col_mask = self._valid_col_mask_for_tile(
+                        block_cols,
+                        causal_mask=causal_mask,
+                        apply_causal_mask=apply_causal_mask,
+                        # A one-tile packed mask starts as all -inf and opens
+                        # only real batch/token blocks.  The local triangular
+                        # mask used by long-context diagonal tiles does not
+                        # cover the final tile's padded columns.
+                        causal_mask_covers_padding=(
+                            seq_len <= mlen and active_k_cols <= mlen
+                        ),
+                    )
                     if valid_col_mask is not None:
                         self.vram_add(s_head, valid_col_mask, num_rows=rows)
-                    apply_causal_mask = causal_mask is not None and k_block == q_block
                     if isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask:
                         self.vram_add(s_head, causal_mask, num_rows=rows)
                     elif causal_mask is True and apply_causal_mask:
@@ -1434,7 +1648,22 @@ class ProgramAttentionMixin:
                         if valid_col_mask is not None or (isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask)
                         else block_cols
                     )
-                    self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
+                    if optimized_schedule and first_processed_k_block:
+                        self.online_softmax_first_block(
+                            s_head,
+                            softmax_scale,
+                            rows=rows,
+                            valid_cols=softmax_valid_cols,
+                        )
+                        stats["softmax_first_block_specialized_count"] += 1
+                        stats["softmax_first_block_specialized_rows"] += rows
+                    else:
+                        self.online_softmax_block(
+                            s_head,
+                            softmax_scale,
+                            rows=rows,
+                            valid_cols=softmax_valid_cols,
+                        )
                     if resident_v_mram is None:
                         self.compute_pv(s_head, V, physical_k_idx, pv, head_slot_dim, rows=rows)
                     else:
@@ -1445,11 +1674,38 @@ class ProgramAttentionMixin:
                             head_slot_dim=head_slot_dim,
                             rows=rows,
                         )
-                    self.scale_o_row(o_head, 0, rows=rows)
-                    self.vram_add(o_head, pv, num_rows=rows)
+                    stats["pv_compute_count"] += 1
+                    if optimized_direct_output:
+                        if not first_processed_k_block:
+                            self._scale_packed_o_lane(
+                                output_base_address=output_block_base,
+                                head_slot=output_lane,
+                                rows=rows,
+                            )
+                        self._add_pv_to_packed_o_lane(
+                            output_base_address=output_block_base,
+                            pv=pv,
+                            head_slot=output_lane,
+                            head_slot_dim=head_slot_dim,
+                            rows=rows,
+                            scratch_address=pack_scratch_addr,
+                        )
+                        stats["direct_o_lane_updates"] += rows
+                    else:
+                        if not optimized_schedule or not first_processed_k_block:
+                            self.scale_o_row(o_head, 0, rows=rows)
+                        self.vram_add(o_head, pv, num_rows=rows)
+                    first_processed_k_block = False
 
-                self.final_scale_o(0, o_head, rows=rows)
-                if not direct_output:
+                if optimized_direct_output:
+                    self._final_scale_packed_o_lane(
+                        output_base_address=output_block_base,
+                        head_slot=output_lane,
+                        rows=rows,
+                    )
+                else:
+                    self.final_scale_o(0, o_head, rows=rows)
+                if not use_direct_output:
                     self._pack_o_head_to_output(
                         o_head=o_head,
                         output_base_address=output_block_base,
@@ -1479,10 +1735,19 @@ class ProgramAttentionMixin:
         physical_broadcast: int,
         head_slot_dim: int,
         scratch_base_address: int,
+        groups_per_storage_block: int = 1,
+        attention_group_width: int | None = None,
+        storage_block_count: int | None = None,
         scale: float | None = None,
         causal_mask: bool | VRAMMatrixVar | None = True,
     ) -> PackedGQASchedule:
-        """Canonical packed-GQA lowering scheduled by logical KV group."""
+        """Canonical packed-GQA lowering scheduled by logical KV group.
+
+        Q/O storage blocks may contain several groups. Since Vector SRAM reads
+        are MLEN aligned, the current KV head is replicated across all lanes in
+        that block; ``q_lane_base`` selects the group whose scores and output
+        are retained. No operation broadcasts different KV heads together.
+        """
         if kv_seq_len is None:
             kv_seq_len = seq_len
         schedule = PackedGQASchedule.build(
@@ -1513,6 +1778,22 @@ class ProgramAttentionMixin:
                 "physical_broadcast*head_slot_dim must fit MLEN "
                 f"({physical_broadcast}*{head_slot_dim} > {self.mlen})"
             )
+        if attention_group_width is None:
+            attention_group_width = physical_broadcast * head_slot_dim
+        if attention_group_width < physical_broadcast * head_slot_dim:
+            raise ValueError(
+                "attention_group_width cannot be smaller than the active packed heads "
+                f"({attention_group_width} < {physical_broadcast * head_slot_dim})"
+            )
+        if groups_per_storage_block <= 0:
+            raise ValueError(
+                f"groups_per_storage_block must be positive, got {groups_per_storage_block}"
+            )
+        if groups_per_storage_block * attention_group_width > self.mlen:
+            raise ValueError(
+                "packed attention groups do not fit one MLEN storage block: "
+                f"{groups_per_storage_block}*{attention_group_width} > {self.mlen}"
+            )
         if rows_per_batch % self.mlen != 0:
             raise ValueError(
                 f"rows_per_batch={rows_per_batch} must be a multiple of MLEN={self.mlen}"
@@ -1529,7 +1810,26 @@ class ProgramAttentionMixin:
             )
 
         group_count = len(kv_pairs) * schedule.chunks_per_kv
-        required_width = group_count * self.mlen
+        expected_storage_blocks = math.ceil(group_count / groups_per_storage_block)
+        if storage_block_count is None:
+            storage_block_count = expected_storage_blocks
+        if storage_block_count != expected_storage_blocks:
+            raise ValueError(
+                f"storage_block_count={storage_block_count} does not match packed group "
+                f"geometry ({expected_storage_blocks})"
+            )
+        required_width = storage_block_count * self.mlen
+        hardware_broadcast = groups_per_storage_block * physical_broadcast
+        if hardware_broadcast * head_slot_dim > self.mlen:
+            raise ValueError(
+                "storage-block broadcast does not fit MLEN: "
+                f"{hardware_broadcast}*{head_slot_dim} > {self.mlen}"
+            )
+        if getattr(self, "broadcast_amount", hardware_broadcast) != hardware_broadcast:
+            raise ValueError(
+                "compiler BROADCAST_AMOUNT must match all packed head lanes in one "
+                f"storage block ({self.broadcast_amount} != {hardware_broadcast})"
+            )
         if Q_full.physical_shape[1] < required_width:
             raise ValueError(
                 f"Q_full physical width {Q_full.physical_shape[1]} cannot hold "
@@ -1551,6 +1851,13 @@ class ProgramAttentionMixin:
         batch_row_stride = rows_per_batch * self.mlen
         row_blocks_per_batch = rows_per_batch // self.mlen
 
+        def group_offset(group_idx: int, physical_rows: int) -> int:
+            block_idx, slot_idx = divmod(group_idx, groups_per_storage_block)
+            return (
+                block_idx * physical_rows * self.mlen
+                + slot_idx * attention_group_width
+            )
+
         self.emit(
             "; === Canonical packed GQA schedule: logical KV groups, "
             f"resident={int(schedule.resident_kv)} ===\n"
@@ -1567,9 +1874,17 @@ class ProgramAttentionMixin:
                         first_k_idx=first_k_idx,
                         num_k_blocks=schedule.k_blocks,
                     )
+                    resident_tile_loads = 2 * schedule.k_blocks
+                    self._packed_attention_stats["kv_tile_load_count"] += (
+                        resident_tile_loads
+                    )
+                    self._packed_attention_stats["ideal_kv_tile_load_count"] += (
+                        resident_tile_loads
+                    )
                 if (
                     schedule.resident_kv
                     and physical_broadcast == 1
+                    and groups_per_storage_block == 1
                     and q_group_stride == o_group_stride
                 ):
                     first_group = kv_head * schedule.chunks_per_kv
@@ -1602,11 +1917,17 @@ class ProgramAttentionMixin:
                     if group_heads <= 0:
                         continue
                     group_idx = kv_head * schedule.chunks_per_kv + chunk
+                    block_idx, slot_idx = divmod(
+                        group_idx, groups_per_storage_block
+                    )
+                    q_lane_base = slot_idx * physical_broadcast
                     q_group = self.alloc_at(
                         f"_canonical_Q_b{batch_idx}_kv{kv_head}_c{chunk}",
                         seq_len,
                         self.mlen,
-                        q_base + group_idx * q_group_stride + batch_offset,
+                        q_base
+                        + block_idx * total_physical_rows * self.mlen
+                        + batch_offset,
                         physical_shape=(rows_per_batch, self.mlen),
                     )
                     self._emit_packed_attention_group_internal(
@@ -1616,11 +1937,13 @@ class ProgramAttentionMixin:
                         group_heads=group_heads,
                         head_slot_dim=head_slot_dim,
                         output_base_address=(
-                            o_base + group_idx * o_group_stride + batch_offset
+                            o_base
+                            + block_idx * O_full.physical_shape[0] * self.mlen
+                            + batch_offset
                         ),
                         output_physical_rows=rows_per_batch,
                         scratch_base_address=scratch_base_address,
-                        broadcast_amount=physical_broadcast,
+                        broadcast_amount=hardware_broadcast,
                         scale=scale,
                         causal_mask=causal_mask,
                         k_idx=first_k_idx,
@@ -1628,7 +1951,9 @@ class ProgramAttentionMixin:
                         resident_k_mram=resident_k,
                         resident_v_mram=resident_v,
                         output_precleared=True,
-                        direct_output=physical_broadcast == 1,
+                        direct_output=hardware_broadcast == 1,
+                        output_head_base=q_lane_base,
+                        q_lane_base=q_lane_base,
                     )
                     self.free_tensor(q_group)
         return schedule
@@ -1698,12 +2023,6 @@ class ProgramAttentionMixin:
         pack_scratch = self.alloc("_packed_tiled_loop_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen))
         pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
 
-        valid_col_masks: dict[int, VRAMMatrixVar] = {}
-        for k_block in range(num_k_blocks):
-            block_cols = min(mlen, seq_len - k_block * mlen)
-            if self._needs_explicit_valid_col_mask(block_cols):
-                valid_col_masks[block_cols] = self._get_valid_col_mask(block_cols)
-
         gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop = self.register_allocator.allocate_gp(6)
         k_addr_reg, v_addr_reg = self.register_allocator.allocate_addr(2)
         try:
@@ -1752,10 +2071,15 @@ class ProgramAttentionMixin:
                             k_hbm_offset=k_block_offset,
                         )
 
-                        valid_col_mask = valid_col_masks.get(block_cols)
+                        apply_causal_mask = causal_mask is not None and k_block == q_block
+                        valid_col_mask = self._valid_col_mask_for_tile(
+                            block_cols,
+                            causal_mask=causal_mask,
+                            apply_causal_mask=apply_causal_mask,
+                            causal_mask_covers_padding=False,
+                        )
                         if valid_col_mask is not None:
                             self.vram_add(s_head, valid_col_mask, num_rows=rows)
-                        apply_causal_mask = causal_mask is not None and k_block == q_block
                         if isinstance(causal_mask, VRAMMatrixVar) and apply_causal_mask:
                             self.vram_add(s_head, causal_mask, num_rows=rows)
                         elif causal_mask is True and apply_causal_mask:
@@ -1941,10 +2265,11 @@ class ProgramAttentionMixin:
         pv = self.alloc("_packed_loop_PV", rows, head_slot_dim, strict=False, physical_shape=(mlen, mlen))
         pack_scratch = self.alloc("_packed_loop_pack_scratch", 1, mlen, strict=False, physical_shape=(1, mlen))
         pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
-        valid_col_mask = (
-            self._get_valid_col_mask(seq_len)
-            if self._needs_explicit_valid_col_mask(seq_len)
-            else None
+        valid_col_mask = self._valid_col_mask_for_tile(
+            seq_len,
+            causal_mask=causal_mask,
+            apply_causal_mask=causal_mask is not None,
+            causal_mask_covers_padding=seq_len <= mlen,
         )
 
         gp_q, gp_o, gp_k, gp_v, gp_tmp, gp_kv_loop = self.register_allocator.allocate_gp(6)
@@ -2082,7 +2407,15 @@ class ProgramAttentionMixin:
             valid_cols=valid_cols,
         )
 
-    def init_online_softmax(self, q_idx: int, o_matrix: VRAMMatrixVar, rows: int | None = None):
+    def init_online_softmax(
+        self,
+        q_idx: int,
+        o_matrix: VRAMMatrixVar,
+        rows: int | None = None,
+        *,
+        reset_state: bool = True,
+        reset_output: bool = True,
+    ):
         """Initialize Online Softmax state: m=-inf, l=0, O_row=0"""
         o_info = super().get_tensor_info(o_matrix.name)
         seq_len, head_dim = o_info.shape
@@ -2093,6 +2426,23 @@ class ProgramAttentionMixin:
             seq_len=seq_len,
             head_dim=head_dim,
             rows=rows,
+            reset_state=reset_state,
+            reset_output=reset_output,
+        )
+
+    def online_softmax_first_block(
+        self,
+        s_block: VRAMMatrixVar,
+        scale: float,
+        rows: int | None = None,
+        valid_cols: int | None = None,
+    ):
+        """Initialize online-softmax state directly from the first K block."""
+        super().online_softmax_first_block(
+            s_block_matrix=s_block.name,
+            scale=scale,
+            rows=rows,
+            valid_cols=valid_cols,
         )
 
     def online_softmax_block(

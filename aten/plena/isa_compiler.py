@@ -26,6 +26,7 @@ from compiler.aten.plena.cost_kernels import (
     rms_norm_cost_counts,
     rms_norm_cost_schedule,
 )
+from compiler.aten.plena.normalization_plan import build_active_row_rms_norm
 
 
 class IsaCompiler(
@@ -340,6 +341,8 @@ class IsaCompiler(
         reci_hid_offset: int = 2,
         vlen: int | None = None,
         scratchpad_vram_addr: int | None = None,
+        physical_rows: int | None = None,
+        active_row_ranges: tuple[tuple[int, int], ...] | None = None,
     ) -> str:
         """
         Normalize a VRAM tensor in-place.
@@ -367,6 +370,11 @@ class IsaCompiler(
         physical_batch_size, physical_hidden_dim = tensor_info.physical_shape
         batch_size = physical_batch_size or logical_batch_size
         hidden_dim = physical_hidden_dim or logical_hidden_dim
+        if physical_rows is not None and physical_rows != batch_size:
+            raise ValueError(
+                f"physical_rows={physical_rows} does not match tensor physical rows "
+                f"{batch_size} for {tensor_name!r}"
+            )
         if vlen is None:
             vlen = self.mlen
         if hidden_dim % vlen != 0:
@@ -376,7 +384,11 @@ class IsaCompiler(
         if mode not in ("rms", "layer"):
             raise ValueError(f"Unsupported normalization mode: {mode}. Expected 'rms' or 'layer'.")
 
-        gp_regs = self.register_allocator.allocate_gp(4)
+        optimized_rms = (
+            mode == "rms"
+            and getattr(self, "vector_scalar_schedule", "legacy") == "compiler-v1"
+        )
+        gp_regs = self.register_allocator.allocate_gp(6 if optimized_rms else 4)
 
         temp_scratchpad_name = None
         if scratchpad_vram_addr is None:
@@ -384,6 +396,34 @@ class IsaCompiler(
             scratchpad_vram_addr = self.vram_allocator.allocate(vlen, name=temp_scratchpad_name)
 
         try:
+            if optimized_rms:
+                lowering = build_active_row_rms_norm(
+                    name=tensor_name,
+                    activation_base_address=tensor_info.vram_addr,
+                    scratch_base_address=scratchpad_vram_addr,
+                    physical_rows=batch_size,
+                    hidden_dim=hidden_dim,
+                    vlen=vlen,
+                    active_row_ranges=active_row_ranges,
+                    gp_row=gp_regs[0],
+                    gp_scratch=gp_regs[1],
+                    gp_stats=gp_regs[2],
+                    gp_act=gp_regs[3],
+                    gp_loop=gp_regs[4],
+                    gp_stride=gp_regs[5],
+                    epsilon_slot=eps_offset,
+                    reciprocal_hidden_slot=reci_hid_offset,
+                )
+                self.record_vector_scalar_stats(lowering.metadata)
+                if getattr(self, "_cost_sink", None) is None:
+                    return self._emit(lowering.rendered_asm)
+                self.emit_cost_schedule(
+                    static_opcodes=lowering.static_opcodes,
+                    dynamic_opcodes=lowering.dynamic_opcodes,
+                    schedule=lowering.schedule,
+                    rendered_asm=lowering.rendered_asm,
+                )
+                return ""
             if getattr(self, "_emission_mode", "asm") == "cost" and mode == "rms":
                 counts = rms_norm_cost_counts(
                     activation_base_address=tensor_info.vram_addr,

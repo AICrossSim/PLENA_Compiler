@@ -162,8 +162,14 @@ class IsaEmitMixin:
         dynamic_opcodes,
         schedule,
         memory_streams=(),
+        rendered_asm: AsmInput | None = None,
     ) -> None:
-        """Emit a compact ordered kernel schedule plus algebraic counts."""
+        """Emit a compact ordered kernel schedule plus algebraic counts.
+
+        ``rendered_asm`` is only needed by a lowering shared between cost and
+        assembly modes.  In ``both`` mode it preserves the original program
+        without sending the expanded instructions through CostSink again.
+        """
         cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
         if cost_sink is None:
             raise RuntimeError("emit_cost_schedule requires cost or both emission mode")
@@ -184,6 +190,11 @@ class IsaEmitMixin:
             stage=stage,
             memory_stream_indices=stream_indices,
         )
+        if (
+            rendered_asm is not None
+            and getattr(self, "_emission_mode", "asm") == "both"
+        ):
+            self._code_chunks.append(render_asm(rendered_asm))
 
     def record_dma_stream(self, transfer, *, multiplicity=1, axes=()) -> None:
         """Attach exact DMA metadata without changing rendered assembly."""
@@ -207,6 +218,19 @@ class IsaEmitMixin:
             yield
         finally:
             self._active_cost_stage = previous
+
+    @contextmanager
+    def cost_repeat_region(
+        self, count: int, *, name: str, repeat_kind: str = "compile_time"
+    ):
+        """Compress repeated cost-only operations without rendering ASM."""
+        cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
+        if cost_sink is None or getattr(self, "_emission_mode", "asm") != "cost":
+            raise RuntimeError("cost_repeat_region is available only in cost mode")
+        with cost_sink.repeated_region(
+            count, name=name, repeat_kind=repeat_kind
+        ):
+            yield
 
     # ------------------------------------------------------------------
     # FP Register management

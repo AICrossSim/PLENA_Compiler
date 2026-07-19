@@ -9,7 +9,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from compiler.aten.model_extract import LayerWeights, ModelConfig
+from compiler.aten.model_extract import (
+    DecoderLayerWeights,
+    LayerWeights,
+    MoeLayerWeights,
+    ModelConfig,
+)
+from compiler.aten.moe import MoeRoutingPlan
 from quant.quantizer.hardware_quantizer.mxfp import _mx_fp_quantize_hardware
 
 
@@ -81,6 +87,14 @@ class ScheduledReferenceConfig:
     chunks_per_kv: int = 1
     batch_size: int = 1
     rows_per_batch: int | None = None
+    batch_pack_factor: int = 1
+    attention_group_count: int | None = None
+    attention_group_seq_len: int | None = None
+    groups_per_storage_block: int = 1
+    attention_group_width: int | None = None
+    num_experts: int = 0
+    experts_per_token: int = 0
+    norm_topk_prob: bool = False
 
     @property
     def head_ratio(self) -> int:
@@ -108,7 +122,34 @@ class ScheduledReferenceConfig:
 
     @property
     def total_physical_rows(self) -> int:
-        return self.batch_size * self.physical_rows_per_batch
+        return self.packed_attention_group_count * self.physical_rows_per_batch
+
+    @property
+    def packed_attention_group_count(self) -> int:
+        if self.attention_group_count is not None:
+            return self.attention_group_count
+        return math.ceil(self.batch_size / self.batch_pack_factor)
+
+    def physical_row(self, batch_idx: int, token_idx: int = 0) -> int:
+        """Return the physical row for one logical batch/token pair."""
+        if not 0 <= batch_idx < self.batch_size:
+            raise IndexError(f"batch_idx={batch_idx} outside [0, {self.batch_size})")
+        if not 0 <= token_idx < self.seq_len:
+            raise IndexError(f"token_idx={token_idx} outside [0, {self.seq_len})")
+        group_idx, slot_idx = divmod(batch_idx, self.batch_pack_factor)
+        return (
+            group_idx * self.physical_rows_per_batch
+            + slot_idx * self.seq_len
+            + token_idx
+        )
+
+    def packed_group_start_col(self, group_idx: int) -> int:
+        """Map one logical KV/chunk group into its compact MLEN block/slot."""
+        if group_idx < 0:
+            raise IndexError(f"group_idx must be nonnegative, got {group_idx}")
+        block_idx, slot_idx = divmod(group_idx, self.groups_per_storage_block)
+        slot_width = self.attention_group_width or self.mlen
+        return block_idx * self.mlen + slot_idx * slot_width
 
 
 def quantize_to_mxfp(tensor: torch.Tensor) -> torch.Tensor:
@@ -168,6 +209,7 @@ def run_decoder_reference(
     max_k_tiles: int = _HW_MAX_K_TILES,
     precision: ReferencePrecision,
     trace: Callable[[int, torch.Tensor], None] | None = None,
+    final_norm_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the compiled decoder blocks under a given precision policy."""
     quantize = precision.quantize
@@ -191,13 +233,14 @@ def run_decoder_reference(
         if trace is not None:
             trace(layer_idx, x)
 
-    return _rms_norm_ref(x, weights[0].eps, precision)
+    out = _rms_norm_ref(x, weights[0].eps, precision)
+    return _apply_norm_weight_scheduled_ref(out, final_norm_weight, precision)
 
 
 def run_native_decoder_scheduled_reference(
     token_embeds: torch.Tensor,
     pos_weight: torch.Tensor,
-    weights: list[LayerWeights],
+    weights: list[DecoderLayerWeights],
     config: ScheduledReferenceConfig,
     rope_matrix: torch.Tensor,
     cos_table: torch.Tensor,
@@ -205,6 +248,8 @@ def run_native_decoder_scheduled_reference(
     *,
     precision: ReferencePrecision,
     trace: Callable[[int, torch.Tensor], None] | None = None,
+    moe_routing_plans: dict[int, MoeRoutingPlan] | None = None,
+    final_norm_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the native decoder on the same padded tensors the compiler emits.
 
@@ -234,12 +279,23 @@ def run_native_decoder_scheduled_reference(
             sin_ref,
             precision,
         )
-        x = _scheduled_ffn_block_ref(x, layer, config, precision)
+        if isinstance(layer, MoeLayerWeights):
+            plan = None if moe_routing_plans is None else moe_routing_plans.get(layer_idx)
+            if plan is None:
+                raise ValueError(
+                    f"Scheduled MoE reference requires a routing plan for layer {layer_idx}"
+                )
+            x = _scheduled_moe_block_ref(x, layer, config, precision, plan)
+        else:
+            x = _scheduled_ffn_block_ref(x, layer, config, precision)
 
         if trace is not None:
             trace(layer_idx, x)
 
-    return _rms_norm_scheduled_ref(x, config.hidden_size, weights[0].eps, config.mlen, precision)
+    out = _rms_norm_scheduled_ref(
+        x, config.hidden_size, weights[0].eps, config.mlen, precision
+    )
+    return _apply_norm_weight_scheduled_ref(out, final_norm_weight, precision)
 
 
 def _attention_block_ref(
@@ -256,6 +312,9 @@ def _attention_block_ref(
     quantize = precision.quantize
     residual = x.clone()
     x_normed = _rms_norm_ref(x, layer.eps, precision)
+    x_normed = _apply_norm_weight_scheduled_ref(
+        x_normed, layer.input_norm_weight, precision
+    )
     q_full = _round(_linear_ref(x_normed, quantize(layer.w_q), mlen, max_k_tiles, precision), precision)
 
     k_heads = []
@@ -282,7 +341,7 @@ def _attention_block_ref(
 
 def _scheduled_attention_block_ref(
     x: torch.Tensor,
-    layer: LayerWeights,
+    layer: DecoderLayerWeights,
     config: ScheduledReferenceConfig,
     rope_matrix: torch.Tensor,
     cos_table: torch.Tensor,
@@ -291,7 +350,11 @@ def _scheduled_attention_block_ref(
 ) -> torch.Tensor:
     residual = x.clone()
     x_normed = _rms_norm_scheduled_ref(x, config.hidden_size, layer.eps, config.mlen, precision)
+    x_normed = _apply_norm_weight_scheduled_ref(
+        x_normed, layer.input_norm_weight, precision
+    )
     q_full = _linear_scheduled_ref(x_normed, layer.w_q, config, precision)
+    q_full = _q_norm_scheduled_ref(q_full, layer, config, precision)
 
     if config.attention_head_packing:
         attn_out = _packed_attention_scheduled_ref(
@@ -323,7 +386,7 @@ def _scheduled_attention_block_ref(
 def _packed_attention_scheduled_ref(
     q_full: torch.Tensor,
     x_normed: torch.Tensor,
-    layer: LayerWeights,
+    layer: DecoderLayerWeights,
     config: ScheduledReferenceConfig,
     rope_matrix: torch.Tensor,
     cos_table: torch.Tensor,
@@ -356,10 +419,10 @@ def _packed_attention_scheduled_ref(
         raise ValueError(
             f"rows_per_batch={rows_per_batch} cannot cover seq_len={config.seq_len}"
         )
-    if rows < config.batch_size * rows_per_batch:
+    if rows < config.total_physical_rows:
         raise ValueError(
-            f"q_full rows={rows} cannot cover batch_size*rows_per_batch="
-            f"{config.batch_size * rows_per_batch}"
+            f"q_full rows={rows} cannot cover total_physical_rows="
+            f"{config.total_physical_rows}"
         )
 
     k_heads = []
@@ -367,6 +430,7 @@ def _packed_attention_scheduled_ref(
     for kv_h in range(config.num_kv_heads):
         k_h = _linear_scheduled_ref(x_normed, layer.w_k_heads[kv_h], config, precision)
         v_h = _linear_scheduled_ref(x_normed, layer.w_v_heads[kv_h], config, precision)
+        k_h = _k_norm_scheduled_ref(k_h, layer, config, precision)
         k_h = _pad_cols_ref(k_h, group_width)
         v_h = _pad_cols_ref(v_h, group_width)
         k_h = _rope_scheduled_ref(k_h, rope_matrix, cos_table, sin_table, config, precision)
@@ -374,7 +438,7 @@ def _packed_attention_scheduled_ref(
         v_heads.append(_hbm_round_ref(v_h, precision))
 
     for batch_idx in range(config.batch_size):
-        row_start = batch_idx * rows_per_batch
+        row_start = config.physical_row(batch_idx)
         row_end = row_start + config.seq_len
         for kv_h in range(config.num_kv_heads):
             k_h = k_heads[kv_h][row_start:row_end]
@@ -382,7 +446,7 @@ def _packed_attention_scheduled_ref(
 
             for chunk in range(chunks_per_kv):
                 group_idx = kv_h * chunks_per_kv + chunk
-                group_start = group_idx * group_width
+                group_start = config.packed_group_start_col(group_idx)
                 q_group = q_full[row_start:row_end, group_start:group_start + group_width]
                 q_group = _rope_scheduled_ref(
                     q_group,
@@ -418,7 +482,7 @@ def _packed_attention_scheduled_ref(
 def _mha_attention_scheduled_ref(
     q_full: torch.Tensor,
     x_normed: torch.Tensor,
-    layer: LayerWeights,
+    layer: DecoderLayerWeights,
     config: ScheduledReferenceConfig,
     rope_matrix: torch.Tensor,
     cos_table: torch.Tensor,
@@ -433,10 +497,10 @@ def _mha_attention_scheduled_ref(
         raise ValueError(
             f"rows_per_batch={rows_per_batch} cannot cover seq_len={config.seq_len}"
         )
-    if rows < config.batch_size * rows_per_batch:
+    if rows < config.total_physical_rows:
         raise ValueError(
-            f"q_full rows={rows} cannot cover batch_size*rows_per_batch="
-            f"{config.batch_size * rows_per_batch}"
+            f"q_full rows={rows} cannot cover total_physical_rows="
+            f"{config.total_physical_rows}"
         )
 
     k_heads = []
@@ -444,6 +508,7 @@ def _mha_attention_scheduled_ref(
     for kv_h in range(config.num_kv_heads):
         k_h = _linear_scheduled_ref(x_normed, layer.w_k_heads[kv_h], config, precision)
         v_h = _linear_scheduled_ref(x_normed, layer.w_v_heads[kv_h], config, precision)
+        k_h = _k_norm_scheduled_ref(k_h, layer, config, precision)
         k_h = _pad_cols_ref(k_h, head_width)
         v_h = _pad_cols_ref(v_h, head_width)
         k_h = _rope_scheduled_ref(k_h, rope_matrix, cos_table, sin_table, config, precision)
@@ -452,7 +517,7 @@ def _mha_attention_scheduled_ref(
 
     out = torch.zeros((rows, config.attention_width), dtype=q_full.dtype, device=q_full.device)
     for batch_idx in range(config.batch_size):
-        row_start = batch_idx * rows_per_batch
+        row_start = config.physical_row(batch_idx)
         row_end = row_start + config.seq_len
         for h in range(config.num_heads):
             kv_h = h // config.head_ratio
@@ -489,6 +554,9 @@ def _ffn_block_ref(
     quantize = precision.quantize
     residual = x.clone()
     x_normed = _rms_norm_ref(x, layer.eps, precision)
+    x_normed = _apply_norm_weight_scheduled_ref(
+        x_normed, layer.post_attn_norm_weight, precision
+    )
     up_out = _linear_ref(x_normed, quantize(layer.w_up), mlen, max_k_tiles, precision)
     gate_out = _linear_ref(x_normed, quantize(layer.w_gate), mlen, max_k_tiles, precision)
     silu_gate = precision.to_inter(F.silu(_round(up_out, precision)) * _round(gate_out, precision))
@@ -504,6 +572,9 @@ def _scheduled_ffn_block_ref(
 ) -> torch.Tensor:
     residual = x.clone()
     x_normed = _rms_norm_scheduled_ref(x, config.hidden_size, layer.eps, config.mlen, precision)
+    x_normed = _apply_norm_weight_scheduled_ref(
+        x_normed, layer.post_attn_norm_weight, precision
+    )
     up_out = _linear_scheduled_ref(x_normed, layer.w_up, config, precision)
     gate_out = _linear_scheduled_ref(x_normed, layer.w_gate, config, precision)
     silu_gate = _silu_gate_scheduled_ref(up_out, gate_out, precision)
@@ -569,6 +640,268 @@ def _rms_norm_scheduled_ref(
     return out
 
 
+def _apply_norm_weight_scheduled_ref(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    precision: ReferencePrecision,
+) -> torch.Tensor:
+    """Mirror an HBM load followed by the compiler's VRAM multiply."""
+    if weight is None:
+        return x
+    loaded = _vram_load_ref(weight, precision)
+    if loaded.ndim == 1:
+        loaded = loaded.unsqueeze(0)
+    if loaded.shape[0] == 1 and x.shape[0] != 1:
+        loaded = loaded.expand(x.shape[0], -1)
+    if loaded.shape != x.shape:
+        raise ValueError(
+            f"Norm weight shape {tuple(loaded.shape)} does not match activation "
+            f"shape {tuple(x.shape)}"
+        )
+    return _round(x * loaded, precision)
+
+
+def _segmented_rms_norm_scheduled_ref(
+    x: torch.Tensor,
+    *,
+    segment_starts: list[int],
+    segment_width: int,
+    active_width: int,
+    eps: float,
+    config: ScheduledReferenceConfig,
+    precision: ReferencePrecision,
+) -> torch.Tensor:
+    """Apply RMSNorm independently to packed head slots.
+
+    The denominator uses ``active_width`` (the Qwen head dimension), while the
+    vector operation covers the physical ``segment_width`` slot.  Padded lanes
+    are therefore multiplied by the same inverse RMS but remain zero.
+    """
+    out = x.clone()
+    for start in segment_starts:
+        end = start + segment_width
+        out[:, start:end] = _rms_norm_scheduled_ref(
+            x[:, start:end], active_width, eps, config.mlen, precision
+        )
+    return out
+
+
+def _q_norm_scheduled_ref(
+    q: torch.Tensor,
+    layer: DecoderLayerWeights,
+    config: ScheduledReferenceConfig,
+    precision: ReferencePrecision,
+) -> torch.Tensor:
+    if layer.q_norm_weight is None:
+        return q
+    starts: list[int] = []
+    if config.attention_head_packing:
+        if config.head_slot_dim is None or config.broadcast_amount is None:
+            raise ValueError("Packed Q norm requires head_slot_dim and broadcast_amount")
+        ratio = config.head_ratio
+        for kv_h in range(config.num_kv_heads):
+            for chunk in range(config.chunks_per_kv):
+                group = kv_h * config.chunks_per_kv + chunk
+                group_start = config.packed_group_start_col(group)
+                chunk_heads = min(
+                    config.broadcast_amount,
+                    ratio - chunk * config.broadcast_amount,
+                )
+                for lane in range(max(0, chunk_heads)):
+                    starts.append(group_start + lane * config.head_slot_dim)
+        segment_width = config.head_slot_dim
+    else:
+        segment_width = config.padded_head_dim
+        starts = [head * segment_width for head in range(config.num_heads)]
+    normalized = _segmented_rms_norm_scheduled_ref(
+        q,
+        segment_starts=starts,
+        segment_width=segment_width,
+        active_width=config.head_dim,
+        eps=layer.eps,
+        config=config,
+        precision=precision,
+    )
+    return _apply_norm_weight_scheduled_ref(
+        normalized, layer.q_norm_weight, precision
+    )
+
+
+def _k_norm_scheduled_ref(
+    k: torch.Tensor,
+    layer: DecoderLayerWeights,
+    config: ScheduledReferenceConfig,
+    precision: ReferencePrecision,
+) -> torch.Tensor:
+    if layer.k_norm_weight is None:
+        return k
+    segment_width = (
+        config.head_slot_dim
+        if config.attention_head_packing and config.head_slot_dim is not None
+        else config.padded_head_dim
+    )
+    normalized = _segmented_rms_norm_scheduled_ref(
+        k,
+        segment_starts=[0],
+        segment_width=segment_width,
+        active_width=config.head_dim,
+        eps=layer.eps,
+        config=config,
+        precision=precision,
+    )
+    return _apply_norm_weight_scheduled_ref(
+        normalized, layer.k_norm_weight, precision
+    )
+
+
+def _router_softmax_scheduled_ref(
+    logits: torch.Tensor,
+    *,
+    num_experts: int,
+    precision: ReferencePrecision,
+) -> torch.Tensor:
+    """One-block online softmax matching the emitted router ISA."""
+    if num_experts <= 0 or num_experts > logits.shape[1]:
+        raise ValueError(
+            f"num_experts={num_experts} incompatible with logits {tuple(logits.shape)}"
+        )
+    out = torch.zeros_like(logits.float())
+    for row_idx in range(logits.shape[0]):
+        row = _round(logits[row_idx, :num_experts], precision)
+        row_max = _scalar_round(float(row.max()), precision)
+        shifted = _round(row - row_max, precision)
+        exponentials = _round(torch.clamp(shifted, -88.0, 88.0).exp(), precision)
+        denominator = _scalar_round(float(exponentials.sum()), precision)
+        inverse = _scalar_round(1.0 / denominator, precision)
+        out[row_idx, :num_experts] = _round(exponentials * inverse, precision)
+    return out
+
+
+def scheduled_moe_router_probabilities(
+    x_after_attention: torch.Tensor,
+    layer: MoeLayerWeights,
+    config: ScheduledReferenceConfig,
+    precision: ReferencePrecision,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return post-attention normalized input and hardware router probabilities."""
+    normalized = _rms_norm_scheduled_ref(
+        x_after_attention, config.hidden_size, layer.eps, config.mlen, precision
+    )
+    normalized = _apply_norm_weight_scheduled_ref(
+        normalized, layer.post_attn_norm_weight, precision
+    )
+    logits = _linear_scheduled_ref(normalized, layer.w_router, config, precision)
+    probabilities = _router_softmax_scheduled_ref(
+        logits, num_experts=config.num_experts, precision=precision
+    )
+    return normalized, probabilities
+
+
+def derive_moe_router_probabilities_from_decoder_input(
+    token_embeds: torch.Tensor,
+    pos_weight: torch.Tensor,
+    layer: MoeLayerWeights,
+    config: ScheduledReferenceConfig,
+    rope_matrix: torch.Tensor,
+    cos_table: torch.Tensor,
+    sin_table: torch.Tensor,
+    *,
+    precision: ReferencePrecision,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run embedding + attention + router for static-index plan selection."""
+    x = _vram_load_ref(token_embeds.clone(), precision)
+    pos = _vram_load_ref(pos_weight, precision)
+    x = _round(x + pos, precision)
+    x = _scheduled_attention_block_ref(
+        x,
+        layer,
+        config,
+        rope_matrix,
+        _vram_load_ref(cos_table, precision),
+        _vram_load_ref(sin_table, precision),
+        precision,
+    )
+    return scheduled_moe_router_probabilities(x, layer, config, precision)
+
+
+def _normalized_route_weights_ref(
+    probabilities: torch.Tensor,
+    plan: MoeRoutingPlan,
+    *,
+    normalize: bool,
+    precision: ReferencePrecision,
+) -> dict[tuple[int, int], float]:
+    by_token: dict[int, list] = {}
+    for route in plan.routes:
+        by_token.setdefault(route.token_index, []).append(route)
+    result: dict[tuple[int, int], float] = {}
+    for token_routes in by_token.values():
+        token_routes.sort(key=lambda route: route.rank)
+        selected = [
+            _scalar_round(
+                float(probabilities[route.physical_row, route.expert_id]), precision
+            )
+            for route in token_routes
+        ]
+        if normalize:
+            total = _scalar_round(0.0, precision)
+            for value in selected:
+                total = _scalar_round(total + value, precision)
+            inverse = _scalar_round(1.0 / total, precision)
+            selected = [
+                _scalar_round(value * inverse, precision) for value in selected
+            ]
+        for route, value in zip(token_routes, selected):
+            result[(route.token_index, route.rank)] = value
+    return result
+
+
+def _scheduled_moe_block_ref(
+    x: torch.Tensor,
+    layer: MoeLayerWeights,
+    config: ScheduledReferenceConfig,
+    precision: ReferencePrecision,
+    plan: MoeRoutingPlan,
+) -> torch.Tensor:
+    if layer.active_experts is None:
+        raise ValueError("Scheduled MoE reference requires materialized active experts")
+    residual = x.clone()
+    normalized, probabilities = scheduled_moe_router_probabilities(
+        x, layer, config, precision
+    )
+    route_weights = _normalized_route_weights_ref(
+        probabilities,
+        plan,
+        normalize=config.norm_topk_prob,
+        precision=precision,
+    )
+    combined = torch.zeros_like(x.float())
+    for expert_id in plan.active_expert_ids:
+        expert = layer.active_experts[expert_id]
+        routes = [route for route in plan.routes if route.expert_id == expert_id]
+        bucket_rows = math.ceil(len(routes) / config.blen) * config.blen
+        bucket = torch.zeros(
+            (bucket_rows, config.padded_hidden_size),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        for bucket_row, route in enumerate(routes):
+            bucket[bucket_row] = normalized[route.physical_row]
+        up = _linear_scheduled_ref(bucket, expert.w_up, config, precision)
+        gate = _linear_scheduled_ref(bucket, expert.w_gate, config, precision)
+        activated = _silu_gate_scheduled_ref(up, gate, precision)
+        expert_out = _linear_scheduled_ref(
+            activated, expert.w_down, config, precision
+        )
+        for bucket_row, route in enumerate(routes):
+            weight = route_weights[(route.token_index, route.rank)]
+            weighted = _round(expert_out[bucket_row] * weight, precision)
+            combined[route.physical_row] = _round(
+                combined[route.physical_row] + weighted, precision
+            )
+    return _residual_add_ref(combined, residual, precision)
+
+
 def _linear_ref(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -594,6 +927,28 @@ def _linear_scheduled_ref(
     config: ScheduledReferenceConfig,
     precision: ReferencePrecision,
 ) -> torch.Tensor:
+    # Native layouts often contain an MLEN-sized physical row tile for only a
+    # handful of active tokens.  A zero activation row is exactly zero after a
+    # bias-free projection, so skip those rows without changing arithmetic for
+    # any active row.  This is essential for realistic seq=1 model-dimension
+    # smoke tests (for example Qwen3-235B with MLEN=128).
+    nonzero_rows = torch.count_nonzero(x, dim=1).ne(0)
+    if not bool(nonzero_rows.all()):
+        out = torch.zeros(
+            (x.shape[0], weight.shape[1]), dtype=torch.float32, device=x.device
+        )
+        if bool(nonzero_rows.any()):
+            out[nonzero_rows] = _round(
+                _linear_ref(
+                    x[nonzero_rows],
+                    precision.quantize(weight),
+                    config.mlen,
+                    config.max_k_tiles,
+                    precision,
+                ),
+                precision,
+            )
+        return out
     return _round(
         _linear_ref(
             x,

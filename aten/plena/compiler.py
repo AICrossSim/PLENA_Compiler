@@ -34,6 +34,14 @@ def _behavior_config_value(key: str, default: int) -> int:
 
     try:
         config = load_toml_config(settings_path, "CONFIG", mode="BEHAVIOR")
+        # Most simulator-generated settings files only carry a TRANSACTIONAL
+        # section.  Falling straight back to a hard-coded default here can make
+        # compiler address increments disagree with the emulator's DMA amount:
+        # e.g. codegen advances four rows while H_PREFETCH_V writes eight.  Use
+        # TRANSACTIONAL as the authoritative fallback so both sides consume the
+        # same transfer contract.
+        if key not in config:
+            config = load_toml_config(settings_path, "CONFIG", mode="TRANSACTIONAL")
     except Exception:
         return default
 
@@ -77,6 +85,8 @@ class PlenaCompiler(
         hbm_v_writeback_amount: int | None = None,
         emission_mode: str = "asm",
         cost_strict_raw: bool = False,
+        packed_attention_schedule: str = "direct-first-block-v1",
+        vector_scalar_schedule: str = "compiler-v1",
     ):
         """
         Args:
@@ -120,6 +130,41 @@ class PlenaCompiler(
         self.hbm_v_writeback_amount = hbm_v_writeback_amount
         self.hlen = _behavior_config_value("HLEN", mlen)
         self.broadcast_amount = _behavior_config_value("BROADCAST_AMOUNT", max(1, mlen // max(1, self.hlen)))
+        if packed_attention_schedule not in {"direct-first-block-v1", "legacy"}:
+            raise ValueError(
+                "packed_attention_schedule must be 'direct-first-block-v1' or "
+                f"'legacy', got {packed_attention_schedule!r}"
+            )
+        self.packed_attention_schedule = packed_attention_schedule
+        if vector_scalar_schedule not in {"compiler-v1", "legacy"}:
+            raise ValueError(
+                "vector_scalar_schedule must be 'compiler-v1' or 'legacy', got "
+                f"{vector_scalar_schedule!r}"
+            )
+        self.vector_scalar_schedule = vector_scalar_schedule
+        self._vector_scalar_stats: dict[str, int] = {
+            "segmented_norm_square_ops_elided": 0,
+            "segmented_norm_copy_ops_elided": 0,
+            "segmented_norm_constant_loads_elided": 0,
+            "inactive_norm_rows_elided": 0,
+            "redundant_valid_masks_elided": 0,
+            "valid_mask_build_count": 0,
+            "rms_norm_address_loads_elided": 0,
+            "rms_norm_nops_elided": 0,
+        }
+        self._packed_attention_stats: dict[str, int] = {
+            "softmax_first_block_specialized_count": 0,
+            "softmax_first_block_specialized_rows": 0,
+            "softmax_state_initializations_elided": 0,
+            "softmax_state_initialization_rows_elided": 0,
+            "temporary_o_matrices_elided": 0,
+            "direct_o_lane_updates": 0,
+            "qk_compute_count": 0,
+            "ideal_qk_compute_count": 0,
+            "pv_compute_count": 0,
+            "kv_tile_load_count": 0,
+            "ideal_kv_tile_load_count": 0,
+        }
 
         # HBM address auto-allocation
         self._next_hbm_addr: int = 0
@@ -131,6 +176,42 @@ class PlenaCompiler(
         self._fp_vars: dict[str, FPVar] = {}
         self._registered_hbm_sub_matrices: dict[str, bool] = {}
         self._registered_vram_sub_matrices: dict[str, bool] = {}
+
+    def packed_attention_stats(self) -> dict[str, int | float | str]:
+        """Return compiler-observed packed-attention work and reuse factors."""
+
+        stats: dict[str, int | float | str] = {
+            "packed_attention_schedule": self.packed_attention_schedule,
+            **self._packed_attention_stats,
+        }
+        qk_ideal = self._packed_attention_stats["ideal_qk_compute_count"]
+        kv_ideal = self._packed_attention_stats["ideal_kv_tile_load_count"]
+        stats["qk_recompute_factor"] = (
+            self._packed_attention_stats["qk_compute_count"] / qk_ideal
+            if qk_ideal
+            else 0.0
+        )
+        stats["kv_reload_factor"] = (
+            self._packed_attention_stats["kv_tile_load_count"] / kv_ideal
+            if kv_ideal
+            else 0.0
+        )
+        return stats
+
+    def record_vector_scalar_stats(self, values: dict[str, int]) -> None:
+        """Accumulate metadata emitted by shared normalization/mask plans."""
+
+        for key, value in values.items():
+            if key not in self._vector_scalar_stats:
+                self._vector_scalar_stats[key] = 0
+            self._vector_scalar_stats[key] += int(value)
+
+    def vector_scalar_stats(self) -> dict[str, int | str]:
+        return {
+            "vector_scalar_schedule": self.vector_scalar_schedule,
+            "valid_mask_scope": "program" if self._vector_scalar_stats["valid_mask_build_count"] else "none",
+            **self._vector_scalar_stats,
+        }
 
     # ========================================================================
     # Compilation

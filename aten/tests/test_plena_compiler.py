@@ -420,6 +420,16 @@ def test_kv_grouped_head_packing_preserves_slots():
         _pad_q_weight_grouped_by_kv,
         _pad_rope_inputs_for_head_slots,
     )
+    from compiler.aten.plena.native_layout import build_attention_head_packing
+
+    packing = build_attention_head_packing(
+        mlen=8,
+        hlen=2,
+        head_dim=2,
+        logical_broadcast_amount=3,
+        gqa_ratio=3,
+        num_kv_heads=1,
+    )
 
     w_q = torch.arange(2 * 6, dtype=torch.float32).reshape(2, 6)
     padded_q = _pad_q_weight_grouped_by_kv(
@@ -428,8 +438,7 @@ def test_kv_grouped_head_packing_preserves_slots():
         num_kv_heads=1,
         head_dim=2,
         padded_hidden=4,
-        group_width=8,
-        head_slot_dim=2,
+        head_packing=packing,
     )
     assert padded_q.shape == (4, 8)
     assert torch.equal(padded_q[:2, 0:2], w_q[:, 0:2])
@@ -444,9 +453,8 @@ def test_kv_grouped_head_packing_preserves_slots():
         num_heads=3,
         num_kv_heads=1,
         head_dim=2,
-        group_width=8,
-        head_slot_dim=2,
         padded_hidden=4,
+        head_packing=packing,
     )
     assert padded_o.shape == (8, 4)
     assert torch.equal(padded_o[0:2, :2], w_o[0:2, :])
@@ -740,8 +748,13 @@ def test_canonical_packed_gqa_codegen_reuses_resident_kv_and_direct_o():
     assert "Resident packed GQA full-chunk loop" not in streaming
     assert resident.count("S_MAP_V_FP") == 1
     assert streaming.count("S_MAP_V_FP") == 1
+    # The resident single-lane loop already targets the final lane and needs no
+    # shift.  The streaming path uses direct packed-O shift+masked-add, while
+    # both avoid the former temporary-O pack pass.
     assert "V_SHIFT_V" not in resident
-    assert "V_SHIFT_V" not in streaming
+    assert "V_SHIFT_V" in streaming
+    assert "Pack O head lane" not in resident
+    assert "Pack O head lane" not in streaming
     for asm in (resident, streaming):
         assert all(line.rstrip().endswith("1, 1") for line in asm.splitlines() if "H_PREFETCH_M" in line)
 
@@ -779,9 +792,10 @@ def test_canonical_packed_gqa_codegen_emits_nondivisible_tail():
     assert schedule.chunks_per_kv == 2
     assert schedule.full_chunks == 1
     assert schedule.tail_heads == 2
-    assert asm.count("Pack O head lane") == 5
-    assert "Pack O head lane 2" in asm
-    assert asm.count("Pack O head lane 2") == 1
+    assert "Pack O head lane" not in asm
+    # All five valid heads, including the two-head tail chunk, are accumulated
+    # directly into their destination lane.
+    assert asm.count("V_SHIFT_V") >= 5
 
     print("  PASS test_canonical_packed_gqa_codegen_emits_nondivisible_tail")
 
@@ -1035,6 +1049,147 @@ def test_native_packed_gqa_supports_head_padding_and_rejects_dimension_tiling():
     assert "Packed Q RoPE: slabs=2" in result["isa"]
 
     print("  PASS test_native_packed_gqa_supports_head_padding_and_rejects_dimension_tiling")
+
+
+def test_native_decoder_compacts_batch_rows_and_gqa_groups():
+    """Native lowering should consume the shared compact row/column layout."""
+    import math
+    import tempfile
+    from collections import Counter
+    from types import SimpleNamespace
+
+    from compiler.aten.cost_frontend import (
+        CompilerCostHardware,
+        compile_native_decoder_cost_trace,
+    )
+    from compiler.aten.model_extract import extract_model_config
+    from compiler.aten.plena_frontend import compile_native_hf_decoder
+
+    def dynamic_opcode_histogram(asm: str) -> Counter[str]:
+        histogram: Counter[str] = Counter()
+        loop_stack: list[int] = []
+        for raw_line in asm.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(";"):
+                continue
+            opcode = line.split(maxsplit=1)[0]
+            histogram[opcode] += math.prod(loop_stack)
+            if opcode == "C_LOOP_START":
+                loop_stack.append(int(line.rsplit(",", 1)[1]))
+            elif opcode == "C_LOOP_END":
+                loop_stack.pop()
+        assert not loop_stack
+        return histogram
+
+    class TinyCompactQwen(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(
+                hidden_size=16,
+                intermediate_size=16,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=4,
+                rms_norm_eps=1e-6,
+                rope_theta=10000.0,
+                vocab_size=32,
+                model_type="qwen3",
+            )
+            layer = torch.nn.Module()
+            layer.input_layernorm = SimpleNamespace(
+                eps=1e-6, weight=torch.ones(16)
+            )
+            layer.post_attention_layernorm = SimpleNamespace(
+                eps=1e-6, weight=torch.ones(16)
+            )
+            layer.self_attn = torch.nn.Module()
+            layer.self_attn.q_proj = torch.nn.Linear(16, 16, bias=False)
+            layer.self_attn.k_proj = torch.nn.Linear(16, 8, bias=False)
+            layer.self_attn.v_proj = torch.nn.Linear(16, 8, bias=False)
+            layer.self_attn.o_proj = torch.nn.Linear(16, 16, bias=False)
+            layer.self_attn.q_norm = SimpleNamespace(weight=torch.ones(4))
+            layer.self_attn.k_norm = SimpleNamespace(weight=torch.ones(4))
+            layer.mlp = torch.nn.Module()
+            layer.mlp.gate_proj = torch.nn.Linear(16, 16, bias=False)
+            layer.mlp.up_proj = torch.nn.Linear(16, 16, bias=False)
+            layer.mlp.down_proj = torch.nn.Linear(16, 16, bias=False)
+            self.model = SimpleNamespace(
+                layers=torch.nn.ModuleList([layer]),
+                norm=SimpleNamespace(weight=torch.ones(16)),
+            )
+
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+        f.write("[TRANSACTIONAL.CONFIG.VLEN]\nvalue = 16\n")
+        settings_path = f.name
+    old_settings = os.environ.get("PLENA_SETTINGS_TOML")
+    os.environ["PLENA_SETTINGS_TOML"] = settings_path
+    try:
+        decoder_input = torch.arange(4 * 7 * 16, dtype=torch.float32).reshape(4, 7, 16) / 100
+        model = TinyCompactQwen()
+        result = compile_native_hf_decoder(
+            model,
+            seq_len=7,
+            batch_size=4,
+            num_layers=1,
+            mlen=16,
+            blen=4,
+            hlen=4,
+            broadcast_amount=2,
+            attention_head_packing=True,
+            decoder_input_embeds=decoder_input,
+            golden_precision="fp32",
+        )
+    finally:
+        if old_settings is None:
+            os.environ.pop("PLENA_SETTINGS_TOML", None)
+        else:
+            os.environ["PLENA_SETTINGS_TOML"] = old_settings
+        os.unlink(settings_path)
+
+    info = result["info"]
+    assert info["batch_pack_factor"] == 2
+    assert info["attention_group_count"] == 2
+    assert info["physical_token_rows"] == 32
+    assert info["logical_token_rows"] == 28
+    assert info["attention_groups_per_storage_block"] == 2
+    assert info["attention_physical_q_width"] == 16
+    assert result["input_tensors"]["X"].shape == (32, 16)
+    mask = result["input_tensors"]["causal_mask"]
+    assert torch.isneginf(mask[0, 7])
+    assert torch.isneginf(mask[7, 0])
+    assert mask[6, 0] == 0
+    assert result["golden_output"].shape == (28, 16)
+
+    trace = compile_native_decoder_cost_trace(
+        extract_model_config(model),
+        CompilerCostHardware(
+            mlen=16,
+            blen=4,
+            vlen=16,
+            hlen=4,
+            broadcast_amount=2,
+            mram_tile_capacity=4,
+            hbm_m_prefetch_amount=16,
+            hbm_v_prefetch_amount=4,
+            hbm_v_writeback_amount=4,
+            hbm_channels=8,
+        ),
+        seq_len=7,
+        batch_size=4,
+        num_layers=1,
+        native_layout_mode="compact",
+        use_cache=False,
+    )
+    assert trace.dynamic_opcodes == dynamic_opcode_histogram(result["isa"])
+    dma_counts: Counter[str] = Counter()
+    for event in trace.memory_events:
+        dma_counts[event.transfer.opcode] += event.multiplicity
+    assert dma_counts == {
+        opcode: trace.dynamic_opcodes[opcode]
+        for opcode in ("H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V")
+    }
+
+    print("  PASS test_native_decoder_compacts_batch_rows_and_gqa_groups")
 
 
 def test_compile_native_hf_decoder_golden_vs_hf():

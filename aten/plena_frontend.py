@@ -5,7 +5,8 @@ from __future__ import annotations
 import math
 import os
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,12 +14,16 @@ import torch
 import torch.nn.functional as F
 
 from compiler.aten.model_extract import (
+    DecoderLayerWeights,
     LayerWeights,
+    MoeExpertWeights,
+    MoeLayerWeights,
     VisionConnectorWeights,
     VisionLayerWeights,
     VisionPostNormWeights,
     VisionConfig,
     embedding_module,
+    extract_final_norm_weight,
     extract_layer_weights,
     extract_model_config,
     extract_vision_config,
@@ -28,6 +33,18 @@ from compiler.aten.model_extract import (
     extract_vision_post_norm_weights,
     find_model_root,
     find_vision_model,
+    is_qwen3_moe_layer,
+)
+from compiler.aten.moe import (
+    MoeRoutingPlan,
+    coerce_routing_plan,
+    derive_static_routing_plan,
+)
+from compiler.aten.cost_emitter import (
+    ScheduleAffineLoad,
+    ScheduleInstruction,
+    ScheduleRepeat,
+    ScheduleSequence,
 )
 import compiler.aten.ops as ops
 from compiler.asm_templates.gelu_asm import gelu_asm
@@ -35,6 +52,16 @@ from asm_templates._imm import add_large_int as _add_large_int_lines
 from asm_templates._imm import load_large_int as _load_large_int_lines
 from compiler.aten.ops.registry import Backend, OpRegistry
 from compiler.aten.plena import PlenaCompiler
+from compiler.aten.plena.native_layout import (
+    AttentionHeadPacking,
+    NATIVE_LAYOUT_MODES,
+    NATIVE_LAYOUT_SCHEMA_VERSION,
+    SequencePackingPlan,
+    build_attention_head_packing,
+)
+from compiler.aten.plena.normalization_plan import (
+    build_grouped_segmented_rms_norm,
+)
 from compiler.aten.reference import (
     ReferencePrecision,
     ScheduledReferenceConfig,
@@ -46,6 +73,7 @@ from compiler.aten.reference import (
     quantize_to_mxfp,
     run_decoder_reference,
     run_native_decoder_scheduled_reference,
+    derive_moe_router_probabilities_from_decoder_input,
 )
 from compiler.utils.load_config import load_toml_config
 
@@ -150,6 +178,33 @@ class LayerInputVars:
     w_gate: Any
     w_up: Any
     w_down: Any
+    input_norm: Any | None = None
+    post_attn_norm: Any | None = None
+    q_norm: Any | None = None
+    k_norm: Any | None = None
+
+
+@dataclass(frozen=True)
+class MoeExpertInputVars:
+    w_gate: Any
+    w_up: Any
+    w_down: Any
+
+
+@dataclass(frozen=True)
+class MoeLayerInputVars:
+    """PLENA input variables for one static-index MoE layer."""
+
+    w_q: Any
+    w_o: Any
+    w_k_heads: list[Any]
+    w_v_heads: list[Any]
+    w_router: Any
+    experts: dict[int, MoeExpertInputVars]
+    input_norm: Any | None = None
+    post_attn_norm: Any | None = None
+    q_norm: Any | None = None
+    k_norm: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -184,21 +239,6 @@ class VisionPostNormInputVars:
 class VisionConnectorInputVars:
     weight: Any
     bias: Any | None
-
-
-@dataclass(frozen=True)
-class AttentionHeadPacking:
-    """Packed-head layout for D < MLEN attention lowering."""
-
-    enabled: bool
-    hlen: int
-    broadcast_amount: int
-    head_slot_dim: int
-    group_width: int
-    total_q_dim: int
-    active_head_dim: int | None = None
-    chunks_per_kv: int = 1
-    logical_broadcast_amount: int | None = None
 
 
 @dataclass
@@ -314,6 +354,37 @@ def _pad_batched_sequence_storage(
     return out.contiguous()
 
 
+def _pack_batched_sequence_storage(
+    tensor: torch.Tensor,
+    *,
+    plan: SequencePackingPlan,
+    cols: int,
+) -> torch.Tensor:
+    """Pack logical ``[B,S,C]`` rows according to a shared native layout plan."""
+    if tensor.dim() == 2:
+        if plan.batch_size != 1:
+            raise ValueError(
+                f"2D tensor storage is only valid for batch_size=1, got {plan.batch_size}"
+            )
+        tensor = tensor.unsqueeze(0)
+    if tensor.dim() != 3:
+        raise ValueError(f"Expected 2D or 3D sequence tensor, got shape {tuple(tensor.shape)}")
+    if tensor.shape[:2] != (plan.batch_size, plan.seq_len):
+        raise ValueError(
+            f"Expected tensor shape ({plan.batch_size}, {plan.seq_len}, C), "
+            f"got {tuple(tensor.shape)}"
+        )
+    if tensor.shape[2] > cols:
+        raise ValueError(f"Cannot pad tensor with {tensor.shape[2]} cols to {cols}")
+    out = torch.zeros(
+        (plan.compile_seq_rows, cols), dtype=tensor.dtype, device=tensor.device
+    )
+    for batch_idx in range(plan.batch_size):
+        start = plan.physical_row(batch_idx, 0)
+        out[start : start + plan.seq_len, : tensor.shape[2]] = tensor[batch_idx]
+    return out.contiguous()
+
+
 def _repeat_sequence_storage(
     tensor: torch.Tensor,
     *,
@@ -334,6 +405,30 @@ def _repeat_sequence_storage(
     for batch_idx in range(batch_size):
         start = batch_idx * rows_per_batch
         out[start:start + seq_len] = tensor[:seq_len]
+    return out.contiguous()
+
+
+def _pack_sequence_table_storage(
+    tensor: torch.Tensor,
+    *,
+    plan: SequencePackingPlan,
+) -> torch.Tensor:
+    """Repeat one positional table into every real and dummy packed batch slot."""
+    if tensor.dim() != 2:
+        raise ValueError(f"Expected 2D sequence table, got shape {tuple(tensor.shape)}")
+    if tensor.shape[0] < plan.seq_len:
+        raise ValueError(f"Table rows {tensor.shape[0]} cannot cover seq_len={plan.seq_len}")
+    out = torch.zeros(
+        (plan.compile_seq_rows, tensor.shape[1]),
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    for padded_batch_idx in range(plan.padded_batch_size):
+        group_idx, slot_idx = divmod(padded_batch_idx, plan.batch_pack_factor)
+        start = (
+            group_idx * plan.rows_per_attention_group + slot_idx * plan.seq_len
+        )
+        out[start : start + plan.seq_len] = tensor[: plan.seq_len]
     return out.contiguous()
 
 
@@ -453,6 +548,47 @@ def _compact_active_sequence_rows(
     return torch.cat(rows, dim=0).contiguous()
 
 
+def _gather_packed_active_sequence_rows(
+    tensor: torch.Tensor,
+    *,
+    plan: SequencePackingPlan,
+    cols: int,
+) -> torch.Tensor:
+    """Gather only real logical batches from compact physical row storage."""
+    rows = []
+    for batch_idx in range(plan.batch_size):
+        start = plan.physical_row(batch_idx, 0)
+        rows.append(tensor[start : start + plan.seq_len, :cols])
+    return torch.cat(rows, dim=0).contiguous()
+
+
+def _build_packed_causal_mask(
+    plan: SequencePackingPlan,
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build one reusable causal score mask for a packed attention group."""
+    mask = torch.full((plan.mlen, plan.mlen), float("-inf"), dtype=dtype)
+    if plan.batch_pack_factor == 1 and plan.seq_len > plan.mlen:
+        # Multi-tile attention applies this local triangle only to q==k tiles;
+        # future K tiles are skipped by the scheduler.
+        return torch.triu(torch.full_like(mask, float("-inf")), diagonal=1).masked_fill(
+            torch.tril(torch.ones_like(mask, dtype=torch.bool)), 0.0
+        )
+    for slot in range(plan.batch_pack_factor):
+        start = slot * plan.seq_len
+        end = start + plan.seq_len
+        local = torch.zeros((plan.seq_len, plan.seq_len), dtype=dtype)
+        local.masked_fill_(
+            torch.triu(
+                torch.ones((plan.seq_len, plan.seq_len), dtype=torch.bool), diagonal=1
+            ),
+            float("-inf"),
+        )
+        mask[start:end, start:end] = local
+    return mask
+
+
 def _pad_q_weight_grouped(weight: torch.Tensor, num_heads: int, head_dim: int, padded_hidden: int, padded_head_dim: int):
     """Pad Q weights while keeping each head in its own padded head block."""
     hidden, _ = weight.shape
@@ -481,47 +617,29 @@ def _pad_q_weight_grouped_by_kv(
     num_kv_heads: int,
     head_dim: int,
     padded_hidden: int,
-    group_width: int,
-    head_slot_dim: int,
-    chunks_per_kv: int = 1,
-    heads_per_chunk: int | None = None,
+    head_packing: AttentionHeadPacking,
 ):
-    """Pad Q weights into KV-group MLEN rows with HLEN-sized head slots."""
+    """Pad Q weights into compact KV/chunk slots inside MLEN blocks."""
     hidden, _ = weight.shape
     if num_heads % num_kv_heads != 0:
         raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
     ratio = num_heads // num_kv_heads
-    if chunks_per_kv <= 0:
-        raise ValueError(f"chunks_per_kv must be positive, got {chunks_per_kv}")
-    if heads_per_chunk is None:
-        heads_per_chunk = group_width // head_slot_dim
-    if heads_per_chunk <= 0:
-        raise ValueError(f"heads_per_chunk must be positive, got {heads_per_chunk}")
-    if head_slot_dim > group_width:
-        raise ValueError(f"head_slot_dim={head_slot_dim} exceeds group_width={group_width}")
-    if heads_per_chunk * head_slot_dim > group_width:
+    if head_packing.chunks_per_kv * head_packing.broadcast_amount < ratio:
         raise ValueError(
-            f"Q head slots do not fit one chunk: heads_per_chunk={heads_per_chunk}, "
-            f"head_slot_dim={head_slot_dim}, group_width={group_width}"
-        )
-    if chunks_per_kv * heads_per_chunk < ratio:
-        raise ValueError(
-            f"Q chunks cannot cover ratio={ratio}: chunks_per_kv={chunks_per_kv}, "
-            f"heads_per_chunk={heads_per_chunk}"
+            f"Q chunks cannot cover ratio={ratio}: "
+            f"chunks_per_kv={head_packing.chunks_per_kv}, "
+            f"heads_per_chunk={head_packing.broadcast_amount}"
         )
     out = torch.zeros(
-        (padded_hidden, num_kv_heads * chunks_per_kv * group_width),
+        (padded_hidden, head_packing.total_q_dim),
         dtype=weight.dtype,
         device=weight.device,
     )
     for h in range(num_heads):
         kv_h = h // ratio
         local_head = h % ratio
-        chunk = local_head // heads_per_chunk
-        lane = local_head % heads_per_chunk
         src_start = h * head_dim
-        dst_group = kv_h * chunks_per_kv + chunk
-        dst_start = dst_group * group_width + lane * head_slot_dim
+        dst_start = head_packing.head_start_col(kv_head=kv_h, local_head=local_head)
         out[:hidden, dst_start:dst_start + head_dim] = weight[:, src_start:src_start + head_dim]
     return out.contiguous()
 
@@ -531,61 +649,115 @@ def _pad_o_weight_grouped_by_kv(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    group_width: int,
-    head_slot_dim: int,
+    head_packing: AttentionHeadPacking,
     padded_hidden: int,
-    chunks_per_kv: int = 1,
-    heads_per_chunk: int | None = None,
 ):
-    """Pad O weights from KV-group HLEN head slots into hidden projection."""
+    """Pad O weights from compact KV/chunk slots into hidden projection."""
     _, hidden = weight.shape
     if num_heads % num_kv_heads != 0:
         raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
     ratio = num_heads // num_kv_heads
-    if chunks_per_kv <= 0:
-        raise ValueError(f"chunks_per_kv must be positive, got {chunks_per_kv}")
-    if heads_per_chunk is None:
-        heads_per_chunk = group_width // head_slot_dim
-    if heads_per_chunk <= 0:
-        raise ValueError(f"heads_per_chunk must be positive, got {heads_per_chunk}")
-    if head_slot_dim > group_width:
-        raise ValueError(f"head_slot_dim={head_slot_dim} exceeds group_width={group_width}")
-    if heads_per_chunk * head_slot_dim > group_width:
+    if head_packing.chunks_per_kv * head_packing.broadcast_amount < ratio:
         raise ValueError(
-            f"O head slots do not fit one chunk: heads_per_chunk={heads_per_chunk}, "
-            f"head_slot_dim={head_slot_dim}, group_width={group_width}"
-        )
-    if chunks_per_kv * heads_per_chunk < ratio:
-        raise ValueError(
-            f"O chunks cannot cover ratio={ratio}: chunks_per_kv={chunks_per_kv}, "
-            f"heads_per_chunk={heads_per_chunk}"
+            f"O chunks cannot cover ratio={ratio}: "
+            f"chunks_per_kv={head_packing.chunks_per_kv}, "
+            f"heads_per_chunk={head_packing.broadcast_amount}"
         )
     out = torch.zeros(
-        (num_kv_heads * chunks_per_kv * group_width, padded_hidden),
+        (head_packing.total_q_dim, padded_hidden),
         dtype=weight.dtype,
         device=weight.device,
     )
     for h in range(num_heads):
         kv_h = h // ratio
         local_head = h % ratio
-        chunk = local_head // heads_per_chunk
-        lane = local_head % heads_per_chunk
         src_start = h * head_dim
-        dst_group = kv_h * chunks_per_kv + chunk
-        dst_start = dst_group * group_width + lane * head_slot_dim
+        dst_start = head_packing.head_start_col(kv_head=kv_h, local_head=local_head)
         out[dst_start:dst_start + head_dim, :hidden] = weight[src_start:src_start + head_dim, :]
     return out.contiguous()
 
 
+def _repeat_norm_weight(
+    weight: torch.Tensor | None,
+    *,
+    rows: int,
+    cols: int,
+) -> torch.Tensor | None:
+    if weight is None:
+        return None
+    flat = weight.reshape(-1)
+    if flat.numel() > cols:
+        raise ValueError(
+            f"Cannot fit norm weight of width {flat.numel()} into {cols} columns"
+        )
+    padded = torch.zeros((cols,), dtype=flat.dtype, device=flat.device)
+    padded[: flat.numel()] = flat
+    return padded.unsqueeze(0).repeat(rows, 1).contiguous()
+
+
+def _pad_q_norm_weight(
+    weight: torch.Tensor | None,
+    model_cfg,
+    *,
+    rows: int,
+    padded_head_dim: int,
+    head_packing: AttentionHeadPacking | None,
+) -> torch.Tensor | None:
+    if weight is None:
+        return None
+    head_weight = weight.reshape(-1)[: model_cfg.head_dim]
+    if head_packing is not None and head_packing.enabled:
+        cols = head_packing.total_q_dim
+        packed = torch.zeros((cols,), dtype=weight.dtype, device=weight.device)
+        ratio = model_cfg.head_ratio
+        for kv_h in range(model_cfg.num_kv_heads):
+            for chunk in range(head_packing.chunks_per_kv):
+                group = kv_h * head_packing.chunks_per_kv + chunk
+                group_start = head_packing.group_start_col(group)
+                chunk_heads = min(
+                    head_packing.broadcast_amount,
+                    ratio - chunk * head_packing.broadcast_amount,
+                )
+                for lane in range(max(0, chunk_heads)):
+                    start = group_start + lane * head_packing.head_slot_dim
+                    packed[start : start + model_cfg.head_dim] = head_weight
+    else:
+        cols = model_cfg.num_heads * padded_head_dim
+        packed = torch.zeros((cols,), dtype=weight.dtype, device=weight.device)
+        for head in range(model_cfg.num_heads):
+            start = head * padded_head_dim
+            packed[start : start + model_cfg.head_dim] = head_weight
+    return packed.unsqueeze(0).repeat(rows, 1).contiguous()
+
+
+def _pad_k_norm_weight(
+    weight: torch.Tensor | None,
+    model_cfg,
+    *,
+    rows: int,
+    padded_head_dim: int,
+    head_packing: AttentionHeadPacking | None,
+) -> torch.Tensor | None:
+    if weight is None:
+        return None
+    cols = (
+        head_packing.head_slot_dim
+        if head_packing is not None and head_packing.enabled
+        else padded_head_dim
+    )
+    return _repeat_norm_weight(weight, rows=rows, cols=cols)
+
+
 def _pad_decoder_weights_for_tiles(
-    weights: LayerWeights,
+    weights: DecoderLayerWeights,
     model_cfg,
     *,
     padded_hidden: int,
     padded_inter: int,
     padded_head_dim: int,
+    norm_rows: int = 1,
     head_packing: AttentionHeadPacking | None = None,
-) -> LayerWeights:
+) -> DecoderLayerWeights:
     head_dim = model_cfg.head_dim
     num_heads = model_cfg.num_heads
     num_kv_heads = model_cfg.num_kv_heads
@@ -597,36 +769,73 @@ def _pad_decoder_weights_for_tiles(
             num_kv_heads,
             head_dim,
             padded_hidden,
-            head_packing.group_width,
-            head_packing.head_slot_dim,
-            chunks_per_kv=head_packing.chunks_per_kv,
-            heads_per_chunk=head_packing.broadcast_amount,
+            head_packing,
         )
         w_o = _pad_o_weight_grouped_by_kv(
             weights.w_o,
             num_heads,
             num_kv_heads,
             head_dim,
-            head_packing.group_width,
-            head_packing.head_slot_dim,
+            head_packing,
             padded_hidden,
-            chunks_per_kv=head_packing.chunks_per_kv,
-            heads_per_chunk=head_packing.broadcast_amount,
         )
     else:
         w_q = _pad_q_weight_grouped(weights.w_q, num_heads, head_dim, padded_hidden, padded_head_dim)
         w_o = _pad_o_weight_grouped(weights.w_o, num_heads, head_dim, padded_head_dim, padded_hidden)
 
     kv_head_dim = head_packing.head_slot_dim if head_packing is not None and head_packing.enabled else padded_head_dim
-    return LayerWeights(
+    common = dict(
         w_q=w_q,
         w_o=w_o,
         w_k_heads=[_pad_2d(w, padded_hidden, kv_head_dim) for w in weights.w_k_heads],
         w_v_heads=[_pad_2d(w, padded_hidden, kv_head_dim) for w in weights.w_v_heads],
+        eps=weights.eps,
+        input_norm_weight=_repeat_norm_weight(
+            weights.input_norm_weight, rows=norm_rows, cols=padded_hidden
+        ),
+        post_attn_norm_weight=_repeat_norm_weight(
+            weights.post_attn_norm_weight, rows=norm_rows, cols=padded_hidden
+        ),
+        q_norm_weight=_pad_q_norm_weight(
+            weights.q_norm_weight,
+            model_cfg,
+            rows=norm_rows,
+            padded_head_dim=padded_head_dim,
+            head_packing=head_packing,
+        ),
+        k_norm_weight=_pad_k_norm_weight(
+            weights.k_norm_weight,
+            model_cfg,
+            rows=norm_rows,
+            padded_head_dim=padded_head_dim,
+            head_packing=head_packing,
+        ),
+    )
+    if isinstance(weights, MoeLayerWeights):
+        active_experts = None
+        if weights.active_experts is not None:
+            active_experts = {
+                expert_id: MoeExpertWeights(
+                    w_gate=_pad_2d(expert.w_gate, padded_hidden, padded_inter),
+                    w_up=_pad_2d(expert.w_up, padded_hidden, padded_inter),
+                    w_down=_pad_2d(expert.w_down, padded_inter, padded_hidden),
+                )
+                for expert_id, expert in weights.active_experts.items()
+            }
+        return MoeLayerWeights(
+            **common,
+            # Static-index v1 requires num_experts <= MLEN.  The router is
+            # padded to one complete vector tile so existing online-softmax
+            # and mask instructions can process it without a new opcode.
+            w_router=_pad_2d(weights.w_router, padded_hidden, padded_head_dim),
+            expert_provider=weights.expert_provider,
+            active_experts=active_experts,
+        )
+    return LayerWeights(
+        **common,
         w_gate=_pad_2d(weights.w_gate, padded_hidden, padded_inter),
         w_up=_pad_2d(weights.w_up, padded_hidden, padded_inter),
         w_down=_pad_2d(weights.w_down, padded_inter, padded_hidden),
-        eps=weights.eps,
     )
 
 
@@ -776,11 +985,298 @@ def _pad_rope_inputs_for_head_slots(
     return r.contiguous(), cos.contiguous(), sin.contiguous()
 
 
-def _save_residual_and_norm(prog, source, scratch):
+def _save_residual_and_norm(prog, source, scratch, norm_weight=None):
     """Emit the common decoder pre-norm residual prologue."""
     prog.vram_fill_zero(scratch)
     prog.vram_add(scratch, source)
-    ops.rms_norm(prog, source, eps_offset=3, reci_hid_offset=4)
+    ops.rms_norm(
+        prog,
+        source,
+        eps_offset=3,
+        reci_hid_offset=4,
+        physical_rows=source.physical_shape[0],
+        active_row_ranges=getattr(prog, "_native_active_row_ranges", None),
+    )
+    if norm_weight is not None:
+        _load_and_mul(prog, source, norm_weight, f"{source.display_name}_learned_norm")
+
+
+def _emit_segmented_head_rms_norm_legacy(
+    prog,
+    tensor,
+    *,
+    segments: list[tuple[int, int]],
+    name: str,
+):
+    """Normalize selected HLEN lanes using existing masked vector ISA.
+
+    ``segments`` contains ``(column_block, lane)`` pairs.  The vector mask is
+    interpreted in HLEN units by both RTL and the transactional emulator.  A
+    temporary full vector holds squares; only the selected lane participates
+    in the reduction and in the final scale.
+    """
+    if not segments:
+        return tensor
+    if prog.hlen <= 0 or prog.mlen % prog.hlen != 0:
+        raise ValueError(
+            f"Segmented Q/K RMSNorm requires positive HLEN dividing MLEN; "
+            f"got HLEN={prog.hlen}, MLEN={prog.mlen}"
+        )
+    physical_rows, physical_cols = tensor.physical_shape
+    if physical_cols % prog.mlen != 0:
+        raise ValueError(
+            f"Segmented Q/K RMSNorm requires MLEN-aligned columns, got {physical_cols}"
+        )
+    scratch = prog.alloc(
+        f"{name}_square_scratch",
+        1,
+        prog.mlen,
+        strict=False,
+        physical_shape=(1, prog.mlen),
+    )
+    scratch_addr = prog.get_vram_addr(scratch.name)
+    tensor_addr = prog.get_vram_addr(tensor.name)
+    gp_src, gp_scratch, gp_mask = prog.register_allocator.allocate_gp(3)
+    try:
+        lines = [f"; === Segmented Q/K RMSNorm: {name} ==="]
+        lines.extend(_load_large_int_lines(gp_scratch, scratch_addr))
+        schedule_children = [
+            ScheduleAffineLoad(
+                key=f"{name}:scratch",
+                register=f"gp{gp_scratch}",
+                start=scratch_addr,
+                step=0,
+                period=1,
+            )
+        ]
+        for col_block, lane in segments:
+            if col_block < 0 or col_block >= physical_cols // prog.mlen:
+                raise ValueError(f"Q/K norm column block {col_block} out of range")
+            if lane < 0 or lane >= prog.mlen // prog.hlen:
+                raise ValueError(f"Q/K norm lane {lane} out of range")
+            mask = 1 << lane
+            lines.append(f"S_ADDI_INT gp{gp_mask}, gp0, {mask}")
+            lines.append(f"C_SET_V_MASK_REG gp{gp_mask}")
+            block_base = tensor_addr + col_block * physical_rows * prog.mlen
+            schedule_children.extend(
+                (
+                    ScheduleInstruction(
+                        "S_ADDI_INT",
+                        (f"gp{gp_mask}", "gp0", str(mask)),
+                    ),
+                    ScheduleInstruction("C_SET_V_MASK_REG", (f"gp{gp_mask}",)),
+                )
+            )
+            row_schedule = ScheduleSequence(
+                (
+                    ScheduleAffineLoad(
+                        key=f"{name}:block{col_block}:lane{lane}:row",
+                        register=f"gp{gp_src}",
+                        start=block_base,
+                        step=prog.mlen,
+                        period=physical_rows,
+                    ),
+                    ScheduleInstruction(
+                        "V_MUL_VF",
+                        (f"gp{gp_scratch}", f"gp{gp_scratch}", "f0", "0"),
+                    ),
+                    ScheduleInstruction(
+                        "V_ADD_VV",
+                        (f"gp{gp_scratch}", f"gp{gp_scratch}", f"gp{gp_src}", "0"),
+                    ),
+                    ScheduleInstruction(
+                        "V_MUL_VV",
+                        (f"gp{gp_scratch}", f"gp{gp_scratch}", f"gp{gp_scratch}", "0"),
+                    ),
+                    ScheduleInstruction("S_ADD_FP", ("f1", "f0", "f0")),
+                    ScheduleInstruction(
+                        "V_RED_SUM", ("f1", f"gp{gp_scratch}", "1", "0")
+                    ),
+                    ScheduleInstruction("S_LD_FP", ("f2", "gp0", "6")),
+                    ScheduleInstruction("S_MUL_FP", ("f1", "f1", "f2")),
+                    ScheduleInstruction("S_LD_FP", ("f2", "gp0", "3")),
+                    ScheduleInstruction("S_ADD_FP", ("f1", "f1", "f2")),
+                    ScheduleInstruction("S_SQRT_FP", ("f1", "f1", "0")),
+                    ScheduleInstruction("S_RECI_FP", ("f1", "f1", "0")),
+                    ScheduleInstruction(
+                        "V_MUL_VF", (f"gp{gp_src}", f"gp{gp_src}", "f1", "1")
+                    ),
+                )
+            )
+            schedule_children.append(
+                ScheduleRepeat(
+                    count=physical_rows,
+                    body=row_schedule,
+                    name=f"{name}_block{col_block}_lane{lane}_rows",
+                    repeat_kind="compile_time",
+                )
+            )
+            for row in range(physical_rows):
+                lines.extend(_load_large_int_lines(gp_src, block_base + row * prog.mlen))
+                lines.append(f"V_MUL_VF gp{gp_scratch}, gp{gp_scratch}, f0, 0")
+                lines.append(f"V_ADD_VV gp{gp_scratch}, gp{gp_scratch}, gp{gp_src}, 0")
+                lines.append(f"V_MUL_VV gp{gp_scratch}, gp{gp_scratch}, gp{gp_scratch}, 0")
+                lines.append("S_ADD_FP f1, f0, f0")
+                lines.append(f"V_RED_SUM f1, gp{gp_scratch}, 1, 0")
+                lines.append("S_LD_FP f2, gp0, 6")
+                lines.append("S_MUL_FP f1, f1, f2")
+                lines.append("S_LD_FP f2, gp0, 3")
+                lines.append("S_ADD_FP f1, f1, f2")
+                lines.append("S_SQRT_FP f1, f1, 0")
+                lines.append("S_RECI_FP f1, f1, 0")
+                lines.append(f"V_MUL_VF gp{gp_src}, gp{gp_src}, f1, 1")
+        rendered = "\n".join(lines) + "\n"
+        if getattr(prog, "_cost_sink", None) is None:
+            prog.emit(rendered)
+        else:
+            counts = Counter(
+                line.split(None, 1)[0]
+                for line in lines
+                if line and not line.lstrip().startswith(";")
+            )
+            prog.emit_cost_schedule(
+                static_opcodes=counts,
+                dynamic_opcodes=counts,
+                schedule=ScheduleSequence(tuple(schedule_children)),
+                rendered_asm=rendered,
+            )
+    finally:
+        prog.register_allocator.free_gp([gp_src, gp_scratch, gp_mask])
+        prog.free_tensor(scratch)
+    return tensor
+
+
+def _emit_segmented_head_rms_norm(
+    prog,
+    tensor,
+    *,
+    segments: list[tuple[int, int]],
+    name: str,
+    active_row_ranges: tuple[tuple[int, int], ...] | None = None,
+):
+    """Emit legacy or grouped Q/K RMSNorm from one compiler schedule switch."""
+
+    if getattr(prog, "vector_scalar_schedule", "legacy") == "legacy":
+        return _emit_segmented_head_rms_norm_legacy(
+            prog,
+            tensor,
+            segments=segments,
+            name=name,
+        )
+    if not segments:
+        return tensor
+    if active_row_ranges is None:
+        active_row_ranges = getattr(prog, "_native_active_row_ranges", None)
+    physical_rows, physical_cols = tensor.physical_shape
+    scratch = prog.alloc(
+        f"{name}_square_scratch",
+        1,
+        prog.mlen,
+        strict=False,
+        physical_shape=(1, prog.mlen),
+    )
+    gp_src, gp_scratch, gp_mask, gp_loop = (
+        prog.register_allocator.allocate_gp(4)
+    )
+    try:
+        lowering = build_grouped_segmented_rms_norm(
+            name=name,
+            tensor_base_address=prog.get_vram_addr(tensor.name),
+            scratch_base_address=prog.get_vram_addr(scratch.name),
+            physical_rows=physical_rows,
+            physical_cols=physical_cols,
+            mlen=prog.mlen,
+            hlen=prog.hlen,
+            segments=segments,
+            active_row_ranges=active_row_ranges,
+            gp_src=gp_src,
+            gp_scratch=gp_scratch,
+            gp_mask=gp_mask,
+            gp_loop=gp_loop,
+        )
+        prog.record_vector_scalar_stats(lowering.metadata)
+        if getattr(prog, "_cost_sink", None) is None:
+            prog.emit(lowering.rendered_asm)
+        else:
+            prog.emit_cost_schedule(
+                static_opcodes=lowering.static_opcodes,
+                dynamic_opcodes=lowering.dynamic_opcodes,
+                schedule=lowering.schedule,
+                rendered_asm=lowering.rendered_asm,
+            )
+    finally:
+        prog.register_allocator.free_gp(
+            [gp_src, gp_scratch, gp_mask, gp_loop]
+        )
+        prog.free_tensor(scratch)
+    return tensor
+
+
+def _emit_q_norm(
+    prog,
+    q,
+    layer_inputs,
+    *,
+    config,
+    head_packing,
+    layer_idx,
+    active_row_ranges: tuple[tuple[int, int], ...] | None = None,
+):
+    if layer_inputs.q_norm is None:
+        return q
+    segments: list[tuple[int, int]] = []
+    if head_packing is not None:
+        ratio = config.head_ratio
+        for kv_h in range(config.num_kv_heads):
+            for chunk in range(head_packing.chunks_per_kv):
+                group = kv_h * head_packing.chunks_per_kv + chunk
+                block, slot_offset = head_packing.group_location(group)
+                first_lane = slot_offset // head_packing.head_slot_dim
+                chunk_heads = min(
+                    head_packing.broadcast_amount,
+                    ratio - chunk * head_packing.broadcast_amount,
+                )
+                segments.extend(
+                    (block, first_lane + lane)
+                    for lane in range(max(0, chunk_heads))
+                )
+    else:
+        if config.padded_head_dim != prog.mlen:
+            raise ValueError(
+                "Qwen Q norm generic path currently requires one MLEN block per head"
+            )
+        segments = [(head, 0) for head in range(config.num_heads)]
+    _emit_segmented_head_rms_norm(
+        prog,
+        q,
+        segments=segments,
+        name=f"q_norm_l{layer_idx}",
+        active_row_ranges=active_row_ranges,
+    )
+    return _load_and_mul(prog, q, layer_inputs.q_norm, f"Q_norm_weight_{layer_idx}")
+
+
+def _emit_k_norm(
+    prog,
+    k,
+    layer_inputs,
+    *,
+    layer_idx,
+    kv_head,
+    active_row_ranges: tuple[tuple[int, int], ...] | None = None,
+):
+    if layer_inputs.k_norm is None:
+        return k
+    _emit_segmented_head_rms_norm(
+        prog,
+        k,
+        segments=[(0, 0)],
+        name=f"k_norm_l{layer_idx}_h{kv_head}",
+        active_row_ranges=active_row_ranges,
+    )
+    return _load_and_mul(
+        prog, k, layer_inputs.k_norm, f"K_norm_weight_{layer_idx}_h{kv_head}"
+    )
 
 
 def _add_residual(prog, target, scratch):
@@ -858,6 +1354,13 @@ def _emit_kv_stores(
             f"V_{layer_idx}_h{kv_h}",
             physical_shape=v_physical_shape,
         )
+        _emit_k_norm(
+            prog,
+            K_h,
+            layer_inputs,
+            layer_idx=layer_idx,
+            kv_head=kv_h,
+        )
         checkpoint_cols = active_head_dim or K_h.shape[1]
         if checkpoint_recorder is not None:
             checkpoint_recorder.record(
@@ -919,6 +1422,7 @@ def _emit_packed_attention_block(
     num_kv_heads,
     ratio,
     head_packing: AttentionHeadPacking,
+    model_cfg,
     checkpoint_recorder: StageCheckpointRecorder | None = None,
     active_seq_len: int | None = None,
     active_hidden: int | None = None,
@@ -947,7 +1451,7 @@ def _emit_packed_attention_block(
             semantic="decoder layer input before attention RMS norm",
         )
 
-    _save_residual_and_norm(prog, current, scratch)
+    _save_residual_and_norm(prog, current, scratch, layer_inputs.input_norm)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -965,6 +1469,14 @@ def _emit_packed_attention_block(
         layer_inputs.w_q,
         f"Q_{layer_idx}",
         physical_shape=q_physical_shape,
+    )
+    _emit_q_norm(
+        prog,
+        Q,
+        layer_inputs,
+        config=model_cfg,
+        head_packing=head_packing,
+        layer_idx=layer_idx,
     )
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
@@ -998,7 +1510,7 @@ def _emit_packed_attention_block(
         active_head_dim=head_packing.active_head_dim or head_dim,
     )
 
-    scratch_rows = prog.mlen * (head_packing.broadcast_amount + ratio)
+    scratch_rows = prog.mlen * (head_packing.heads_per_storage_block + ratio)
     attn_scratch = prog.alloc(
         f"packed_attn_scratch_{layer_idx}",
         scratch_rows,
@@ -1013,7 +1525,7 @@ def _emit_packed_attention_block(
         rope_matrix,
         cos_var,
         sin_var,
-        slab_count=num_kv_heads * head_packing.chunks_per_kv * batch_size,
+        slab_count=head_packing.storage_block_count * batch_size,
         rows_per_slab=rows_per_batch,
         active_rows=active_seq_len_per_batch,
     )
@@ -1030,6 +1542,9 @@ def _emit_packed_attention_block(
         physical_broadcast=head_packing.broadcast_amount,
         head_slot_dim=head_packing.head_slot_dim,
         scratch_base_address=attn_scratch_addr,
+        groups_per_storage_block=head_packing.groups_per_storage_block,
+        attention_group_width=head_packing.attention_group_width,
+        storage_block_count=head_packing.storage_block_count,
         scale=scale,
         causal_mask=causal_mask,
     )
@@ -1082,6 +1597,7 @@ def _emit_attention_block(
     num_heads,
     num_kv_heads,
     ratio,
+    model_cfg,
     checkpoint_recorder: StageCheckpointRecorder | None = None,
     active_seq_len: int | None = None,
     active_hidden: int | None = None,
@@ -1104,7 +1620,7 @@ def _emit_attention_block(
             semantic="decoder layer input before attention RMS norm",
         )
 
-    _save_residual_and_norm(prog, current, scratch)
+    _save_residual_and_norm(prog, current, scratch, layer_inputs.input_norm)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -1121,6 +1637,14 @@ def _emit_attention_block(
         layer_inputs.w_q,
         f"Q_{layer_idx}",
         physical_shape=(total_physical_rows, total_q_dim) if batch_size > 1 else None,
+    )
+    _emit_q_norm(
+        prog,
+        Q,
+        layer_inputs,
+        config=model_cfg,
+        head_packing=None,
+        layer_idx=layer_idx,
     )
     q_full_addr = prog.get_vram_addr(Q.name)
     if checkpoint_recorder is not None:
@@ -1291,7 +1815,7 @@ def _emit_ffn_block(
             active_shape=(active_seq_len, active_hidden),
             semantic="FFN block input before RMS norm",
         )
-    _save_residual_and_norm(prog, current, scratch)
+    _save_residual_and_norm(prog, current, scratch, layer_inputs.post_attn_norm)
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -1322,6 +1846,337 @@ def _emit_ffn_block(
             semantic="FFN block output after residual add",
         )
     return out
+
+
+def _reset_moe_fpram_scratch(prog, value_slot: int = 0):
+    base = prog._ONLINE_SOFTMAX_FPSRAM_BASE
+    prog.emit(prog._reset_fpsram_asm(base, prog.mlen, value_slot))
+    return base
+
+
+def _emit_router_softmax(prog, router_logits, *, physical_rows: int):
+    """Run one-tile online softmax over every router row in-place."""
+    base_addr = prog.get_vram_addr(router_logits.name)
+    for row_start in range(0, physical_rows, prog.mlen):
+        rows = min(prog.mlen, physical_rows - row_start)
+        view = prog.alloc_at(
+            f"{router_logits.display_name}_softmax_rows_{row_start}",
+            rows,
+            prog.mlen,
+            base_addr + row_start * prog.mlen,
+            physical_shape=(physical_rows, prog.mlen),
+        )
+        scratch_base = prog._ONLINE_SOFTMAX_FPSRAM_BASE
+        prog.emit(prog._reset_fpsram_asm(scratch_base, prog.mlen, 2))
+        prog.emit(
+            prog._reset_fpsram_asm(scratch_base + 2 * prog.mlen, prog.mlen, 0)
+        )
+        prog.online_softmax_block(view, scale=1.0, rows=rows)
+        prog.final_scale_o(0, view, rows=rows)
+        prog.free_tensor(view)
+    return router_logits
+
+
+def _emit_fpram_row_to_vram(prog, *, fpram_addr: int, vram_addr: int):
+    gp_dst, gp_src = prog.register_allocator.allocate_gp(2)
+    try:
+        lines = ["; Map compact MoE route weights from FPRAM to VRAM"]
+        lines.extend(_load_large_int_lines(gp_dst, vram_addr))
+        lines.extend(_load_large_int_lines(gp_src, fpram_addr))
+        lines.append(f"S_MAP_V_FP gp{gp_dst}, gp{gp_src}, 0")
+        prog.emit("\n".join(lines) + "\n")
+    finally:
+        prog.register_allocator.free_gp([gp_dst, gp_src])
+
+
+def _emit_normalize_route_weights(
+    prog,
+    *,
+    fpram_addr: int,
+    count: int,
+):
+    """Normalize selected route probabilities with scalar FP instructions."""
+    gp_addr = prog.register_allocator.allocate_gp(1)[0]
+    try:
+        lines = [f"; Normalize {count} selected MoE route weights"]
+        lines.extend(_load_large_int_lines(gp_addr, fpram_addr))
+        lines.append("S_ADD_FP f2, f0, f0")
+        for rank in range(count):
+            lines.append(f"S_LD_FP f1, gp{gp_addr}, {rank}")
+            lines.append("S_ADD_FP f2, f2, f1")
+        lines.append("S_RECI_FP f2, f2, 0")
+        for rank in range(count):
+            lines.append(f"S_LD_FP f1, gp{gp_addr}, {rank}")
+            lines.append("S_MUL_FP f1, f1, f2")
+            lines.append(f"S_ST_FP f1, gp{gp_addr}, {rank}")
+        prog.emit("\n".join(lines) + "\n")
+    finally:
+        prog.register_allocator.free_gp([gp_addr])
+
+
+def _emit_selected_probability(
+    prog,
+    *,
+    router_probs,
+    identity,
+    scratch,
+    physical_row: int,
+    identity_row: int,
+    fpram_addr: int,
+):
+    prog.vram_fill_zero(scratch)
+    prog.vram_add(
+        scratch,
+        router_probs,
+        src_row_offset=physical_row,
+        num_rows=1,
+    )
+    prog.vram_mul(
+        scratch,
+        identity,
+        src_row_offset=identity_row,
+        num_rows=1,
+    )
+    prog.tile_row_sum(fpram_addr, scratch, row_idx=0)
+
+
+def _emit_static_route_weights(
+    prog,
+    *,
+    router_probs,
+    identity,
+    plan: MoeRoutingPlan,
+    physical_rows: int,
+    normalize: bool,
+    layer_idx: int,
+):
+    route_weights = prog.alloc(
+        f"moe_route_weights_{layer_idx}",
+        physical_rows,
+        prog.mlen,
+        strict=False,
+        physical_shape=(physical_rows, prog.mlen),
+    )
+    prog.vram_fill_zero(route_weights)
+    scratch = prog.alloc(
+        f"moe_route_extract_{layer_idx}",
+        1,
+        prog.mlen,
+        strict=False,
+        physical_shape=(1, prog.mlen),
+    )
+    routes_by_token: dict[int, list] = {}
+    for route in plan.routes:
+        routes_by_token.setdefault(route.token_index, []).append(route)
+    route_base = prog._ONLINE_SOFTMAX_FPSRAM_BASE
+    route_weights_addr = prog.get_vram_addr(route_weights.name)
+    for token_routes in routes_by_token.values():
+        token_routes.sort(key=lambda route: route.rank)
+        _reset_moe_fpram_scratch(prog)
+        for route in token_routes:
+            _emit_selected_probability(
+                prog,
+                router_probs=router_probs,
+                identity=identity,
+                scratch=scratch,
+                physical_row=route.physical_row,
+                identity_row=route.expert_id,
+                fpram_addr=route_base + route.rank,
+            )
+        if normalize:
+            _emit_normalize_route_weights(
+                prog, fpram_addr=route_base, count=len(token_routes)
+            )
+        _emit_fpram_row_to_vram(
+            prog,
+            fpram_addr=route_base,
+            vram_addr=route_weights_addr + token_routes[0].physical_row * prog.mlen,
+        )
+    prog.free_tensor(scratch)
+    return route_weights
+
+
+def _emit_scale_wide_row_from_fpram(
+    prog,
+    tensor,
+    *,
+    row: int,
+    fpram_addr: int,
+):
+    physical_rows, physical_cols = tensor.physical_shape
+    base = prog.get_vram_addr(tensor.name)
+    for col_block in range(physical_cols // prog.mlen):
+        col_base = base + col_block * physical_rows * prog.mlen
+        prog.tile_row_mul_fp_broadcast_asm(col_base, fpram_addr, [row])
+
+
+def _emit_moe_block(
+    prog,
+    current,
+    layer_inputs: MoeLayerInputVars,
+    scratch,
+    *,
+    router_mask,
+    route_identity,
+    plan: MoeRoutingPlan,
+    model_cfg,
+    layer_idx: int,
+    checkpoint_recorder: StageCheckpointRecorder | None = None,
+    active_seq_len: int | None = None,
+    active_hidden: int | None = None,
+):
+    """Lower static-index Qwen3-MoE using only existing PLENA ISA."""
+    with prog.cost_stage("norm"):
+        _save_residual_and_norm(
+            prog, current, scratch, layer_inputs.post_attn_norm
+        )
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="moe_norm",
+            tensor=current,
+            active_shape=(
+                active_seq_len or current.shape[0],
+                active_hidden or current.shape[1],
+            ),
+            semantic="post-attention RMS-normalized MoE input",
+        )
+    physical_rows, padded_hidden = current.physical_shape
+    with prog.cost_stage("router"):
+        router_probs = _linear_projection(
+            prog,
+            current,
+            layer_inputs.w_router,
+            f"moe_router_logits_{layer_idx}",
+            physical_shape=(physical_rows, prog.mlen),
+        )
+        prog.vram_add(router_probs, router_mask)
+        _emit_router_softmax(prog, router_probs, physical_rows=physical_rows)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="moe_router_probs",
+            tensor=router_probs,
+            active_shape=(
+                active_seq_len or physical_rows,
+                model_cfg.num_experts,
+            ),
+            semantic="runtime router probabilities before static route extraction",
+        )
+    with prog.cost_stage("router"):
+        route_weights = _emit_static_route_weights(
+            prog,
+            router_probs=router_probs,
+            identity=route_identity,
+            plan=plan,
+            physical_rows=physical_rows,
+            normalize=model_cfg.norm_topk_prob,
+            layer_idx=layer_idx,
+        )
+    with prog.cost_stage("combine"):
+        combined = prog.alloc(
+            f"moe_combined_{layer_idx}",
+            physical_rows,
+            padded_hidden,
+            strict=False,
+            physical_shape=(physical_rows, padded_hidden),
+        )
+        prog.vram_fill_zero(combined)
+    scalar_scratch = prog.alloc(
+        f"moe_route_scalar_{layer_idx}",
+        1,
+        prog.mlen,
+        strict=False,
+        physical_shape=(1, prog.mlen),
+    )
+    scalar_addr = prog._ONLINE_SOFTMAX_FPSRAM_BASE
+    bucket_metadata: dict[int, dict[str, int]] = {}
+    for expert_id in plan.active_expert_ids:
+        routes = [route for route in plan.routes if route.expert_id == expert_id]
+        real_rows = len(routes)
+        padded_rows = _ceil_to_multiple(real_rows, prog.blen)
+        bucket_metadata[expert_id] = {
+            "real_rows": real_rows,
+            "padded_rows": padded_rows,
+        }
+        with prog.cost_stage("dispatch"):
+            bucket = prog.alloc(
+                f"moe_expert_{expert_id}_bucket_l{layer_idx}",
+                padded_rows,
+                padded_hidden,
+                strict=False,
+                physical_shape=(padded_rows, padded_hidden),
+            )
+            prog.vram_fill_zero(bucket)
+            for bucket_row, route in enumerate(routes):
+                prog.vram_add(
+                    bucket,
+                    current,
+                    dst_row_offset=bucket_row,
+                    src_row_offset=route.physical_row,
+                    num_rows=1,
+                )
+        expert = layer_inputs.experts[expert_id]
+        with prog.cost_stage("experts"):
+            ops.ffn(prog, bucket, expert.w_gate, expert.w_up, expert.w_down)
+        with prog.cost_stage("combine"):
+            for bucket_row, route in enumerate(routes):
+                _emit_selected_probability(
+                    prog,
+                    router_probs=route_weights,
+                    identity=route_identity,
+                    scratch=scalar_scratch,
+                    physical_row=route.physical_row,
+                    identity_row=route.rank,
+                    fpram_addr=scalar_addr,
+                )
+                _emit_scale_wide_row_from_fpram(
+                    prog, bucket, row=bucket_row, fpram_addr=scalar_addr
+                )
+                prog.vram_add(
+                    combined,
+                    bucket,
+                    dst_row_offset=route.physical_row,
+                    src_row_offset=bucket_row,
+                    num_rows=1,
+                )
+        prog.free_tensor(bucket)
+    with prog.cost_stage("combine"):
+        prog.vram_fill_zero(current)
+        prog.vram_add(current, combined)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="moe_combined",
+            tensor=current,
+            active_shape=(
+                active_seq_len or physical_rows,
+                active_hidden or padded_hidden,
+            ),
+            semantic="weighted expert sum before residual add",
+        )
+    with prog.cost_stage("combine"):
+        _add_residual(prog, current, scratch)
+    if checkpoint_recorder is not None:
+        checkpoint_recorder.record(
+            prog,
+            layer_idx=layer_idx,
+            stage="moe_residual",
+            tensor=current,
+            active_shape=(
+                active_seq_len or physical_rows,
+                active_hidden or padded_hidden,
+            ),
+            semantic="MoE block output after residual add",
+        )
+    prog.free_tensor(scalar_scratch)
+    prog.free_tensor(route_weights)
+    prog.free_tensor(router_probs)
+    prog.free_tensor(combined)
+    return current, bucket_metadata
 
 
 def _load_and_add(prog, target, input_var, name: str):
@@ -1671,12 +2526,13 @@ def _emit_vision_connector(
 def _register_layer_inputs(
     prog,
     layer_idx: int,
-    weights: LayerWeights,
+    weights: DecoderLayerWeights,
     physical_shapes: dict[str, tuple[int, int]] | None = None,
-) -> LayerInputVars:
+) -> LayerInputVars | MoeLayerInputVars:
     named_vars = {}
     w_k_heads = []
     w_v_heads = []
+    expert_vars: dict[int, dict[str, Any]] = {}
     physical_shapes = physical_shapes or {}
     for tensor_name, tensor in weights.tensor_entries(layer_idx):
         var = prog.input(tensor_name, shape=tuple(tensor.shape), physical_shape=physical_shapes.get(tensor_name))
@@ -1684,8 +2540,42 @@ def _register_layer_inputs(
             w_k_heads.append(var)
         elif tensor_name.startswith(f"W_v_{layer_idx}_h"):
             w_v_heads.append(var)
+        elif match := re.fullmatch(
+            rf"W_expert_(gate|up|down)_{layer_idx}_e(\d+)", tensor_name
+        ):
+            kind, expert_id = match.groups()
+            expert_vars.setdefault(int(expert_id), {})[kind] = var
         else:
             named_vars[tensor_name[: tensor_name.rfind(f"_{layer_idx}")]] = var
+
+    optional = {
+        "input_norm": named_vars.get("W_input_norm"),
+        "post_attn_norm": named_vars.get("W_post_attn_norm"),
+        "q_norm": named_vars.get("W_q_norm"),
+        "k_norm": named_vars.get("W_k_norm"),
+    }
+    if isinstance(weights, MoeLayerWeights):
+        experts = {}
+        for expert_id, values in sorted(expert_vars.items()):
+            missing = {"gate", "up", "down"} - values.keys()
+            if missing:
+                raise ValueError(
+                    f"Missing MoE expert {expert_id} tensors: {sorted(missing)}"
+                )
+            experts[expert_id] = MoeExpertInputVars(
+                w_gate=values["gate"],
+                w_up=values["up"],
+                w_down=values["down"],
+            )
+        return MoeLayerInputVars(
+            w_q=named_vars["W_q"],
+            w_o=named_vars["W_o"],
+            w_k_heads=w_k_heads,
+            w_v_heads=w_v_heads,
+            w_router=named_vars["W_router"],
+            experts=experts,
+            **optional,
+        )
 
     return LayerInputVars(
         w_q=named_vars["W_q"],
@@ -1695,6 +2585,7 @@ def _register_layer_inputs(
         w_gate=named_vars["W_gate"],
         w_up=named_vars["W_up"],
         w_down=named_vars["W_down"],
+        **optional,
     )
 
 
@@ -2163,7 +3054,7 @@ def _run_vision_connector_reference(
 
 def _weight_physical_shapes_for_layer(
     layer_idx: int,
-    weights: LayerWeights,
+    weights: DecoderLayerWeights,
     *,
     head_packing: AttentionHeadPacking | None,
     padded_head_dim: int,
@@ -2175,6 +3066,11 @@ def _weight_physical_shapes_for_layer(
     for kv_h, (w_k, w_v) in enumerate(zip(weights.w_k_heads, weights.w_v_heads)):
         physical_shapes[f"W_k_{layer_idx}_h{kv_h}"] = (w_k.shape[0], padded_head_dim)
         physical_shapes[f"W_v_{layer_idx}_h{kv_h}"] = (w_v.shape[0], padded_head_dim)
+    if weights.k_norm_weight is not None:
+        physical_shapes[f"W_k_norm_{layer_idx}"] = (
+            weights.k_norm_weight.shape[0],
+            padded_head_dim,
+        )
     return physical_shapes
 
 
@@ -2901,6 +3797,8 @@ def compile_native_hf_decoder(
     broadcast_amount: int | None = None,
     attention_head_packing: bool | None = None,
     mram_tile_capacity: int = 4,
+    hbm_v_prefetch_amount: int | None = None,
+    hbm_v_writeback_amount: int | None = None,
     seed: int = 42,
     golden_precision: str = "hardware",
     reference_backend: str = "scheduled",
@@ -2909,6 +3807,12 @@ def compile_native_hf_decoder(
     component: str = "decoder",
     vision_stop_after: str | None = None,
     decoder_input_embeds: torch.Tensor | None = None,
+    moe_routing_mode: str | None = None,
+    max_static_routes: int = 1024,
+    moe_routing_plan: MoeRoutingPlan | dict[str, Any] | None = None,
+    native_layout_mode: str = "compact",
+    packed_attention_schedule: str = "direct-first-block-v1",
+    vector_scalar_schedule: str = "compiler-v1",
 ) -> dict:
     """Compile a HuggingFace decoder model at native dimensions to PLENA ISA metadata."""
     component = component.lower()
@@ -2943,8 +3847,81 @@ def compile_native_hf_decoder(
 
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if native_layout_mode not in NATIVE_LAYOUT_MODES:
+        raise ValueError(
+            f"native_layout_mode must be one of {sorted(NATIVE_LAYOUT_MODES)}, "
+            f"got {native_layout_mode!r}"
+        )
+    if packed_attention_schedule not in {"direct-first-block-v1", "legacy"}:
+        raise ValueError(
+            "packed_attention_schedule must be 'direct-first-block-v1' or "
+            f"'legacy', got {packed_attention_schedule!r}"
+        )
+    if vector_scalar_schedule not in {"compiler-v1", "legacy"}:
+        raise ValueError(
+            "vector_scalar_schedule must be 'compiler-v1' or 'legacy', got "
+            f"{vector_scalar_schedule!r}"
+        )
 
     model_cfg = extract_model_config(model)
+    root = find_model_root(model)
+    layers = root.layers
+    n_layers = num_layers if num_layers is not None else len(layers)
+    assert layer_idx_start + n_layers <= len(layers), (
+        f"Requested layers [{layer_idx_start}, {layer_idx_start + n_layers}) "
+        f"but model only has {len(layers)} layers"
+    )
+    selected_moe_layers = [
+        is_qwen3_moe_layer(layers[layer_idx_start + offset])
+        for offset in range(n_layers)
+    ]
+    if any(selected_moe_layers) and n_layers != 1:
+        raise NotImplementedError(
+            "Static-index Qwen3-MoE v1 supports one decoder layer per compile; "
+            f"requested {n_layers} layers"
+        )
+
+    # A hybrid Qwen3-MoE checkpoint can contain ordinary dense FFN layers.
+    # Select the active intermediate width from the concrete layer structure,
+    # rather than treating every layer in a model with ``num_experts`` as MoE.
+    is_moe_model = bool(selected_moe_layers and selected_moe_layers[0])
+    source_layer_idx = int(
+        getattr(model, "_plena_source_layer_idx", layer_idx_start)
+    )
+    config_expected_moe = model_cfg.is_moe_layer(source_layer_idx)
+    selected_inter = (
+        model_cfg.moe_inter_dim if is_moe_model else model_cfg.dense_inter_dim
+    )
+    if selected_inter is None:
+        selected_inter = model_cfg.inter_dim
+    model_cfg = replace(model_cfg, inter_dim=int(selected_inter))
+    if config_expected_moe != is_moe_model:
+        _verbose(
+            "Warning: config hybrid-layer rule and concrete layer structure "
+            f"disagree at source layer {source_layer_idx}; using the concrete "
+            f"layer (is_moe={is_moe_model})."
+        )
+    if is_moe_model:
+        if moe_routing_mode is None:
+            moe_routing_mode = "static-indices"
+        if moe_routing_mode != "static-indices":
+            raise ValueError(
+                "Qwen3-MoE currently supports only moe_routing_mode='static-indices'"
+            )
+        if max_static_routes <= 0:
+            raise ValueError(
+                f"max_static_routes must be positive, got {max_static_routes}"
+            )
+        if model_cfg.num_experts > mlen:
+            raise ValueError(
+                f"Static-index MoE requires num_experts <= MLEN; "
+                f"got {model_cfg.num_experts} > {mlen}"
+            )
+        if hlen is None or hlen < model_cfg.head_dim:
+            raise ValueError(
+                f"Qwen3-MoE requires HLEN >= HEAD_DIM; got HLEN={hlen}, "
+                f"HEAD_DIM={model_cfg.head_dim}"
+            )
     if hidden_size is not None and hidden_size != model_cfg.hidden_size:
         raise ValueError(
             f"compile_native_hf_decoder currently supports native hidden size only: "
@@ -2966,35 +3943,18 @@ def compile_native_hf_decoder(
     if uses_packed_attention is None:
         uses_packed_attention = hlen is not None and broadcast_amount is not None
 
-    # Rows only need enough physical lanes for the matrix writeback group
-    # (BLEN) in the generic path. Packed GQA, however, addresses KV-group
-    # Q/O slabs as MLEN-row sequence tiles, and the downstream O projection
-    # expects those slabs to be MLEN-aligned.
-    #
-    # Exception: when seq_len < MLEN the flash-attention kernel still requires
-    # Q/K/V to occupy a full MLEN tile physically (it asserts physical rows per
-    # batch >= max(MLEN, seq_len)). A BLEN-padded sub-MLEN sequence leaves the
-    # per-head Q/O slices with only `padded_seq_len` physical rows, so pad the
-    # sequence up to MLEN in that case. The extra padding query rows are never
-    # compared (comparison uses the real seq_len), and the causal mask keeps the
-    # real query rows from attending to the padding KV rows, so this is just the
-    # proven seq_len==MLEN tile path with fewer logically-active rows.
-    #
-    # Also keep an opt-in compatibility path for reproducing older tile-scaling
-    # reports that padded every sequence (even seq_len >= MLEN) up to MLEN.
-    pad_seq_to_mlen = (
-        os.environ.get("PLENA_PAD_SEQ_TO_MLEN") == "1"
-        or seq_len < mlen
-        or uses_packed_attention
+    effective_layout_mode = native_layout_mode if uses_packed_attention else "legacy"
+    sequence_packing = SequencePackingPlan.build(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        mlen=mlen,
+        mode=effective_layout_mode,
     )
-    seq_padding_multiple = mlen if pad_seq_to_mlen else blen
-    padded_seq_len = _ceil_to_multiple(seq_len, seq_padding_multiple)
-    rows_per_batch = (
-        padded_seq_len
-        if batch_size == 1
-        else _ceil_to_multiple(max(mlen, padded_seq_len), mlen)
-    )
-    compile_seq_rows = batch_size * rows_per_batch
+    # Keep these aliases while downstream helpers migrate from per-logical-batch
+    # slabs to per-attention-group slabs.
+    padded_seq_len = sequence_packing.rows_per_attention_group
+    rows_per_batch = sequence_packing.rows_per_attention_group
+    compile_seq_rows = sequence_packing.compile_seq_rows
     active_rows = batch_size * seq_len
     checkpoint_rows = compile_seq_rows if batch_size > 1 else seq_len
     padded_hidden = _ceil_to_multiple(hidden, mlen)
@@ -3018,24 +3978,14 @@ def compile_native_hf_decoder(
                 f"Packed attention requires MLEN >= HLEN so at least one head fits "
                 f"({mlen} < {hlen})"
             )
-        logical_broadcast_amount = broadcast_amount
-        physical_broadcast_amount = min(logical_broadcast_amount, mlen // hlen)
-        if physical_broadcast_amount <= 0:
-            raise ValueError(
-                f"Packed attention cannot derive positive physical broadcast from "
-                f"MLEN={mlen}, HLEN={hlen}, logical_broadcast={logical_broadcast_amount}"
-            )
-        chunks_per_kv = math.ceil(ratio / physical_broadcast_amount)
-        head_packing = AttentionHeadPacking(
-            enabled=True,
+        head_packing = build_attention_head_packing(
+            mlen=mlen,
             hlen=hlen,
-            logical_broadcast_amount=logical_broadcast_amount,
-            broadcast_amount=physical_broadcast_amount,
-            head_slot_dim=hlen,
-            group_width=mlen,
-            total_q_dim=num_kv_heads * chunks_per_kv * mlen,
-            active_head_dim=head_dim,
-            chunks_per_kv=chunks_per_kv,
+            head_dim=head_dim,
+            logical_broadcast_amount=broadcast_amount,
+            gqa_ratio=ratio,
+            num_kv_heads=num_kv_heads,
+            mode=effective_layout_mode,
         )
     else:
         head_packing = None
@@ -3048,14 +3998,6 @@ def compile_native_hf_decoder(
         or padded_inter != inter
         or padded_head_dim != head_dim
         or head_packing is not None
-    )
-
-    root = find_model_root(model)
-    layers = root.layers
-    n_layers = num_layers if num_layers is not None else len(layers)
-    assert layer_idx_start + n_layers <= len(layers), (
-        f"Requested layers [{layer_idx_start}, {layer_idx_start + n_layers}) "
-        f"but model only has {len(layers)} layers"
     )
 
     scale = 1.0 / math.sqrt(head_dim)
@@ -3085,8 +4027,12 @@ def compile_native_hf_decoder(
             "  attention head packing: "
             f"head_dim={head_dim}, hlen={head_packing.hlen}, "
             f"logical_broadcast_amount={head_packing.logical_broadcast_amount}, "
-            f"physical_broadcast_amount={head_packing.broadcast_amount}, "
+            f"group_broadcast_amount={head_packing.broadcast_amount}, "
+            f"hardware_broadcast_amount={head_packing.hardware_broadcast_amount}, "
+            f"stored_heads_per_block={head_packing.heads_per_storage_block}, "
             f"group_width={head_packing.group_width}, "
+            f"attention_group_width={head_packing.attention_group_width}, "
+            f"groups_per_storage_block={head_packing.groups_per_storage_block}, "
             f"chunks_per_kv={head_packing.chunks_per_kv}, "
             f"q_groups={num_kv_heads * head_packing.chunks_per_kv}"
         )
@@ -3099,11 +4045,18 @@ def compile_native_hf_decoder(
         layer_module = layers[layer_idx_start + i]
         w = extract_layer_weights(layer_module, model_cfg)
         all_weights.append(w)
-        _verbose(
-            f"  Layer {i}: W_q={w.w_q.shape}, W_o={w.w_o.shape}, "
-            f"W_gate={w.w_gate.shape}, "
-            f"K_heads={len(w.w_k_heads)}x{w.w_k_heads[0].shape}, eps={w.eps}"
-        )
+        if isinstance(w, MoeLayerWeights):
+            _verbose(
+                f"  Layer {i}: W_q={w.w_q.shape}, W_o={w.w_o.shape}, "
+                f"W_router={w.w_router.shape}, lazy_experts={model_cfg.num_experts}, "
+                f"K_heads={len(w.w_k_heads)}x{w.w_k_heads[0].shape}, eps={w.eps}"
+            )
+        else:
+            _verbose(
+                f"  Layer {i}: W_q={w.w_q.shape}, W_o={w.w_o.shape}, "
+                f"W_gate={w.w_gate.shape}, "
+                f"K_heads={len(w.w_k_heads)}x{w.w_k_heads[0].shape}, eps={w.eps}"
+            )
     compile_weights = [
         _pad_decoder_weights_for_tiles(
             w,
@@ -3111,10 +4064,15 @@ def compile_native_hf_decoder(
             padded_hidden=padded_hidden,
             padded_inter=padded_inter,
             padded_head_dim=padded_head_dim,
+            norm_rows=compile_seq_rows,
             head_packing=head_packing,
         )
         for w in all_weights
     ]
+    final_norm_weight = extract_final_norm_weight(model, model_cfg)
+    compile_final_norm_weight = _repeat_norm_weight(
+        final_norm_weight, rows=compile_seq_rows, cols=padded_hidden
+    )
 
     eps = all_weights[0].eps
 
@@ -3174,19 +4132,11 @@ def compile_native_hf_decoder(
     # Llama-style models use RoPE (not learned position embeddings).
     # Set pos_weight to zeros so embedding_add is a no-op for position.
     pos_weight = torch.zeros_like(token_embeds)
-    compile_token_embeds = _pad_batched_sequence_storage(
-        token_embeds,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
-        cols=padded_hidden,
+    compile_token_embeds = _pack_batched_sequence_storage(
+        token_embeds, plan=sequence_packing, cols=padded_hidden
     )
-    compile_pos_weight = _pad_batched_sequence_storage(
-        pos_weight,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
-        cols=padded_hidden,
+    compile_pos_weight = _pack_batched_sequence_storage(
+        pos_weight, plan=sequence_packing, cols=padded_hidden
     )
 
     _verbose(f"pos_weight: zeros {pos_weight.shape} (RoPE model; learned position add is a no-op)")
@@ -3207,7 +4157,7 @@ def compile_native_hf_decoder(
             padded_seq_len=padded_seq_len,
             group_width=head_packing.group_width,
             head_slot_dim=head_packing.head_slot_dim,
-            broadcast_amount=head_packing.broadcast_amount,
+            broadcast_amount=head_packing.heads_per_storage_block,
         )
         rope_width = head_packing.group_width
     else:
@@ -3219,21 +4169,16 @@ def compile_native_hf_decoder(
             padded_head_dim=padded_head_dim,
         )
         rope_width = padded_head_dim
-    compile_cos_table = _repeat_sequence_storage(
-        per_sequence_cos_table,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
+    compile_cos_table = _pack_sequence_table_storage(
+        per_sequence_cos_table, plan=sequence_packing
     )
-    compile_sin_table = _repeat_sequence_storage(
-        per_sequence_sin_table,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
+    compile_sin_table = _pack_sequence_table_storage(
+        per_sequence_sin_table, plan=sequence_packing
     )
 
     golden_policy = ReferencePrecision.from_mode(golden_precision)
     reference_backend = reference_backend.lower()
+    routing_plans: dict[int, MoeRoutingPlan] = {}
     print(f"\nComputing CPU golden reference ({golden_policy.label}, backend={reference_backend})")
     if reference_backend == "scheduled":
         scheduled_cfg = ScheduledReferenceConfig(
@@ -3241,6 +4186,9 @@ def compile_native_hf_decoder(
             padded_seq_len=padded_seq_len,
             batch_size=batch_size,
             rows_per_batch=rows_per_batch,
+            batch_pack_factor=sequence_packing.batch_pack_factor,
+            attention_group_count=sequence_packing.attention_group_count,
+            attention_group_seq_len=sequence_packing.attention_group_seq_len,
             hidden_size=hidden,
             padded_hidden_size=padded_hidden,
             inter_dim=inter,
@@ -3257,7 +4205,81 @@ def compile_native_hf_decoder(
             broadcast_amount=head_packing.broadcast_amount if head_packing is not None else None,
             total_q_dim=padded_total_q_dim,
             chunks_per_kv=head_packing.chunks_per_kv if head_packing is not None else 1,
+            groups_per_storage_block=(
+                head_packing.groups_per_storage_block
+                if head_packing is not None
+                else 1
+            ),
+            attention_group_width=(
+                head_packing.attention_group_width
+                if head_packing is not None
+                else None
+            ),
+            num_experts=model_cfg.num_experts,
+            experts_per_token=model_cfg.experts_per_token,
+            norm_topk_prob=model_cfg.norm_topk_prob,
         )
+        if is_moe_model:
+            provisional = compile_weights[0]
+            if not isinstance(provisional, MoeLayerWeights):
+                raise ValueError(
+                    "Model config declares MoE but selected decoder layer is dense; "
+                    "hybrid layer compilation requires selecting an actual MoE layer"
+                )
+            active_physical_rows = list(sequence_packing.active_physical_rows())
+            if moe_routing_plan is None:
+                _, router_probabilities = derive_moe_router_probabilities_from_decoder_input(
+                    compile_token_embeds,
+                    compile_pos_weight,
+                    provisional,
+                    scheduled_cfg,
+                    compile_R_matrix,
+                    compile_cos_table,
+                    compile_sin_table,
+                    precision=golden_policy,
+                )
+                plan = derive_static_routing_plan(
+                    router_probabilities,
+                    active_physical_rows=active_physical_rows,
+                    num_experts=model_cfg.num_experts,
+                    experts_per_token=model_cfg.experts_per_token,
+                    max_routes=max_static_routes,
+                )
+            else:
+                plan = coerce_routing_plan(moe_routing_plan)
+                if plan.num_experts != model_cfg.num_experts:
+                    raise ValueError(
+                        f"Routing plan num_experts={plan.num_experts} does not match "
+                        f"model num_experts={model_cfg.num_experts}"
+                    )
+                if plan.experts_per_token != model_cfg.experts_per_token:
+                    raise ValueError(
+                        f"Routing plan top-k={plan.experts_per_token} does not match "
+                        f"model top-k={model_cfg.experts_per_token}"
+                    )
+                plan.validate(
+                    active_physical_rows=active_physical_rows,
+                    max_routes=max_static_routes,
+                )
+            routing_plans[0] = plan
+            materialized = all_weights[0].with_active_experts(
+                set(plan.active_expert_ids)
+            )
+            all_weights[0] = materialized
+            compile_weights[0] = _pad_decoder_weights_for_tiles(
+                materialized,
+                model_cfg,
+                padded_hidden=padded_hidden,
+                padded_inter=padded_inter,
+                padded_head_dim=padded_head_dim,
+                norm_rows=compile_seq_rows,
+                head_packing=head_packing,
+            )
+            print(
+                "  static MoE routing: "
+                f"routes={plan.route_count}, active_experts={len(plan.active_expert_ids)}, "
+                f"hash={plan.routing_plan_hash[:12]}"
+            )
         padded_golden_output = run_native_decoder_scheduled_reference(
             compile_token_embeds,
             compile_pos_weight,
@@ -3267,16 +4289,16 @@ def compile_native_hf_decoder(
             compile_cos_table,
             compile_sin_table,
             precision=golden_policy,
+            moe_routing_plans=routing_plans,
+            final_norm_weight=compile_final_norm_weight,
             trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
         )
-        golden_out = _compact_active_sequence_rows(
-            padded_golden_output,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            rows_per_batch=rows_per_batch,
-            cols=hidden,
+        golden_out = _gather_packed_active_sequence_rows(
+            padded_golden_output, plan=sequence_packing, cols=hidden
         )
     elif reference_backend == "legacy":
+        if is_moe_model:
+            raise ValueError("Qwen3-MoE requires reference_backend='scheduled'")
         if batch_size != 1:
             raise NotImplementedError("legacy reference_backend does not support batch_size > 1")
         golden_out = run_decoder_reference(
@@ -3290,6 +4312,7 @@ def compile_native_hf_decoder(
             mlen=mlen,
             max_k_tiles=mram_tile_capacity,
             precision=golden_policy,
+            final_norm_weight=final_norm_weight,
             trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
         )
         padded_golden_output = _pad_2d(golden_out, padded_seq_len, padded_hidden)
@@ -3300,7 +4323,7 @@ def compile_native_hf_decoder(
 
     print(f"\nComputing HF reference (float32, {n_layers} layer{'s' if n_layers != 1 else ''}, no quantization)")
     with torch.no_grad():
-        if batch_size == 1:
+        if batch_size == 1 and not is_moe_model:
             hf_ground_truth = run_decoder_reference(
                 token_embeds,
                 pos_weight,
@@ -3312,6 +4335,7 @@ def compile_native_hf_decoder(
                 mlen=mlen,
                 max_k_tiles=mram_tile_capacity,
                 precision=ReferencePrecision.from_mode("hf_fp32"),
+                final_norm_weight=final_norm_weight,
                 trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
             )
         else:
@@ -3324,14 +4348,12 @@ def compile_native_hf_decoder(
                 compile_cos_table,
                 compile_sin_table,
                 precision=ReferencePrecision.from_mode("hf_fp32"),
+                moe_routing_plans=routing_plans,
+                final_norm_weight=compile_final_norm_weight,
                 trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
             )
-            hf_ground_truth = _compact_active_sequence_rows(
-                padded_hf_output,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=hidden,
+            hf_ground_truth = _gather_packed_active_sequence_rows(
+                padded_hf_output, plan=sequence_packing, cols=hidden
             )
 
     print(f"  hf_ground_truth: {hf_ground_truth.shape}")
@@ -3347,11 +4369,16 @@ def compile_native_hf_decoder(
         blen=blen,
         real_data_ratio=REAL_DATA_RATIO,
         mram_tile_capacity=mram_tile_capacity,
+        hbm_v_prefetch_amount=hbm_v_prefetch_amount,
+        hbm_v_writeback_amount=hbm_v_writeback_amount,
+        packed_attention_schedule=packed_attention_schedule,
+        vector_scalar_schedule=vector_scalar_schedule,
     )
+    prog._native_active_row_ranges = sequence_packing.active_row_ranges()
     if hlen is not None:
         prog.hlen = hlen
     if head_packing is not None:
-        prog.broadcast_amount = head_packing.broadcast_amount
+        prog.broadcast_amount = head_packing.hardware_broadcast_amount
     elif broadcast_amount is not None:
         prog.broadcast_amount = broadcast_amount
     checkpoints = StageCheckpointRecorder(enabled=stage_checkpoints)
@@ -3372,11 +4399,35 @@ def compile_native_hf_decoder(
     # Bidirectional models (e.g. LLaDA) use an all-zero mask.
     causal_mask_data = torch.zeros(mlen, mlen)
     if model_cfg.model_type != "llada":
-        causal_mask_data.masked_fill_(
-            torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
-        )
+        causal_mask_data = _build_packed_causal_mask(sequence_packing)
     causal_mask_input = prog.input("causal_mask", shape=(mlen, mlen))
     CAUSAL_MASK = prog.load_batch(causal_mask_input, name="CAUSAL_MASK")
+
+    moe_router_mask_data = None
+    moe_route_identity_data = None
+    MOE_ROUTER_MASK = None
+    MOE_ROUTE_IDENTITY = None
+    if is_moe_model:
+        moe_router_mask_data = torch.zeros(
+            (compile_seq_rows, mlen), dtype=compile_token_embeds.dtype
+        )
+        if model_cfg.num_experts < mlen:
+            moe_router_mask_data[:, model_cfg.num_experts :] = -6.0e4
+        moe_route_identity_data = torch.eye(mlen, dtype=compile_token_embeds.dtype)
+        router_mask_input = prog.input(
+            "MOE_ROUTER_MASK",
+            shape=(compile_seq_rows, mlen),
+            physical_shape=(compile_seq_rows, mlen),
+        )
+        route_identity_input = prog.input(
+            "MOE_ROUTE_IDENTITY", shape=(mlen, mlen)
+        )
+        MOE_ROUTER_MASK = prog.load_batch(
+            router_mask_input, name="MOE_ROUTER_MASK"
+        )
+        MOE_ROUTE_IDENTITY = prog.load_batch(
+            route_identity_input, name="MOE_ROUTE_IDENTITY"
+        )
 
     # Per-layer weight inputs (order determines HBM layout)
     layer_inputs = []
@@ -3419,6 +4470,7 @@ def compile_native_hf_decoder(
 
     # Chain layers
     current = X_batch
+    moe_bucket_metadata: dict[int, dict[str, int]] = {}
 
     for i in range(n_layers):
         li = layer_inputs[i]
@@ -3441,12 +4493,13 @@ def compile_native_hf_decoder(
                 num_kv_heads,
                 ratio,
                 head_packing,
+                model_cfg,
                 checkpoints,
                 checkpoint_rows,
                 hidden,
-                batch_size=batch_size,
-                rows_per_batch=rows_per_batch,
-                active_seq_len_per_batch=seq_len,
+                batch_size=sequence_packing.attention_group_count,
+                rows_per_batch=sequence_packing.rows_per_attention_group,
+                active_seq_len_per_batch=sequence_packing.attention_group_seq_len,
             )
         else:
             current_after_attn = _emit_attention_block(
@@ -3464,6 +4517,7 @@ def compile_native_hf_decoder(
                 num_heads,
                 num_kv_heads,
                 ratio,
+                model_cfg,
                 checkpoints,
                 checkpoint_rows,
                 hidden,
@@ -3472,20 +4526,51 @@ def compile_native_hf_decoder(
                 active_seq_len_per_batch=seq_len,
             )
 
-        current = _emit_ffn_block(
-            prog,
-            current_after_attn,
-            li,
-            scratch,
-            layer_idx=i,
-            checkpoint_recorder=checkpoints,
-            active_seq_len=checkpoint_rows,
-            active_hidden=hidden,
-        )
+        if isinstance(li, MoeLayerInputVars):
+            current, moe_bucket_metadata = _emit_moe_block(
+                prog,
+                current_after_attn,
+                li,
+                scratch,
+                router_mask=MOE_ROUTER_MASK,
+                route_identity=MOE_ROUTE_IDENTITY,
+                plan=routing_plans[i],
+                model_cfg=model_cfg,
+                layer_idx=i,
+                checkpoint_recorder=checkpoints,
+                active_seq_len=checkpoint_rows,
+                active_hidden=hidden,
+            )
+        else:
+            current = _emit_ffn_block(
+                prog,
+                current_after_attn,
+                li,
+                scratch,
+                layer_idx=i,
+                checkpoint_recorder=checkpoints,
+                active_seq_len=checkpoint_rows,
+                active_hidden=hidden,
+            )
         prog.emit_comment(f"=== LAYER {i}/{n_layers} COMPLETE ===")
 
     # Final norm
-    ops.rms_norm(prog, current, eps_offset=3, reci_hid_offset=4)
+    ops.rms_norm(
+        prog,
+        current,
+        eps_offset=3,
+        reci_hid_offset=4,
+        physical_rows=current.physical_shape[0],
+        active_row_ranges=sequence_packing.active_row_ranges(),
+    )
+    final_norm_input = None
+    if compile_final_norm_weight is not None:
+        final_norm_input = prog.input(
+            "W_final_norm",
+            shape=tuple(compile_final_norm_weight.shape),
+            physical_shape=(compile_seq_rows, padded_hidden),
+        )
+        _load_and_mul(prog, current, final_norm_input, "W_final_norm_load")
     checkpoints.record(
         prog,
         layer_idx=n_layers - 1,
@@ -3511,10 +4596,17 @@ def compile_native_hf_decoder(
     data_order = ["X", "POS", "R_rope", "COS", "SIN"]
     input_tensors["causal_mask"] = causal_mask_data
     data_order.append("causal_mask")
+    if is_moe_model:
+        input_tensors["MOE_ROUTER_MASK"] = moe_router_mask_data
+        input_tensors["MOE_ROUTE_IDENTITY"] = moe_route_identity_data
+        data_order.extend(["MOE_ROUTER_MASK", "MOE_ROUTE_IDENTITY"])
     for i in range(n_layers):
         for name, tensor in compile_weights[i].tensor_entries(i):
             input_tensors[name] = tensor
             data_order.append(name)
+    if compile_final_norm_weight is not None:
+        input_tensors["W_final_norm"] = compile_final_norm_weight
+        data_order.append("W_final_norm")
     tensor_layouts = _tensor_layout_metadata(prog, input_tensors)
 
     # FPRAM layout (same as single-layer decoder):
@@ -3524,7 +4616,8 @@ def compile_native_hf_decoder(
     #   slot 3 = eps         (rms_norm, offset=3)
     #   slot 4 = 1/hidden    (rms_norm, offset=4)
     #   slot 5 = 1.0         (FFN SiLU)
-    #   slots 6-9 = 0.0      (padding)
+    #   slot 6 = 1/head_dim  (Q/K per-head RMSNorm)
+    #   slots 7-9 = 0.0      (padding)
     # slot 2 must be a large NEGATIVE FINITE, not -inf: it is the padded-column score
     # mask (program_attention._build_valid_col_mask loads f7 from FP_SRAM[2]) and the
     # packed-attention col-mask buffer VRAM-aliases O_proj's tile-align padding rows.
@@ -3533,18 +4626,25 @@ def compile_native_hf_decoder(
     # (x)*0 = 0. NOTE: fp_preload is cast to float16 in create_sim_env (max ~65504),
     # so use a value WITHIN float16 range (not -1e30, which overflows to -inf).
     # -6e4 still masks (exp(score - 6e4) = 0) and its square stays finite.
-    fp_preload = [0.0, scale, -6.0e4, eps, 1.0 / hidden, 1.0] + [0.0] * 4
+    fp_preload = [
+        0.0,
+        scale,
+        -6.0e4,
+        eps,
+        1.0 / hidden,
+        1.0,
+        1.0 / head_dim,
+    ] + [0.0] * 3
 
     # Result is at current's VRAM location
     o_vram_addr = prog.get_vram_addr(current.name)
 
     out_features = padded_hidden
     comparison_rows = compile_seq_rows if batch_size > 1 else seq_len
-    # The compact golden holds only the active rows (batch_size*seq_len). For batch>1
-    # the active rows are rpb-strided (batch b lives at physical row b*rows_per_batch),
-    # so num_batches counts active rows and the reader extracts them via
-    # rows_per_batch/active_seq_per_batch instead of reading contiguous rows. For
-    # batch==1 this equals seq_len and the reader falls back to contiguous (unchanged).
+    # The compact golden holds only the active rows (batch_size*seq_len). Several
+    # logical batches may share one attention-group slab, so the reader reconstructs
+    # batch-major order from rows_per_batch, active_seq_per_batch, and pack factor.
+    # For batch==1 this equals seq_len and remains a contiguous read.
     active_comparison_rows = batch_size * seq_len
 
     # Output is column-block-major: each batch's `out_features` span ceil(out_features/mlen)
@@ -3562,12 +4662,18 @@ def compile_native_hf_decoder(
         "elements_per_batch": out_features,
         "row_dim": mlen,
         "physical_rows": _physical_rows,
-        "use_stride_mode": out_features > mlen,
+        # Packed batches require logical-to-physical row gathering even when
+        # the output fits in one MLEN column block.
+        "use_stride_mode": out_features > mlen or batch_size > 1,
         "rows_per_batch": rows_per_batch if batch_size > 1 else None,
         "active_seq_per_batch": seq_len if batch_size > 1 else None,
+        "batch_pack_factor": sequence_packing.batch_pack_factor,
+        "rows_per_attention_group": sequence_packing.rows_per_attention_group,
+        "attention_group_count": sequence_packing.attention_group_count,
     }
 
     packed_schedule = getattr(prog, "_last_packed_gqa_schedule", None)
+    routing_plan = routing_plans.get(0)
     info = {
         "model_type": model_cfg.model_type,
         "hidden_size": hidden,
@@ -3581,6 +4687,19 @@ def compile_native_hf_decoder(
         "rows_per_batch": rows_per_batch,
         "compile_seq_rows": compile_seq_rows,
         "active_rows": active_rows,
+        "native_layout_schema_version": NATIVE_LAYOUT_SCHEMA_VERSION,
+        "native_layout_mode": effective_layout_mode,
+        **prog.packed_attention_stats(),
+        **prog.vector_scalar_stats(),
+        "logical_token_rows": sequence_packing.logical_active_rows,
+        "physical_token_rows": sequence_packing.compile_seq_rows,
+        "sequence_row_utilization": sequence_packing.row_utilization,
+        "batch_pack_factor": sequence_packing.batch_pack_factor,
+        "padded_batch_size": sequence_packing.padded_batch_size,
+        "dummy_batch_count": sequence_packing.dummy_batch_count,
+        "attention_group_count": sequence_packing.attention_group_count,
+        "rows_per_attention_group": sequence_packing.rows_per_attention_group,
+        "attention_mask_kind": sequence_packing.mask_kind,
         "head_dim": head_dim,
         "padded_head_dim": padded_head_dim,
         "attention_head_packing": head_packing is not None,
@@ -3593,9 +4712,39 @@ def compile_native_hf_decoder(
         "attention_logical_broadcast_amount": (
             head_packing.logical_broadcast_amount if head_packing is not None else None
         ),
-        "attention_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
-        "attention_physical_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
+        "attention_broadcast_amount": (
+            head_packing.hardware_broadcast_amount if head_packing is not None else None
+        ),
+        "attention_physical_broadcast_amount": (
+            head_packing.broadcast_amount if head_packing is not None else None
+        ),
+        "attention_hardware_broadcast_amount": (
+            head_packing.hardware_broadcast_amount if head_packing is not None else None
+        ),
+        "attention_group_broadcast_amount": (
+            head_packing.broadcast_amount if head_packing is not None else None
+        ),
+        "attention_storage_block_broadcast_strategy": (
+            "replicate_single_kv_head_select_group_lanes"
+            if head_packing is not None
+            and head_packing.groups_per_storage_block > 1
+            else "single_group"
+        ),
         "attention_chunks_per_kv": head_packing.chunks_per_kv if head_packing is not None else 1,
+        "attention_logical_group_count": (
+            head_packing.logical_group_count if head_packing is not None else None
+        ),
+        "attention_groups_per_storage_block": (
+            head_packing.groups_per_storage_block if head_packing is not None else None
+        ),
+        "attention_storage_block_count": (
+            head_packing.storage_block_count if head_packing is not None else None
+        ),
+        "attention_logical_q_width": total_q_dim,
+        "attention_physical_q_width": padded_total_q_dim,
+        "attention_head_lane_utilization": (
+            head_packing.head_lane_utilization if head_packing is not None else None
+        ),
         "attention_kv_resident": (
             packed_schedule.resident_kv if packed_schedule is not None else None
         ),
@@ -3617,6 +4766,8 @@ def compile_native_hf_decoder(
         "mlen": mlen,
         "blen": blen,
         "mram_tile_capacity": mram_tile_capacity,
+        "hbm_v_prefetch_amount": prog.hbm_v_prefetch_amount,
+        "hbm_v_writeback_amount": prog.hbm_v_writeback_amount,
         "stage_checkpoints_enabled": stage_checkpoints,
         "stage_checkpoint_count": len(checkpoints.checkpoints or []),
         "reference_backend": reference_backend,
@@ -3624,6 +4775,42 @@ def compile_native_hf_decoder(
         "decoder_input_source": decoder_input_source,
         "padding_enabled": padding_enabled,
         "isa_lines": len(lines),
+        "dense_inter_dim": model_cfg.dense_inter_dim,
+        "moe_inter_dim": model_cfg.moe_inter_dim,
+        "num_experts": model_cfg.num_experts,
+        "experts_per_token": model_cfg.experts_per_token,
+        "norm_topk_prob": model_cfg.norm_topk_prob,
+        "decoder_sparse_step": model_cfg.decoder_sparse_step,
+        "mlp_only_layers": list(model_cfg.mlp_only_layers),
+        "source_layer_idx": source_layer_idx,
+        "selected_layer_type": "moe" if is_moe_model else "dense",
+        "config_expected_moe_layer": config_expected_moe,
+        "moe_routing_mode": moe_routing_mode if is_moe_model else None,
+        "routing_plan_hash": (
+            routing_plan.routing_plan_hash if routing_plan is not None else None
+        ),
+        "active_expert_count": (
+            len(routing_plan.active_expert_ids) if routing_plan is not None else 0
+        ),
+        "active_expert_ids": (
+            list(routing_plan.active_expert_ids) if routing_plan is not None else []
+        ),
+        "routes_per_expert": (
+            {str(k): v for k, v in routing_plan.routes_per_expert.items()}
+            if routing_plan is not None
+            else {}
+        ),
+        "expert_bucket_rows": {
+            str(k): v for k, v in moe_bucket_metadata.items()
+        },
+        "topk_margin_min": (
+            routing_plan.topk_margin_min if routing_plan is not None else None
+        ),
+        "route_count": routing_plan.route_count if routing_plan is not None else 0,
+        "host_selected_indices": bool(is_moe_model),
+        "runtime_computed_route_weights": bool(is_moe_model),
+        "rtl_validation_status": "static_indices" if is_moe_model else None,
+        "excluded_runtime_operation": "arg_topk" if is_moe_model else None,
     }
     stage_checkpoint_metadata = checkpoints.metadata()
     stage_checkpoint_metadata["compile_info"] = {
@@ -3697,6 +4884,9 @@ def compile_native_hf_decoder(
         },
         "golden_precision": golden_precision,
         "reference_backend": reference_backend,
+        "moe_routing_plan": (
+            routing_plan.as_dict() if routing_plan is not None else None
+        ),
     }
 # Backwards-compatible alias for older callers.
 compile_hf_model = compile_native_hf_decoder

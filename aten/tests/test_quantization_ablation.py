@@ -1,12 +1,12 @@
-"""Ablation study proving HF-vs-golden accuracy gap is from MXFP8 weight quantization.
+"""Ablate weight and intermediate quantization in the scheduled reference.
 
 Runs compile_native_hf_decoder in four precision modes and compares golden output
 against the HF float32 ground truth. Expected result:
 
     hardware       (MXFP8 + BF16)  ~52% allclose  ← full HW gap
-    no_weight_quant (fp32 + BF16)  ~99% allclose  ← removing MXFP8 closes it
-    no_bf16        (MXFP8 + fp32)  ~52% allclose  ← BF16 doesn't matter
-    fp32           (fp32 + fp32)   ~99% allclose  ← confirms quantization is sole cause
+    no_weight_quant (fp32 + BF16)  isolates accumulated BF16 error
+    no_bf16        (MXFP8 + fp32)  isolates MXFP8 weight error
+    fp32           (fp32 + fp32)   must close against the FP32 reference
 
 Usage:
     pytest aten/tests/test_quantization_ablation.py -v -s
@@ -53,8 +53,8 @@ def _run_ablation(num_layers: int) -> dict[str, dict]:
 
 
 @pytest.mark.slow
-def test_mxfp8_is_sole_gap_source():
-    """Prove MXFP8 weight quantization accounts for the full HF-vs-golden gap."""
+def test_weight_quantization_dominates_gap_and_fp32_closes():
+    """Separate dominant weight error from accumulated intermediate error."""
     results = _run_ablation(DEFAULT_LAYERS)
 
     hw = results["hardware"]["allclose"]
@@ -62,13 +62,22 @@ def test_mxfp8_is_sole_gap_source():
     no_bf = results["no_bf16"]["allclose"]
     fp = results["fp32"]["allclose"]
 
-    # BF16 intermediates contribute nothing: hardware ≈ no_bf16
-    assert abs(hw - no_bf) < 2.0, f"BF16 should not matter: hardware={hw:.1f}% vs no_bf16={no_bf:.1f}%"
+    # With MXFP8 weights, removing BF16 rounding does not materially change the
+    # result. The weight error dominates this pair of configurations.
+    assert abs(hw - no_bf) < 2.0, (
+        f"weight-dominated pair diverged: hardware={hw:.1f}% vs "
+        f"no_bf16={no_bf:.1f}%"
+    )
 
-    # Removing MXFP8 closes the gap: no_weight_quant ≈ fp32 ≈ ~99%
-    assert no_q > 95.0, f"no_weight_quant should be >95%: got {no_q:.1f}%"
+    # The all-FP32 scheduled path must close against the independent FP32
+    # reference. The hardware-shaped scheduled reference now models every BF16
+    # boundary, so five-layer BF16 error is expected to accumulate measurably.
     assert fp > 95.0, f"fp32 should be >95%: got {fp:.1f}%"
-    assert abs(no_q - fp) < 3.0, f"no_weight_quant ≈ fp32: {no_q:.1f}% vs {fp:.1f}%"
+    assert no_q > 75.0, f"BF16-only path regressed unexpectedly: got {no_q:.1f}%"
+    assert no_q < fp - 5.0, (
+        f"scheduled BF16 boundaries should be measurable over {DEFAULT_LAYERS} layers: "
+        f"no_weight_quant={no_q:.1f}% vs fp32={fp:.1f}%"
+    )
 
     # The gap is real: hardware should be meaningfully lower
     assert hw < no_q - 10.0, f"MXFP8 should cause >10% gap: hardware={hw:.1f}% vs no_quant={no_q:.1f}%"
@@ -81,8 +90,8 @@ def test_mxfp8_is_sole_gap_source():
     for mode in MODES:
         r = results[mode]
         print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print("\n  MXFP8 weight quantization = 100% of the gap")
-    print("  BF16 intermediate precision = 0% of the gap")
+    print("\n  MXFP8 weight quantization dominates the hardware pair")
+    print("  BF16 intermediate rounding also accumulates across layers")
 
 
 if __name__ == "__main__":
@@ -100,5 +109,4 @@ if __name__ == "__main__":
     for mode in MODES:
         r = results[mode]
         print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print("\n  Conclusion: MXFP8 weight quantization = 100% of the gap")
-    print("  BF16 intermediate precision = 0% of the gap")
+    print("\n  Conclusion: report weight and intermediate effects separately")

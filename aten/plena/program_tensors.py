@@ -330,6 +330,8 @@ class ProgramTensorMixin:
         reci_hid_offset: int = 2,
         vlen: int | None = None,
         scratchpad_vram_addr: int | None = None,
+        physical_rows: int | None = None,
+        active_row_ranges: tuple[tuple[int, int], ...] | None = None,
     ) -> TensorVar:
         """
         Normalize tensor in-place.
@@ -355,6 +357,8 @@ class ProgramTensorMixin:
             reci_hid_offset=reci_hid_offset,
             vlen=vlen,
             scratchpad_vram_addr=scratchpad_vram_addr,
+            physical_rows=physical_rows,
+            active_row_ranges=active_row_ranges,
         )
         return tensor_var
 
@@ -365,6 +369,8 @@ class ProgramTensorMixin:
         reci_hid_offset: int = 2,
         vlen: int | None = None,
         scratchpad_vram_addr: int | None = None,
+        physical_rows: int | None = None,
+        active_row_ranges: tuple[tuple[int, int], ...] | None = None,
     ) -> TensorVar:
         """RMS normalization (in-place)."""
         return self.norm(
@@ -374,6 +380,8 @@ class ProgramTensorMixin:
             reci_hid_offset=reci_hid_offset,
             vlen=vlen,
             scratchpad_vram_addr=scratchpad_vram_addr,
+            physical_rows=physical_rows,
+            active_row_ranges=active_row_ranges,
         )
 
     def layer_norm(
