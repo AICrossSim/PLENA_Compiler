@@ -576,23 +576,24 @@ class ProgramAttentionMixin:
         n_q_tiles = max(1, (min(mlen, q_rows or mlen) + blen - 1) // blen)
         n_kv_tiles = max(1, (min(mlen, kv_cols or mlen) + blen - 1) // blen)
 
-        gp_q, gp_s, gp_k = self.register_allocator.allocate_gp(3)
-        lines = ["; === Packed GQA QK^T using compiler M_BTMM "
-                 f"({n_q_tiles} query-tile x {n_kv_tiles} kv-tile) ==="]
-        for qt in range(n_q_tiles):
-            for kt in range(n_kv_tiles):
-                k_off = k_head_offset + kt * blen * mlen
-                # kt==0 reads K from MRAM base 0 (gp0); kt>0 offsets by kt*BLEN*MLEN
-                # (the kv-tile's block rows, read transposed).
-                k_reg = "gp0" if k_off == 0 else f"gp{gp_k}"
-                lines += ([] if k_off == 0 else load_large_int(gp_k, k_off))
-                lines += [
-                    *load_large_int(gp_q, q_base + qt * blen * mlen),
-                    f"M_BTMM 0, {k_reg}, gp{gp_q}",
-                    *load_large_int(gp_s, s_base_address + qt * blen * mlen + kt * blen),
-                    f"M_BMM_WO gp{gp_s}, 0",
-                ]
-        self.register_allocator.free_gp([gp_q, gp_s, gp_k])
+        # EXPERIMENT (row-granular ABI): the emulator's M_BTMM is a whole-tile,
+        # all-(broadcast)-heads operator with NO kv-column sub-tile dimension -- it
+        # reads the full [MLEN,MLEN] K tile and produces the entire S=Q@K^T for the
+        # head group in one op, drained head-major by M_BMM_WO. So emit ONE M_BTMM
+        # over the whole MLEN KV (matrix operand = head offset < MLEN) instead of
+        # kv-tiling with kt*BLEN*MLEN offsets that the whole-tile decode cannot map
+        # (they land as out-of-range row starts). The full-tile compute covers all
+        # n_q_tiles*n_kv_tiles blocks at once.
+        _ = (n_q_tiles, n_kv_tiles)
+        gp_q, gp_s = self.register_allocator.allocate_gp(2)
+        lines = ["; === Packed GQA QK^T using compiler M_BTMM (whole-tile) ==="]
+        lines += [
+            *load_large_int(gp_q, q_base),
+            f"M_BTMM {k_head_offset}, gp0, gp{gp_q}",
+            *load_large_int(gp_s, s_base_address),
+            f"M_BMM_WO gp{gp_s}, 0",
+        ]
+        self.register_allocator.free_gp([gp_q, gp_s])
         self.emit("\n".join(lines) + "\n")
 
     def _emit_packed_qkt_to_s_dynamic(

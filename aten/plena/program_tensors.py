@@ -416,7 +416,13 @@ class ProgramTensorMixin:
             )
         activation_base_address = self.get_vram_addr(input_var.name)
         max_k_tiles = max(hidden_size // mlen, inter_dim // mlen)
-        use_loop_instructions = max_k_tiles <= self.mram_tile_capacity
+        # EXPERIMENT (row-granular ABI stopgap): the C_LOOP FFN path
+        # (_ffn_asm_with_loops) advances the M_MM weight pointer by `blen`
+        # (element-granular), which the row-granular matrix SRAM read collapses
+        # onto column-block 0. Force the unrolled path (_ffn_asm_unrolled ->
+        # _emit_ffn_projection_chunk), which advances the weight by `blen*mlen`.
+        use_loop_instructions = False
+        _ = max_k_tiles  # retained for the (currently disabled) loop-path heuristic
         workspace_elems = batch_size * (2 * inter_dim + max(hidden_size, inter_dim))
         workspace_rows = (workspace_elems + mlen - 1) // mlen
         workspace = self.alloc(
