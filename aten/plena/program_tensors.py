@@ -415,14 +415,13 @@ class ProgramTensorMixin:
                 f"FFN activation rows ({batch_size}) must be a positive multiple of BLEN ({blen})."
             )
         activation_base_address = self.get_vram_addr(input_var.name)
-        max_k_tiles = max(hidden_size // mlen, inter_dim // mlen)
-        # EXPERIMENT (row-granular ABI stopgap): the C_LOOP FFN path
-        # (_ffn_asm_with_loops) advances the M_MM weight pointer by `blen`
-        # (element-granular), which the row-granular matrix SRAM read collapses
-        # onto column-block 0. Force the unrolled path (_ffn_asm_unrolled ->
-        # _emit_ffn_projection_chunk), which advances the weight by `blen*mlen`.
+        # Always emit the unrolled FFN projection path. The matrix SRAM read is
+        # row-granular (raddr >> log2(MLEN)), so a matrix-operand column sub-tile
+        # must advance by BLEN*MLEN to land on a distinct MRAM row. The C_LOOP
+        # variant (_ffn_asm_with_loops) advances the M_MM weight pointer by BLEN,
+        # which collapses every sub-tile onto column-block 0; the unrolled path
+        # (_emit_ffn_projection_chunk) uses the correct BLEN*MLEN stride.
         use_loop_instructions = False
-        _ = max_k_tiles  # retained for the (currently disabled) loop-path heuristic
         workspace_elems = batch_size * (2 * inter_dim + max(hidden_size, inter_dim))
         workspace_rows = (workspace_elems + mlen - 1) // mlen
         workspace = self.alloc(
