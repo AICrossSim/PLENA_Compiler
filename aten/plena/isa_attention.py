@@ -379,7 +379,11 @@ class IsaAttentionMixin:
             lines.append(f"S_ADDI_INT gp{gp_p}, gp{gp_p}, {blen * mlen}")
             lines.append(f"S_ADDI_INT gp{gp_pv}, gp{gp_pv}, {blen * mlen}")
             lines.append(f"C_LOOP_END gp{gp_p_loop}")
-            lines.append(f"S_ADDI_INT gp{gp_v}, gp{gp_v}, {blen}")
+            # The V weight is the M_MM matrix operand; its column sub-tile must
+            # advance by BLEN*MLEN (row-aligned) so each reads a distinct MRAM row
+            # under the row-granular matrix SRAM read. The PV output column
+            # (gp_pv_col_base) stays +BLEN because the VRAM output is packed.
+            lines.append(f"S_ADDI_INT gp{gp_v}, gp{gp_v}, {blen * mlen}")
             lines.append(f"S_ADDI_INT gp{gp_pv_col_base}, gp{gp_pv_col_base}, {blen}")
             lines.append(f"C_LOOP_END gp{gp_v_loop}")
 

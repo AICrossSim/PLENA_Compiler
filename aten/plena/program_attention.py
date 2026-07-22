@@ -545,13 +545,15 @@ class ProgramAttentionMixin:
     ) -> None:
         """Emit packed QK^T with M_BTMM/M_BMM_WO into head-major S tiles.
 
-        The per-head systolic (M_BTMM) produces one BLEN(query) x BLEN(kv) tile per
-        head per op. The full per-head S is tiled BLEN x BLEN: outer loop over
-        query-row tiles (qt), inner over kv-column tiles (kt). Each M_BTMM reads
-          rs1 = K MRAM base + kt*BLEN*MLEN  (the kv-tile's block rows, transposed)
-          rs2 = Q VRAM base + qt*BLEN*MLEN  (the query-row tile)
-        and M_BMM_WO writes to s_base + qt*BLEN*MLEN + kt*BLEN; the DFC per-head drain
-        then scatters the ROW_BLOCK_NUM heads head-major (base + head*MLEN*MLEN).
+        M_BTMM is a whole-tile, all-(broadcast)-heads systolic op: one M_BTMM reads
+        the full [MLEN, MLEN] K tile (transposed) against the [MLEN, MLEN] Q tile and
+        computes the entire S = Q @ K^T for the head group. It reads
+          rs1 = K MRAM base + k_head_offset  (head offset < MLEN)
+          rs2 = Q VRAM base
+        and M_BMM_WO drains the ROW_BLOCK_NUM heads head-major (base + head*MLEN*MLEN).
+        Packed GQA requires seq_len <= MLEN, so K and V fit in one tile and no kv/query
+        sub-tiling is needed; padding of partial rows/cols is applied by the caller's
+        valid-column score mask.
         """
         self._ensure_hbm_sub_matrix_registered(K)
         k_layout = self.get_hbm_layout(K.name)
@@ -571,28 +573,25 @@ class ProgramAttentionMixin:
             ),
         )
 
-        mlen, blen = self.mlen, self.blen
+        mlen = self.mlen
         q_base = self.get_vram_addr(Q_group.name) + q_idx * mlen * mlen
-        n_q_tiles = max(1, (min(mlen, q_rows or mlen) + blen - 1) // blen)
-        n_kv_tiles = max(1, (min(mlen, kv_cols or mlen) + blen - 1) // blen)
 
-        gp_q, gp_s, gp_k = self.register_allocator.allocate_gp(3)
-        lines = ["; === Packed GQA QK^T using compiler M_BTMM "
-                 f"({n_q_tiles} query-tile x {n_kv_tiles} kv-tile) ==="]
-        for qt in range(n_q_tiles):
-            for kt in range(n_kv_tiles):
-                k_off = k_head_offset + kt * blen * mlen
-                # kt==0 reads K from MRAM base 0 (gp0); kt>0 offsets by kt*BLEN*MLEN
-                # (the kv-tile's block rows, read transposed).
-                k_reg = "gp0" if k_off == 0 else f"gp{gp_k}"
-                lines += ([] if k_off == 0 else load_large_int(gp_k, k_off))
-                lines += [
-                    *load_large_int(gp_q, q_base + qt * blen * mlen),
-                    f"M_BTMM 0, {k_reg}, gp{gp_q}",
-                    *load_large_int(gp_s, s_base_address + qt * blen * mlen + kt * blen),
-                    f"M_BMM_WO gp{gp_s}, 0",
-                ]
-        self.register_allocator.free_gp([gp_q, gp_s, gp_k])
+        # The compiler M_BTMM is a whole-tile, all-(broadcast)-heads operator: it
+        # reads the full [MLEN, MLEN] K tile and produces the entire S = Q @ K^T for
+        # the head group in one op, drained head-major by M_BMM_WO. Emit a single
+        # M_BTMM over the whole MLEN KV (matrix operand = head offset < MLEN); it
+        # covers every query/kv sub-tile at once. Padding of partial q_rows/kv_cols
+        # is handled by the caller's valid-column score mask, not by tiling here.
+        # (Packed GQA requires seq_len <= MLEN, so K and V fit in one tile.)
+        gp_q, gp_s = self.register_allocator.allocate_gp(2)
+        lines = ["; === Packed GQA QK^T using compiler M_BTMM (whole-tile) ==="]
+        lines += [
+            *load_large_int(gp_q, q_base),
+            f"M_BTMM {k_head_offset}, gp0, gp{gp_q}",
+            *load_large_int(gp_s, s_base_address),
+            f"M_BMM_WO gp{gp_s}, 0",
+        ]
+        self.register_allocator.free_gp([gp_q, gp_s])
         self.emit("\n".join(lines) + "\n")
 
     def _emit_packed_qkt_to_s_dynamic(
