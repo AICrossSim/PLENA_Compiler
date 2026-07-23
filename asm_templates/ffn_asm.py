@@ -228,9 +228,10 @@ def _ffn_asm_unrolled(
     generated_code += _load_large_int(gate_result_register, gate_result_base)
     generated_code += _load_large_int(intermediate_register, activation_base_address)
 
+    # SiLU: sigmoid(x) * x * gate, using activation region as scratchpad
     for b in range(batch * seq_len):
         for i in range(intermediate_size // vlen):
-            generated_code += f"V_SUB_VF gp{intermediate_register}, gp{gate_result_register}, f0, 0, 1 \n"
+            generated_code += f"V_SUB_VF gp{intermediate_register}, gp{up_result_register}, f0, 0, 1 \n"
             generated_code += (
                 f"V_EXP_V  gp{intermediate_register}, gp{intermediate_register}, 0 \n"
             )
@@ -238,8 +239,8 @@ def _ffn_asm_unrolled(
             generated_code += (
                 f"V_RECI_V  gp{intermediate_register}, gp{intermediate_register}, 0 \n"
             )
-            generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{gate_result_register}, 0 \n"
-            generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{up_result_register}, 0 \n"
+            generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{up_result_register}, 0 \n"
+            generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{gate_result_register}, 0 \n"
             generated_code += f"S_ADDI_INT gp{gate_result_register}, gp{gate_result_register}, {vlen} \n"
             generated_code += (
                 f"S_ADDI_INT gp{up_result_register}, gp{up_result_register}, {vlen} \n"
@@ -555,8 +556,15 @@ def _emit_ffn_projection_chunk(
                 )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n")
         else:
+            # Sub-column tile within an MLEN block. The WEIGHT-read pointer must
+            # advance by blen*mlen (row-aligned) so each sub-column reads a DISTINCT
+            # MRAM row: the RTL matrix SRAM read is row-granular (raddr >> log2(MLEN)
+            # drops the low log2(MLEN) bits), so a plain +blen would collapse tiles
+            # 1..(mlen/blen-1) onto tile 0's row. The OUTPUT-write pointer stays at
+            # +blen (the low bits select the 4-wide column lane of the VLEN row).
+            # This matches the working projection_asm (_emit_projection_chunk).
             lines.append(
-                f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} \n"
+                f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen * mlen} \n"
             )
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_base_register}, {(weight_row % (mlen // blen)) * blen} \n"
@@ -1010,9 +1018,9 @@ def ffn_intermediate_asm(
     generated_code += f"; SILU loop: {num_silu_iters} iterations\n"
     generated_code += f"C_LOOP_START gp{loop_outer_reg}, {num_silu_iters}\n"
 
-    # SwiGLU: out = SiLU(gate) * up = (sigmoid(gate) * gate) * up
+    # SILU computation: sigmoid(x) * x * gate
     generated_code += (
-        f"V_SUB_VF gp{intermediate_register}, gp{gate_result_register}, f0, 0, 1\n"
+        f"V_SUB_VF gp{intermediate_register}, gp{up_result_register}, f0, 0, 1\n"
     )
     generated_code += (
         f"V_EXP_V  gp{intermediate_register}, gp{intermediate_register}, 0\n"
@@ -1023,8 +1031,8 @@ def ffn_intermediate_asm(
     generated_code += (
         f"V_RECI_V  gp{intermediate_register}, gp{intermediate_register}, 0\n"
     )
-    generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{gate_result_register}, 0\n"
-    generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{up_result_register}, 0\n"
+    generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{up_result_register}, 0\n"
+    generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{gate_result_register}, 0\n"
     generated_code += (
         f"S_ADDI_INT gp{gate_result_register}, gp{gate_result_register}, {vlen}\n"
     )
@@ -1279,9 +1287,9 @@ def _ffn_asm_with_loops(
     generated_code += f"; SILU loop: {num_silu_iters} iterations\n"
     generated_code += f"C_LOOP_START gp{loop_outer_reg}, {num_silu_iters}\n"
 
-    # SwiGLU: out = SiLU(gate) * up = (sigmoid(gate) * gate) * up
+    # SILU computation: sigmoid(x) * x * gate
     generated_code += (
-        f"V_SUB_VF gp{intermediate_register}, gp{gate_result_register}, f0, 0, 1\n"
+        f"V_SUB_VF gp{intermediate_register}, gp{up_result_register}, f0, 0, 1\n"
     )
     generated_code += (
         f"V_EXP_V  gp{intermediate_register}, gp{intermediate_register}, 0\n"
@@ -1292,8 +1300,8 @@ def _ffn_asm_with_loops(
     generated_code += (
         f"V_RECI_V  gp{intermediate_register}, gp{intermediate_register}, 0\n"
     )
-    generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{gate_result_register}, 0\n"
-    generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{up_result_register}, 0\n"
+    generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{up_result_register}, 0\n"
+    generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{gate_result_register}, 0\n"
     generated_code += (
         f"S_ADDI_INT gp{gate_result_register}, gp{gate_result_register}, {vlen}\n"
     )
@@ -1679,7 +1687,7 @@ def _ffn_asm_fused_up_gate(
     for silu_iter in range(num_silu_iters):
         # SILU computation
         generated_code += (
-            f"V_SUB_VF gp{intermediate_register}, gp{gate_result_register}, f0, 0, 1\n"
+            f"V_SUB_VF gp{intermediate_register}, gp{up_result_register}, f0, 0, 1\n"
         )
         generated_code += (
             f"V_EXP_V  gp{intermediate_register}, gp{intermediate_register}, 0\n"
@@ -1690,8 +1698,8 @@ def _ffn_asm_fused_up_gate(
         generated_code += (
             f"V_RECI_V  gp{intermediate_register}, gp{intermediate_register}, 0\n"
         )
-        generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{gate_result_register}, 0\n"
-        generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{up_result_register}, 0\n"
+        generated_code += f"V_MUL_VV gp{intermediate_register}, gp{intermediate_register}, gp{up_result_register}, 0\n"
+        generated_code += f"V_MUL_VV gp{up_result_register}, gp{intermediate_register}, gp{gate_result_register}, 0\n"
         generated_code += (
             f"S_ADDI_INT gp{gate_result_register}, gp{gate_result_register}, {vlen}\n"
         )

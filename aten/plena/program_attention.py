@@ -461,8 +461,19 @@ class ProgramAttentionMixin:
         k_idx: int,
         s_base_address: int,
         k_head_offset: int = 0,
+        q_rows: int | None = None,
+        kv_cols: int | None = None,
     ) -> None:
-        """Emit packed QK^T with M_BTMM/M_BMM_WO into head-major S tiles."""
+        """Emit packed QK^T with M_BTMM/M_BMM_WO into head-major S tiles.
+
+        The per-head systolic (M_BTMM) produces one BLEN(query) x BLEN(kv) tile per
+        head per op. The full per-head S is tiled BLEN x BLEN: outer loop over
+        query-row tiles (qt), inner over kv-column tiles (kt). Each M_BTMM reads
+          rs1 = K MRAM base + kt*BLEN*MLEN  (the kv-tile's block rows, transposed)
+          rs2 = Q VRAM base + qt*BLEN*MLEN  (the query-row tile)
+        and M_BMM_WO writes to s_base + qt*BLEN*MLEN + kt*BLEN; the DFC per-head drain
+        then scatters the ROW_BLOCK_NUM heads head-major (base + head*MLEN*MLEN).
+        """
         self._ensure_hbm_sub_matrix_registered(K)
         k_layout = self.get_hbm_layout(K.name)
         self._emit_hbm_matrix_load(
@@ -478,16 +489,28 @@ class ProgramAttentionMixin:
             ),
         )
 
-        q_base = self.get_vram_addr(Q_group.name) + q_idx * self.mlen * self.mlen
-        gp_q, gp_s = self.register_allocator.allocate_gp(2)
-        lines = [
-            "; === Packed GQA QK^T using compiler M_BTMM ===",
-            *load_large_int(gp_q, q_base),
-            f"M_BTMM {k_head_offset}, gp0, gp{gp_q}",
-            *load_large_int(gp_s, s_base_address),
-            f"M_BMM_WO gp{gp_s}, 0",
-        ]
-        self.register_allocator.free_gp([gp_q, gp_s])
+        mlen, blen = self.mlen, self.blen
+        q_base = self.get_vram_addr(Q_group.name) + q_idx * mlen * mlen
+        n_q_tiles = max(1, (min(mlen, q_rows or mlen) + blen - 1) // blen)
+        n_kv_tiles = max(1, (min(mlen, kv_cols or mlen) + blen - 1) // blen)
+
+        gp_q, gp_s, gp_k = self.register_allocator.allocate_gp(3)
+        lines = ["; === Packed GQA QK^T using compiler M_BTMM "
+                 f"({n_q_tiles} query-tile x {n_kv_tiles} kv-tile) ==="]
+        for qt in range(n_q_tiles):
+            for kt in range(n_kv_tiles):
+                k_off = k_head_offset + kt * blen * mlen
+                # kt==0 reads K from MRAM base 0 (gp0); kt>0 offsets by kt*BLEN*MLEN
+                # (the kv-tile's block rows, read transposed).
+                k_reg = "gp0" if k_off == 0 else f"gp{gp_k}"
+                lines += ([] if k_off == 0 else load_large_int(gp_k, k_off))
+                lines += [
+                    *load_large_int(gp_q, q_base + qt * blen * mlen),
+                    f"M_BTMM 0, {k_reg}, gp{gp_q}",
+                    *load_large_int(gp_s, s_base_address + qt * blen * mlen + kt * blen),
+                    f"M_BMM_WO gp{gp_s}, 0",
+                ]
+        self.register_allocator.free_gp([gp_q, gp_s, gp_k])
         self.emit("\n".join(lines) + "\n")
 
     def _emit_packed_qkt_to_s_dynamic(
@@ -559,13 +582,27 @@ class ProgramAttentionMixin:
             *load_large_int(gp_dst, output_base_address),
             *load_large_int(gp_scratch, scratch_address),
             *load_large_int(gp_shift, shift),
-            f"C_LOOP_START gp{gp_loop}, {rows}",
-            f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
-            f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0",
-            f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}",
-            f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
-            f"C_LOOP_END gp{gp_loop}",
         ]
+        if getattr(self, "unroll_attention", False):
+            # Straight-line pack (no C_LOOP). The last head's pack C_LOOP_END sits
+            # right before the program's C_BREAK, and the decoder's early_loop_end_stall
+            # lookahead pins pc_reg there (C_BREAK never decodes -> hang). Unrolling
+            # removes every pack loop, so no C_LOOP_END precedes the trailing C_BREAK.
+            for i in range(rows):
+                lines.append(f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}")
+                lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0")
+                if i < rows - 1:
+                    lines.append(f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}")
+                    lines.append(f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}")
+        else:
+            lines += [
+                f"C_LOOP_START gp{gp_loop}, {rows}",
+                f"V_SHIFT_V gp{gp_scratch}, gp{gp_src}, gp{gp_shift}",
+                f"V_ADD_VV gp{gp_dst}, gp{gp_dst}, gp{gp_scratch}, 0",
+                f"S_ADDI_INT gp{gp_src}, gp{gp_src}, {self.mlen}",
+                f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
+                f"C_LOOP_END gp{gp_loop}",
+            ]
         self.register_allocator.free_gp([gp_src, gp_dst, gp_scratch, gp_shift, gp_loop])
         self.emit("\n".join(lines) + "\n")
 
@@ -643,9 +680,10 @@ class ProgramAttentionMixin:
         self._ensure_vram_matrix_layout(Q_group.name)
 
         rows = min(mlen, seq_len)
-        # M_BTMM applies the emulator's fixed bmm_scale (0.25). Compensate in
-        # online softmax so the effective QK scale remains caller-provided.
-        softmax_scale = scale / 0.25
+        # RTL M_BTMM applies NO bmm_scale (unlike the emulator's fixed 0.25), so the
+        # QK^T scores reach the softmax unscaled -> apply the caller's scale directly.
+        # (scale/0.25 would make the softmax 4x too sharp -> peaked P -> inflated P@V.)
+        softmax_scale = scale
 
         s_views = [
             self.alloc_at(
@@ -676,6 +714,8 @@ class ProgramAttentionMixin:
             q_idx=0,
             k_idx=k_idx,
             s_base_address=scratch_base_address,
+            q_rows=rows,
+            kv_cols=(valid_cols if valid_cols is not None else seq_len),
         )
 
         active_cols = valid_cols or seq_len
@@ -684,6 +724,9 @@ class ProgramAttentionMixin:
             if self._needs_explicit_valid_col_mask(active_cols)
             else None
         )
+        # Warm V into MSRAM once so head 0's cold-start-reprimed first tile reads V
+        # (not the QK^T's stale K) on row 0 too — it lands during head 0's softmax.
+        self.warm_v_prefetch(V.name, k_idx)
         for head, s_head in enumerate(s_views):
             o_head = self.alloc(
                 f"_packed_O_head{head}",
@@ -704,11 +747,15 @@ class ProgramAttentionMixin:
                 if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar)
                 else active_cols
             )
-            self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
+            # Single KV block (fused packed path): normalise P register-direct in the
+            # softmax block, so pv = softmax(S)@V = O directly. This avoids the FP-SRAM
+            # l/m_res round-trip used by scale_o_row/final_scale_o, whose per-row store
+            # is racy on this RTL (drops -> O saturates to FP12 max; see online_softmax.py).
+            # o_head was zeroed by init_online_softmax, so vram_add copies pv into O.
+            self.online_softmax_block(s_head, softmax_scale, rows=rows,
+                                      valid_cols=softmax_valid_cols, inline_normalize=True)
             self.compute_pv(s_head, V, k_idx, pv, head_slot_dim, rows=rows)
-            self.scale_o_row(o_head, 0, rows=rows)
             self.vram_add(o_head, pv, num_rows=rows)
-            self.final_scale_o(0, o_head, rows=rows)
             output_head = output_head_base + head
             output_col_block = (output_head * head_slot_dim) // mlen
             output_lane = (output_head * head_slot_dim) % mlen // head_slot_dim
@@ -974,6 +1021,7 @@ class ProgramAttentionMixin:
         scale: float,
         rows: int | None = None,
         valid_cols: int | None = None,
+        inline_normalize: bool = False,
     ):
         """Perform Online Softmax on S block"""
         super().online_softmax_block(
@@ -981,6 +1029,7 @@ class ProgramAttentionMixin:
             scale=scale,
             rows=rows,
             valid_cols=valid_cols,
+            inline_normalize=inline_normalize,
         )
 
     def compute_pv(

@@ -18,6 +18,7 @@ def qkt_multiply(
     s_head_offset: int = 0,
     use_batched: bool = True,
     blen: int = 4,
+    prefetch_k: bool = True,  # emit the K HBM->MSRAM prefetch; False = K already resident
 ) -> str:
     """
     Args:
@@ -56,14 +57,18 @@ def qkt_multiply(
     s_base_register = q_base_register
     generated_code = "; QKT Per KV Head Multiplication \n"
 
-    # Prefetch K from HBM (shared by both batched and per-head paths)
     generated_code += f"S_ADDI_INT gp{q_base_register}, gp0, {q_base_address + q_head_index * d} \n"
-    generated_code += f"S_ADDI_INT gp{k_base_register}, gp0, {k_head_index * d} \n"
 
-    # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
-    # When stride < 64 elements, strided access causes unaligned HBM reads
-    # Parameter order: rd, rs1, rs2, rstride(stride_en), funct1(scale_en)
-    generated_code += f"H_PREFETCH_M gp0, gp{k_base_register}, a{k_base_hbm_offset_reg}, 0, 1 \n"
+    # Prefetch K from HBM into MSRAM tile 0 (shared by both batched and
+    # per-head paths). K is identical for every Q head of a KV group, so the
+    # caller requests the prefetch only on the first head of the group
+    # (prefetch_k=False afterwards) and the resident copy is reused.
+    if prefetch_k:
+        generated_code += f"S_ADDI_INT gp{k_base_register}, gp0, {k_head_index * d} \n"
+        # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
+        # When stride < 64 elements, strided access causes unaligned HBM reads
+        # Parameter order: rd, rs1, rs2, rstride(stride_en), funct1(scale_en)
+        generated_code += f"H_PREFETCH_M gp0, gp{k_base_register}, a{k_base_hbm_offset_reg}, 0, 1 \n"
 
     if use_batched:
         # --- Batched path: M_BTMM processes blen heads simultaneously ---

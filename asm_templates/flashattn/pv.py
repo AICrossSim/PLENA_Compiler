@@ -20,8 +20,9 @@ def computing_pv_code(
     v_head_index: int,
     output_base_address: int,
     head_offset: int,
-    v_msram_base: int = 0,  # MSRAM base address for V (can be 0, prefetched after K is used)
+    v_msram_base: int = 0,  # MSRAM base for V; use its own tile (e.g. mlen*mlen) so K at tile 0 cannot clobber it
     rows: int | None = None,
+    prefetch_v: bool = True,  # emit the V HBM->MSRAM prefetch; False = V already resident
 ) -> str:
     """
     Compute PV = P @ V and write directly to packed output format.
@@ -52,15 +53,16 @@ def computing_pv_code(
     inner_loop_register = alive_registers[4]
     out_col_register = alive_registers[5]
 
-    # Prefetch V from HBM (MLEN, head_dim) to MSRAM at v_msram_base
-    # NOTE: We ALWAYS prefetch V because K prefetch in qkt_multiply uses MSRAM 0,
-    # which overwrites any previously prefetched V. Even though all heads share
-    # the same V data (same KV head), we must re-prefetch after each K prefetch.
-    generated_code += _load_large_int(v_base_register, v_head_index * head_dim)
-    # Use v_msram_base as MSRAM destination (can be 0 since K was already used)
-    generated_code += _load_large_int(out_base_register, v_msram_base)
-    # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
-    generated_code += f"H_PREFETCH_M gp{out_base_register}, gp{v_base_register}, a{v_base_hbm_offset_reg}, 0, 1 \n"
+    # Prefetch V from HBM (MLEN, head_dim) to MSRAM at v_msram_base. With
+    # v_msram_base pointing at its own tile (separate from K's tile 0), V stays
+    # resident across the Q heads of one KV group, so the caller only requests
+    # the prefetch on the first head (prefetch_v=False afterwards) — the other
+    # heads reuse the resident copy instead of re-reading HBM.
+    if prefetch_v:
+        generated_code += _load_large_int(v_base_register, v_head_index * head_dim)
+        generated_code += _load_large_int(out_base_register, v_msram_base)
+        # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
+        generated_code += f"H_PREFETCH_M gp{out_base_register}, gp{v_base_register}, a{v_base_hbm_offset_reg}, 0, 1 \n"
 
     # P address for this head's softmax scores
     p_start_address = p_base_address + q_head_index * mlen * mlen

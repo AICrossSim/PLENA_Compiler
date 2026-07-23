@@ -199,9 +199,9 @@ class IsaCompiler(
 
             if tensor_info.hbm_addr < 0 or tensor_info.hbm_addr != hbm_addr:
                 tensor_info.hbm_addr = hbm_addr
-                # HBM stores the MXFP-expanded size (logical size × real_data_ratio).
+                # HBM stores element + scale rows, each row-aligned (see hbm_tensor_size).
                 size = batch_size * hidden_size
-                tensor_info.hbm_size = int(size * self.real_data_ratio)
+                tensor_info.hbm_size = self.hbm_tensor_size(size)
         finally:
             self.register_allocator.free_gp(gp_regs)
             if need_free_addr:

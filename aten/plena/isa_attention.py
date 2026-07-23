@@ -20,6 +20,7 @@ class IsaAttentionMixin:
         scale: float = 1.0,
         rows: int | None = None,
         valid_cols: int | None = None,
+        inline_normalize: bool = False,
     ) -> str:
         """
         Online Softmax Computation.
@@ -43,6 +44,7 @@ class IsaAttentionMixin:
                 m_start_address=m_start_address,
                 scale=scale,
                 valid_cols=valid_cols,
+                inline_normalize=inline_normalize,
             )
 
         gp_regs = self.register_allocator.allocate_gp(5)
@@ -110,15 +112,24 @@ class IsaAttentionMixin:
         lines.append(f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m_old}, {mask_en}, 0")
         lines.append(f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0")
 
-        lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, 0")
+        if inline_normalize:
+            # Single-block fast path (parity with _online_softmax_asm_unrolled).
+            lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+            lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+            lines.append(f"S_RECI_FP f{fp_sum_p}, f{fp_sum_p}, 0")
+            for _ in range(4):  # retire multi-cycle S_RECI_FP before V_MUL_VF reads it
+                lines.append("S_ADDI_INT gp0, gp0, 0")
+            lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_sum_p}, {mask_en}")
+        else:
+            lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, 0")
 
-        lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
-        lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+            lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+            lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
 
-        lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
-        lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
+            lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
+            lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
 
-        lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, 0")
+            lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, 0")
 
         lines.append(f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}")
         lines.append(f"S_ADDI_INT gp{gp_m_addr}, gp{gp_m_addr}, 1")
@@ -136,6 +147,7 @@ class IsaAttentionMixin:
         m_start_address: int,
         scale: float = 1.0,
         valid_cols: int | None = None,
+        inline_normalize: bool = False,
     ) -> str:
         """Legacy Python-unrolled online softmax emission, kept for A/B comparisons."""
         gp_regs = self.register_allocator.allocate_gp(5)
@@ -194,15 +206,27 @@ class IsaAttentionMixin:
             lines.append(f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m_old}, {mask_en}, 0")
             lines.append(f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0")
 
-            lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
+            if inline_normalize:
+                # Single-block fast path: normalise P register-direct (no FP-SRAM l
+                # round-trip, whose per-row store is racy in the unrolled kernel and
+                # PC-pins when looped). softmax(S)=exp(S-m)/sum(exp(S-m)); for one KV
+                # block this also gives correct attention O since (P/l)@V == (P@V)/l.
+                lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+                lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+                lines.append(f"S_RECI_FP f{fp_sum_p}, f{fp_sum_p}, 0")
+                for _ in range(4):  # retire multi-cycle S_RECI_FP before V_MUL_VF reads it
+                    lines.append("S_ADDI_INT gp0, gp0, 0")
+                lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_sum_p}, {mask_en}")
+            else:
+                lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
 
-            lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
-            lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
+                lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+                lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
 
-            lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
-            lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
+                lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
+                lines.append(f"S_ADD_FP f{fp_l_old}, f{fp_l_old}, f{fp_sum_p}")
 
-            lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
+                lines.append(f"S_ST_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
 
             lines.append(f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}")
 
@@ -291,11 +315,20 @@ class IsaAttentionMixin:
             v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
+            # funct1=0 => PREFETCH_M_H (High Precision, m_controller_precision_select=0),
+            # matching how V is staged in HBM (same High-Precision MXINT format as the K/W
+            # weights, which load via _H). funct1=1 (_L / Low Precision) mis-decodes the
+            # High-staged V into garbage (~constant mantissas) -> rank-1 P@V collapse.
+            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 0")
 
             pv_col_block_base = pv_address + v_col_block * pv_physical_rows * mlen
             lines.extend(load_large_int(gp_pv_col_base, pv_col_block_base))
-            lines.append(f"C_LOOP_START gp{gp_v_loop}, {tiles_per_mlen}")
+            # Only cover the output columns this block actually has. head_dim < mlen
+            # (e.g. GQA head_slot_dim=4) would otherwise over-iterate V's zero-pad
+            # columns, writing garbage into PV cols head_dim..mlen (spilled by the pack).
+            block_cols = min(head_dim - v_col_block * mlen, mlen)
+            v_col_tiles = max(1, math.ceil(block_cols / blen))
+            lines.append(f"C_LOOP_START gp{gp_v_loop}, {v_col_tiles}")
             lines.extend(load_large_int(gp_p, p_address))
             lines.append(f"S_ADDI_INT gp{gp_pv}, gp{gp_pv_col_base}, 0")
             lines.append(f"C_LOOP_START gp{gp_p_loop}, {p_row_groups}")
@@ -349,9 +382,17 @@ class IsaAttentionMixin:
             v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 1")
+            # funct1=0 => PREFETCH_M_H (High Precision), matching V's HBM staging; _L
+            # (Low Precision) mis-decodes it to garbage. See _pv_multiply_asm above.
+            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 0")
 
-            for v_col in range(mlen // blen):
+            # Only emit output-column tiles that this block actually covers. When
+            # head_dim < mlen (e.g. GQA head_slot_dim=4), mlen//blen would over-iterate
+            # over V's zero-padded columns, writing GARBAGE into PV cols head_dim..mlen
+            # that the pack (V_SHFT_V + V_ADD_VV over all lanes) then spills across heads.
+            block_cols = min(head_dim - v_col_block * mlen, mlen)
+            v_col_tiles = max(1, math.ceil(block_cols / blen))
+            for v_col in range(v_col_tiles):
                 lines.append(f"; V column {v_col_block * mlen + v_col * blen}")
                 v_msram_offset = v_col * blen
                 lines.append(f"S_ADDI_INT gp{gp_v}, gp0, {v_msram_offset}")
@@ -738,6 +779,7 @@ class IsaAttentionMixin:
         scale: float,
         rows: int | None = None,
         valid_cols: int | None = None,
+        inline_normalize: bool = False,
     ) -> str:
         """
         Run Online Softmax on one S block.
@@ -745,6 +787,8 @@ class IsaAttentionMixin:
           Output:  P (mlen × mlen) in-place in VRAM
           Updates: m_old, m_res, l in FP SRAM
           ``scale`` is the QK^T scaling factor (typically 1/sqrt(d)).
+          ``inline_normalize`` (single-block only): normalise P by its row-sum
+          register-direct here and skip the FP-SRAM l/final-scale path.
         """
         s_info = self[s_block_matrix]
         s_address = s_info.vram_addr
@@ -760,6 +804,7 @@ class IsaAttentionMixin:
             scale=scale,
             rows=rows,
             valid_cols=valid_cols,
+            inline_normalize=inline_normalize,
         )
 
         return self._emit(isa_code)
@@ -816,6 +861,34 @@ class IsaAttentionMixin:
         self.register_allocator.free_gp(gp_regs)
         self.register_allocator.free_addr(addr_regs)
 
+        return self._emit(isa_code)
+
+    def warm_v_prefetch(self, v_sub_matrix: str, k_idx: int) -> str:
+        """Prefetch V[k_idx] into MSRAM ONCE (High precision) before the per-head P@V
+        loop so it has fully landed by head 0's first tile. Paired with the RTL
+        cold-start re-prime at the M_BTMM->M_MM boundary: the re-prime re-warms the
+        weight-read pipe, but its ~20-cycle spin can outrun head 0's own (late) per-head
+        prefetch, leaving row 0 reading stale K. Landing V here (during head 0's softmax)
+        guarantees the spin reads V for row 0 too."""
+        v_layout = self.get_hbm_layout(v_sub_matrix)
+        physical_head_dim = (v_layout.physical_shape or v_layout.full_shape)[1]
+        v_hbm_offset = k_idx * self.mlen * physical_head_dim
+        addr_regs = self.register_allocator.allocate_addr(1)
+        v_hbm_reg = addr_regs[0]
+        gp_regs = self.register_allocator.allocate_gp(2)
+
+        from compiler.asm_templates import preload_addr_reg_asm
+
+        isa_code = "; === Warm V into MSRAM once (head-0 row-0 stale-K guard) ===\n"
+        isa_code += preload_addr_reg_asm(
+            addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
+        )
+        isa_code += f"S_ADDI_INT gp{gp_regs[0]}, gp0, 0\n"
+        isa_code += "\n".join(load_large_int(gp_regs[1], v_hbm_offset)) + "\n"
+        isa_code += f"H_PREFETCH_M gp{gp_regs[0]}, gp{gp_regs[1]}, a{v_hbm_reg}, 1, 0\n"
+
+        self.register_allocator.free_gp(gp_regs)
+        self.register_allocator.free_addr(addr_regs)
         return self._emit(isa_code)
 
     def scale_o_row(

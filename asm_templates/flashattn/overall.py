@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Main Flash Attention assembly code generation - orchestrates all components."""
 
+from .._imm import load_large_int_str as _load_large_int
 from ..reset_reg_asm import reset_fpreg_asm, reset_reg_asm, reset_vmask_asm
 from .online_softmax import online_softmax_code
 from .output import computing_o_code, computing_row_wise_scaling_code
@@ -130,6 +131,40 @@ def flash_attn_asm(
         alive_registers_int=alive_registers_int[0:1],
     )
 
+    # Decode software pipelining. Matrix ops stall behind any in-flight matrix
+    # load (single-slot load engine), so a K/V prefetch only overlaps with
+    # vector/scalar work, and the engine serializes back-to-back prefetches at
+    # issue. Decode (q_seq == 1) therefore splits the two loads around their
+    # hiding windows: K for the NEXT (kv head, kv tile) iteration is issued at
+    # the tail of the current one (its DMA hides behind the softmax-state
+    # resets), and V for the CURRENT iteration is issued right after QKT (its
+    # DMA hides behind the online softmax). K occupies MSRAM tile 0, V tile 1,
+    # so a resident tile is never clobbered before its last matrix use.
+    def _emit_k_prefetch(head_index: int) -> str:
+        code = f"; Pipelined K prefetch for KV head {head_index} \n"
+        code += f"S_ADDI_INT gp{alive_registers_int[1]}, gp0, {head_index * d} \n"
+        code += f"H_PREFETCH_M gp0, gp{alive_registers_int[1]}, a{k_base_hbm_offset_reg}, 0, 1 \n"
+        code += reset_reg_asm(alive_registers_int[1:2])
+        return code
+
+    def _emit_v_prefetch(head_index: int) -> str:
+        code = f"; Pipelined V prefetch for KV head {head_index} \n"
+        code += _load_large_int(alive_registers_int[1], head_index * d)
+        code += _load_large_int(alive_registers_int[2], mlen * mlen)
+        code += f"H_PREFETCH_M gp{alive_registers_int[2]}, gp{alive_registers_int[1]}, a{v_base_hbm_offset_reg}, 0, 1 \n"
+        code += reset_reg_asm(alive_registers_int[1:3])
+        return code
+
+    # The pipelined schedule is valid whenever one (kv head, kv tile) iteration
+    # contains the entire q loop (q_seq == 1): the decode chip's case, where
+    # the q rows are the batch's single tokens. Long-q prefill (q_seq > 1)
+    # keeps the original at-use prefetch placement.
+    pipelined_decode = q_seq_iteration_number == 1
+    kv_iters = [(h, t) for h in range(hkv) for t in range(k_seq_iteration_number)]
+    kv_iter_idx = 0
+    if pipelined_decode:
+        generated_code += _emit_k_prefetch(kv_iters[0][0])
+
     # loop over kv heads
     for kv_head_index in range(hkv):
         group_q_base_address = q_base_address + kv_head_index * (
@@ -216,15 +251,23 @@ def flash_attn_asm(
                         s_head_offset=0,
                         use_batched=True,
                         blen=blen,
+                        # Pipelined decode: K was prefetched at the previous
+                        # iteration's tail (or the pre-loop prologue).
+                        prefetch_k=not pipelined_decode,
                     )
                     generated_code += reset_reg_asm(alive_registers_int[0:2])
+                    # V for this iteration: issued now so its DMA hides behind
+                    # the online softmax; PV is its first consumer.
+                    if pipelined_decode:
+                        generated_code += _emit_v_prefetch(kv_head_index)
 
                 for inner_q_head_index in range(q_index_2_kv_index_ratio):
                     if not use_batched:
                         # --- Per-head path: M_TMM computes one head's QKT ---
-                        # K prefetch is inside qkt_multiply (one H_PREFETCH_M
-                        # per head).  Since MSRAM tile 0 is reloaded each time,
-                        # the K data is always fresh.
+                        # K lives in MSRAM tile 0 and V in its own tile (see
+                        # the pv call below), so K/V are prefetched only on the
+                        # first Q head of the KV group and stay resident for
+                        # the remaining heads — no per-head HBM re-reads.
                         abs_q_head = kv_head_index * q_index_2_kv_index_ratio + inner_q_head_index
                         generated_code += qkt_multiply(
                             d=d,
@@ -239,8 +282,16 @@ def flash_attn_asm(
                             s_head_offset=0,  # single S tile, always at offset 0
                             use_batched=False,
                             blen=blen,
+                            # K shared across the group's Q heads: fetch on the
+                            # first head only; pipelined decode fetched it at
+                            # the previous iteration's tail already.
+                            prefetch_k=(not pipelined_decode) and inner_q_head_index == 0,
                         )
                         generated_code += reset_reg_asm(alive_registers_int[0:9])
+                        # V for this iteration: issued after the first head's
+                        # QKT so its DMA hides behind the online softmax.
+                        if pipelined_decode and inner_q_head_index == 0:
+                            generated_code += _emit_v_prefetch(kv_head_index)
 
                     # Per Q head level online softmax.  ``attn_scale_fp_address``
                     # is forwarded by the caller from
@@ -285,7 +336,13 @@ def flash_attn_asm(
                         v_head_index=kv_head_index,
                         output_base_address=pv_base_address,
                         head_offset=inner_q_head_index,  # This head's position within the row
+                        # V gets its own MSRAM tile (after K's tile 0) and is
+                        # fetched once per KV group; later heads reuse it.
+                        # Pipelined decode fetched it at the previous
+                        # iteration's tail already.
+                        v_msram_base=mlen * mlen,
                         rows=br,
+                        prefetch_v=(not pipelined_decode) and inner_q_head_index == 0,
                     )
 
                     generated_code += reset_reg_asm(alive_registers_int[0:6])
@@ -331,4 +388,13 @@ def flash_attn_asm(
                         use_mask=True,
                         rows=br,
                     )
+
+            # Pipelined decode: issue the NEXT iteration's K prefetch here. The
+            # last matrix op of this iteration has retired, so overwriting
+            # MSRAM tile 0 is safe, and the DMA overlaps the vector-only
+            # softmax-state resets that separate it from its first matrix use.
+            if pipelined_decode:
+                kv_iter_idx += 1
+                if kv_iter_idx < len(kv_iters):
+                    generated_code += _emit_k_prefetch(kv_iters[kv_iter_idx][0])
     return generated_code
