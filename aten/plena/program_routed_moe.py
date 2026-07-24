@@ -186,7 +186,7 @@ class ProgramRoutedMoeMixin:
         gp_dst, gp_src = self._reg.allocate_gp(2)
         try:
             asm = IsaBuilder().comment(
-                f"Qwen router {label} logits pack: rows={rows}, experts={num_experts}, blocks={expert_blocks}"
+                f"{label} logits pack: rows={rows}, experts={num_experts}, blocks={expert_blocks}"
             )
             for token_idx in range(rows):
                 for expert_block in range(expert_blocks):
@@ -202,6 +202,62 @@ class ProgramRoutedMoeMixin:
 
         self.free_tensor(matrix_logits)
         return packed_logits
+
+    def router_logits_matrix_mx_rowpacked_v0(
+        self,
+        x: VRAMMatrixVar,
+        router_weight_matrix: InputVar,
+        *,
+        rows: int,
+        hidden: int,
+        num_experts: int,
+        name: str = "router_logits_matrix_mx",
+    ) -> VRAMMatrixVar:
+        """Emit a router linear through the current RTL MXINT matrix path.
+
+        HBM activations and weights use the normal MX element-plus-scale layout;
+        matrix results use the RTL vector FP format. Multi-block expert outputs
+        are copied into the contiguous token-major rows consumed by ``V_TOPK``.
+        """
+        if hidden <= 0 or hidden % self.mlen != 0:
+            raise ValueError(f"router hidden={hidden} must be divisible by MLEN={self.mlen}")
+        if rows <= 0 or rows > x.shape[0]:
+            raise ValueError(f"router rows={rows} outside x rows={x.shape[0]}")
+        if num_experts <= 0:
+            raise ValueError(f"router num_experts={num_experts} must be positive")
+        if hidden > x.shape[1]:
+            raise ValueError(f"router hidden={hidden} exceeds x width={x.shape[1]}")
+        if router_weight_matrix.shape[0] < hidden or router_weight_matrix.shape[1] < num_experts:
+            raise ValueError(
+                "router_weight_matrix must have shape at least "
+                f"({hidden}, {num_experts}), got {router_weight_matrix.shape}"
+            )
+
+        expert_blocks = math.ceil(num_experts / self.mlen)
+        physical_rows = max(self.blen, math.ceil(x.shape[0] / self.blen) * self.blen)
+        physical_experts = expert_blocks * self.mlen
+        logical_logit_rows = rows if expert_blocks == 1 else rows * expert_blocks
+        physical_logit_rows = max(self.blen, math.ceil(logical_logit_rows / self.blen) * self.blen)
+
+        matrix_logits = self.linear_projection(
+            x,
+            router_weight_matrix,
+            name=f"{name}_matrix",
+            physical_shape=(physical_rows, physical_experts),
+            matrix_precision="weights",
+            set_scale=True,
+            hbm_element_bytes=1,
+        )
+        return self._pack_router_logits_token_major(
+            matrix_logits,
+            rows=rows,
+            num_experts=num_experts,
+            expert_blocks=expert_blocks,
+            logical_logit_rows=logical_logit_rows,
+            physical_logit_rows=physical_logit_rows,
+            name=name,
+            label="Router MX matrix",
+        )
 
     def qwen3_router_logits_matrix_bf16_rowpacked_v0(
         self,
@@ -272,7 +328,7 @@ class ProgramRoutedMoeMixin:
             logical_logit_rows=logical_logit_rows,
             physical_logit_rows=physical_logit_rows,
             name=name,
-            label="matrix",
+            label="Qwen router matrix",
         )
 
     def qwen3_router_logits_packed_skinny_bf16_rowpacked_v0(
@@ -352,7 +408,7 @@ class ProgramRoutedMoeMixin:
             logical_logit_rows=logical_logit_rows,
             physical_logit_rows=physical_logit_rows,
             name=name,
-            label="packed-skinny",
+            label="Qwen router packed-skinny",
         )
 
     def gpt_oss_router_topk_softmax_v0(
@@ -368,11 +424,12 @@ class ProgramRoutedMoeMixin:
     ) -> None:
         """Emit V_TOPK for one router-logit row.
 
-        V_TOPK v0 reads one BF16 router-logit row from VRAM, performs a
+        V_TOPK v0 reads vector-format router logits from VRAM (V_FP12 in the
+        current RTL), performs a
         linear-scan top-k with low-index tie break, stores the selected expert
         ids to INT SRAM, and stores the softmax-over-selected weights to FP
-        SRAM.  The instruction intentionally keeps router/top-k on the BF16
-        path and does not touch MX scale state.
+        SRAM. The instruction consumes the stored vector values directly and
+        does not touch MX scale state.
         """
         if token_idx < 0 or token_idx >= logits.shape[0]:
             raise ValueError(f"token_idx={token_idx} outside logits rows={logits.shape[0]}")

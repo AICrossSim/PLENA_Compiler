@@ -350,6 +350,49 @@ def test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts():
     print("  PASS test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts")
 
 
+def test_router_mx_linear_rowpacked_compiles_for_rtl_topk():
+    """Current MXINT RTL router emits matrix linear, row pack, then V_TOPK."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(
+        mlen=8,
+        blen=4,
+        mram_tile_capacity=128,
+        hbm_v_prefetch_amount=4,
+        unroll_loops=True,
+    )
+    x_input = prog.input("X", shape=(1, 8), physical_shape=(4, 8))
+    x = prog.load_batch(x_input, name="X")
+    router_weight = prog.input("W_router", shape=(8, 32), physical_shape=(8, 32))
+
+    logits = prog.router_logits_matrix_mx_rowpacked_v0(
+        x,
+        router_weight,
+        rows=1,
+        hidden=8,
+        num_experts=32,
+    )
+    prog.gpt_oss_router_topk_softmax_v0(
+        logits,
+        token_idx=0,
+        weights_fp_base=0,
+        indices_int_base=0,
+        num_experts=32,
+        top_k=4,
+    )
+    code = prog.compile()
+
+    assert logits.shape == (4, 8)
+    assert x_input.hbm_addr == 0
+    assert router_weight.hbm_addr == 64
+    assert code.count("H_PREFETCH_M") == 4
+    assert code.count("M_MM ") == 8
+    assert code.count("M_MM_WO") == 8
+    assert code.count("V_ADD_VF") == 4
+    assert "C_SET_SCALE_REG" in code
+    assert "V_TOPK" in code
+
+
 def _build_dynamic_expert_projection(hidden, out_features=64, mlen=64, blen=4):
     """Compile one runtime-expert-id linear projection and return (code, output)."""
     from compiler.aten.plena import PlenaCompiler
