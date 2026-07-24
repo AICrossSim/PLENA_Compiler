@@ -40,16 +40,20 @@ class TestVectorRmaskHandling(unittest.TestCase):
             self.assertEqual((binary >> 18) & 0xF, 1)  # rmask
 
     def test_v_topk_encodes_like_masked_vector_op(self):
-        # Non-zero rmask so the rmask-lane assertion actually exercises the field
-        # (with rmask=0 it would pass even if the encoder dropped the lane).
-        instr = Instruction("V_TOPK", 1, 2, 3, 1, None, None, None)
-        binary = self.asm._convert_to_binary(instr)
+        # These exact words are shared ABI fixtures with PLENA_Simulator and RTL.
+        # rd=gp1, rs1=gp2, rs2=gp3; rmask selects the routing policy.
+        fixtures = ((0, 0x0000C877), (1, 0x0004C877))
 
-        self.assertEqual(binary & 0x3F, self.asm.isa_definitions["V_TOPK"])
-        self.assertEqual((binary >> 6) & 0xF, 1)   # rd
-        self.assertEqual((binary >> 10) & 0xF, 2)  # rs1
-        self.assertEqual((binary >> 14) & 0xF, 3)  # rs2
-        self.assertEqual((binary >> 18) & 0xF, 1)  # rmask
+        for rmask, expected in fixtures:
+            instr = Instruction("V_TOPK", 1, 2, 3, rmask, None, None, None)
+            binary = self.asm._convert_to_binary(instr)
+
+            self.assertEqual(binary, expected)
+            self.assertEqual(binary & 0x3F, self.asm.isa_definitions["V_TOPK"])
+            self.assertEqual((binary >> 6) & 0xF, 1)   # rd
+            self.assertEqual((binary >> 10) & 0xF, 2)  # rs1
+            self.assertEqual((binary >> 14) & 0xF, 3)  # rs2
+            self.assertEqual((binary >> 18) & 0xF, rmask)
 
 
 if __name__ == "__main__":
