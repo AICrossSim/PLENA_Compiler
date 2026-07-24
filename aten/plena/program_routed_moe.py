@@ -574,9 +574,19 @@ class ProgramRoutedMoeMixin:
         k_block_count: int | None = None,
         name: str = "gpt_oss_dynamic_weight_load",
     ) -> None:
-        """Load one weight column tile using runtime true expert id addressing."""
+        """Load one weight column tile using runtime true expert id addressing.
+
+        ``table_base`` and ``per_expert_stride`` are byte addresses. In affine
+        mode each stride must cover the template's complete element, scale, and
+        padding footprint; larger strides may be used for table alignment.
+        """
         self._ensure_hbm_sub_matrix_registered(weight_template)
         layout = self.get_hbm_layout(weight_template.name)
+        if expert_base_table_int_base is None and per_expert_stride < layout.hbm_size:
+            raise ValueError(
+                f"{name}: per_expert_stride={per_expert_stride} bytes is smaller than "
+                f"{weight_template.name} HBM footprint={layout.hbm_size} bytes"
+            )
         num_row_blocks = layout.num_row_blocks
         block_size = self.mlen * self.mlen
         effective_count = k_block_count if k_block_count is not None else num_row_blocks
