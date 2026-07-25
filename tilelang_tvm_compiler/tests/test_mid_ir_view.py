@@ -11,8 +11,7 @@ Coverage:
   * Outside cluster body: refs not rewritten
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_view
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_view
 """
 
 from __future__ import annotations

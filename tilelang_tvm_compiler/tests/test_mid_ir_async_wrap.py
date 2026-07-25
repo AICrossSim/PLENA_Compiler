@@ -10,8 +10,7 @@ Coverage:
   * BufferRef indices NOT rewritten — that's the next (view) pass
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_async_wrap
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_async_wrap
 """
 
 from __future__ import annotations
