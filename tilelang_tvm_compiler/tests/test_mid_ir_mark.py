@@ -11,8 +11,7 @@ Coverage:
   * Idempotency: mark(mark(x)) == mark(x)
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_mark
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_mark
 """
 
 from __future__ import annotations
