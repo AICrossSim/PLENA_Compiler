@@ -11,6 +11,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR)))
@@ -137,15 +138,30 @@ def test_golden_a_matches_hf_gpt_oss_mlp_tiny():
         hf_mlp.experts.down_proj.copy_(down_w)
         hf_mlp.experts.down_proj_bias.copy_(down_b)
 
-        # transformers 5.1.0 GptOssTopKRouter.forward returns
-        # (router_logits, router_scores, router_indices); router_scores and
-        # router_indices are already the (tokens, top_k) softmaxed top-k, so the
-        # old gather against a full-width score row is gone. GptOssExperts.forward
-        # takes a 2D (tokens, hidden) input and indexes routing_weights as
-        # [token, top_k_pos], i.e. the (tokens, top_k) scores directly.
-        hf_router_logits, hf_scores, hf_indices = hf_mlp.router(x)
-        hf_expert_out = hf_mlp.experts(x, hf_indices, hf_scores)
-        hf_mlp_out, hf_mlp_scores = hf_mlp(x.unsqueeze(0))
+        router_result = hf_mlp.router(x)
+        if len(router_result) == 3:
+            # transformers >=5.1 returns full logits followed by compact
+            # (tokens, top_k) scores and indices.
+            hf_router_logits, hf_scores, hf_indices = router_result
+            hf_expert_out = hf_mlp.experts(x, hf_indices, hf_scores)
+            hf_mlp_out, hf_mlp_scores = hf_mlp(x.unsqueeze(0))
+        elif len(router_result) == 2:
+            # transformers 4.x returns a dense (tokens, num_experts) score
+            # matrix. Experts consume that dense matrix and a batched input.
+            hf_dense_scores, hf_indices = router_result
+            hf_router_logits = F.linear(x, hf_mlp.router.weight, hf_mlp.router.bias)
+            hf_scores = hf_dense_scores.gather(1, hf_indices)
+            hf_expert_out = hf_mlp.experts(
+                x.unsqueeze(0),
+                router_indices=hf_indices,
+                routing_weights=hf_dense_scores,
+            ).squeeze(0)
+            hf_mlp_out, hf_mlp_dense_scores = hf_mlp(x.unsqueeze(0))
+            hf_mlp_scores = hf_mlp_dense_scores.squeeze(0).gather(1, hf_indices)
+        else:
+            raise AssertionError(
+                f"unsupported GptOssTopKRouter result length: {len(router_result)}"
+            )
 
     golden = gpt_oss_moe_golden_a(
         *args,
