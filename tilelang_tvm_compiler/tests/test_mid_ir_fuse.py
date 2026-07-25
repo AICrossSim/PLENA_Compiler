@@ -11,8 +11,7 @@ Coverage:
   * cluster_guard skip → no-op
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_fuse
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_fuse
 """
 
 from __future__ import annotations

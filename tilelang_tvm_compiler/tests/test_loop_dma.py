@@ -2,9 +2,7 @@
 
 Run:
     LD_LIBRARY_PATH="" \\
-    PYTHONPATH=/home/.../PLENA_Simulator/compiler \\
-    /home/.../PLENA_Simulator/.venv-tvm/bin/python -m \\
-        tilelang_tvm_compiler.tests.test_loop_dma
+    python -m tilelang_tvm_compiler.tests.test_loop_dma
 """
 
 from __future__ import annotations

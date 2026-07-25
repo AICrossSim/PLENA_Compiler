@@ -11,8 +11,7 @@ Coverage:
   * blockIdx grid wrappers preserved as For(thread_tag=...)
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_fold
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_fold
 """
 
 from __future__ import annotations

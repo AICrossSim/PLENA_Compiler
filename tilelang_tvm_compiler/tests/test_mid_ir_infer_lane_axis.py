@@ -15,8 +15,7 @@ Coverage:
   * Grid var with extent NOT multiple of LANE → not eligible
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_infer_lane_axis
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_infer_lane_axis
 """
 
 from __future__ import annotations

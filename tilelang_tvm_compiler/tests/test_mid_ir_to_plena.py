@@ -18,8 +18,7 @@ Coverage:
   * cluster_guard skip → still produces an HLIRModule
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_to_plena
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_to_plena
 """
 
 from __future__ import annotations

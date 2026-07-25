@@ -2,9 +2,7 @@
 
 Run:
     LD_LIBRARY_PATH="" \\
-    PYTHONPATH=/home/.../PLENA_Simulator/compiler \\
-    /home/.../PLENA_Simulator/.venv-tvm/bin/python -m \\
-        tilelang_tvm_compiler.tests.test_expr_materializer
+    python -m tilelang_tvm_compiler.tests.test_expr_materializer
 
 These tests do NOT touch the BTMM pipeline -- they exercise expr lowering
 in isolation so we can iterate on it before wiring it into Pass 3.

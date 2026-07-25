@@ -13,8 +13,7 @@ Coverage:
   * Extent not divisible → SplitError
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_split
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_split
 """
 
 from __future__ import annotations

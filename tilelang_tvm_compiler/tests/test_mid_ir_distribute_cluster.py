@@ -11,8 +11,7 @@ Coverage:
   * Cluster with no unroll For at all → no change
 
 Run:
-    /home/a13247568123124/project/PLENA_Simulator/.venv-tvm/bin/python \\
-        -m tilelang_tvm_compiler.tests.test_mid_ir_distribute_cluster
+    python -m tilelang_tvm_compiler.tests.test_mid_ir_distribute_cluster
 """
 
 from __future__ import annotations
