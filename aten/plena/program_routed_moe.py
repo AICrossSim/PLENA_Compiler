@@ -803,7 +803,6 @@ class ProgramRoutedMoeMixin:
         self._ensure_vram_sub_matrix_registered(dst)
         self._ensure_vram_sub_matrix_registered(bias_table)
         num_col_blocks = width // self.mlen
-        bias_rows = bias_table.physical_shape[0]
         expert_row_stride = self.blen * self.mlen
 
         gp_table, gp_expert, gp_stride, gp_expert_offset, gp_src_base, gp_src, gp_dst = self._reg.allocate_gp(7)
@@ -833,7 +832,6 @@ class ProgramRoutedMoeMixin:
         rows: int,
         hidden: int,
         zero_row: FPVar | None = None,
-        fp_scratch: FPVar | None = None,
         name: str = "gpt_oss_device_route_weight",
     ) -> VRAMMatrixVar:
         """Expand device V_TOPK scalar weight into a VRAM route matrix."""
@@ -841,6 +839,13 @@ class ProgramRoutedMoeMixin:
             raise ValueError(f"{name}: v0 expects one routed pair slot (rows<=BLEN), got rows={rows}")
         if hidden % self.mlen != 0:
             raise ValueError(f"{name}: hidden={hidden} must be divisible by MLEN={self.mlen}")
+        zero_row = zero_row or self.fp_var(f"{name}_zero_row", size=self.mlen)
+        weight_addr = weights_fp_base + pair_idx
+        if zero_row.address <= weight_addr < zero_row.address + zero_row.size:
+            raise ValueError(
+                f"{name}: zero-row scratch [{zero_row.address}, "
+                f"{zero_row.address + zero_row.size}) overlaps TopK weight {weight_addr}"
+            )
         route = self.alloc(name, rows=rows, cols=hidden, strict=False, physical_shape=(self.blen, hidden))
         self.gpt_oss_true_zero_vram_rows_v0(
             route,
@@ -849,22 +854,28 @@ class ProgramRoutedMoeMixin:
             zero_row=zero_row,
             name=f"{name}_zero",
         )
-        fp_scratch = fp_scratch or self.fp_var(f"{name}_fp_row", size=self.mlen)
-        gp_dst, gp_fp = self._reg.allocate_gp(2)
+        gp_registers: list[int] = []
+        fp_registers: list[int] = []
         try:
-            # The scalar route weight depends only on pair_idx, so broadcast it into
-            # fp_scratch once; S_MAP_V_FP only reads fp_scratch and never mutates it.
-            self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
+            gp_registers = self._reg.allocate_gp(2)
+            fp_registers = self.allocate_fp_reg(1)
+            gp_dst, gp_weight = gp_registers
+            fp_weight = fp_registers[0]
+            asm = IsaBuilder().comment(
+                f"GPT-OSS load route weight pair={pair_idx} from scalar FP SRAM"
+            )
+            asm.instr("S_ADDI_INT", gp(gp_weight), gp(0), weights_fp_base)
+            asm.instr("S_LD_FP", fp(fp_weight), gp(gp_weight), pair_idx)
             for col_block in range(hidden // self.mlen):
-                asm = IsaBuilder().comment(
+                asm.comment(
                     f"GPT-OSS materialize route weight pair={pair_idx}, col_block={col_block}"
                 )
                 asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), self._vram_matrix_row_addr(route, 0, col_block))
-                asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_scratch.address)
-                asm.instr("S_MAP_V_FP", gp(gp_dst), gp(gp_fp), 0)
-                self._emit(asm)
+                asm.instr("V_ADD_VF", gp(gp_dst), gp(gp_dst), fp(fp_weight), 0)
+            self._emit(asm)
         finally:
-            self._reg.free_gp([gp_dst, gp_fp])
+            self.free_fp_reg(fp_registers)
+            self._reg.free_gp(gp_registers)
         return route
 
     def gpt_oss_materialize_route_weights_for_active_rows_v0(
@@ -876,7 +887,6 @@ class ProgramRoutedMoeMixin:
         rows: int,
         hidden: int,
         zero_row: FPVar | None = None,
-        fp_scratch: FPVar | None = None,
         name: str = "gpt_oss_device_route_weights_grouped",
     ) -> VRAMMatrixVar:
         """Expand selected scalar route weights into specific active VRAM rows."""
@@ -894,6 +904,17 @@ class ProgramRoutedMoeMixin:
         if active_list and (min(active_list) < 0 or max(active_list) >= physical_rows):
             raise ValueError(f"{name}: active rows {active_list} exceed physical rows={physical_rows}")
 
+        zero_row = zero_row or self.fp_var(f"{name}_zero_row", size=self.mlen)
+        weight_addrs = [weights_fp_base + pair_idx for pair_idx in pair_list]
+        if any(
+            zero_row.address <= weight_addr < zero_row.address + zero_row.size
+            for weight_addr in weight_addrs
+        ):
+            raise ValueError(
+                f"{name}: zero-row scratch [{zero_row.address}, "
+                f"{zero_row.address + zero_row.size}) overlaps TopK weights {weight_addrs}"
+            )
+
         route = self.alloc(name, rows=rows, cols=hidden, strict=False, physical_shape=(physical_rows, hidden))
         self.gpt_oss_true_zero_vram_rows_v0(
             route,
@@ -902,25 +923,38 @@ class ProgramRoutedMoeMixin:
             zero_row=zero_row,
             name=f"{name}_zero",
         )
-        fp_scratch = fp_scratch or self.fp_var(f"{name}_fp_row", size=self.mlen)
-        gp_dst, gp_fp = self._reg.allocate_gp(2)
+        gp_registers: list[int] = []
+        fp_registers: list[int] = []
         try:
+            gp_registers = self._reg.allocate_gp(2)
+            fp_registers = self.allocate_fp_reg(1)
+            gp_dst, gp_weight = gp_registers
+            fp_weight = fp_registers[0]
             for pair_idx, active_row in zip(pair_list, active_list, strict=True):
-                # Fill depends only on pair_idx (not col_block); broadcast once per pair.
-                self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
+                asm = IsaBuilder().comment(
+                    f"GPT-OSS load route weight pair={pair_idx} from scalar FP SRAM"
+                )
+                asm.instr("S_ADDI_INT", gp(gp_weight), gp(0), weights_fp_base)
+                asm.instr("S_LD_FP", fp(fp_weight), gp(gp_weight), pair_idx)
                 for col_block in range(hidden // self.mlen):
-                    asm = IsaBuilder().comment(
+                    asm.comment(
                         f"GPT-OSS materialize route weight pair={pair_idx}, active_row={active_row}, col_block={col_block}"
                     )
                     asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), self._vram_matrix_row_addr(route, active_row, col_block))
-                    asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_scratch.address)
-                    asm.instr("S_MAP_V_FP", gp(gp_dst), gp(gp_fp), 0)
-                    self._emit(asm)
+                    asm.instr(
+                        "V_ADD_VF",
+                        gp(gp_dst),
+                        gp(gp_dst),
+                        fp(fp_weight),
+                        0,
+                    )
+                self._emit(asm)
         finally:
-            self._reg.free_gp([gp_dst, gp_fp])
+            self.free_fp_reg(fp_registers)
+            self._reg.free_gp(gp_registers)
         return route
 
-    def gpt_oss_dynamic_expert_pair_v0(
+    def gpt_oss_dynamic_expert_ffn_v0(
         self,
         x: VRAMMatrixVar,
         weights: ExpertWeights,
@@ -928,18 +962,19 @@ class ProgramRoutedMoeMixin:
         weight_table_bases: tuple[int, int, int],
         weight_table_strides: tuple[int, int, int],
         expert_indices_int_base: int,
-        weights_fp_base: int,
         pair_idx: int,
         bias_tables: ExpertBiases | None,
         rows: int,
         intermediate: int,
         constants: GptOssFPConstants,
-        zero_row: FPVar | None = None,
-        route_fp_scratch: FPVar | None = None,
         activation_policy: str = "gpt_oss_clamp_gated",
-        name: str = "gpt_oss_dynamic_expert_pair",
+        name: str = "gpt_oss_dynamic_expert_ffn",
     ) -> VRAMMatrixVar:
-        """Run one routed pair using true expert id from device V_TOPK output."""
+        """Run gate/up/activation/down for one device-selected expert.
+
+        This helper stops before routing-weight multiplication so the expert
+        FFN and weighted-combine stages can be validated independently.
+        """
         w_gate, w_up, w_down = weights
         gate_bias_table, up_bias_table, down_bias_table = bias_tables or (None, None, None)
         gate_base, up_base, down_base = weight_table_bases
@@ -1015,17 +1050,144 @@ class ProgramRoutedMoeMixin:
                 width=w_down.physical_shape[1],
                 name=f"{name}_down_bias",
             )
-        route = self.gpt_oss_materialize_topk_route_weight_v0(
+        return out
+
+    def gpt_oss_dynamic_expert_pair_v0(
+        self,
+        x: VRAMMatrixVar,
+        weights: ExpertWeights,
+        *,
+        weight_table_bases: tuple[int, int, int],
+        weight_table_strides: tuple[int, int, int],
+        expert_indices_int_base: int,
+        weights_fp_base: int,
+        pair_idx: int,
+        bias_tables: ExpertBiases | None,
+        rows: int,
+        intermediate: int,
+        constants: GptOssFPConstants,
+        activation_policy: str = "gpt_oss_clamp_gated",
+        name: str = "gpt_oss_dynamic_expert_pair",
+    ) -> VRAMMatrixVar:
+        """Run one routed pair and multiply by its device V_TOPK weight."""
+        out = self.gpt_oss_dynamic_expert_ffn_v0(
+            x,
+            weights,
+            weight_table_bases=weight_table_bases,
+            weight_table_strides=weight_table_strides,
+            expert_indices_int_base=expert_indices_int_base,
+            pair_idx=pair_idx,
+            bias_tables=bias_tables,
+            rows=rows,
+            intermediate=intermediate,
+            constants=constants,
+            activation_policy=activation_policy,
+            name=name,
+        )
+        self.gpt_oss_apply_topk_route_weight_v0(
+            out,
             weights_fp_base=weights_fp_base,
             pair_idx=pair_idx,
             rows=rows,
-            hidden=w_down.physical_shape[1],
-            zero_row=zero_row,
-            fp_scratch=route_fp_scratch,
             name=f"{name}_route",
         )
-        self.vram_mul(out, route, num_rows=rows)
         return out
+
+    def gpt_oss_apply_topk_route_weight_v0(
+        self,
+        output: VRAMMatrixVar,
+        *,
+        weights_fp_base: int,
+        pair_idx: int,
+        rows: int,
+        name: str = "gpt_oss_apply_route_weight",
+    ) -> None:
+        """Multiply active expert rows directly by one scalar TopK weight."""
+        if rows <= 0 or rows > output.shape[0]:
+            raise ValueError(
+                f"{name}: rows={rows} must be within output rows={output.shape[0]}"
+            )
+        if output.shape[1] % self.mlen != 0:
+            raise ValueError(
+                f"{name}: width={output.shape[1]} must be divisible by MLEN={self.mlen}"
+            )
+
+        gp_registers: list[int] = []
+        fp_registers: list[int] = []
+        try:
+            gp_registers = self._reg.allocate_gp(2)
+            fp_registers = self.allocate_fp_reg(1)
+            gp_dst, gp_weight = gp_registers
+            fp_weight = fp_registers[0]
+            asm = IsaBuilder().comment(
+                f"GPT-OSS apply route weight pair={pair_idx} from scalar FP SRAM"
+            )
+            asm.instr("S_ADDI_INT", gp(gp_weight), gp(0), weights_fp_base)
+            asm.instr("S_LD_FP", fp(fp_weight), gp(gp_weight), pair_idx)
+            for col_block in range(output.shape[1] // self.mlen):
+                for row_idx in range(rows):
+                    dst_addr = self._vram_matrix_row_addr(
+                        output, row_idx, col_block
+                    )
+                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
+                    asm.instr(
+                        "V_MUL_VF",
+                        gp(gp_dst),
+                        gp(gp_dst),
+                        fp(fp_weight),
+                        0,
+                    )
+            self._emit(asm)
+        finally:
+            self.free_fp_reg(fp_registers)
+            self._reg.free_gp(gp_registers)
+
+    def gpt_oss_dynamic_moe_v0(
+        self,
+        x: VRAMMatrixVar,
+        weights: ExpertWeights,
+        *,
+        weight_table_bases: tuple[int, int, int],
+        weight_table_strides: tuple[int, int, int],
+        expert_indices_int_base: int,
+        weights_fp_base: int,
+        pair_count: int,
+        bias_tables: ExpertBiases | None,
+        rows: int,
+        intermediate: int,
+        constants: GptOssFPConstants,
+        activation_policy: str = "gpt_oss_clamp_gated",
+        name: str = "gpt_oss_dynamic_moe",
+    ) -> VRAMMatrixVar:
+        """Run, weight, and sum all device-selected experts in TopK order."""
+        if pair_count <= 0:
+            raise ValueError(f"{name}: pair_count must be positive, got {pair_count}")
+
+        combined: VRAMMatrixVar | None = None
+        for pair_idx in range(pair_count):
+            expert_out = self.gpt_oss_dynamic_expert_pair_v0(
+                x,
+                weights,
+                weight_table_bases=weight_table_bases,
+                weight_table_strides=weight_table_strides,
+                expert_indices_int_base=expert_indices_int_base,
+                weights_fp_base=weights_fp_base,
+                pair_idx=pair_idx,
+                bias_tables=bias_tables,
+                rows=rows,
+                intermediate=intermediate,
+                constants=constants,
+                activation_policy=activation_policy,
+                name=f"{name}_expert{pair_idx}",
+            )
+            if combined is None:
+                combined = expert_out
+            else:
+                self.vram_add(combined, expert_out, num_rows=rows)
+                self.free_tensor(expert_out)
+
+        assert combined is not None
+        return combined
 
     def gpt_oss_gather_token_rows_from_hbm_v0(
         self,

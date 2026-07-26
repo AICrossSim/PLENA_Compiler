@@ -477,6 +477,160 @@ def test_gpt_oss_dynamic_linear_projection_rejects_overlapping_expert_stride():
     print("  PASS test_gpt_oss_dynamic_linear_projection_rejects_overlapping_expert_stride")
 
 
+def _build_dynamic_expert_ffn(*, weighted: bool):
+    """Compile a one-tile device-selected expert FFN."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=8, blen=4, mram_tile_capacity=4)
+    zero = prog.fp_var("zero", size=1)
+    unused_pos = prog.fp_var("unused_pos", size=1)
+    unused_neg = prog.fp_var("unused_neg", size=1)
+    one = prog.fp_var("one", size=1)
+    neg_one = prog.fp_var("neg_one", size=1)
+    constants = (zero, unused_pos, unused_neg, one, neg_one)
+
+    x_input = prog.input("X", shape=(1, 8), physical_shape=(4, 8))
+    x = prog.load_batch(x_input, name="X")
+    table_bases = (0x5000, 0x8000, 0xB000)
+    weights = tuple(
+        prog.input(name, shape=(8, 8), physical_shape=(8, 8), hbm_addr=table_base)
+        for name, table_base in zip(("W_gate", "W_up", "W_down"), table_bases, strict=True)
+    )
+    stride = prog.hbm_tensor_size(8 * 8)
+    kwargs = {
+        "weight_table_bases": table_bases,
+        "weight_table_strides": (stride, stride, stride),
+        "expert_indices_int_base": 16,
+        "pair_idx": 3,
+        "bias_tables": None,
+        "rows": 1,
+        "intermediate": 8,
+        "constants": constants,
+        "activation_policy": "standard_swiglu",
+        "name": "dynamic_ffn",
+    }
+    if weighted:
+        output = prog.gpt_oss_dynamic_expert_pair_v0(x, weights, weights_fp_base=32, **kwargs)
+    else:
+        output = prog.gpt_oss_dynamic_expert_ffn_v0(x, weights, **kwargs)
+    return prog.get_code(), output
+
+
+def test_gpt_oss_dynamic_expert_ffn_compiles_three_selected_projections():
+    """The isolated expert FFN must consume one TopK ID for gate/up/down."""
+    code, output = _build_dynamic_expert_ffn(weighted=False)
+
+    assert output.shape == (1, 8)
+    assert code.count("expert_id_to_weight_base pair=3") == 3
+    assert code.count("S_LD_INT") == 3
+    assert code.count("S_MUL_INT") == 3
+    assert code.count("H_PREFETCH_M") == 3
+    assert code.count("M_MM 0,") == 3
+    assert code.count("M_MM_WO") == 3
+    assert "V_EXP_V" in code
+    assert "V_RECI_V" in code
+    assert "dynamic_ffn_route" not in code
+    print("  PASS test_gpt_oss_dynamic_expert_ffn_compiles_three_selected_projections")
+
+
+def test_gpt_oss_dynamic_expert_pair_preserves_route_weight_stage():
+    """The weighted pair wrapper must retain FFN work plus route materialization."""
+    code, output = _build_dynamic_expert_ffn(weighted=True)
+
+    assert output.shape == (1, 8)
+    assert code.count("expert_id_to_weight_base pair=3") == 3
+    assert "GPT-OSS apply route weight pair=3" in code
+    assert "S_LD_FP" in code
+    assert "V_MUL_VF" in code
+    assert code.count("V_MUL_VV") >= 2
+    print("  PASS test_gpt_oss_dynamic_expert_pair_preserves_route_weight_stage")
+
+
+def test_gpt_oss_dynamic_moe_weights_and_combines_every_topk_pair():
+    """The dynamic MoE helper must consume, weight, and sum every TopK pair."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=8, blen=4, mram_tile_capacity=4)
+    constants = tuple(
+        prog.fp_var(name, size=1)
+        for name in ("zero", "unused_pos", "unused_neg", "one", "neg_one")
+    )
+    x_input = prog.input("X", shape=(1, 8), physical_shape=(4, 8))
+    x = prog.load_batch(x_input, name="X")
+    table_bases = (0x5000, 0x8000, 0xB000)
+    weights = tuple(
+        prog.input(name, shape=(8, 8), physical_shape=(8, 8), hbm_addr=table_base)
+        for name, table_base in zip(
+            ("W_gate", "W_up", "W_down"), table_bases, strict=True
+        )
+    )
+    stride = prog.hbm_tensor_size(8 * 8)
+    freed_tensors: list[str] = []
+    original_free_tensor = prog.free_tensor
+
+    def track_free_tensor(tensor):
+        freed_tensors.append(tensor.name)
+        original_free_tensor(tensor)
+
+    prog.free_tensor = track_free_tensor
+
+    output = prog.gpt_oss_dynamic_moe_v0(
+        x,
+        weights,
+        weight_table_bases=table_bases,
+        weight_table_strides=(stride, stride, stride),
+        expert_indices_int_base=16,
+        weights_fp_base=32,
+        pair_count=4,
+        bias_tables=None,
+        rows=1,
+        intermediate=8,
+        constants=constants,
+        activation_policy="standard_swiglu",
+        name="dynamic_moe",
+    )
+    code = prog.get_code()
+
+    assert output.shape == (1, 8)
+    assert code.count("expert_id_to_weight_base pair=") == 12
+    assert code.count("GPT-OSS apply route weight pair=") == 4
+    assert code.count("S_LD_INT") == 12
+    assert code.count("S_MUL_INT") == 12
+    assert code.count("H_PREFETCH_M") == 12
+    assert code.count("V_ADD_VV") >= 3
+    assert freed_tensors == [
+        "dynamic_moe_expert1_out",
+        "dynamic_moe_expert2_out",
+        "dynamic_moe_expert3_out",
+    ]
+    for pair_idx in range(4):
+        assert f"expert_id_to_weight_base pair={pair_idx}" in code
+        assert f"GPT-OSS apply route weight pair={pair_idx}" in code
+    print("  PASS test_gpt_oss_dynamic_moe_weights_and_combines_every_topk_pair")
+
+
+def test_route_weight_materialization_rejects_scalar_sram_overlap():
+    """Compiler scratch must never overwrite device-produced TopK weights."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=8, blen=4)
+    zero_row = prog.fp_var("overlapping_zero_row", size=8)
+
+    try:
+        prog.gpt_oss_materialize_topk_route_weight_v0(
+            weights_fp_base=4,
+            pair_idx=0,
+            rows=1,
+            hidden=8,
+            zero_row=zero_row,
+        )
+    except ValueError as exc:
+        assert "overlaps TopK weight" in str(exc)
+    else:
+        raise AssertionError("overlapping route scratch was accepted")
+    print("  PASS test_route_weight_materialization_rejects_scalar_sram_overlap")
+
+
 def test_vram_layout_tracks_logical_and_physical_shape():
     """Layouts should keep native logical rows while allocating physical BLEN row storage."""
     from compiler.aten.plena import PlenaCompiler
@@ -1067,6 +1221,10 @@ if __name__ == "__main__":
         test_gpt_oss_dynamic_linear_projection_single_k_group_compiles,
         test_gpt_oss_dynamic_linear_projection_k_split_compiles,
         test_gpt_oss_dynamic_linear_projection_rejects_overlapping_expert_stride,
+        test_gpt_oss_dynamic_expert_ffn_compiles_three_selected_projections,
+        test_gpt_oss_dynamic_expert_pair_preserves_route_weight_stage,
+        test_gpt_oss_dynamic_moe_weights_and_combines_every_topk_pair,
+        test_route_weight_materialization_rejects_scalar_sram_overlap,
         test_vram_layout_tracks_logical_and_physical_shape,
         test_partial_row_linear_uses_one_blen_row_group,
         test_ffn_workspace_uses_allocator_and_avoids_rope_tables,
