@@ -176,7 +176,13 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_PS_V                 = 6'h31,
     V_SHFT_V               = 6'h32,
     C_HADAMARD_TRANSFORM   = 6'h33,
-    C_BREAK                = 6'h34
+    C_BREAK                = 6'h34,
+
+    // Vector max/min vs scalar + MoE routing. Kept in sync with the RTL
+    // (src/definitions/operation.svh) and the standalone PLENA_Compiler.
+    V_MAX_VF               = 6'h35,
+    V_MIN_VF               = 6'h36,
+    V_TOPK                 = 6'h37
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {
