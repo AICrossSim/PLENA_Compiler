@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 import math
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ from compiler.aten.model_extract import (
 )
 from compiler.aten.moe import (
     FixedBalancedRoutingSummary,
+    MoeExpertRoutePlan,
     MoeRoutingPlan,
     StaticRoute,
     derive_static_routing_plan,
@@ -44,18 +46,9 @@ class _ProceduralExperts:
         generator = torch.Generator().manual_seed(1000 + expert_id)
         scale = 0.03
         return MoeExpertWeights(
-            w_gate=torch.randn(
-                self.hidden_size, self.intermediate_size, generator=generator
-            )
-            * scale,
-            w_up=torch.randn(
-                self.hidden_size, self.intermediate_size, generator=generator
-            )
-            * scale,
-            w_down=torch.randn(
-                self.intermediate_size, self.hidden_size, generator=generator
-            )
-            * scale,
+            w_gate=torch.randn(self.hidden_size, self.intermediate_size, generator=generator) * scale,
+            w_up=torch.randn(self.hidden_size, self.intermediate_size, generator=generator) * scale,
+            w_down=torch.randn(self.intermediate_size, self.hidden_size, generator=generator) * scale,
         )
 
 
@@ -73,14 +66,10 @@ def make_tiny_qwen3_moe():
     head_dim = 16
     intermediate = 64
     num_experts = 8
-    provider = _ProceduralExperts(
-        num_experts=num_experts, hidden=hidden, intermediate=intermediate
-    )
+    provider = _ProceduralExperts(num_experts=num_experts, hidden=hidden, intermediate=intermediate)
     # Non-unity weights make the tests exercise the learned decoder and Q/K
     # RMSNorm multiply paths instead of passing through an identity wrapper.
-    norm = lambda width: SimpleNamespace(
-        weight=torch.linspace(0.75, 1.25, width), eps=1e-6
-    )
+    norm = lambda width: SimpleNamespace(weight=torch.linspace(0.75, 1.25, width), eps=1e-6)
     attention = SimpleNamespace(
         q_proj=_linear(hidden, heads * head_dim, 1),
         k_proj=_linear(hidden, kv_heads * head_dim, 2),
@@ -125,15 +114,17 @@ def make_tiny_qwen3_moe():
 
 def _dynamic_opcode_histogram(asm: str) -> Counter[str]:
     dynamic: Counter[str] = Counter()
-    loop_stack: list[int] = []
+    loop_stack: list[tuple[int, bool]] = []
     for raw_line in asm.splitlines():
         line = raw_line.strip()
         if not line or line.startswith(";"):
             continue
         opcode = line.split(maxsplit=1)[0]
-        dynamic[opcode] += math.prod(loop_stack)
-        if opcode == "C_LOOP_START":
-            loop_stack.append(int(line.rsplit(",", 1)[1]))
+        multiplier = math.prod(count for count, _agu in loop_stack)
+        if opcode != "C_LOOP_END" or not loop_stack[-1][1]:
+            dynamic[opcode] += multiplier
+        if opcode in {"C_LOOP_START", "C_LOOP_START_AGU"}:
+            loop_stack.append((int(line.rsplit(",", 1)[1]), opcode == "C_LOOP_START_AGU"))
         elif opcode == "C_LOOP_END":
             loop_stack.pop()
     assert not loop_stack
@@ -159,9 +150,7 @@ def test_qwen3_moe_config_and_lazy_extraction():
 
 
 def test_static_route_plan_is_stable_and_hash_checked():
-    probabilities = torch.tensor(
-        [[0.05, 0.30, 0.10, 0.25, 0.05, 0.05, 0.15, 0.05]]
-    )
+    probabilities = torch.tensor([[0.05, 0.30, 0.10, 0.25, 0.05, 0.05, 0.15, 0.05]])
     plan = derive_static_routing_plan(
         probabilities,
         active_physical_rows=[0],
@@ -175,25 +164,44 @@ def test_static_route_plan_is_stable_and_hash_checked():
     assert restored.routing_plan_hash == plan.routing_plan_hash
 
 
-def test_fixed_balanced_routing_summary_is_compact_and_deterministic():
-    summary = FixedBalancedRoutingSummary.build(
-        num_tokens=7_712, num_experts=128, experts_per_token=8
+def test_expert_route_plan_groups_ranked_affine_runs_once():
+    plan = MoeRoutingPlan(
+        num_experts=4,
+        experts_per_token=2,
+        routes=tuple(
+            StaticRoute(
+                token_index=token,
+                physical_row=token * 2,
+                rank=rank,
+                expert_id=(token + rank) % 4,
+            )
+            for token in range(6)
+            for rank in range(2)
+        ),
     )
+    grouped = MoeExpertRoutePlan.build(plan)
+    assert grouped.route_count == plan.route_count
+    assert sum(len(routes) for _, routes in grouped.routes_by_expert) == plan.route_count
+    assert grouped.affine_route_count + grouped.irregular_route_count == plan.route_count
+    assert grouped.run_count <= plan.route_count
+
+
+def test_fixed_balanced_routing_summary_is_compact_and_deterministic():
+    summary = FixedBalancedRoutingSummary.build(num_tokens=7_712, num_experts=128, experts_per_token=8)
     assert summary.route_count == 61_696
     assert summary.active_expert_ids == tuple(range(128))
     assert set(summary.routes_per_expert.values()) == {482}
     assert set(summary.padded_bucket_rows(64).values()) == {512}
     assert not hasattr(summary, "routes")
-    assert summary.routing_summary_hash == FixedBalancedRoutingSummary.build(
-        num_tokens=7_712, num_experts=128, experts_per_token=8
-    ).routing_summary_hash
-    uneven = FixedBalancedRoutingSummary.build(
-        num_tokens=5, num_experts=7, experts_per_token=2
+    assert (
+        summary.routing_summary_hash
+        == FixedBalancedRoutingSummary.build(
+            num_tokens=7_712, num_experts=128, experts_per_token=8
+        ).routing_summary_hash
     )
+    uneven = FixedBalancedRoutingSummary.build(num_tokens=5, num_experts=7, experts_per_token=2)
     assert sum(uneven.routes_per_expert.values()) == 10
-    assert max(uneven.routes_per_expert.values()) - min(
-        uneven.routes_per_expert.values()
-    ) == 1
+    assert max(uneven.routes_per_expert.values()) - min(uneven.routes_per_expert.values()) == 1
 
 
 def test_fixed_balanced_cost_trace_matches_explicit_round_robin_plan():
@@ -215,8 +223,7 @@ def test_fixed_balanced_cost_trace_matches_explicit_round_robin_plan():
             token_index=token,
             physical_row=token,
             rank=rank,
-            expert_id=(token * config.experts_per_token + rank)
-            % config.num_experts,
+            expert_id=(token * config.experts_per_token + rank) % config.num_experts,
         )
         for token in range(8)
         for rank in range(config.experts_per_token)
@@ -241,10 +248,7 @@ def test_fixed_balanced_cost_trace_matches_explicit_round_robin_plan():
         use_cache=False,
     )
     assert aggregate.dynamic_opcodes == explicit.dynamic_opcodes
-    assert {
-        stage: cost.dynamic_opcodes
-        for stage, cost in aggregate.stages.items()
-    } == {
+    assert {stage: cost.dynamic_opcodes for stage, cost in aggregate.stages.items()} == {
         stage: cost.dynamic_opcodes for stage, cost in explicit.stages.items()
     }
     assert [event.to_dict() for event in aggregate.memory_events] == [
@@ -270,14 +274,62 @@ def test_fixed_balanced_cost_trace_matches_explicit_round_robin_plan():
         )
 
 
+@pytest.mark.parametrize(
+    ("top_k", "normalize", "expected_schedule"),
+    (
+        (1, False, "compact-route-v2"),
+        (2, True, "compact-route-v2"),
+        (8, True, "compact-route-v2"),
+        (9, True, "legacy-static-v1"),
+    ),
+)
+def test_compact_route_register_boundary_and_fallback(
+    top_k: int,
+    normalize: bool,
+    expected_schedule: str,
+):
+    config = replace(
+        extract_model_config(make_tiny_qwen3_moe()),
+        num_experts=max(16, top_k),
+        experts_per_token=top_k,
+        norm_topk_prob=normalize,
+    )
+    trace = compile_native_decoder_cost_trace(
+        config,
+        CompilerCostHardware(
+            mlen=64,
+            blen=4,
+            vlen=64,
+            hlen=16,
+            broadcast_amount=4,
+            mram_tile_capacity=4,
+            hbm_m_prefetch_amount=64,
+            hbm_v_prefetch_amount=4,
+            hbm_v_writeback_amount=4,
+            hbm_channels=128,
+        ),
+        seq_len=2,
+        batch_size=1,
+        num_layers=1,
+        moe_routing_mode="fixed-balanced",
+        moe_lowering_schedule="compact-route-v2",
+        use_cache=False,
+    )
+    assert trace.metadata["moe_lowering_schedule"] == expected_schedule
+    if top_k <= 8:
+        assert trace.metadata["route_identity_elided"] is True
+        assert trace.metadata["materialized_route_count"] == 0
+    else:
+        assert trace.metadata["route_identity_elided"] is False
+        assert trace.metadata["moe_fallback_reasons"] == {"top_k_exceeds_compact_register_capacity": 1}
+
+
 def test_fused_expert_provider_splits_gate_up_without_materializing_all_experts():
     hidden, intermediate, experts = 3, 2, 2
-    gate_up = torch.arange(
-        experts * 2 * intermediate * hidden, dtype=torch.float32
-    ).reshape(experts, 2 * intermediate, hidden)
-    down = torch.arange(
-        experts * hidden * intermediate, dtype=torch.float32
-    ).reshape(experts, hidden, intermediate)
+    gate_up = torch.arange(experts * 2 * intermediate * hidden, dtype=torch.float32).reshape(
+        experts, 2 * intermediate, hidden
+    )
+    down = torch.arange(experts * hidden * intermediate, dtype=torch.float32).reshape(experts, hidden, intermediate)
     provider = TensorMoeExpertProvider(
         gate_up_proj=gate_up,
         down_proj=down,
@@ -385,8 +437,13 @@ def test_tiny_qwen3_moe_compile_emits_existing_isa_only():
     assert len(model._test_expert_provider.materialized) == info["active_expert_count"]
     assert torch.isfinite(result["golden_output"]).all()
     isa = result["isa"]
-    assert "S_MAP_V_FP" in isa
-    assert "Normalize 2 selected MoE route weights" in isa
+    assert "S_MAP_V_FP" not in isa
+    assert "S_LD_VLANE_FP" in isa
+    assert "S_ST_VLANE_FP" in isa
+    assert info["moe_lowering_schedule"] == "compact-route-v2"
+    assert info["route_identity_elided"] is True
+    assert "MOE_ROUTE_IDENTITY" not in result["input_tensors"]
+    assert "MOE_ROUTER_MASK" not in result["input_tensors"]
     assert "V_ADD_VV" in isa
     assert "W_input_norm_0" in result["input_tensors"]
     assert "W_post_attn_norm_0" in result["input_tensors"]
@@ -415,13 +472,23 @@ def test_tiny_qwen3_moe_compile_emits_existing_isa_only():
         moe_routing_plan=result["moe_routing_plan"],
         use_cache=False,
     )
-    assert trace.dynamic_opcodes == _dynamic_opcode_histogram(isa)
+    asm_opcodes = _dynamic_opcode_histogram(isa)
+    address_control_ops = {
+        "C_AGU_BIND",
+        "C_AGU_LOOP_LEN",
+        "C_LOOP_END",
+        "C_LOOP_START",
+        "C_LOOP_START_AGU",
+        "S_ADDI_INT",
+    }
+    assert Counter(
+        {opcode: count for opcode, count in trace.dynamic_opcodes.items() if opcode not in address_control_ops}
+    ) == Counter({opcode: count for opcode, count in asm_opcodes.items() if opcode not in address_control_ops})
     dma_counts = Counter()
     for event in trace.memory_events:
         dma_counts[event.transfer.opcode] += event.multiplicity
     assert dma_counts == {
-        opcode: trace.dynamic_opcodes[opcode]
-        for opcode in ("H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V")
+        opcode: trace.dynamic_opcodes[opcode] for opcode in ("H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V")
     }
     assert trace.metadata["routing_plan_hash"] == info["routing_plan_hash"]
     assert trace.metadata["active_expert_ids"] == info["active_expert_ids"]
@@ -432,6 +499,27 @@ def test_tiny_qwen3_moe_compile_emits_existing_isa_only():
         "layer/moe/experts",
         "layer/moe/combine",
     } <= trace.stages.keys()
+
+    legacy = compile_native_hf_decoder(
+        make_tiny_qwen3_moe(),
+        seq_len=1,
+        batch_size=1,
+        num_layers=1,
+        mlen=64,
+        blen=4,
+        hlen=16,
+        broadcast_amount=4,
+        mram_tile_capacity=4,
+        seed=7,
+        reference_backend="scheduled",
+        moe_routing_mode="static-indices",
+        moe_lowering_schedule="legacy-static-v1",
+        hbm_v_prefetch_amount=4,
+        hbm_v_writeback_amount=4,
+    )
+    assert "S_MAP_V_FP" in legacy["isa"]
+    assert "MOE_ROUTE_IDENTITY" in legacy["input_tensors"]
+    assert "MOE_ROUTER_MASK" in legacy["input_tensors"]
 
 
 def test_moe_cost_frontend_requires_explicit_plan_and_opt_in_layer_repeat():
@@ -449,13 +537,9 @@ def test_moe_cost_frontend_requires_explicit_plan_and_opt_in_layer_repeat():
         hbm_v_writeback_amount=4,
     )
     with pytest.raises(ValueError, match="explicit moe_routing_plan"):
-        compile_native_decoder_cost_trace(
-            config, hardware, seq_len=1, num_layers=1, use_cache=False
-        )
+        compile_native_decoder_cost_trace(config, hardware, seq_len=1, num_layers=1, use_cache=False)
 
-    probabilities = torch.tensor(
-        [[0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.04, 0.03]]
-    )
+    probabilities = torch.tensor([[0.30, 0.25, 0.15, 0.10, 0.08, 0.05, 0.04, 0.03]])
     plan = derive_static_routing_plan(
         probabilities,
         active_physical_rows=[0],
@@ -515,9 +599,7 @@ def test_moe_cost_frontend_requires_explicit_plan_and_opt_in_layer_repeat():
         moe_routing_plan=plan,
         moe_layer_scaling="repeat-static-plan",
     )
-    assert repeated.metadata["layer_scaling_fidelity"] == (
-        "approximate_repeated_static_plan"
-    )
+    assert repeated.metadata["layer_scaling_fidelity"] == ("approximate_repeated_static_plan")
     for stage_name, stage in one_layer.stages.items():
         multiplier = 2 if stage_name.startswith("layer/") else 1
         assert repeated.stages[stage_name].dynamic_opcodes == Counter(
@@ -531,6 +613,7 @@ def test_vector_prefetch_codegen_uses_runtime_transfer_amount():
         blen=8,
         hbm_v_prefetch_amount=8,
         hbm_v_writeback_amount=8,
+        address_generation_mode="legacy",
     )
     source = prog.input("prefetch_source", shape=(128, 128))
     prog.load_batch(source, name="prefetched")
@@ -591,9 +674,7 @@ def test_partial_safetensors_loader_reads_only_selected_expert(tmp_path):
         )
     )
     (tmp_path / "model.safetensors.index.json").write_text(
-        __import__("json").dumps(
-            {"weight_map": {name: shard for name in names}}
-        )
+        __import__("json").dumps({"weight_map": {name: shard for name in names}})
     )
 
     model = load_qwen3_moe_partial_model(tmp_path, layer_idx=layer_idx)

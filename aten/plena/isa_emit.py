@@ -97,9 +97,7 @@ class IsaEmitMixin:
     ) -> DmaTransfer:
         """Resolve reference MXFP8 streams and preserve precision-neutral offsets."""
         if element_offset < 0 or element_offset % 8:
-            raise ValueError(
-                f"exact MX DMA offset must be nonnegative and block-8 aligned, got {element_offset}"
-            )
+            raise ValueError(f"exact MX DMA offset must be nonnegative and block-8 aligned, got {element_offset}")
         return DmaTransfer(
             opcode=opcode,
             direction="write" if opcode == "H_STORE_V" else "read",
@@ -190,10 +188,7 @@ class IsaEmitMixin:
             stage=stage,
             memory_stream_indices=stream_indices,
         )
-        if (
-            rendered_asm is not None
-            and getattr(self, "_emission_mode", "asm") == "both"
-        ):
+        if rendered_asm is not None and getattr(self, "_emission_mode", "asm") == "both":
             self._code_chunks.append(render_asm(rendered_asm))
 
     def record_dma_stream(self, transfer, *, multiplicity=1, axes=()) -> None:
@@ -220,16 +215,91 @@ class IsaEmitMixin:
             self._active_cost_stage = previous
 
     @contextmanager
-    def cost_repeat_region(
-        self, count: int, *, name: str, repeat_kind: str = "compile_time"
+    def cost_parallel_kernel(
+        self,
+        kernel: str,
+        *,
+        tp_semantics: str,
+        cp_semantics: str,
+        ep_semantics: str = "none",
+        logical_rows: int = 0,
+        logical_m: int = 0,
+        logical_n: int = 0,
+        logical_k: int = 0,
     ):
+        """Record an opcode census for one non-overlapping compiler kernel.
+
+        This is orthogonal to ``cost_stage``: stage boundaries still control
+        roofline composition, while these regions preserve the parallel
+        semantics needed to reconstruct rank-local work.
+        """
+
+        sink: CostSink | None = getattr(self, "_cost_sink", None)
+        if sink is None:
+            yield
+            return
+        with sink.parallel_kernel(
+            kernel=kernel,
+            tp_semantics=tp_semantics,
+            cp_semantics=cp_semantics,
+            ep_semantics=ep_semantics,
+            logical_rows=logical_rows,
+            logical_m=logical_m,
+            logical_n=logical_n,
+            logical_k=logical_k,
+            matrix_mlen=self.mlen,
+            matrix_blen=self.blen,
+        ):
+            yield
+
+    @contextmanager
+    def cost_repeat_region(self, count: int, *, name: str, repeat_kind: str = "compile_time"):
         """Compress repeated cost-only operations without rendering ASM."""
         cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
         if cost_sink is None or getattr(self, "_emission_mode", "asm") != "cost":
             raise RuntimeError("cost_repeat_region is available only in cost mode")
-        with cost_sink.repeated_region(
-            count, name=name, repeat_kind=repeat_kind
-        ):
+        with cost_sink.repeated_region(count, name=name, repeat_kind=repeat_kind):
+            yield
+
+    def replay_cost_summary_template(
+        self,
+        key: tuple[object, ...],
+        *,
+        count: int = 1,
+        element_base_delta: int = 0,
+        scale_base_delta: int = 0,
+        memory_object_replacements: tuple[tuple[str, str], ...] = (),
+    ) -> bool:
+        """Replay one previously captured algebraic cost-only kernel."""
+
+        cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
+        return (
+            False
+            if cost_sink is None
+            else cost_sink.replay_summary_template(
+                key,
+                count=count,
+                element_base_delta=element_base_delta,
+                scale_base_delta=scale_base_delta,
+                memory_object_replacements=memory_object_replacements,
+            )
+        )
+
+    def cost_affine_summary_enabled(self) -> bool:
+        """Return whether the current CostSink accepts algebraic templates."""
+
+        cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
+        return bool(cost_sink is not None and cost_sink._summary_enabled)
+
+    @contextmanager
+    def cost_summary_template(self, key: tuple[object, ...], *, allow_memory: bool = False):
+        """Capture one cost kernel for exact summary replay."""
+
+        cost_sink: CostSink | None = getattr(self, "_cost_sink", None)
+        if cost_sink is None:
+            yield
+            return
+        with cost_sink.summary_template(key, allow_memory=allow_memory):
             yield
 
     # ------------------------------------------------------------------

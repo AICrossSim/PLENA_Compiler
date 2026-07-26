@@ -12,9 +12,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+from collections import defaultdict
 from typing import Any, Sequence
 
 import torch
+
+
+MOE_LOWERING_SCHEDULE_COMPACT_ROUTE_V2 = "compact-route-v2"
+MOE_LOWERING_SCHEDULE_LEGACY_STATIC_V1 = "legacy-static-v1"
+MOE_LOWERING_SCHEDULES = frozenset(
+    {
+        MOE_LOWERING_SCHEDULE_COMPACT_ROUTE_V2,
+        MOE_LOWERING_SCHEDULE_LEGACY_STATIC_V1,
+    }
+)
 
 
 @dataclass(frozen=True, order=True)
@@ -61,9 +72,7 @@ class MoeRoutingPlan:
 
     @property
     def routing_plan_hash(self) -> str:
-        payload = json.dumps(
-            self.as_dict(include_hash=False), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
+        payload = json.dumps(self.as_dict(include_hash=False), sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
     def as_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
@@ -94,22 +103,14 @@ class MoeRoutingPlan:
             num_experts=int(value["num_experts"]),
             experts_per_token=int(value["experts_per_token"]),
             routes=routes,
-            topk_margin_min=(
-                None
-                if value.get("topk_margin_min") is None
-                else float(value["topk_margin_min"])
-            ),
+            topk_margin_min=(None if value.get("topk_margin_min") is None else float(value["topk_margin_min"])),
         )
         expected_hash = value.get("routing_plan_hash")
         if expected_hash is not None and expected_hash != plan.routing_plan_hash:
-            raise ValueError(
-                "routing_plan_hash does not match the canonical static routing plan"
-            )
+            raise ValueError("routing_plan_hash does not match the canonical static routing plan")
         return plan
 
-    def validate(
-        self, *, active_physical_rows: Sequence[int], max_routes: int
-    ) -> None:
+    def validate(self, *, active_physical_rows: Sequence[int], max_routes: int) -> None:
         if self.num_experts <= 0:
             raise ValueError("num_experts must be positive")
         if self.experts_per_token <= 0:
@@ -125,30 +126,21 @@ class MoeRoutingPlan:
                 f"= {expected_route_count}"
             )
         if self.route_count > max_routes:
-            raise ValueError(
-                f"Static route count {self.route_count} exceeds max_static_routes={max_routes}"
-            )
+            raise ValueError(f"Static route count {self.route_count} exceeds max_static_routes={max_routes}")
         seen: set[tuple[int, int]] = set()
         token_ranks: dict[int, set[int]] = {}
         for route in self.routes:
             if not 0 <= route.token_index < len(active_rows):
-                raise ValueError(
-                    f"token_index={route.token_index} outside [0, {len(active_rows)})"
-                )
+                raise ValueError(f"token_index={route.token_index} outside [0, {len(active_rows)})")
             expected_row = active_rows[route.token_index]
             if route.physical_row != expected_row:
                 raise ValueError(
-                    f"Route token {route.token_index} uses physical_row={route.physical_row}, "
-                    f"expected {expected_row}"
+                    f"Route token {route.token_index} uses physical_row={route.physical_row}, expected {expected_row}"
                 )
             if not 0 <= route.expert_id < self.num_experts:
-                raise ValueError(
-                    f"expert_id={route.expert_id} outside [0, {self.num_experts})"
-                )
+                raise ValueError(f"expert_id={route.expert_id} outside [0, {self.num_experts})")
             if not 0 <= route.rank < self.experts_per_token:
-                raise ValueError(
-                    f"route rank={route.rank} outside [0, {self.experts_per_token})"
-                )
+                raise ValueError(f"route rank={route.rank} outside [0, {self.experts_per_token})")
             key = (route.token_index, route.rank)
             if key in seen:
                 raise ValueError(f"Duplicate static route for token/rank {key}")
@@ -157,15 +149,115 @@ class MoeRoutingPlan:
         expected_ranks = set(range(self.experts_per_token))
         if set(token_ranks) != set(range(len(active_rows))):
             raise ValueError(
-                f"Routing plan covers token indices {sorted(token_ranks)}, expected "
-                f"{list(range(len(active_rows)))}"
+                f"Routing plan covers token indices {sorted(token_ranks)}, expected {list(range(len(active_rows)))}"
             )
         for token_index, ranks in token_ranks.items():
             if ranks != expected_ranks:
                 raise ValueError(
-                    f"token {token_index} has route ranks {sorted(ranks)}, "
-                    f"expected {sorted(expected_ranks)}"
+                    f"token {token_index} has route ranks {sorted(ranks)}, expected {sorted(expected_ranks)}"
                 )
+
+
+@dataclass(frozen=True)
+class MoeRouteRun:
+    """One maximal constant-rank arithmetic run inside an expert bucket."""
+
+    expert_id: int
+    rank: int
+    bucket_row_start: int
+    physical_row_start: int
+    count: int
+    physical_row_stride: int
+
+
+@dataclass(frozen=True)
+class MoeExpertRoutePlan:
+    """Compiler-oriented indexing of a static routing plan.
+
+    Token order is retained for route-weight normalization. Expert routes are
+    sorted by physical row because each expert FFN row is independent; this
+    exposes deterministic affine runs for dispatch/combine lowering.
+    """
+
+    routes_by_token: tuple[tuple[StaticRoute, ...], ...]
+    routes_by_expert: tuple[tuple[int, tuple[StaticRoute, ...]], ...]
+    runs_by_expert: tuple[tuple[int, tuple[MoeRouteRun, ...]], ...]
+
+    @classmethod
+    def build(cls, plan: MoeRoutingPlan) -> "MoeExpertRoutePlan":
+        token_map: dict[int, list[StaticRoute]] = defaultdict(list)
+        expert_map: dict[int, list[StaticRoute]] = defaultdict(list)
+        for route in plan.routes:
+            token_map[route.token_index].append(route)
+            expert_map[route.expert_id].append(route)
+
+        routes_by_token = tuple(
+            tuple(sorted(token_map[token], key=lambda route: route.rank)) for token in sorted(token_map)
+        )
+        routes_by_expert_list: list[tuple[int, tuple[StaticRoute, ...]]] = []
+        runs_by_expert_list: list[tuple[int, tuple[MoeRouteRun, ...]]] = []
+        for expert_id in sorted(expert_map):
+            routes = tuple(
+                sorted(
+                    expert_map[expert_id],
+                    key=lambda route: (route.rank, route.physical_row),
+                )
+            )
+            routes_by_expert_list.append((expert_id, routes))
+            runs: list[MoeRouteRun] = []
+            start = 0
+            while start < len(routes):
+                rank = routes[start].rank
+                end = start + 1
+                stride = 0
+                if end < len(routes) and routes[end].rank == rank:
+                    stride = routes[end].physical_row - routes[start].physical_row
+                    end += 1
+                    while (
+                        end < len(routes)
+                        and routes[end].rank == rank
+                        and routes[end].physical_row - routes[end - 1].physical_row == stride
+                    ):
+                        end += 1
+                runs.append(
+                    MoeRouteRun(
+                        expert_id=expert_id,
+                        rank=rank,
+                        bucket_row_start=start,
+                        physical_row_start=routes[start].physical_row,
+                        count=end - start,
+                        physical_row_stride=stride,
+                    )
+                )
+                start = end
+            runs_by_expert_list.append((expert_id, tuple(runs)))
+        return cls(
+            routes_by_token=routes_by_token,
+            routes_by_expert=tuple(routes_by_expert_list),
+            runs_by_expert=tuple(runs_by_expert_list),
+        )
+
+    @property
+    def route_count(self) -> int:
+        return sum(len(routes) for routes in self.routes_by_token)
+
+    @property
+    def run_count(self) -> int:
+        return sum(len(runs) for _, runs in self.runs_by_expert)
+
+    @property
+    def affine_route_count(self) -> int:
+        return sum(run.count for _, runs in self.runs_by_expert for run in runs if run.count > 1)
+
+    @property
+    def irregular_route_count(self) -> int:
+        return self.route_count - self.affine_route_count
+
+    def expert_routes(self, expert_id: int) -> tuple[StaticRoute, ...]:
+        for candidate, routes in self.routes_by_expert:
+            if candidate == expert_id:
+                return routes
+        return ()
 
 
 @dataclass(frozen=True)
@@ -184,23 +276,14 @@ class FixedBalancedRoutingSummary:
     algorithm_version: str = "round_robin_token_rank_v1"
 
     @classmethod
-    def build(
-        cls, *, num_tokens: int, num_experts: int, experts_per_token: int
-    ) -> "FixedBalancedRoutingSummary":
+    def build(cls, *, num_tokens: int, num_experts: int, experts_per_token: int) -> "FixedBalancedRoutingSummary":
         if num_tokens <= 0 or num_experts <= 0 or experts_per_token <= 0:
-            raise ValueError(
-                "fixed-balanced routing requires positive tokens, experts, and top-k"
-            )
+            raise ValueError("fixed-balanced routing requires positive tokens, experts, and top-k")
         if experts_per_token > num_experts:
-            raise ValueError(
-                f"experts_per_token={experts_per_token} exceeds num_experts={num_experts}"
-            )
+            raise ValueError(f"experts_per_token={experts_per_token} exceeds num_experts={num_experts}")
         route_count = num_tokens * experts_per_token
         base, remainder = divmod(route_count, num_experts)
-        counts = tuple(
-            base + (1 if expert_id < remainder else 0)
-            for expert_id in range(num_experts)
-        )
+        counts = tuple(base + (1 if expert_id < remainder else 0) for expert_id in range(num_experts))
         return cls(
             num_tokens=num_tokens,
             num_experts=num_experts,
@@ -214,19 +297,11 @@ class FixedBalancedRoutingSummary:
 
     @property
     def active_expert_ids(self) -> tuple[int, ...]:
-        return tuple(
-            expert_id
-            for expert_id, count in enumerate(self.routes_per_expert_tuple)
-            if count
-        )
+        return tuple(expert_id for expert_id, count in enumerate(self.routes_per_expert_tuple) if count)
 
     @property
     def routes_per_expert(self) -> dict[int, int]:
-        return {
-            expert_id: count
-            for expert_id, count in enumerate(self.routes_per_expert_tuple)
-            if count
-        }
+        return {expert_id: count for expert_id, count in enumerate(self.routes_per_expert_tuple) if count}
 
     @property
     def routing_summary_hash(self) -> str:
@@ -243,10 +318,7 @@ class FixedBalancedRoutingSummary:
     def padded_bucket_rows(self, blen: int) -> dict[int, int]:
         if blen <= 0:
             raise ValueError(f"BLEN must be positive, got {blen}")
-        return {
-            expert_id: ((count + blen - 1) // blen) * blen
-            for expert_id, count in self.routes_per_expert.items()
-        }
+        return {expert_id: ((count + blen - 1) // blen) * blen for expert_id, count in self.routes_per_expert.items()}
 
 
 def derive_static_routing_plan(
@@ -259,19 +331,13 @@ def derive_static_routing_plan(
 ) -> MoeRoutingPlan:
     """Select indices from hardware-scheduled router probabilities."""
     if router_probabilities.ndim != 2:
-        raise ValueError(
-            f"router_probabilities must be rank 2, got {router_probabilities.shape}"
-        )
+        raise ValueError(f"router_probabilities must be rank 2, got {router_probabilities.shape}")
     if len(active_physical_rows) * experts_per_token > max_routes:
         raise ValueError(
-            f"Static route count {len(active_physical_rows) * experts_per_token} "
-            f"exceeds max_static_routes={max_routes}"
+            f"Static route count {len(active_physical_rows) * experts_per_token} exceeds max_static_routes={max_routes}"
         )
     if num_experts > router_probabilities.shape[1]:
-        raise ValueError(
-            f"num_experts={num_experts} exceeds router width "
-            f"{router_probabilities.shape[1]}"
-        )
+        raise ValueError(f"num_experts={num_experts} exceeds router width {router_probabilities.shape[1]}")
     active = router_probabilities[active_physical_rows, :num_experts]
     values, indices = torch.topk(active, k=experts_per_token, dim=-1, sorted=True)
     routes = tuple(
@@ -286,9 +352,7 @@ def derive_static_routing_plan(
     )
     margin = None
     if num_experts > experts_per_token:
-        boundary = torch.topk(
-            active, k=experts_per_token + 1, dim=-1, sorted=True
-        ).values
+        boundary = torch.topk(active, k=experts_per_token + 1, dim=-1, sorted=True).values
         margin = float((boundary[:, experts_per_token - 1] - boundary[:, experts_per_token]).min())
     plan = MoeRoutingPlan(
         num_experts=num_experts,
@@ -310,6 +374,11 @@ def coerce_routing_plan(value: MoeRoutingPlan | dict[str, Any]) -> MoeRoutingPla
 
 __all__ = [
     "FixedBalancedRoutingSummary",
+    "MOE_LOWERING_SCHEDULE_COMPACT_ROUTE_V2",
+    "MOE_LOWERING_SCHEDULE_LEGACY_STATIC_V1",
+    "MOE_LOWERING_SCHEDULES",
+    "MoeExpertRoutePlan",
+    "MoeRouteRun",
     "MoeRoutingPlan",
     "StaticRoute",
     "coerce_routing_plan",

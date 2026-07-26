@@ -113,7 +113,7 @@ def test_dma_metadata_inherits_stage_and_repeat() -> None:
     assert event.enclosing_axes[0].name == "column"
     assert event.stream_index == 0
     serialized = sink.trace.to_dict()
-    assert serialized["schema_version"] == 4
+    assert serialized["schema_version"] == 7
     assert serialized["schedule_fidelity"] == "ordered_compressed"
     assert serialized["compressed_memory_events"][0]["geometry_fidelity"] == "exact"
     assert serialized["compressed_memory_events"][0]["stream_instruction_count"] == 8

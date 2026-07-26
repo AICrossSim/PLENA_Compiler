@@ -54,6 +54,8 @@ class IsaCompiler(
         mram_tile_capacity: int = 4,
         emission_mode: str = "asm",
         cost_strict_raw: bool = False,
+        cost_trace_granularity: str = "detailed",
+        cost_address_generation_mode: str = "legacy",
     ):
         if emission_mode not in {"asm", "cost", "both"}:
             raise ValueError(f"emission_mode must be 'asm', 'cost', or 'both', got {emission_mode!r}")
@@ -67,7 +69,15 @@ class IsaCompiler(
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
         self._emission_mode = emission_mode
-        self._cost_sink = CostSink(strict_raw=cost_strict_raw) if emission_mode in {"cost", "both"} else None
+        self._cost_sink = (
+            CostSink(
+                strict_raw=cost_strict_raw,
+                granularity=cost_trace_granularity,
+                address_generation_mode=cost_address_generation_mode,
+            )
+            if emission_mode in {"cost", "both"}
+            else None
+        )
         self._active_cost_stage: str | None = None
         self.generated_code = ""
         self.unroll_attention = unroll_loops
@@ -386,7 +396,8 @@ class IsaCompiler(
 
         optimized_rms = (
             mode == "rms"
-            and getattr(self, "vector_scalar_schedule", "legacy") == "compiler-v1"
+            and getattr(self, "vector_scalar_schedule", "legacy")
+            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4"}
         )
         gp_regs = self.register_allocator.allocate_gp(6 if optimized_rms else 4)
 
@@ -413,6 +424,8 @@ class IsaCompiler(
                     gp_stride=gp_regs[5],
                     epsilon_slot=eps_offset,
                     reciprocal_hidden_slot=reci_hid_offset,
+                    rtl_v2=getattr(self, "vector_scalar_schedule", "legacy")
+                    in {"rtl-v2", "rtl-v3", "rtl-v4"},
                 )
                 self.record_vector_scalar_stats(lowering.metadata)
                 if getattr(self, "_cost_sink", None) is None:
