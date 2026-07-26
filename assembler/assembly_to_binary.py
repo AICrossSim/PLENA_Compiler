@@ -24,8 +24,22 @@ _IMM_RS1_RD_OPS = frozenset(
         "V_EXP_V",
     }
 )
-_IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"})
+_IMM_RD_OPS = frozenset(
+    {
+        "S_LUI_INT",
+        "M_MV_WO",
+        "M_BMM_WO",
+        "M_BMV_WO",
+        "C_AGU_BIND",
+        "C_AGU_LOOP_LEN",
+        "C_LOOP_START_AGU",
+    }
+)
 _RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"})
+_RS1_RD_OPS = _RS1_RD_OPS | frozenset({"S_RSQRT_FP"})
+_SEGMENT_REDUCTION_OPS = frozenset({"V_RED_SUM_SEG", "V_RED_MAX_SEG"})
+_MULTI_SEGMENT_REDUCTION_OPS = frozenset({"V_RED_SUM_SEGS", "V_RED_MAX_SEGS"})
+_FULL_REDUCTION_OPS = frozenset({"V_RED_SUM", "V_RED_MAX"})
 _RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"})
 _FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})
 _RS2_RS1_RD_OPS = frozenset(
@@ -92,7 +106,19 @@ class AssemblyToBinary:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
 
-        if instruction.opcode in _IMM_RS1_RD_OPS:
+        if instruction.opcode in _FULL_REDUCTION_OPS:
+            # Full reductions use rs3 as rmask and funct1[0] as overwrite.
+            # Handle them before the legacy unary/immediate groups, otherwise
+            # those shorter encodings silently discard the overwrite bit.
+            binary_instruction = (
+                ((0 if funct1 is None else funct1) << (opw + 4 * ow))
+                + (rmask << (opw + 3 * ow))
+                + ((0 if rs2 is None else rs2) << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+        elif instruction.opcode in _IMM_RS1_RD_OPS:
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
@@ -105,7 +131,7 @@ class AssemblyToBinary:
         elif instruction.opcode == "C_LOOP_START":
             # C_LOOP_START rd, imm - uses 22-bit immediate like S_LUI_INT
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
-        elif instruction.opcode in _FUNCT_RSTRIDE_OPS:
+        elif instruction.opcode in _FUNCT_RSTRIDE_OPS or instruction.opcode == "V_ALU_VSEG":
             binary_instruction = (
                 (funct1 << (opw + 4 * ow))
                 + (rstride << (opw + 3 * ow))
@@ -114,9 +140,31 @@ class AssemblyToBinary:
                 + (rd << opw)
                 + opcode
             )
+        elif instruction.opcode in _SEGMENT_REDUCTION_OPS:
+            binary_instruction = (
+                ((0 if funct1 is None else funct1) << (opw + 4 * ow))
+                +
+                (rstride << (opw + 3 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+        elif instruction.opcode in _MULTI_SEGMENT_REDUCTION_OPS:
+            binary_instruction = (
+                (rstride << (opw + 3 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
         elif instruction.opcode in _RMASK_VECTOR_OPS:
             binary_instruction = (
-                (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+                ((0 if funct1 is None else funct1) << (opw + 4 * ow))
+                + (rmask << (opw + 3 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
             )
         elif instruction.opcode in _RS2_RS1_RD_OPS:
             binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode

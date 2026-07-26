@@ -37,6 +37,9 @@ def load_isa_definitions(file_path: str) -> dict:
     # same vector-shift instruction.
     if "V_SHIFT_V" not in enum_dict and "V_PS_V" in enum_dict:
         enum_dict["V_SHIFT_V"] = enum_dict["V_PS_V"]
+    if "C_AGU_CONFIG" in enum_dict:
+        enum_dict["C_AGU_BIND"] = enum_dict["C_AGU_CONFIG"]
+        enum_dict["C_AGU_LOOP_LEN"] = enum_dict["C_AGU_CONFIG"]
 
     return enum_dict
 
@@ -101,8 +104,34 @@ class Instruction:
 _REG_PREFIXES = ("gp", "f", "a")
 # Hoisted to module scope: these were previously re-created for every line of the
 # .asm (millions of times for large programs), which dominated sim_env re-parse time.
-vector_masked_unary_or_reduction_ops = frozenset({"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"})
+vector_masked_unary_or_reduction_ops = frozenset(
+    {
+        "V_EXP_V",
+        "V_RECI_V",
+        "V_RED_SUM",
+        "V_RED_MAX",
+        "V_RED_SUM_OVR",
+        "V_RED_MAX_OVR",
+    }
+)
 vector_masked_binary_ops = frozenset({"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF"})
+_VSEG_ALIASES = {
+    "V_ADD_VSEG": 0,
+    "V_SUB_VSEG": 1,
+    "V_MUL_VSEG": 2,
+}
+_COMPACT_STAT_ALIASES = {
+    "V_STAT_MUL_F": 0,
+    "V_STAT_ADD_F": 1,
+    "V_STAT_RSQRT": 2,
+}
+_REDUCTION_OVERWRITE_ALIASES = {
+    "V_RED_SUM_OVR": "V_RED_SUM",
+    "V_RED_MAX_OVR": "V_RED_MAX",
+    "V_RED_SUM_SEG_OVR": "V_RED_SUM_SEG",
+    "V_RED_MAX_SEG_OVR": "V_RED_MAX_SEG",
+}
+_MULTI_SEGMENT_REDUCTIONS = frozenset({"V_RED_SUM_SEGS", "V_RED_MAX_SEGS"})
 
 
 def _parse_operand(operand):
@@ -178,6 +207,27 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             funct1 = None
             funct2 = None
             imm = None
+
+            if opcode == "C_AGU_LOOP_LEN":
+                if len(operands) != 1:
+                    raise ValueError(
+                        f"C_AGU_LOOP_LEN expects one body-length operand: {line}"
+                    )
+                rd = 0
+                imm = _parse_operand(operands[0])
+                instructions.append(
+                    Instruction(opcode, rd, None, None, None, None, None, imm)
+                )
+                continue
+            if opcode in {"C_AGU_BIND", "C_LOOP_START_AGU"}:
+                if len(operands) != 2:
+                    raise ValueError(f"{opcode} expects register, immediate: {line}")
+                rd = _parse_operand(operands[0])
+                imm = _parse_operand(operands[1])
+                instructions.append(
+                    Instruction(opcode, rd, None, None, None, None, None, imm)
+                )
+                continue
 
             if len(operands) == 1:
                 operand_0 = operands[0]
@@ -305,6 +355,40 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                     funct2 = int(funct2_raw)
                 except ValueError:
                     funct2 = funct2_raw  # fallback, if not int, keep as string
+
+            if opcode in _REDUCTION_OVERWRITE_ALIASES:
+                opcode = _REDUCTION_OVERWRITE_ALIASES[opcode]
+                funct1 = 1
+
+            if opcode in _MULTI_SEGMENT_REDUCTIONS:
+                # Syntax: V_RED_*_SEGS gpDst, gpSrc, segment_log2.
+                # The third parsed operand is an immediate; place it in the
+                # rstride field consumed by the RTL decoder.
+                rstride = imm
+                rs2 = 0
+            elif opcode in _VSEG_ALIASES:
+                # Syntax: V_*_VSEG gpDst, gpVector, gpStats, segment_log2[, mask].
+                # funct1[1:0] selects ADD/SUB/MUL and funct1[2] enables the
+                # existing HLEN-granular Vector SRAM write mask.
+                mask_enable = 0 if funct1 is None else int(funct1)
+                if mask_enable not in (0, 1):
+                    raise ValueError(f"VSEG mask flag must be 0 or 1, got {mask_enable}")
+                funct1 = _VSEG_ALIASES[opcode] | (mask_enable << 2)
+                opcode = "V_ALU_VSEG"
+            elif opcode in _COMPACT_STAT_ALIASES:
+                # Syntax: V_STAT_* gpDst, gpSrc, fScalar, segment_count.
+                # Compact operations reuse V_ALU_VSEG with funct1[3] set.
+                # Unlike ordinary VSEG, rstride stores count-1 rather than
+                # log2(segment width).
+                segment_count = rstride
+                if segment_count is None or not 1 <= segment_count <= 16:
+                    raise ValueError(
+                        "compact-stat segment_count must be in [1, 16], got "
+                        f"{segment_count}"
+                    )
+                rstride = segment_count - 1
+                funct1 = 0x8 | _COMPACT_STAT_ALIASES[opcode]
+                opcode = "V_ALU_VSEG"
 
             instructions.append(Instruction(opcode, rd, rs1, rs2, rstride, funct1, funct2, imm))
 

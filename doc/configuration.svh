@@ -40,7 +40,7 @@ endpackage
 
 package instruction_pkg;
     parameter INT_OPERAND_WIDTH     = 4;
-    parameter FP_OPERAND_WIDTH      = 3;
+    parameter FP_OPERAND_WIDTH      = 4;
     parameter HBM_ADR_OPERAND_WIDTH = 3;
     parameter STRIDE_OPERAND_WIDTH  = 3;
     parameter OPERAND_WIDTH         = 4;

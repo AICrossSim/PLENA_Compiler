@@ -81,17 +81,22 @@ typedef enum logic [3:0] {
     COMP_ADDR_2   = 4'hB, // addr_port_2: rd and addr_port_1: rs1 + imm
     LOOP_INIT     = 4'hC, // Write immediate to rd (loop counter initialization)
     LOOP_DEC      = 4'hD, // Decrement rs1 and write back to rd (loop end)
+    AGU_BIND      = 4'hE,
+    AGU_LOOP_INIT = 4'hF,
     STALL_S_INT   = 4'h0
 } S_INT_OP;
 
-typedef enum logic [2:0] {
-    STALL_C             = 3'h0,
-    SET_ADDR_REG        = 3'h1,
-    SET_STRIDE_SIZE     = 3'h2,
-    SET_SCALE_REG       = 3'h3,
-    BREAK               = 3'h4,
-    LOOP_START          = 3'h5,
-    LOOP_END            = 3'h6
+typedef enum logic [3:0] {
+    STALL_C             = 4'h0,
+    SET_ADDR_REG        = 4'h1,
+    SET_STRIDE_SIZE     = 4'h2,
+    SET_SCALE_REG       = 4'h3,
+    BREAK               = 4'h4,
+    LOOP_START          = 4'h5,
+    LOOP_END            = 4'h6,
+    SET_V_MASK          = 4'h7,
+    AGU_CONFIG          = 4'h8,
+    AGU_LOOP_START      = 4'h9
 } C_OP;
 
 typedef enum logic [2:0] {
@@ -176,7 +181,21 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_PS_V                 = 6'h31,
     V_SHFT_V               = 6'h32,
     C_HADAMARD_TRANSFORM   = 6'h33,
-    C_BREAK                = 6'h34
+    C_BREAK                = 6'h34,
+
+    // Segment reductions encode rd=FP accumulator, rs1=vector address,
+    // rs2=segment-index GP register and rstride=log2(segment width).
+    V_RED_SUM_SEG          = 6'h35,
+    V_RED_MAX_SEG          = 6'h36,
+    S_MV_FP                = 6'h37,
+    S_RSQRT_FP             = 6'h38,
+    V_RED_SUM_SEGS         = 6'h39,
+    V_RED_MAX_SEGS         = 6'h3A,
+    V_ALU_VSEG             = 6'h3B,
+    S_LD_VLANE_FP          = 6'h3C,
+    S_ST_VLANE_FP          = 6'h3D,
+    C_AGU_CONFIG           = 6'h3E,
+    C_LOOP_START_AGU       = 6'h3F
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {

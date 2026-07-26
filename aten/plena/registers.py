@@ -8,8 +8,9 @@ class RegisterAllocator:
         # HW OPERAND_WIDTH = 4 bits → gp0-gp15; gp0 reserved as constant 0.
         self.gp_registers = list(range(start_gp, 16))
         self.addr_registers = list(range(start_addr, 8))
-        # f0 reserved as constant 0 (writing to f0 is a no-op for V_RED_MAX/V_RED_SUM).
-        self.fp_registers = list(range(start_fp, 8))
+        # RTL-v3 expands the scalar FP register index to four bits. f0 remains
+        # the architectural zero constant; f1-f15 are allocatable.
+        self.fp_registers = list(range(start_fp, 16))
         self.used_gp = []
         self.used_addr = []
         self.used_fp = []
