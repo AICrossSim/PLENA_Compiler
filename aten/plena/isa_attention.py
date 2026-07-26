@@ -5,6 +5,11 @@ from __future__ import annotations
 import math
 
 from compiler.asm_templates._imm import load_large_int
+from compiler.aten.plena.attention_pipeline_plan import (
+    GQATimingProfile,
+    RowPipelineOp,
+    interleave_row_chains,
+)
 
 
 class IsaAttentionMixin:
@@ -36,6 +41,28 @@ class IsaAttentionMixin:
           [mlen, 2*mlen):   m_res = exp(m_old - m_curr)
           [2*mlen, 3*mlen): l_old / l_new
         """
+        pipelined = self._online_softmax_pipeline_asm(
+            mlen=mlen,
+            s_address=s_address,
+            m_start_address=m_start_address,
+            scale=scale,
+            rows=rows,
+            valid_cols=valid_cols,
+            first_block=False,
+        )
+        if pipelined is not None:
+            return pipelined
+        segmented = self._online_softmax_segmented_asm(
+            mlen=mlen,
+            s_address=s_address,
+            m_start_address=m_start_address,
+            scale=scale,
+            rows=rows,
+            valid_cols=valid_cols,
+            first_block=False,
+        )
+        if segmented is not None:
+            return segmented
         if getattr(self, "unroll_attention", False):
             return self._online_softmax_asm_unrolled(
                 mlen=mlen,
@@ -62,6 +89,11 @@ class IsaAttentionMixin:
         fp_sum_p = 4  # f4: sum(P)
         fp_scale = 5  # f5: scale factor
         fp_row_max = 6  # f6: current row max (temporary)
+        rtl_v2 = getattr(self, "vector_scalar_schedule", "legacy") in {
+            "rtl-v2",
+            "rtl-v3",
+            "rtl-v4",
+        }
 
         lines = []
         lines.append("; === Online Softmax ===")
@@ -88,7 +120,11 @@ class IsaAttentionMixin:
         loop_rows = mlen if rows is None else rows
         lines.append(f"C_LOOP_START gp{gp_loop}, {loop_rows}")
         lines.append(f"S_LD_FP f{fp_m_old}, gp{gp_m_addr}, 0")
-        lines.append(f"S_ADD_FP f{fp_m_res}, f{fp_m_old}, f0")
+        lines.append(
+            f"S_MV_FP f{fp_m_res}, f{fp_m_old}"
+            if rtl_v2
+            else f"S_ADD_FP f{fp_m_res}, f{fp_m_old}, f0"
+        )
 
         if scale != 1.0:
             lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}")
@@ -112,7 +148,11 @@ class IsaAttentionMixin:
 
         lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, 0")
 
-        lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+        lines.append(
+            f"S_MV_FP f{fp_sum_p}, f0"
+            if rtl_v2
+            else f"S_ADD_FP f{fp_sum_p}, f0, f0"
+        )
         lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
 
         lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
@@ -127,6 +167,815 @@ class IsaAttentionMixin:
         lines.append(f"C_LOOP_END gp{gp_loop}")
 
         self.register_allocator.free_gp(gp_regs)
+        return "\n".join(lines) + "\n"
+
+    def _online_softmax_streamed_asm(
+        self,
+        *,
+        mlen: int,
+        s_address: int,
+        m_address: int,
+        l_address: int,
+        output_address: int,
+        output_head_slot: int,
+        scale: float = 1.0,
+        rows: int | None = None,
+        valid_cols: int | None = None,
+        last_block: bool = False,
+    ) -> str:
+        """Update online-softmax state and consume ``m_res`` in-register.
+
+        This is the streamed-v2 recurrence.  The output lane is scaled in the
+        same row chain that creates ``m_res``; no m_res SRAM allocation exists.
+        """
+
+        gp_s, gp_m, gp_l, gp_o, gp_loop, gp_aux, gp_selector = (
+            self.register_allocator.allocate_gp(7)
+        )
+        fp_m = 1
+        fp_m_res = 2
+        fp_l = 3
+        fp_sum = 4
+        fp_scale = 5
+        fp_row_max = 6
+        lines = [
+            "; === Online Softmax Streamed v2 ===",
+        ]
+        plan = getattr(self, "_native_sequence_packing", None)
+        compact_segments = (
+            plan is not None
+            and plan.mode == "compact"
+            and plan.seq_len <= mlen
+            and (valid_cols is None or valid_cols >= mlen)
+            and (rows is None or rows == plan.attention_group_seq_len)
+        )
+        if compact_segments:
+            slot_rows = int(plan.batch_slot_rows)
+            if slot_rows <= 0 or slot_rows & (slot_rows - 1):
+                raise ValueError(
+                    f"streamed softmax segment width must be a power of two, "
+                    f"got {slot_rows}"
+                )
+            row_groups = tuple(
+                (
+                    slot * slot_rows,
+                    int(plan.seq_len),
+                    slot,
+                    slot_rows,
+                )
+                for slot in range(int(plan.batch_pack_factor))
+            )
+        else:
+            row_groups = ((0, mlen if rows is None else rows, None, mlen),)
+        valid_mask = None
+        mask_en = 0
+        if valid_cols is not None and valid_cols < mlen:
+            mask_unit = getattr(self, "hlen", mlen)
+            valid_lanes = max(1, math.ceil(valid_cols / mask_unit))
+            valid_mask = (1 << valid_lanes) - 1
+            lines.extend(
+                (
+                    f"S_ADDI_INT gp{gp_aux}, gp0, {valid_mask}",
+                    f"C_SET_V_MASK_REG gp{gp_aux}",
+                )
+            )
+            mask_en = 1
+        if scale != 1.0:
+            lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+        overwrite = (
+            getattr(self, "reduction_output_mode", "accumulate-v1")
+            == "overwrite-v1"
+        )
+        hoist_selector = (
+            getattr(self, "selector_schedule", "legacy") == "hoisted-v1"
+        )
+        for row_start, row_count, segment, segment_width in row_groups:
+            lines.extend(load_large_int(gp_s, s_address + row_start * mlen))
+            lines.extend(load_large_int(gp_m, m_address + row_start))
+            lines.extend(load_large_int(gp_l, l_address + row_start))
+            lines.extend(
+                load_large_int(
+                    gp_o, output_address + row_start * mlen
+                )
+            )
+            if segment is not None and hoist_selector:
+                lines.append(f"S_ADDI_INT gp{gp_selector}, gp0, {segment}")
+            lines.append(f"C_LOOP_START gp{gp_loop}, {row_count}")
+            lines.extend(
+                (
+                    f"S_LD_FP f{fp_m}, gp{gp_m}, 0",
+                    f"S_MV_FP f{fp_m_res}, f{fp_m}",
+                )
+            )
+            if scale != 1.0:
+                lines.append(
+                    f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}"
+                )
+            if not overwrite:
+                lines.append(f"S_LD_FP f{fp_row_max}, gp0, 2")
+            if segment is None:
+                lines.append(
+                    f"V_RED_MAX{'_OVR' if overwrite else ''} "
+                    f"f{fp_row_max}, gp{gp_s}, {mask_en}"
+                )
+            else:
+                if not hoist_selector:
+                    lines.append(f"S_ADDI_INT gp{gp_selector}, gp0, {segment}")
+                lines.append(
+                    f"V_RED_MAX_SEG{'_OVR' if overwrite else ''} "
+                    f"f{fp_row_max}, gp{gp_s}, gp{gp_selector}, "
+                    f"{int(math.log2(segment_width))}"
+                )
+            lines.extend(
+                (
+                    f"S_MAX_FP f{fp_m}, f{fp_row_max}, f{fp_m}",
+                    f"S_SUB_FP f{fp_m_res}, f{fp_m_res}, f{fp_m}",
+                    f"S_EXP_FP f{fp_m_res}, f{fp_m_res}, 0",
+                )
+            )
+            if not last_block:
+                lines.append(f"S_ST_FP f{fp_m}, gp{gp_m}, 0")
+            output_mask = 1 << output_head_slot
+            lines.extend(
+                (
+                    f"S_ADDI_INT gp{gp_aux}, gp0, {output_mask}",
+                    f"C_SET_V_MASK_REG gp{gp_aux}",
+                    f"V_MUL_VF gp{gp_o}, gp{gp_o}, f{fp_m_res}, 1",
+                )
+            )
+            if valid_mask is not None:
+                lines.extend(
+                    (
+                        f"S_ADDI_INT gp{gp_aux}, gp0, {valid_mask}",
+                        f"C_SET_V_MASK_REG gp{gp_aux}",
+                    )
+                )
+            lines.extend(
+                (
+                    f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m}, {mask_en}, 0",
+                    f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0",
+                    f"S_LD_FP f{fp_l}, gp{gp_l}, 0",
+                )
+            )
+            if not overwrite:
+                lines.append(f"S_MV_FP f{fp_sum}, f0")
+            if segment is None:
+                lines.append(
+                    f"V_RED_SUM{'_OVR' if overwrite else ''} "
+                    f"f{fp_sum}, gp{gp_s}, {mask_en}, 0"
+                )
+            else:
+                if not hoist_selector:
+                    lines.append(f"S_ADDI_INT gp{gp_selector}, gp0, {segment}")
+                lines.append(
+                    f"V_RED_SUM_SEG{'_OVR' if overwrite else ''} "
+                    f"f{fp_sum}, gp{gp_s}, gp{gp_selector}, "
+                    f"{int(math.log2(segment_width))}"
+                )
+            lines.extend(
+                (
+                    f"S_MUL_FP f{fp_l}, f{fp_l}, f{fp_m_res}",
+                    f"S_ADD_FP f{fp_l}, f{fp_l}, f{fp_sum}",
+                    f"S_ST_FP f{fp_l}, gp{gp_l}, 0",
+                    f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}",
+                    f"S_ADDI_INT gp{gp_m}, gp{gp_m}, 1",
+                    f"S_ADDI_INT gp{gp_l}, gp{gp_l}, 1",
+                    f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {mlen}",
+                    f"C_LOOP_END gp{gp_loop}",
+                )
+            )
+        if hasattr(self, "record_vector_scalar_stats"):
+            active_rows = sum(row_count for _, row_count, _, _ in row_groups)
+            selector_rows = sum(
+                row_count
+                for _, row_count, segment, _ in row_groups
+                if segment is not None
+            )
+            setup_count = sum(
+                1 for _, _, segment, _ in row_groups if segment is not None
+            )
+            self.record_vector_scalar_stats(
+                {
+                    "selector_loads_before": 2 * selector_rows,
+                    "selector_loads_hoisted": (
+                        2 * selector_rows - setup_count if hoist_selector else 0
+                    ),
+                    "selector_setup_instructions": (
+                        setup_count if hoist_selector else 2 * selector_rows
+                    ),
+                    "neutral_accumulator_setups_before": 2 * active_rows,
+                    "neutral_accumulator_setups_elided": (
+                        2 * active_rows if overwrite else 0
+                    ),
+                }
+            )
+        self.register_allocator.free_gp(
+            [gp_s, gp_m, gp_l, gp_o, gp_loop, gp_aux, gp_selector]
+        )
+        return "\n".join(lines) + "\n"
+
+    def _online_softmax_first_block_streamed_asm(
+        self,
+        *,
+        mlen: int,
+        s_address: int,
+        m_address: int,
+        l_address: int,
+        scale: float = 1.0,
+        rows: int | None = None,
+        valid_cols: int | None = None,
+        last_block: bool = False,
+    ) -> str:
+        """Create first-block state without scalar copy operations."""
+
+        gp_s, gp_m, gp_l, gp_loop, gp_aux, gp_selector = (
+            self.register_allocator.allocate_gp(6)
+        )
+        fp_m = 1
+        fp_l = 3
+        fp_scale = 5
+        lines = [
+            "; === Online Softmax First Block Streamed v2 ===",
+        ]
+        plan = getattr(self, "_native_sequence_packing", None)
+        compact_segments = (
+            plan is not None
+            and plan.mode == "compact"
+            and plan.seq_len <= mlen
+            and (valid_cols is None or valid_cols >= mlen)
+            and (rows is None or rows == plan.attention_group_seq_len)
+        )
+        if compact_segments:
+            slot_rows = int(plan.batch_slot_rows)
+            if slot_rows <= 0 or slot_rows & (slot_rows - 1):
+                raise ValueError(
+                    f"streamed softmax segment width must be a power of two, "
+                    f"got {slot_rows}"
+                )
+            row_groups = tuple(
+                (
+                    slot * slot_rows,
+                    int(plan.seq_len),
+                    slot,
+                    slot_rows,
+                )
+                for slot in range(int(plan.batch_pack_factor))
+            )
+        else:
+            row_groups = ((0, mlen if rows is None else rows, None, mlen),)
+        mask_en = 0
+        if valid_cols is not None and valid_cols < mlen:
+            mask_unit = getattr(self, "hlen", mlen)
+            valid_lanes = max(1, math.ceil(valid_cols / mask_unit))
+            lines.extend(
+                (
+                    f"S_ADDI_INT gp{gp_aux}, gp0, {(1 << valid_lanes) - 1}",
+                    f"C_SET_V_MASK_REG gp{gp_aux}",
+                )
+            )
+            mask_en = 1
+        if scale != 1.0:
+            lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+        overwrite = (
+            getattr(self, "reduction_output_mode", "accumulate-v1")
+            == "overwrite-v1"
+        )
+        hoist_selector = (
+            getattr(self, "selector_schedule", "legacy") == "hoisted-v1"
+        )
+        for row_start, row_count, segment, segment_width in row_groups:
+            lines.extend(load_large_int(gp_s, s_address + row_start * mlen))
+            lines.extend(load_large_int(gp_m, m_address + row_start))
+            lines.extend(load_large_int(gp_l, l_address + row_start))
+            if segment is not None and hoist_selector:
+                lines.append(f"S_ADDI_INT gp{gp_selector}, gp0, {segment}")
+            lines.append(f"C_LOOP_START gp{gp_loop}, {row_count}")
+            if scale != 1.0:
+                lines.append(
+                    f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}"
+                )
+            if not overwrite:
+                lines.append(f"S_LD_FP f{fp_m}, gp0, 2")
+            if segment is None:
+                lines.append(
+                    f"V_RED_MAX{'_OVR' if overwrite else ''} "
+                    f"f{fp_m}, gp{gp_s}, {mask_en}"
+                )
+            else:
+                if not hoist_selector:
+                    lines.append(f"S_ADDI_INT gp{gp_selector}, gp0, {segment}")
+                lines.append(
+                    f"V_RED_MAX_SEG{'_OVR' if overwrite else ''} "
+                    f"f{fp_m}, gp{gp_s}, gp{gp_selector}, "
+                    f"{int(math.log2(segment_width))}"
+                )
+            if not last_block:
+                lines.append(f"S_ST_FP f{fp_m}, gp{gp_m}, 0")
+            lines.extend(
+                (
+                    f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m}, {mask_en}, 0",
+                    f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0",
+                )
+            )
+            if not overwrite:
+                lines.append(f"S_LD_FP f{fp_l}, gp0, 0")
+            if segment is None:
+                lines.append(
+                    f"V_RED_SUM{'_OVR' if overwrite else ''} "
+                    f"f{fp_l}, gp{gp_s}, {mask_en}, 0"
+                )
+            else:
+                if not hoist_selector:
+                    lines.append(f"S_ADDI_INT gp{gp_selector}, gp0, {segment}")
+                lines.append(
+                    f"V_RED_SUM_SEG{'_OVR' if overwrite else ''} "
+                    f"f{fp_l}, gp{gp_s}, gp{gp_selector}, "
+                    f"{int(math.log2(segment_width))}"
+                )
+            lines.extend(
+                (
+                    f"S_ST_FP f{fp_l}, gp{gp_l}, 0",
+                    f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}",
+                    f"S_ADDI_INT gp{gp_m}, gp{gp_m}, 1",
+                    f"S_ADDI_INT gp{gp_l}, gp{gp_l}, 1",
+                    f"C_LOOP_END gp{gp_loop}",
+                )
+            )
+        if hasattr(self, "record_vector_scalar_stats"):
+            active_rows = sum(row_count for _, row_count, _, _ in row_groups)
+            selector_rows = sum(
+                row_count
+                for _, row_count, segment, _ in row_groups
+                if segment is not None
+            )
+            setup_count = sum(
+                1 for _, _, segment, _ in row_groups if segment is not None
+            )
+            self.record_vector_scalar_stats(
+                {
+                    "selector_loads_before": 2 * selector_rows,
+                    "selector_loads_hoisted": (
+                        2 * selector_rows - setup_count if hoist_selector else 0
+                    ),
+                    "selector_setup_instructions": (
+                        setup_count if hoist_selector else 2 * selector_rows
+                    ),
+                    "neutral_accumulator_setups_before": 2 * active_rows,
+                    "neutral_accumulator_setups_elided": (
+                        2 * active_rows if overwrite else 0
+                    ),
+                }
+            )
+        self.register_allocator.free_gp(
+            [gp_s, gp_m, gp_l, gp_loop, gp_aux, gp_selector]
+        )
+        return "\n".join(lines) + "\n"
+
+    def _online_softmax_pipeline_asm(
+        self,
+        *,
+        mlen: int,
+        s_address: int,
+        m_start_address: int,
+        scale: float,
+        rows: int | None,
+        valid_cols: int | None,
+        first_block: bool,
+    ) -> str | None:
+        """Interleave independent softmax rows using measured RTL-v3 timing.
+
+        Every row retains the exact arithmetic instruction order emitted by the
+        row-serial lowering. Only instructions from different rows are mixed.
+        The generated hardware-loop body is parsed by both the assembler and
+        CostEmitter, so the two paths cannot drift in opcode order.
+        """
+
+        if getattr(self, "gqa_pipeline_schedule", "row-serial") != "row-interleaved-v1":
+            return None
+        if getattr(self, "vector_scalar_schedule", "legacy") not in {
+            "rtl-v3",
+            "rtl-v4",
+        }:
+            raise ValueError(
+                "row-interleaved-v1 requires vector_scalar_schedule='rtl-v3' "
+                "or 'rtl-v4'"
+            )
+
+        timing: GQATimingProfile = getattr(self, "gqa_timing_profile", None)
+        if timing is None:
+            timing = GQATimingProfile.load(
+                getattr(self, "gqa_timing_calibration", None)
+            )
+            self.gqa_timing_profile = timing
+
+        width = 3 if first_block else 2
+        regs_per_row = 4 if first_block else 5
+        required_fp = width * regs_per_row + int(scale != 1.0)
+        if required_fp > timing.fp_register_count - 1:
+            raise RuntimeError(
+                f"softmax width {width} needs {required_fp} allocatable FP registers, "
+                f"artifact provides {timing.fp_register_count - 1}"
+            )
+        if width > timing.rob_depth:
+            raise RuntimeError(
+                f"softmax width {width} exceeds scalar ROB depth {timing.rob_depth}"
+            )
+
+        sequence_plan = getattr(self, "_native_sequence_packing", None)
+        compact = (
+            sequence_plan is not None
+            and sequence_plan.mode == "compact"
+            and sequence_plan.seq_len <= mlen
+            and valid_cols is None
+            and (rows is None or rows == sequence_plan.attention_group_seq_len)
+        )
+        if compact:
+            slot_rows = int(sequence_plan.batch_slot_rows)
+            if slot_rows <= 0 or slot_rows & (slot_rows - 1):
+                raise ValueError(
+                    f"segment softmax slot width must be a power of two, got {slot_rows}"
+                )
+            row_ranges = tuple(
+                (slot * slot_rows, int(sequence_plan.seq_len), slot, slot_rows)
+                for slot in range(int(sequence_plan.batch_pack_factor))
+            )
+        else:
+            loop_rows = mlen if rows is None else int(rows)
+            row_ranges = ((0, loop_rows, None, mlen),)
+
+        fp_regs = self.register_allocator.allocate_fp(required_fp)
+        score_gps = self.register_allocator.allocate_gp(width)
+        gp_m, gp_m_res, gp_l, gp_loop, gp_aux = self.register_allocator.allocate_gp(5)
+        fp_scale = fp_regs[-1] if scale != 1.0 else None
+        row_fp = [
+            fp_regs[row * regs_per_row : (row + 1) * regs_per_row]
+            for row in range(width)
+        ]
+        lines = [
+            "; === RTL-v3 row-interleaved online softmax ===",
+            f"; rows_in_flight={width}, first_block={int(first_block)}, timing_sha256={timing.sha256}",
+        ]
+        if fp_scale is not None:
+            lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+
+        scalar = timing.scalar_ready
+        scalar_ii = timing.scalar_ii
+
+        def scalar_op(text: str, kind: str) -> RowPipelineOp:
+            return RowPipelineOp(
+                text,
+                f"scalar_{kind}",
+                scalar[kind],
+                scalar_ii.get(kind, 1),
+            )
+
+        def vector_op(
+            text: str,
+            kind: str,
+            *,
+            latency: int | None = None,
+            blocking: bool = False,
+        ) -> RowPipelineOp:
+            return RowPipelineOp(
+                text,
+                "vector",
+                timing.vector_ready[kind] if latency is None else latency,
+                timing.vector_ii,
+                is_blocking_reduction=blocking,
+            )
+
+        def build_chain(
+            row: int,
+            *,
+            segment: int | None,
+            segment_width: int,
+        ) -> tuple[RowPipelineOp, ...]:
+            regs = row_fp[row]
+            if first_block:
+                fp_m, fp_l, fp_sum, fp_row_max = regs
+                fp_m_res = None
+            else:
+                fp_m, fp_m_res, fp_l, fp_sum, fp_row_max = regs
+            gp_s = score_gps[row]
+            mask_en = int(
+                segment is None
+                and valid_cols is not None
+                and valid_cols < mlen
+            )
+            chain: list[RowPipelineOp] = []
+            if fp_scale is not None:
+                chain.append(
+                    vector_op(
+                        f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}",
+                        "mul_vf",
+                    )
+                )
+            chain.append(scalar_op(f"S_LD_FP f{fp_row_max}, gp0, 2", "load"))
+            if segment is None:
+                reduction = f"V_RED_MAX f{fp_row_max}, gp{gp_s}, {mask_en}"
+            else:
+                reduction = (
+                    f"V_RED_MAX_SEG f{fp_row_max}, gp{gp_s}, gp{gp_aux}, "
+                    f"{int(math.log2(segment_width))}"
+                )
+            chain.append(
+                vector_op(
+                    reduction,
+                    "reduction",
+                    latency=timing.reduction_latency(
+                        kind="max", segment_width=segment_width
+                    ),
+                    blocking=True,
+                )
+            )
+            if first_block:
+                chain.extend(
+                    (
+                        scalar_op(f"S_MV_FP f{fp_m}, f{fp_row_max}", "move"),
+                        scalar_op(f"S_ST_FP f{fp_m}, gp{gp_m}, {row}", "store"),
+                    )
+                )
+            else:
+                assert fp_m_res is not None
+                chain.extend(
+                    (
+                        scalar_op(f"S_LD_FP f{fp_m}, gp{gp_m}, {row}", "load"),
+                        scalar_op(f"S_MV_FP f{fp_m_res}, f{fp_m}", "move"),
+                        scalar_op(
+                            f"S_MAX_FP f{fp_m}, f{fp_row_max}, f{fp_m}", "max"
+                        ),
+                        scalar_op(
+                            f"S_SUB_FP f{fp_m_res}, f{fp_m_res}, f{fp_m}", "sub"
+                        ),
+                        scalar_op(
+                            f"S_EXP_FP f{fp_m_res}, f{fp_m_res}, 0", "exp"
+                        ),
+                        scalar_op(
+                            f"S_ST_FP f{fp_m_res}, gp{gp_m_res}, {row}", "store"
+                        ),
+                        scalar_op(f"S_ST_FP f{fp_m}, gp{gp_m}, {row}", "store"),
+                    )
+                )
+            chain.extend(
+                (
+                    vector_op(
+                        f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m}, {mask_en}, 0",
+                        "sub_vf",
+                    ),
+                    vector_op(f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0", "exp"),
+                    scalar_op(f"S_MV_FP f{fp_sum}, f0", "move"),
+                )
+            )
+            if segment is None:
+                reduction = f"V_RED_SUM f{fp_sum}, gp{gp_s}, {mask_en}, 0"
+            else:
+                reduction = (
+                    f"V_RED_SUM_SEG f{fp_sum}, gp{gp_s}, gp{gp_aux}, "
+                    f"{int(math.log2(segment_width))}"
+                )
+            chain.append(
+                vector_op(
+                    reduction,
+                    "reduction",
+                    latency=timing.reduction_latency(
+                        kind="sum", segment_width=segment_width
+                    ),
+                    blocking=True,
+                )
+            )
+            if first_block:
+                chain.extend(
+                    (
+                        scalar_op(f"S_MV_FP f{fp_l}, f{fp_sum}", "move"),
+                        scalar_op(f"S_ST_FP f{fp_l}, gp{gp_l}, {row}", "store"),
+                    )
+                )
+            else:
+                assert fp_m_res is not None
+                chain.extend(
+                    (
+                        scalar_op(f"S_LD_FP f{fp_l}, gp{gp_l}, {row}", "load"),
+                        scalar_op(
+                            f"S_MUL_FP f{fp_l}, f{fp_l}, f{fp_m_res}", "mul"
+                        ),
+                        scalar_op(
+                            f"S_ADD_FP f{fp_l}, f{fp_l}, f{fp_sum}", "add"
+                        ),
+                        scalar_op(f"S_ST_FP f{fp_l}, gp{gp_l}, {row}", "store"),
+                    )
+                )
+            return tuple(chain)
+
+        try:
+            for row_start, row_count, segment, segment_width in row_ranges:
+                for lane, gp_s in enumerate(score_gps):
+                    lines.extend(
+                        load_large_int(
+                            gp_s, s_address + (row_start + lane) * mlen
+                        )
+                    )
+                lines.extend(load_large_int(gp_m, m_start_address + row_start))
+                lines.extend(
+                    load_large_int(gp_m_res, m_start_address + mlen + row_start)
+                )
+                lines.extend(
+                    load_large_int(gp_l, m_start_address + 2 * mlen + row_start)
+                )
+                if segment is not None:
+                    lines.append(f"S_ADDI_INT gp{gp_aux}, gp0, {segment}")
+                elif valid_cols is not None and valid_cols < mlen:
+                    mask_unit = getattr(self, "hlen", mlen)
+                    valid_lanes = max(1, math.ceil(valid_cols / mask_unit))
+                    lines.extend(
+                        (
+                            f"S_ADDI_INT gp{gp_aux}, gp0, {(1 << valid_lanes) - 1}",
+                            f"C_SET_V_MASK_REG gp{gp_aux}",
+                        )
+                    )
+
+                full_groups, tail = divmod(row_count, width)
+                if full_groups:
+                    lines.append(f"C_LOOP_START gp{gp_loop}, {full_groups}")
+                    chains = tuple(
+                        build_chain(
+                            row,
+                            segment=segment,
+                            segment_width=segment_width,
+                        )
+                        for row in range(width)
+                    )
+                    lines.extend(interleave_row_chains(chains))
+                    for gp_s in score_gps:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {width * mlen}"
+                        )
+                    lines.extend(
+                        (
+                            f"S_ADDI_INT gp{gp_m}, gp{gp_m}, {width}",
+                            f"S_ADDI_INT gp{gp_m_res}, gp{gp_m_res}, {width}",
+                            f"S_ADDI_INT gp{gp_l}, gp{gp_l}, {width}",
+                            f"C_LOOP_END gp{gp_loop}",
+                        )
+                    )
+                if tail:
+                    lines.append(f"; row-interleaved tail rows={tail}")
+                    chains = tuple(
+                        build_chain(
+                            row,
+                            segment=segment,
+                            segment_width=segment_width,
+                        )
+                        for row in range(tail)
+                    )
+                    lines.extend(interleave_row_chains(chains))
+
+            if hasattr(self, "record_gqa_pipeline_stats"):
+                active_rows = sum(row_count for _, row_count, _, _ in row_ranges)
+                self.record_gqa_pipeline_stats(
+                    {
+                        "softmax_first_block_pipeline_width"
+                        if first_block
+                        else "softmax_recurrent_pipeline_width": width,
+                        "interleaved_softmax_rows": active_rows,
+                    }
+                )
+            return "\n".join(lines) + "\n"
+        finally:
+            self.register_allocator.free_fp(fp_regs)
+            self.register_allocator.free_gp(
+                [*score_gps, gp_m, gp_m_res, gp_l, gp_loop, gp_aux]
+            )
+
+    def _online_softmax_segmented_asm(
+        self,
+        *,
+        mlen: int,
+        s_address: int,
+        m_start_address: int,
+        scale: float,
+        rows: int | None,
+        valid_cols: int | None,
+        first_block: bool,
+    ) -> str | None:
+        """Use aligned batch slots and the RTL segment-reduction opcodes.
+
+        QK still computes a full MLEN-wide score row. The block-diagonal causal
+        mask makes every non-local slot ``-inf``; full-vector subtract/exp turns
+        those entries into zero before PV. Only the max/sum trees are shortened
+        to the selected power-of-two batch slot.
+        """
+
+        if getattr(self, "vector_scalar_schedule", "legacy") not in {
+            "rtl-v2",
+            "rtl-v3",
+            "rtl-v4",
+        }:
+            return None
+        plan = getattr(self, "_native_sequence_packing", None)
+        if plan is None or plan.mode != "compact" or plan.seq_len > mlen:
+            return None
+        if valid_cols is not None:
+            return None
+        if rows is not None and rows != plan.attention_group_seq_len:
+            return None
+        slot_rows = int(plan.batch_slot_rows)
+        if slot_rows <= 0 or slot_rows & (slot_rows - 1):
+            raise ValueError(f"segment softmax slot width must be a power of two, got {slot_rows}")
+        segment_log2 = int(math.log2(slot_rows))
+        gp_s, gp_m, gp_m_res, gp_l, gp_loop, gp_segment = self.register_allocator.allocate_gp(6)
+        fp_m = 1
+        fp_m_res = 2
+        fp_l = 3
+        fp_sum = 4
+        fp_scale = 5
+        fp_row_max = 6
+        lines = [
+            "; === Aligned-slot segment online softmax ===",
+        ]
+        if scale != 1.0:
+            lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+
+        for slot in range(plan.batch_pack_factor):
+            row_start = slot * slot_rows
+            lines.extend(load_large_int(gp_s, s_address + row_start * mlen))
+            lines.extend(load_large_int(gp_m, m_start_address + row_start))
+            lines.extend(load_large_int(gp_m_res, m_start_address + mlen + row_start))
+            lines.extend(load_large_int(gp_l, m_start_address + 2 * mlen + row_start))
+            lines.append(f"S_ADDI_INT gp{gp_segment}, gp0, {slot}")
+            lines.append(f"C_LOOP_START gp{gp_loop}, {plan.seq_len}")
+            if scale != 1.0:
+                lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, 0")
+            lines.extend(
+                [
+                    f"S_LD_FP f{fp_row_max}, gp0, 2",
+                    f"V_RED_MAX_SEG f{fp_row_max}, gp{gp_s}, gp{gp_segment}, {segment_log2}",
+                ]
+            )
+            if first_block:
+                lines.extend(
+                    [
+                        f"S_MV_FP f{fp_m}, f{fp_row_max}",
+                        f"S_ST_FP f{fp_m}, gp{gp_m}, 0",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        f"S_LD_FP f{fp_m}, gp{gp_m}, 0",
+                        f"S_MV_FP f{fp_m_res}, f{fp_m}",
+                        f"S_MAX_FP f{fp_m}, f{fp_row_max}, f{fp_m}",
+                        f"S_SUB_FP f{fp_m_res}, f{fp_m_res}, f{fp_m}",
+                        f"S_EXP_FP f{fp_m_res}, f{fp_m_res}, 0",
+                        f"S_ST_FP f{fp_m_res}, gp{gp_m_res}, 0",
+                        f"S_ST_FP f{fp_m}, gp{gp_m}, 0",
+                    ]
+                )
+            lines.extend(
+                [
+                    f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m}, 0, 0",
+                    f"V_EXP_V gp{gp_s}, gp{gp_s}, 0, 0",
+                    f"S_MV_FP f{fp_sum}, f0",
+                    f"V_RED_SUM_SEG f{fp_sum}, gp{gp_s}, gp{gp_segment}, {segment_log2}",
+                ]
+            )
+            if first_block:
+                lines.extend(
+                    [
+                        f"S_MV_FP f{fp_l}, f{fp_sum}",
+                        f"S_ST_FP f{fp_l}, gp{gp_l}, 0",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        f"S_LD_FP f{fp_l}, gp{gp_l}, 0",
+                        f"S_MUL_FP f{fp_l}, f{fp_l}, f{fp_m_res}",
+                        f"S_ADD_FP f{fp_l}, f{fp_l}, f{fp_sum}",
+                        f"S_ST_FP f{fp_l}, gp{gp_l}, 0",
+                    ]
+                )
+            lines.extend(
+                [
+                    f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}",
+                    f"S_ADDI_INT gp{gp_m}, gp{gp_m}, 1",
+                    f"S_ADDI_INT gp{gp_m_res}, gp{gp_m_res}, 1",
+                    f"S_ADDI_INT gp{gp_l}, gp{gp_l}, 1",
+                    f"C_LOOP_END gp{gp_loop}",
+                ]
+            )
+
+        if hasattr(self, "record_vector_scalar_stats"):
+            reductions = 2 * plan.batch_pack_factor * plan.seq_len
+            self.record_vector_scalar_stats(
+                {
+                    "softmax_segment_reductions_emitted": reductions,
+                    "softmax_inactive_rows_elided": plan.attention_group_seq_len
+                    - plan.batch_pack_factor * plan.seq_len,
+                }
+            )
+        self.register_allocator.free_gp(
+            [gp_s, gp_m, gp_m_res, gp_l, gp_loop, gp_segment]
+        )
         return "\n".join(lines) + "\n"
 
     def _online_softmax_asm_unrolled(
@@ -151,6 +1000,11 @@ class IsaAttentionMixin:
         fp_sum_p = 4
         fp_scale = 5
         fp_row_max = 6
+        rtl_v2 = getattr(self, "vector_scalar_schedule", "legacy") in {
+            "rtl-v2",
+            "rtl-v3",
+            "rtl-v4",
+        }
 
         lines = []
         lines.append("; === Online Softmax ===")
@@ -174,7 +1028,11 @@ class IsaAttentionMixin:
         for row in range(mlen):
             lines.append(f"; Row {row}")
             lines.append(f"S_LD_FP f{fp_m_old}, gp{gp_m_addr}, {row}")
-            lines.append(f"S_ADD_FP f{fp_m_res}, f{fp_m_old}, f0")
+            lines.append(
+                f"S_MV_FP f{fp_m_res}, f{fp_m_old}"
+                if rtl_v2
+                else f"S_ADD_FP f{fp_m_res}, f{fp_m_old}, f0"
+            )
 
             if scale != 1.0:
                 lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_scale}, {mask_en}")
@@ -196,7 +1054,11 @@ class IsaAttentionMixin:
 
             lines.append(f"S_LD_FP f{fp_l_old}, gp{gp_l_addr}, {row}")
 
-            lines.append(f"S_ADD_FP f{fp_sum_p}, f0, f0")
+            lines.append(
+                f"S_MV_FP f{fp_sum_p}, f0"
+                if rtl_v2
+                else f"S_ADD_FP f{fp_sum_p}, f0, f0"
+            )
             lines.append(f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0")
 
             lines.append(f"S_MUL_FP f{fp_l_old}, f{fp_l_old}, f{fp_m_res}")
@@ -227,12 +1089,40 @@ class IsaAttentionMixin:
         avoiding the redundant scalar recurrence and FP-SRAM initialization.
         """
 
+        pipelined = self._online_softmax_pipeline_asm(
+            mlen=mlen,
+            s_address=s_address,
+            m_start_address=m_start_address,
+            scale=scale,
+            rows=rows,
+            valid_cols=valid_cols,
+            first_block=True,
+        )
+        if pipelined is not None:
+            return pipelined
+        segmented = self._online_softmax_segmented_asm(
+            mlen=mlen,
+            s_address=s_address,
+            m_start_address=m_start_address,
+            scale=scale,
+            rows=rows,
+            valid_cols=valid_cols,
+            first_block=True,
+        )
+        if segmented is not None:
+            return segmented
+
         gp_s, gp_m_addr, gp_l_addr, gp_loop = self.register_allocator.allocate_gp(4)
         fp_m = 1
         fp_l = 3
         fp_sum_p = 4
         fp_scale = 5
         fp_row_max = 6
+        rtl_v2 = getattr(self, "vector_scalar_schedule", "legacy") in {
+            "rtl-v2",
+            "rtl-v3",
+            "rtl-v4",
+        }
 
         lines = [
             "; === Online Softmax First Block ===",
@@ -268,15 +1158,27 @@ class IsaAttentionMixin:
                 f"V_RED_MAX f{fp_row_max}, gp{gp_s}, {mask_en}",
                 # Preserve the scalar-copy rounding of the generic path while
                 # replacing max(row_max, -inf) with its exact result.
-                f"S_ADD_FP f{fp_m}, f{fp_row_max}, f0",
+                (
+                    f"S_MV_FP f{fp_m}, f{fp_row_max}"
+                    if rtl_v2
+                    else f"S_ADD_FP f{fp_m}, f{fp_row_max}, f0"
+                ),
                 f"S_ST_FP f{fp_m}, gp{gp_m_addr}, 0",
                 f"V_SUB_VF gp{gp_s}, gp{gp_s}, f{fp_m}, {mask_en}, 0",
                 f"V_EXP_V gp{gp_s}, gp{gp_s}, {mask_en}, 0",
-                f"S_ADD_FP f{fp_sum_p}, f0, f0",
+                (
+                    f"S_MV_FP f{fp_sum_p}, f0"
+                    if rtl_v2
+                    else f"S_ADD_FP f{fp_sum_p}, f0, f0"
+                ),
                 f"V_RED_SUM f{fp_sum_p}, gp{gp_s}, {mask_en}, 0",
                 # The generic first update computes 0 * 0 + sum(P).  Keep a
                 # scalar ALU copy so the destination format/rounding is equal.
-                f"S_ADD_FP f{fp_l}, f{fp_sum_p}, f0",
+                (
+                    f"S_MV_FP f{fp_l}, f{fp_sum_p}"
+                    if rtl_v2
+                    else f"S_ADD_FP f{fp_l}, f{fp_sum_p}, f0"
+                ),
                 f"S_ST_FP f{fp_l}, gp{gp_l_addr}, 0",
                 f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {mlen}",
                 f"S_ADDI_INT gp{gp_m_addr}, gp{gp_m_addr}, 1",
@@ -820,11 +1722,30 @@ class IsaAttentionMixin:
         scale: float,
         rows: int | None = None,
         valid_cols: int | None = None,
+        state_head: int = 0,
+        last_block: bool = False,
+        stream_state: bool = False,
     ) -> str:
         """Create running online-softmax state from the first K block."""
 
         s_info = self[s_block_matrix]
         isa_code = f"; === Online Softmax First Block {s_block_matrix} ===\n"
+        if (
+            getattr(self, "softmax_state_schedule", "sram-v1") == "streamed-v2"
+            and stream_state
+        ):
+            layout = self._softmax_state_layout
+            isa_code += self._online_softmax_first_block_streamed_asm(
+                mlen=self.mlen,
+                s_address=s_info.vram_addr,
+                m_address=layout.m_base(state_head),
+                l_address=layout.l_base(state_head),
+                scale=scale,
+                rows=rows,
+                valid_cols=valid_cols,
+                last_block=last_block,
+            )
+            return self._emit(isa_code)
         isa_code += self._online_softmax_first_block_asm(
             mlen=self.mlen,
             s_address=s_info.vram_addr,
@@ -841,6 +1762,10 @@ class IsaAttentionMixin:
         scale: float,
         rows: int | None = None,
         valid_cols: int | None = None,
+        state_head: int = 0,
+        output_address: int | None = None,
+        output_head_slot: int | None = None,
+        last_block: bool = False,
     ) -> str:
         """
         Run Online Softmax on one S block.
@@ -851,6 +1776,26 @@ class IsaAttentionMixin:
         """
         s_info = self[s_block_matrix]
         s_address = s_info.vram_addr
+        if (
+            getattr(self, "softmax_state_schedule", "sram-v1") == "streamed-v2"
+            and output_address is not None
+            and output_head_slot is not None
+        ):
+            layout = self._softmax_state_layout
+            isa_code = f"; === Online Softmax Block {s_block_matrix} ===\n"
+            isa_code += self._online_softmax_streamed_asm(
+                mlen=self.mlen,
+                s_address=s_address,
+                m_address=layout.m_base(state_head),
+                l_address=layout.l_base(state_head),
+                output_address=output_address,
+                output_head_slot=output_head_slot,
+                scale=scale,
+                rows=rows,
+                valid_cols=valid_cols,
+                last_block=last_block,
+            )
+            return self._emit(isa_code)
 
         fp_sram_start = self._ONLINE_SOFTMAX_FPSRAM_BASE
         m_start_address = fp_sram_start

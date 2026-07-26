@@ -11,8 +11,25 @@ import math
 from dataclasses import dataclass
 
 
-NATIVE_LAYOUT_SCHEMA_VERSION = 3
+NATIVE_LAYOUT_SCHEMA_VERSION = 5
 NATIVE_LAYOUT_MODES = frozenset({"compact", "legacy"})
+FP_CONSTANT_NUM_DEFAULT = 10
+SOFTMAX_STATE_SCHEDULE_STREAMED_V2 = "streamed-v2"
+SOFTMAX_STATE_SCHEDULE_SRAM_V1 = "sram-v1"
+SOFTMAX_STATE_SCHEDULES = frozenset(
+    {
+        SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
+        SOFTMAX_STATE_SCHEDULE_SRAM_V1,
+    }
+)
+PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1 = "broadcast-k-major-v1"
+PACKED_QK_SCHEDULE_HEAD_MAJOR_V1 = "head-major-v1"
+PACKED_QK_SCHEDULES = frozenset(
+    {
+        PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
+        PACKED_QK_SCHEDULE_HEAD_MAJOR_V1,
+    }
+)
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:
@@ -38,6 +55,7 @@ class SequencePackingPlan:
     batch_pack_factor: int
     padded_batch_size: int
     attention_group_count: int
+    batch_slot_rows: int
     attention_group_seq_len: int
     rows_per_attention_group: int
     compile_seq_rows: int
@@ -62,12 +80,14 @@ class SequencePackingPlan:
             )
 
         if mode == "compact" and seq_len <= mlen:
-            pack_factor = max(1, min(batch_size, mlen // seq_len))
+            slot_rows = 1 << (seq_len - 1).bit_length()
+            pack_factor = max(1, min(batch_size, mlen // slot_rows))
         else:
+            slot_rows = seq_len
             pack_factor = 1
         padded_batch_size = math.ceil(batch_size / pack_factor) * pack_factor
         group_count = padded_batch_size // pack_factor
-        group_seq_len = pack_factor * seq_len
+        group_seq_len = pack_factor * slot_rows
         rows_per_group = _ceil_to_multiple(max(mlen, group_seq_len), mlen)
         return cls(
             mode=mode,
@@ -77,6 +97,7 @@ class SequencePackingPlan:
             batch_pack_factor=pack_factor,
             padded_batch_size=padded_batch_size,
             attention_group_count=group_count,
+            batch_slot_rows=slot_rows,
             attention_group_seq_len=group_seq_len,
             rows_per_attention_group=rows_per_group,
             compile_seq_rows=group_count * rows_per_group,
@@ -110,7 +131,7 @@ class SequencePackingPlan:
         group_idx, slot_idx = divmod(batch_idx, self.batch_pack_factor)
         return (
             group_idx * self.rows_per_attention_group
-            + slot_idx * self.seq_len
+            + slot_idx * self.batch_slot_rows
             + token_idx
         )
 
@@ -139,11 +160,16 @@ class SequencePackingPlan:
             if real_slots <= 0:
                 break
             start = group_idx * self.rows_per_attention_group
-            end = start + real_slots * self.seq_len
-            if ranges and ranges[-1][1] == start:
-                ranges[-1] = (ranges[-1][0], end)
-            else:
-                ranges.append((start, end))
+            for slot_idx in range(real_slots):
+                start = (
+                    group_idx * self.rows_per_attention_group
+                    + slot_idx * self.batch_slot_rows
+                )
+                end = start + self.seq_len
+                if ranges and ranges[-1][1] == start:
+                    ranges[-1] = (ranges[-1][0], end)
+                else:
+                    ranges.append((start, end))
             remaining_batches -= real_slots
         return tuple(ranges)
 
@@ -156,6 +182,7 @@ class SequencePackingPlan:
             "dummy_batch_count": self.dummy_batch_count,
             "seq_len": self.seq_len,
             "batch_pack_factor": self.batch_pack_factor,
+            "batch_slot_rows": self.batch_slot_rows,
             "attention_group_count": self.attention_group_count,
             "attention_group_seq_len": self.attention_group_seq_len,
             "rows_per_attention_group": self.rows_per_attention_group,
@@ -258,6 +285,99 @@ class AttentionHeadPacking:
             "execution_head_lane_utilization": self.execution_head_lane_utilization,
             "compact": self.compact,
         }
+
+
+@dataclass(frozen=True)
+class SoftmaxStateLayout:
+    """Scalar FP SRAM allocation for packed online-softmax state.
+
+    Constants always occupy the fixed prefix.  The streamed layout allocates
+    one ``m`` and one ``l`` row per simultaneously active broadcast head.  The
+    compatibility layout preserves the historical ``m/m_res/l`` allocation.
+    """
+
+    schedule: str
+    mlen: int
+    active_broadcast_heads: int
+    fp_constant_num: int
+    required_depth: int
+
+    @property
+    def state_base(self) -> int:
+        return self.fp_constant_num
+
+    @property
+    def m_res_base(self) -> int | None:
+        if self.schedule == SOFTMAX_STATE_SCHEDULE_SRAM_V1:
+            return self.state_base + self.mlen
+        return None
+
+    def m_base(self, head: int) -> int:
+        self._validate_head(head)
+        if self.schedule == SOFTMAX_STATE_SCHEDULE_SRAM_V1:
+            return self.state_base
+        return self.state_base + head * self.mlen
+
+    def l_base(self, head: int) -> int:
+        self._validate_head(head)
+        if self.schedule == SOFTMAX_STATE_SCHEDULE_SRAM_V1:
+            return self.state_base + 2 * self.mlen
+        return (
+            self.state_base
+            + self.active_broadcast_heads * self.mlen
+            + head * self.mlen
+        )
+
+    def _validate_head(self, head: int) -> None:
+        if not 0 <= head < self.active_broadcast_heads:
+            raise IndexError(
+                f"softmax head={head} outside [0, {self.active_broadcast_heads})"
+            )
+
+    def metadata(self) -> dict[str, int | float | str]:
+        state_entries = self.required_depth - self.fp_constant_num
+        return {
+            "softmax_state_schedule": self.schedule,
+            "softmax_state_heads": self.active_broadcast_heads,
+            "softmax_state_entries_required": state_entries,
+            "scalar_fp_sram_depth": self.required_depth,
+            "scalar_fp_sram_state_utilization": (
+                state_entries / self.required_depth if self.required_depth else 0.0
+            ),
+        }
+
+
+def build_softmax_state_layout(
+    *,
+    mlen: int,
+    active_broadcast_heads: int,
+    schedule: str = SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
+    fp_constant_num: int = FP_CONSTANT_NUM_DEFAULT,
+) -> SoftmaxStateLayout:
+    """Build and validate the canonical Scalar FP SRAM state allocation."""
+
+    if schedule not in SOFTMAX_STATE_SCHEDULES:
+        raise ValueError(
+            f"softmax_state_schedule must be one of "
+            f"{sorted(SOFTMAX_STATE_SCHEDULES)}, got {schedule!r}"
+        )
+    if mlen <= 0 or active_broadcast_heads <= 0 or fp_constant_num <= 0:
+        raise ValueError(
+            "mlen, active_broadcast_heads, and fp_constant_num must be positive, "
+            f"got {mlen}, {active_broadcast_heads}, {fp_constant_num}"
+        )
+    state_rows = (
+        3
+        if schedule == SOFTMAX_STATE_SCHEDULE_SRAM_V1
+        else 2 * active_broadcast_heads
+    )
+    return SoftmaxStateLayout(
+        schedule=schedule,
+        mlen=mlen,
+        active_broadcast_heads=active_broadcast_heads,
+        fp_constant_num=fp_constant_num,
+        required_depth=fp_constant_num + state_rows * mlen,
+    )
 
 
 def build_attention_head_packing(

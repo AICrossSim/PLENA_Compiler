@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 
 from compiler.asm_templates._k_split import k_chunks
 from compiler.asm_templates._imm import IMM2_BOUND, add_large_int, load_large_int
+from compiler.asm_templates.ffn_address_plan import (
+    FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1,
+    build_ffn_address_plan,
+    uses_invariant_stride,
+)
 from compiler.aten.cost_emitter import (
     ScheduleAffineAdd,
     ScheduleAffineLoad,
@@ -91,6 +96,49 @@ def _add_large_schedule(
             )
         )
     return tuple(instructions)
+
+
+def _ffn_stride_update_schedule(
+    destination: int,
+    value: int,
+    *,
+    mode: str,
+    stride_register: int,
+) -> tuple[ScheduleInstruction, ...]:
+    if uses_invariant_stride(value, update_count=1, mode=mode):
+        return (
+            _schedule_instruction(
+                "S_ADD_INT",
+                f"gp{destination}",
+                f"gp{destination}",
+                f"gp{stride_register}",
+            ),
+        )
+    return _add_large_schedule(
+        destination,
+        destination,
+        value,
+    )
+
+
+def _ffn_stride_update_count(
+    result: KernelCounts,
+    value: int,
+    *,
+    count: int,
+    mode: str,
+) -> None:
+    if count <= 0:
+        return
+    if uses_invariant_stride(value, update_count=count, mode=mode):
+        result.add("S_ADD_INT", count)
+    else:
+        _direct_addi(
+            result,
+            value,
+            source_is_zero=False,
+            static=count,
+        )
 
 
 def _add_with_temp_schedule(
@@ -250,6 +298,7 @@ def _ffn_projection_chunk_counts(
     weight_hbm_base: int,
     hbm_prefetch_amount: int,
     source: str,
+    ffn_address_schedule: str,
 ) -> KernelCounts:
     result = KernelCounts()
     num_act_cols = batch_rows // blen
@@ -258,6 +307,11 @@ def _ffn_projection_chunk_counts(
     tiles_per_mlen = mlen // blen
     weight_rows = out_size // blen
     block_rows = weight_rows // tiles_per_mlen
+    address_plan = build_ffn_address_plan(
+        mode=ffn_address_schedule,
+        k_tile_count=k_tile_count,
+        num_activation_columns=num_act_cols,
+    )
 
     result.add_dma(
         DmaTransfer(
@@ -316,16 +370,16 @@ def _ffn_projection_chunk_counts(
     )
     result.add("S_ADDI_INT", block_rows)  # intermediate pointer
     result.add("H_PREFETCH_M", block_rows * k_tile_count)
-    _direct_addi(
+    _ffn_stride_update_count(
         result,
         mlen * mlen,
-        source_is_zero=False,
-        static=block_rows * k_tile_count,
+        count=block_rows * address_plan.prefetch_pointer_updates,
+        mode=ffn_address_schedule,
     )
     _addi_with_temp(
         result,
         mlen * weight_stride,
-        static=block_rows * k_tile_count,
+        static=block_rows * address_plan.prefetch_pointer_updates,
     )
     result.add("S_ADDI_INT", block_rows)
     result.add("S_ADDI_INT", 2 * (weight_rows - block_rows))
@@ -346,30 +400,36 @@ def _ffn_projection_chunk_counts(
     if k_tile_count > 1:
         result.add("C_LOOP_START", cells)
     result.add("M_MM", static=cells, dynamic=cells * k_tile_count)
-    _direct_addi(
-        result,
-        mlen * mlen,
-        source_is_zero=False,
-        static=cells,
-        dynamic=cells * k_tile_count,
-    )
-    _direct_addi(
-        result,
-        mlen * batch_rows,
-        source_is_zero=False,
-        static=cells,
-        dynamic=cells * k_tile_count,
-    )
-    if k_tile_count > 1:
-        result.add("C_LOOP_END", static=cells, dynamic=cells * k_tile_count)
-    result.add("M_MM_WO", cells)
-    _direct_addi(result, blen * mlen, source_is_zero=False, static=cells)
-    if block_rows > 1:
+    if address_plan.matrix_pointer_updates:
+        _direct_addi(
+            result,
+            mlen * mlen,
+            source_is_zero=False,
+            static=cells,
+            dynamic=cells * k_tile_count,
+        )
         _direct_addi(
             result,
             mlen * batch_rows,
             source_is_zero=False,
-            static=block_rows - 1,
+            static=cells,
+            dynamic=cells * k_tile_count,
+        )
+    if k_tile_count > 1:
+        result.add("C_LOOP_END", static=cells, dynamic=cells * k_tile_count)
+    result.add("M_MM_WO", cells)
+    _ffn_stride_update_count(
+        result,
+        blen * mlen,
+        count=weight_rows * address_plan.output_pointer_updates,
+        mode=ffn_address_schedule,
+    )
+    if block_rows > 1:
+        _ffn_stride_update_count(
+            result,
+            mlen * batch_rows,
+            count=block_rows - 1,
+            mode=ffn_address_schedule,
         )
     return result
 
@@ -391,6 +451,7 @@ def _ffn_projection_counts(
     weight_hbm_base: int,
     hbm_prefetch_amount: int,
     source: str,
+    ffn_address_schedule: str,
 ) -> KernelCounts:
     result = KernelCounts()
     num_k_tiles = k_size // mlen
@@ -414,6 +475,7 @@ def _ffn_projection_counts(
                 weight_hbm_base=weight_hbm_base,
                 hbm_prefetch_amount=hbm_prefetch_amount,
                 source=source,
+                ffn_address_schedule=ffn_address_schedule,
             )
         )
         if chunk_idx:
@@ -440,6 +502,7 @@ def ffn_unrolled_cost_counts(
     up_weight_hbm_base: int,
     down_weight_hbm_base: int,
     hbm_prefetch_amount: int,
+    ffn_address_schedule: str = FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1,
 ) -> KernelCounts:
     """Exact opcode counts for asm_templates.ffn_asm._ffn_asm_unrolled."""
     if batch_rows % blen:
@@ -457,6 +520,10 @@ def ffn_unrolled_cost_counts(
     result.add("S_ADDI_INT")
     _load_large(result, up_result_base)
     _load_large(result, gate_result_base)
+    if ffn_address_schedule == FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+        for value in (mlen * mlen, mlen * batch_rows, blen * mlen):
+            if value >= IMM2_BOUND:
+                _load_large(result, value)
 
     for result_base, weight_hbm_base, source in (
         (up_result_base, up_weight_hbm_base, "ffn:up_weight"),
@@ -479,6 +546,7 @@ def ffn_unrolled_cost_counts(
                 weight_hbm_base=weight_hbm_base,
                 hbm_prefetch_amount=hbm_prefetch_amount,
                 source=source,
+                ffn_address_schedule=ffn_address_schedule,
             )
         )
 
@@ -497,7 +565,8 @@ def ffn_unrolled_cost_counts(
     _load_large(result, hidden_size)
     result.add("C_SET_STRIDE_REG")
     result.add("S_ADDI_INT")
-    _direct_addi(result, batch_rows // blen, source_is_zero=True)
+    if ffn_address_schedule != FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+        result.add("S_ADDI_INT")
     result.merge(
         _ffn_projection_counts(
             mlen=mlen,
@@ -515,6 +584,7 @@ def ffn_unrolled_cost_counts(
             weight_hbm_base=down_weight_hbm_base,
             hbm_prefetch_amount=hbm_prefetch_amount,
             source="ffn:down_weight",
+            ffn_address_schedule=ffn_address_schedule,
         )
     )
     return result
@@ -539,6 +609,7 @@ def _ffn_projection_chunk_schedule(
     weight_addr_reg: int,
     memory_stream_index: int,
     key_prefix: str,
+    ffn_address_schedule: str,
 ) -> ScheduleSequence:
     """Compressed exact order for one unrolled FFN projection K chunk."""
     w_actual = 1
@@ -546,11 +617,19 @@ def _ffn_projection_chunk_schedule(
     a_actual = 3
     intermediate = 5
     w_hbm_offset = 7
+    matrix_stride = 8
+    result_stride = 9
+    output_stride = 10
     tiles_per_mlen = mlen // blen
     block_rows = out_size // mlen
     num_act_cols = batch_rows // blen
     chunk_hbm_offset = k_start_tile * mlen * weight_stride
     chunk_act_offset = k_start_tile * mlen * batch_rows
+    address_plan = build_ffn_address_plan(
+        mode=ffn_address_schedule,
+        k_tile_count=k_tile_count,
+        num_activation_columns=num_act_cols,
+    )
 
     children = [*_load_large_schedule(result_base_register, target_base_value)]
     if activation_base_address is None:
@@ -607,18 +686,24 @@ def _ffn_projection_chunk_schedule(
         period=num_act_cols,
     )
 
+    prefetch_instruction = _schedule_instruction(
+        "H_PREFETCH_M",
+        f"gp{w_actual}",
+        f"gp{w_hbm_offset}",
+        f"a{weight_addr_reg}",
+        1,
+        0,
+        memory_stream_index=memory_stream_index,
+    )
     prefetch_body = ScheduleSequence(
         (
-            _schedule_instruction(
-                "H_PREFETCH_M",
-                f"gp{w_actual}",
-                f"gp{w_hbm_offset}",
-                f"a{weight_addr_reg}",
-                1,
-                0,
-                memory_stream_index=memory_stream_index,
+            prefetch_instruction,
+            *_ffn_stride_update_schedule(
+                w_actual,
+                mlen * mlen,
+                mode=ffn_address_schedule,
+                stride_register=matrix_stride,
             ),
-            *_add_large_schedule(w_actual, w_actual, mlen * mlen),
             *_add_with_temp_schedule(
                 w_hbm_offset,
                 w_hbm_offset,
@@ -628,10 +713,13 @@ def _ffn_projection_chunk_schedule(
         )
     )
     matrix_body = [
-        _schedule_instruction("M_MM", 0, f"gp{w_temp}", f"gp{a_actual}"),
-        *_add_large_schedule(w_temp, w_temp, mlen * mlen),
-        *_add_large_schedule(a_actual, a_actual, mlen * batch_rows),
+        _schedule_instruction("M_MM", 0, f"gp{w_temp}", f"gp{a_actual}")
     ]
+    if address_plan.matrix_pointer_updates:
+        matrix_body.extend(_add_large_schedule(w_temp, w_temp, mlen * mlen))
+        matrix_body.extend(
+            _add_large_schedule(a_actual, a_actual, mlen * batch_rows)
+        )
     if k_tile_count > 1:
         matrix_body.append(
             _schedule_instruction("C_LOOP_END", f"gp{w_hbm_offset}")
@@ -650,8 +738,8 @@ def _ffn_projection_chunk_schedule(
     else:
         matrix_schedule = tuple(matrix_body)
 
-    act_column_body = ScheduleSequence(
-        (
+    def act_column_body(*, advance_output: bool) -> ScheduleSequence:
+        body = [
             activation_pointer,
             _schedule_instruction(
                 "S_ADDI_INT", f"gp{w_temp}", f"gp{w_actual}", 0
@@ -660,21 +748,46 @@ def _ffn_projection_chunk_schedule(
             _schedule_instruction(
                 "M_MM_WO", f"gp{intermediate}", "gp0", 0
             ),
-            *_add_large_schedule(
-                intermediate, intermediate, blen * mlen
+        ]
+        if advance_output:
+            body.extend(
+                _ffn_stride_update_schedule(
+                    intermediate,
+                    blen * mlen,
+                    mode=ffn_address_schedule,
+                    stride_register=output_stride,
+                )
+            )
+        return ScheduleSequence(tuple(body))
+
+    def activation_columns(name: str) -> tuple:
+        if ffn_address_schedule == FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+            children = []
+            if num_act_cols > 1:
+                children.append(
+                    ScheduleRepeat(
+                        num_act_cols - 1,
+                        act_column_body(advance_output=True),
+                        name=name,
+                        repeat_kind="compile_time",
+                    )
+                )
+            children.extend(act_column_body(advance_output=False).children)
+            return tuple(children)
+        return (
+            ScheduleRepeat(
+                num_act_cols,
+                act_column_body(advance_output=True),
+                name=name,
+                repeat_kind="compile_time",
             ),
         )
-    )
+
     later_tile_body = ScheduleSequence(
         (
             weight_tile,
             output_tile,
-            ScheduleRepeat(
-                num_act_cols,
-                act_column_body,
-                name="ffn_projection_activation_columns",
-                repeat_kind="compile_time",
-            ),
+            *activation_columns("ffn_projection_activation_columns"),
         )
     )
 
@@ -684,22 +797,35 @@ def _ffn_projection_chunk_schedule(
             _schedule_instruction(
                 "S_ADDI_INT", f"gp{intermediate}", f"gp{result_base_register}", 0
             ),
-            ScheduleRepeat(
-                k_tile_count,
-                prefetch_body,
-                name="ffn_projection_k_prefetch",
-                repeat_kind="compile_time",
-            ),
+        ]
+        if ffn_address_schedule == FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+            if k_tile_count > 1:
+                body.append(
+                    ScheduleRepeat(
+                        k_tile_count - 1,
+                        prefetch_body,
+                        name="ffn_projection_k_prefetch",
+                        repeat_kind="compile_time",
+                    )
+                )
+            body.append(prefetch_instruction)
+        else:
+            body.append(
+                ScheduleRepeat(
+                    k_tile_count,
+                    prefetch_body,
+                    name="ffn_projection_k_prefetch",
+                    repeat_kind="compile_time",
+                )
+            )
+        body.append(
             _schedule_instruction(
                 "S_ADDI_INT", f"gp{w_actual}", "gp0", 0
-            ),
-            ScheduleRepeat(
-                num_act_cols,
-                act_column_body,
-                name="ffn_projection_first_tile_columns",
-                repeat_kind="compile_time",
-            ),
-        ]
+            )
+        )
+        body.extend(
+            activation_columns("ffn_projection_first_tile_columns")
+        )
         if tiles_per_mlen > 1:
             body.append(
                 ScheduleRepeat(
@@ -719,10 +845,11 @@ def _ffn_projection_chunk_schedule(
         )
         if advance_result:
             body.extend(
-                _add_large_schedule(
-                    result_base_register,
+                _ffn_stride_update_schedule(
                     result_base_register,
                     mlen * batch_rows,
+                    mode=ffn_address_schedule,
+                    stride_register=result_stride,
                 )
             )
         return ScheduleSequence(tuple(body))
@@ -759,6 +886,7 @@ def _ffn_projection_cost_schedule(
     weight_addr_reg: int,
     stream_index_start: int,
     key_prefix: str,
+    ffn_address_schedule: str,
 ) -> tuple[ScheduleSequence, int]:
     children = []
     stream_index = stream_index_start
@@ -786,6 +914,7 @@ def _ffn_projection_cost_schedule(
                 weight_addr_reg=weight_addr_reg,
                 memory_stream_index=stream_index,
                 key_prefix=chunk_key,
+                ffn_address_schedule=ffn_address_schedule,
             ).children
         )
         stream_index += 1
@@ -827,6 +956,7 @@ def ffn_unrolled_cost_schedule(
     activation_base_address: int,
     workspace_base_address: int,
     matrix_sram_size: int,
+    ffn_address_schedule: str = FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1,
 ) -> ScheduleSequence:
     """Ordered compressed counterpart of ``_ffn_asm_unrolled``."""
     up_base = workspace_base_address
@@ -842,6 +972,14 @@ def ffn_unrolled_cost_schedule(
         *_load_large_schedule(4, up_base),
         *_load_large_schedule(6, gate_base),
     ]
+    if ffn_address_schedule == FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+        for register, value in (
+            (8, mlen * mlen),
+            (9, mlen * batch_rows),
+            (10, blen * mlen),
+        ):
+            if value >= IMM2_BOUND:
+                children.extend(_load_large_schedule(register, value))
     stream_index = 0
     for name, result_register, result_base, addr_reg in (
         ("up", 4, up_base, 2),
@@ -865,6 +1003,7 @@ def ffn_unrolled_cost_schedule(
             weight_addr_reg=addr_reg,
             stream_index_start=stream_index,
             key_prefix=f"ffn:{workspace_base_address}:{name}",
+            ffn_address_schedule=ffn_address_schedule,
         )
         children.extend(schedule.children)
 
@@ -904,9 +1043,14 @@ def ffn_unrolled_cost_schedule(
             *_load_large_schedule(1, hidden_size),
             _schedule_instruction("C_SET_STRIDE_REG", "gp1"),
             _schedule_instruction("S_ADDI_INT", "gp1", "gp0", 0),
-            *_load_large_schedule(8, batch_rows // blen),
         )
     )
+    if ffn_address_schedule != FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+        children.append(
+            _schedule_instruction(
+                "S_ADDI_INT", "gp8", "gp0", batch_rows // blen
+            )
+        )
     down, stream_index = _ffn_projection_cost_schedule(
         mlen=mlen,
         vlen=vlen,
@@ -925,6 +1069,7 @@ def ffn_unrolled_cost_schedule(
         weight_addr_reg=3,
         stream_index_start=stream_index,
         key_prefix=f"ffn:{workspace_base_address}:down",
+        ffn_address_schedule=ffn_address_schedule,
     )
     children.extend(down.children)
     return ScheduleSequence(tuple(children))

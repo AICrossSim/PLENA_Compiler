@@ -55,7 +55,8 @@ def test_dummy_batch_tail_has_stable_mapping():
     assert plan.compile_seq_rows == 32
     assert plan.physical_row(2, 0) == 16
     assert plan.physical_row(2, 6) == 22
-    assert plan.active_row_ranges() == ((0, 14), (16, 23))
+    assert plan.batch_slot_rows == 8
+    assert plan.active_row_ranges() == ((0, 7), (8, 15), (16, 23))
 
 
 def test_multi_tile_sequence_falls_back_to_one_batch_per_group():

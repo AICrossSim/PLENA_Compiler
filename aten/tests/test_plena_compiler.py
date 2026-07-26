@@ -22,6 +22,23 @@ for _p in [_SIM_ROOT, os.path.join(_SIM_ROOT, "tools"), os.path.join(_SIM_ROOT, 
 import torch  # noqa: E402
 
 
+def test_compact_attention_mask_always_isolates_batches():
+    from compiler.aten.plena.native_layout import SequencePackingPlan
+    from compiler.aten.plena_frontend import _build_packed_attention_mask
+
+    plan = SequencePackingPlan.build(batch_size=4, seq_len=7, mlen=16)
+    causal = _build_packed_attention_mask(plan, causal=True)
+    bidirectional = _build_packed_attention_mask(plan, causal=False)
+
+    # Slots [0, 7) and [8, 15) share one physical tile but never attend
+    # across the batch boundary.
+    assert torch.isneginf(causal[0, 8])
+    assert torch.isneginf(bidirectional[0, 8])
+    assert causal[6, 0] == 0
+    assert torch.isneginf(causal[0, 6])
+    assert bidirectional[0, 6] == 0
+
+
 def test_isa_builder_renders_typed_instruction():
     """Typed ISA builder should render the existing asm syntax."""
     from compiler.aten.isa_builder import IsaBuilder, fp, gp
@@ -1067,15 +1084,21 @@ def test_native_decoder_compacts_batch_rows_and_gqa_groups():
 
     def dynamic_opcode_histogram(asm: str) -> Counter[str]:
         histogram: Counter[str] = Counter()
-        loop_stack: list[int] = []
+        loop_stack: list[tuple[int, bool]] = []
         for raw_line in asm.splitlines():
             line = raw_line.strip()
             if not line or line.startswith(";"):
                 continue
             opcode = line.split(maxsplit=1)[0]
-            histogram[opcode] += math.prod(loop_stack)
+            multiplier = math.prod(count for count, _ in loop_stack)
+            if opcode == "C_LOOP_END" and loop_stack[-1][1]:
+                loop_stack.pop()
+                continue
+            histogram[opcode] += multiplier
             if opcode == "C_LOOP_START":
-                loop_stack.append(int(line.rsplit(",", 1)[1]))
+                loop_stack.append((int(line.rsplit(",", 1)[1]), False))
+            elif opcode == "C_LOOP_START_AGU":
+                loop_stack.append((int(line.rsplit(",", 1)[1]), True))
             elif opcode == "C_LOOP_END":
                 loop_stack.pop()
         assert not loop_stack
@@ -1136,8 +1159,10 @@ def test_native_decoder_compacts_batch_rows_and_gqa_groups():
             hlen=4,
             broadcast_amount=2,
             attention_head_packing=True,
-            decoder_input_embeds=decoder_input,
-            golden_precision="fp32",
+                decoder_input_embeds=decoder_input,
+                golden_precision="fp32",
+                vector_scalar_schedule="rtl-v2",
+                address_generation_mode="legacy",
         )
     finally:
         if old_settings is None:
@@ -1177,10 +1202,16 @@ def test_native_decoder_compacts_batch_rows_and_gqa_groups():
         seq_len=7,
         batch_size=4,
         num_layers=1,
-        native_layout_mode="compact",
-        use_cache=False,
-    )
+            native_layout_mode="compact",
+            vector_scalar_schedule="rtl-v2",
+            address_generation_mode="legacy",
+            use_cache=False,
+        )
     assert trace.dynamic_opcodes == dynamic_opcode_histogram(result["isa"])
+    assert trace.dynamic_opcodes["V_RED_SUM_SEG"] > 0
+    assert trace.dynamic_opcodes["V_RED_MAX_SEG"] > 0
+    assert trace.dynamic_opcodes["S_MV_FP"] > 0
+    assert trace.dynamic_opcodes["S_RSQRT_FP"] > 0
     dma_counts: Counter[str] = Counter()
     for event in trace.memory_events:
         dma_counts[event.transfer.opcode] += event.multiplicity
