@@ -5,6 +5,7 @@ description = "PLENA assembly compiler and code generation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "PyYAML>=6.0",
     "torch>=2.0.0",
 ]
 
