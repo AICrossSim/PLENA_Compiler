@@ -3,8 +3,34 @@ from __future__ import annotations
 import math
 
 from ._imm import addi_large_int_str as _addi_large_int
+from ._imm import IMM2_BOUND
 from ._imm import load_large_int_str as _load_large_int
 from ._k_split import k_chunks as _k_chunks
+from .ffn_address_plan import (
+    FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1,
+    build_ffn_address_plan,
+    uses_invariant_stride,
+)
+from .ffn_projection_plan import (
+    FFN_PROJECTION_SCHEDULE_AFFINE_LOOP_V2,
+    FFN_PROJECTION_SCHEDULE_LEGACY_AUTO_V1,
+    build_ffn_projection_plan,
+)
+
+
+def _ffn_relative_update(
+    register: int,
+    value: int,
+    *,
+    mode: str,
+    stride_register: int,
+) -> str:
+    if uses_invariant_stride(value, update_count=1, mode=mode):
+        return (
+            f"S_ADD_INT gp{register}, gp{register}, "
+            f"gp{stride_register}\n"
+        )
+    return f"S_ADDI_INT gp{register}, gp{register}, {value}\n"
 
 
 def ffn_asm(
@@ -25,6 +51,8 @@ def ffn_asm(
     use_fused_up_gate: bool = False,
     matrix_sram_size: int = 1024,
     workspace_base_address: int = 0,
+    ffn_address_schedule: str = FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1,
+    ffn_projection_schedule: str = FFN_PROJECTION_SCHEDULE_LEGACY_AUTO_V1,
 ) -> str:
     """
     Generates assembly code for a FFN operation.
@@ -44,6 +72,33 @@ def ffn_asm(
     ``H_PREFETCH_M`` addresses for models whose intermediate/hidden dims exceed the
     MRAM tile count.
     """
+    if ffn_projection_schedule == FFN_PROJECTION_SCHEDULE_AFFINE_LOOP_V2:
+        if use_fused_up_gate:
+            raise ValueError(
+                "affine-loop-v2 does not support the experimental fused up/gate path"
+            )
+        return _ffn_asm_affine_loop_v2(
+            mlen=mlen,
+            vlen=vlen,
+            blen=blen,
+            batch=batch,
+            seq_len=seq_len,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            alive_registers=alive_registers,
+            gate_weight_hbm_offset_reg=gate_weight_hbm_offset_reg,
+            up_weight_hbm_offset_reg=up_weight_hbm_offset_reg,
+            down_weight_hbm_offset_reg=down_weight_hbm_offset_reg,
+            const_one_fp_address=const_one_fp_address,
+            activation_base_address=activation_base_address,
+            matrix_sram_size=matrix_sram_size,
+            workspace_base_address=workspace_base_address,
+            ffn_address_schedule=ffn_address_schedule,
+        )
+    if ffn_projection_schedule != FFN_PROJECTION_SCHEDULE_LEGACY_AUTO_V1:
+        raise ValueError(
+            f"unsupported ffn_projection_schedule={ffn_projection_schedule!r}"
+        )
     if use_fused_up_gate:
         return _ffn_asm_fused_up_gate(
             mlen,
@@ -95,6 +150,7 @@ def ffn_asm(
             activation_base_address,
             matrix_sram_size=matrix_sram_size,
             workspace_base_address=workspace_base_address,
+            ffn_address_schedule=ffn_address_schedule,
         )
 
 
@@ -109,6 +165,385 @@ def _ffn_workspace_layout(
     gate_result_base = up_result_base + rows * intermediate_size
     scratch_base = gate_result_base + rows * intermediate_size
     return up_result_base, gate_result_base, scratch_base
+
+
+def _loop_start(register: int, count: int) -> str:
+    return f"C_LOOP_START gp{register}, {count}\n" if count > 1 else ""
+
+
+def _loop_end(register: int, count: int) -> str:
+    return f"C_LOOP_END gp{register}\n" if count > 1 else ""
+
+
+def _emit_ffn_projection_affine_chunk(
+    *,
+    mlen: int,
+    blen: int,
+    batch_rows: int,
+    k_size: int,
+    out_size: int,
+    weight_stride: int,
+    weight_hbm_offset_reg: int,
+    result_base_register: int,
+    result_base_value: int,
+    activation_base_address: int | None,
+    activation_base_register: int | None,
+    activation_base_register_value: int | None,
+    k_start_tile: int,
+    k_tile_count: int,
+    target_base_value: int,
+    w_actual_register: int,
+    w_temp_register: int,
+    a_actual_register: int,
+    intermediate_register: int,
+    hbm_block_base_register: int,
+    activation_chunk_base_register: int,
+    output_block_loop_register: int,
+    output_tile_loop_register: int,
+    activation_column_loop_register: int,
+    k_loop_register: int,
+    working_base_register: int,
+    section_comment: str,
+) -> str:
+    """Render one projection chunk as explicit affine hardware loops.
+
+    The loop order and all Matrix/HBM addresses match
+    ``_emit_ffn_projection_chunk``.  Only address generation changes: the
+    existing loop AGU sees the affine updates directly instead of recovering
+    loops from an expanded instruction stream.
+    """
+
+    output_blocks = out_size // mlen
+    output_tiles = mlen // blen
+    activation_columns = batch_rows // blen
+    chunk_hbm_base = k_start_tile * mlen * weight_stride
+    chunk_activation_offset = k_start_tile * mlen * batch_rows
+
+    lines = [
+        f" ; {section_comment}: affine chunk k_start={k_start_tile}, "
+        f"k_count={k_tile_count}\n",
+        _load_large_int(result_base_register, target_base_value),
+        _load_large_int(hbm_block_base_register, chunk_hbm_base),
+    ]
+    if activation_base_address is not None:
+        lines.append(
+            _load_large_int(
+                activation_chunk_base_register,
+                activation_base_address + chunk_activation_offset,
+            )
+        )
+    else:
+        if activation_base_register is None or activation_base_register_value is None:
+            raise ValueError(
+                "register-based affine FFN input requires a canonical base value"
+            )
+        lines.append(
+            _load_large_int(
+                activation_base_register, activation_base_register_value
+            )
+        )
+        lines.append(
+            _addi_large_int(
+                activation_chunk_base_register,
+                activation_base_register,
+                chunk_activation_offset,
+                w_temp_register,
+            )
+        )
+
+    lines.append(_loop_start(output_block_loop_register, output_blocks))
+
+    # Prefetch this output block's K chunk into MRAM.
+    lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n")
+    lines.append(
+        f"S_ADDI_INT gp{working_base_register}, "
+        f"gp{hbm_block_base_register}, 0\n"
+    )
+    lines.append(_loop_start(k_loop_register, k_tile_count))
+    lines.append(
+        f"H_PREFETCH_M gp{w_actual_register}, gp{working_base_register}, "
+        f"a{weight_hbm_offset_reg}, 1, 0\n"
+    )
+    if k_tile_count > 1:
+        lines.append(
+            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, "
+            f"{mlen * mlen}\n"
+        )
+        lines.append(
+            f"S_ADDI_INT gp{working_base_register}, "
+            f"gp{working_base_register}, {mlen * weight_stride}\n"
+        )
+    lines.append(_loop_end(k_loop_register, k_tile_count))
+
+    # Compute every BLEN output tile for the current MLEN output block.
+    lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0\n")
+    lines.append(_loop_start(output_tile_loop_register, output_tiles))
+    lines.append(
+        f"S_ADDI_INT gp{working_base_register}, "
+        f"gp{activation_chunk_base_register}, 0\n"
+    )
+    lines.append(
+        f"S_ADD_INT gp{intermediate_register}, "
+        f"gp{result_base_register}, gp{w_actual_register}\n"
+    )
+    lines.append(_loop_start(activation_column_loop_register, activation_columns))
+    lines.append(
+        f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0\n"
+    )
+    lines.append(
+        f"S_ADDI_INT gp{a_actual_register}, gp{working_base_register}, 0\n"
+    )
+    lines.append(_loop_start(k_loop_register, k_tile_count))
+    lines.append(f"M_MM 0, gp{w_temp_register}, gp{a_actual_register}\n")
+    if k_tile_count > 1:
+        lines.append(
+            f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, "
+            f"{mlen * mlen}\n"
+        )
+        lines.append(
+            f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, "
+            f"{mlen * batch_rows}\n"
+        )
+    lines.append(_loop_end(k_loop_register, k_tile_count))
+    lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0\n")
+    if activation_columns > 1:
+        lines.append(
+            f"S_ADDI_INT gp{working_base_register}, "
+            f"gp{working_base_register}, {mlen * blen}\n"
+        )
+        lines.append(
+            f"S_ADDI_INT gp{intermediate_register}, "
+            f"gp{intermediate_register}, {blen * mlen}\n"
+        )
+    lines.append(
+        _loop_end(activation_column_loop_register, activation_columns)
+    )
+    if output_tiles > 1:
+        lines.append(
+            f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {blen}\n"
+        )
+    lines.append(_loop_end(output_tile_loop_register, output_tiles))
+
+    if output_blocks > 1:
+        lines.append(
+            f"S_ADDI_INT gp{hbm_block_base_register}, "
+            f"gp{hbm_block_base_register}, {mlen}\n"
+        )
+        lines.append(
+            f"S_ADDI_INT gp{result_base_register}, "
+            f"gp{result_base_register}, {mlen * batch_rows}\n"
+        )
+    lines.append(_loop_end(output_block_loop_register, output_blocks))
+    return "".join(lines)
+
+
+def _ffn_asm_affine_loop_v2(
+    *,
+    mlen: int,
+    vlen: int,
+    blen: int,
+    batch: int,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    alive_registers: list[int],
+    gate_weight_hbm_offset_reg: int,
+    up_weight_hbm_offset_reg: int,
+    down_weight_hbm_offset_reg: int,
+    const_one_fp_address: int,
+    activation_base_address: int,
+    matrix_sram_size: int,
+    workspace_base_address: int,
+    ffn_address_schedule: str,
+) -> str:
+    """Render the dense FFN through the unified affine-loop projection plan."""
+
+    if vlen != mlen:
+        raise ValueError("affine-loop-v2 requires VLEN == MLEN")
+    if len(alive_registers) < 15:
+        raise ValueError("affine-loop-v2 requires gp1-gp15")
+    if ffn_address_schedule != FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+        raise ValueError(
+            "affine-loop-v2 requires ffn_address_schedule='live-stride-v1'"
+        )
+
+    up_base, gate_base, scratch_base = _ffn_workspace_layout(
+        batch, seq_len, intermediate_size, workspace_base_address
+    )
+    batch_rows = batch * seq_len
+    max_k_tiles = max(1, matrix_sram_size // mlen)
+
+    (
+        w_actual,
+        w_temp,
+        a_actual,
+        up_result,
+        intermediate,
+        gate_result,
+        hbm_block_base,
+        activation_chunk_base,
+        _unused_gp9,
+        _unused_gp10,
+        output_block_loop,
+        output_tile_loop,
+        activation_column_loop,
+        k_loop,
+        working_base,
+    ) = alive_registers[:15]
+
+    lines = ["; FFN Generation (affine-loop-v2)\n"]
+
+    def projection(
+        *,
+        name: str,
+        k_size: int,
+        out_size: int,
+        weight_stride: int,
+        weight_addr_reg: int,
+        result_register: int,
+        result_base: int,
+        input_address: int | None,
+        input_register: int | None,
+        input_register_value: int | None,
+        configure_matrix: bool,
+    ) -> None:
+        if configure_matrix:
+            lines.append(
+                _load_large_int(w_actual, hidden_size * intermediate_size)
+            )
+            lines.append(f"C_SET_SCALE_REG gp{w_actual}\n")
+            lines.append(_load_large_int(w_actual, weight_stride))
+            lines.append(f"C_SET_STRIDE_REG gp{w_actual}\n")
+        plan = build_ffn_projection_plan(
+            schedule=FFN_PROJECTION_SCHEDULE_AFFINE_LOOP_V2,
+            mlen=mlen,
+            blen=blen,
+            batch_rows=batch_rows,
+            k_size=k_size,
+            out_size=out_size,
+            max_k_tiles=max_k_tiles,
+        )
+        for chunk in plan.chunks:
+            target = result_base if chunk.chunk_index == 0 else scratch_base
+            lines.append(
+                _emit_ffn_projection_affine_chunk(
+                    mlen=mlen,
+                    blen=blen,
+                    batch_rows=batch_rows,
+                    k_size=k_size,
+                    out_size=out_size,
+                    weight_stride=weight_stride,
+                    weight_hbm_offset_reg=weight_addr_reg,
+                    result_base_register=result_register,
+                    result_base_value=result_base,
+                    activation_base_address=input_address,
+                    activation_base_register=input_register,
+                    activation_base_register_value=input_register_value,
+                    k_start_tile=chunk.k_start_tile,
+                    k_tile_count=chunk.k_tile_count,
+                    target_base_value=target,
+                    w_actual_register=w_actual,
+                    w_temp_register=w_temp,
+                    a_actual_register=a_actual,
+                    intermediate_register=intermediate,
+                    hbm_block_base_register=hbm_block_base,
+                    activation_chunk_base_register=activation_chunk_base,
+                    output_block_loop_register=output_block_loop,
+                    output_tile_loop_register=output_tile_loop,
+                    activation_column_loop_register=activation_column_loop,
+                    k_loop_register=k_loop,
+                    working_base_register=working_base,
+                    section_comment=name,
+                )
+            )
+            if chunk.chunk_index:
+                vector_adds = math.ceil(out_size * batch_rows / vlen)
+                lines.append(_load_large_int(w_actual, result_base))
+                lines.append(_load_large_int(w_temp, scratch_base))
+                lines.append(_loop_start(output_block_loop, vector_adds))
+                lines.append(
+                    f"V_ADD_VV gp{w_actual}, gp{w_actual}, gp{w_temp}, 0\n"
+                )
+                if vector_adds > 1:
+                    lines.append(
+                        f"S_ADDI_INT gp{w_actual}, gp{w_actual}, {vlen}\n"
+                    )
+                    lines.append(
+                        f"S_ADDI_INT gp{w_temp}, gp{w_temp}, {vlen}\n"
+                    )
+                lines.append(_loop_end(output_block_loop, vector_adds))
+
+    projection(
+        name="FFN up projection",
+        k_size=hidden_size,
+        out_size=intermediate_size,
+        weight_stride=intermediate_size,
+        weight_addr_reg=up_weight_hbm_offset_reg,
+        result_register=up_result,
+        result_base=up_base,
+        input_address=activation_base_address,
+        input_register=None,
+        input_register_value=None,
+        configure_matrix=True,
+    )
+    projection(
+        name="FFN gate projection",
+        k_size=hidden_size,
+        out_size=intermediate_size,
+        weight_stride=intermediate_size,
+        weight_addr_reg=gate_weight_hbm_offset_reg,
+        result_register=gate_result,
+        result_base=gate_base,
+        input_address=activation_base_address,
+        input_register=None,
+        input_register_value=None,
+        configure_matrix=False,
+    )
+
+    lines.extend(
+        (
+            "; FFN SiLU (affine loop)\n",
+            f"S_LD_FP f1, gp0, {const_one_fp_address}\n",
+            _load_large_int(up_result, up_base),
+            _load_large_int(gate_result, gate_base),
+            _load_large_int(intermediate, activation_base_address),
+        )
+    )
+    silu_iterations = batch_rows * (intermediate_size // vlen)
+    lines.append(_loop_start(output_block_loop, silu_iterations))
+    lines.extend(
+        (
+            f"V_SUB_VF gp{intermediate}, gp{up_result}, f0, 0, 1\n",
+            f"V_EXP_V gp{intermediate}, gp{intermediate}, 0\n",
+            f"V_ADD_VF gp{intermediate}, gp{intermediate}, f1, 0\n",
+            f"V_RECI_V gp{intermediate}, gp{intermediate}, 0\n",
+            f"V_MUL_VV gp{intermediate}, gp{intermediate}, gp{up_result}, 0\n",
+            f"V_MUL_VV gp{up_result}, gp{intermediate}, gp{gate_result}, 0\n",
+        )
+    )
+    if silu_iterations > 1:
+        lines.extend(
+            (
+                f"S_ADDI_INT gp{gate_result}, gp{gate_result}, {vlen}\n",
+                f"S_ADDI_INT gp{up_result}, gp{up_result}, {vlen}\n",
+            )
+        )
+    lines.append(_loop_end(output_block_loop, silu_iterations))
+
+    projection(
+        name="FFN down projection",
+        k_size=intermediate_size,
+        out_size=hidden_size,
+        weight_stride=hidden_size,
+        weight_addr_reg=down_weight_hbm_offset_reg,
+        result_register=gate_result,
+        result_base=activation_base_address,
+        input_address=None,
+        input_register=up_result,
+        input_register_value=up_base,
+        configure_matrix=True,
+    )
+    return "".join(lines)
 
 
 def _ffn_asm_unrolled(
@@ -127,6 +562,7 @@ def _ffn_asm_unrolled(
     activation_base_address: int,
     matrix_sram_size: int = 1024,
     workspace_base_address: int = 0,
+    ffn_address_schedule: str = FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1,
 ) -> str:
     """Unrolled FFN: up + gate + SiLU + down projections.
 
@@ -148,7 +584,9 @@ def _ffn_asm_unrolled(
     intermediate_register = alive_registers[4]
     gate_result_register = alive_registers[5]
     w_hbm_offset_register = alive_registers[6]
-    m_stride_register = alive_registers[7]
+    matrix_stride_register = alive_registers[7]
+    result_stride_register = alive_registers[8]
+    output_stride_register = alive_registers[9]
 
     # reset the registers
     generated_code = "; FFN Generation \n"
@@ -164,6 +602,19 @@ def _ffn_asm_unrolled(
     # Set the address for on-chip sram
     generated_code += _load_large_int(up_result_register, up_result_base)
     generated_code += _load_large_int(gate_result_register, gate_result_base)
+    if ffn_address_schedule == FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+        if mlen * mlen >= IMM2_BOUND:
+            generated_code += _load_large_int(
+                matrix_stride_register, mlen * mlen
+            )
+        if mlen * batch * seq_len >= IMM2_BOUND:
+            generated_code += _load_large_int(
+                result_stride_register, mlen * batch * seq_len
+            )
+        if blen * mlen >= IMM2_BOUND:
+            generated_code += _load_large_int(
+                output_stride_register, blen * mlen
+            )
 
     # K-split config: when K tile count > MRAM tile capacity, we split K and
     # accumulate partial sums. `activation` region (used as input) starts at
@@ -195,6 +646,10 @@ def _ffn_asm_unrolled(
         w_hbm_offset_register=w_hbm_offset_register,
         scratch_base_value=scratch_base,
         section_comment="FFN Upsize Linear Generation",
+        ffn_address_schedule=ffn_address_schedule,
+        matrix_stride_register=matrix_stride_register,
+        result_stride_register=result_stride_register,
+        output_stride_register=output_stride_register,
     )
 
     generated_code += " ; FFN Gate Projection Generation \n"
@@ -220,6 +675,10 @@ def _ffn_asm_unrolled(
         w_hbm_offset_register=w_hbm_offset_register,
         scratch_base_value=scratch_base,
         section_comment="FFN Gate Projection (inlined)",
+        ffn_address_schedule=ffn_address_schedule,
+        matrix_stride_register=matrix_stride_register,
+        result_stride_register=result_stride_register,
+        output_stride_register=output_stride_register,
     )
 
     generated_code += "; SILU Generation \n"
@@ -254,9 +713,11 @@ def _ffn_asm_unrolled(
     generated_code += _load_large_int(w_actual_register, hidden_size)
     generated_code += f"C_SET_STRIDE_REG gp{w_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n"
-    generated_code += (
-        f"S_ADDI_INT gp{m_stride_register}, gp0, {((batch * seq_len) // blen)} \n"
-    )
+    if ffn_address_schedule != FFN_ADDRESS_SCHEDULE_LIVE_STRIDE_V1:
+        generated_code += (
+            f"S_ADDI_INT gp{matrix_stride_register}, gp0, "
+            f"{((batch * seq_len) // blen)} \n"
+        )
     # Storing the results to the activation base region
     act_result_register = gate_result_register
     # Down projection: K = intermediate_size. Activation input is at
@@ -285,6 +746,10 @@ def _ffn_asm_unrolled(
         w_hbm_offset_register=w_hbm_offset_register,
         scratch_base_value=scratch_base,
         section_comment="FFN Downsize Linear (inlined)",
+        ffn_address_schedule=ffn_address_schedule,
+        matrix_stride_register=matrix_stride_register,
+        result_stride_register=result_stride_register,
+        output_stride_register=output_stride_register,
     )
     return generated_code
 
@@ -313,6 +778,10 @@ def _emit_ffn_projection_unrolled(
     w_hbm_offset_register: int,
     scratch_base_value: int,
     section_comment: str,
+    ffn_address_schedule: str,
+    matrix_stride_register: int,
+    result_stride_register: int,
+    output_stride_register: int,
 ) -> str:
     """Emit a single FFN-style projection (one of up/gate/down) as unrolled ASM.
 
@@ -371,6 +840,10 @@ def _emit_ffn_projection_unrolled(
                 w_hbm_offset_register=w_hbm_offset_register,
                 target_base_value_override=None,
                 reset_act_base_register=True,
+                ffn_address_schedule=ffn_address_schedule,
+                matrix_stride_register=matrix_stride_register,
+                result_stride_register=result_stride_register,
+                output_stride_register=output_stride_register,
             )
         )
         return "".join(lines)
@@ -415,6 +888,10 @@ def _emit_ffn_projection_unrolled(
                 w_hbm_offset_register=w_hbm_offset_register,
                 target_base_value_override=target_base_value,
                 reset_act_base_register=True,
+                ffn_address_schedule=ffn_address_schedule,
+                matrix_stride_register=matrix_stride_register,
+                result_stride_register=result_stride_register,
+                output_stride_register=output_stride_register,
             )
         )
 
@@ -470,6 +947,10 @@ def _emit_ffn_projection_chunk(
     w_hbm_offset_register: int,
     target_base_value_override: int | None,
     reset_act_base_register: bool,
+    ffn_address_schedule: str,
+    matrix_stride_register: int,
+    result_stride_register: int,
+    output_stride_register: int,
 ) -> str:
     """Emit one K-chunk of an FFN projection.
 
@@ -497,6 +978,11 @@ def _emit_ffn_projection_chunk(
 
     assert k_size % mlen == 0, f"K ({k_size}) must be a multiple of MLEN ({mlen})"
     num_act_cols = (batch * seq_len) // blen
+    address_plan = build_ffn_address_plan(
+        mode=ffn_address_schedule,
+        k_tile_count=k_tile_count,
+        num_activation_columns=num_act_cols,
+    )
     chunk_hbm_base_offset = k_start_tile * mlen * weight_stride
     chunk_act_base_offset = k_start_tile * mlen * batch * seq_len
 
@@ -539,21 +1025,27 @@ def _emit_ffn_projection_chunk(
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_base_register}, 0 \n"
             )
-            for _ in range(k_tile_count):
+            for tile_index in range(k_tile_count):
                 lines.append(
                     f"H_PREFETCH_M gp{w_actual_register}, gp{w_hbm_offset_register}, a{weight_hbm_offset_reg}, 1, 0 \n"
                 )
-                lines.append(
-                    f"S_ADDI_INT gp{w_actual_register}, gp{w_actual_register}, {mlen * mlen} \n"
-                )
-                lines.append(
-                    _addi_large_int(
-                        w_hbm_offset_register,
-                        w_hbm_offset_register,
-                        mlen * weight_stride,
-                        w_temp_register,
+                if tile_index < address_plan.prefetch_pointer_updates:
+                    lines.append(
+                        _ffn_relative_update(
+                            w_actual_register,
+                            mlen * mlen,
+                            mode=ffn_address_schedule,
+                            stride_register=matrix_stride_register,
+                        )
                     )
-                )
+                    lines.append(
+                        _addi_large_int(
+                            w_hbm_offset_register,
+                            w_hbm_offset_register,
+                            mlen * weight_stride,
+                            w_temp_register,
+                        )
+                    )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 \n")
         else:
             lines.append(
@@ -602,24 +1094,38 @@ def _emit_ffn_projection_chunk(
             if k_tile_count > 1:
                 lines.append(f"C_LOOP_START gp{w_hbm_offset_register}, {k_tile_count} \n")
             lines.append(f"M_MM 0, gp{w_temp_register}, gp{a_actual_register} \n")
-            lines.append(
-                f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} \n"
-            )
-            lines.append(
-                f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n"
-            )
+            if address_plan.matrix_pointer_updates:
+                # Keep loop-carried updates as immediates so loop-AGU-v1 can
+                # recognize and eliminate them from hardware-loop bodies.
+                lines.append(
+                    f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} \n"
+                )
+                lines.append(
+                    f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {mlen * batch * seq_len} \n"
+                )
             if k_tile_count > 1:
                 lines.append(f"C_LOOP_END gp{w_hbm_offset_register} \n")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 \n")
-            lines.append(
-                f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} \n"
-            )
+            if act_col < address_plan.output_pointer_updates:
+                lines.append(
+                    _ffn_relative_update(
+                        intermediate_register,
+                        blen * mlen,
+                        mode=ffn_address_schedule,
+                        stride_register=output_stride_register,
+                    )
+                )
 
         if (weight_row + 1) % (
             mlen // blen
         ) == 0 and weight_row != out_size // blen - 1:
             lines.append(
-                f"S_ADDI_INT gp{result_base_register}, gp{result_base_register}, {mlen * batch * seq_len} \n"
+                _ffn_relative_update(
+                    result_base_register,
+                    mlen * batch * seq_len,
+                    mode=ffn_address_schedule,
+                    stride_register=result_stride_register,
+                )
             )
 
     return "".join(lines)

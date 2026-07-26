@@ -3,6 +3,16 @@
 from __future__ import annotations
 
 from compiler.asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
+from compiler.asm_templates.ffn_address_plan import (
+    FFN_ADDRESS_SCHEDULE_LEGACY,
+    summarize_ffn_address_optimization,
+)
+from compiler.asm_templates.ffn_projection_plan import (
+    FFN_LOOP_PLAN_VERSION,
+    FFN_PROJECTION_SCHEDULE_AFFINE_LOOP_V2,
+    FFN_PROJECTION_SCHEDULE_LEGACY_AUTO_V1,
+    build_ffn_projection_plan,
+)
 from compiler.aten.plena.cost_kernels import (
     ffn_unrolled_cost_counts,
     ffn_unrolled_cost_schedule,
@@ -420,7 +430,10 @@ class ProgramTensorMixin:
             )
         activation_base_address = self.get_vram_addr(input_var.name)
         max_k_tiles = max(hidden_size // mlen, inter_dim // mlen)
-        use_loop_instructions = max_k_tiles <= self.mram_tile_capacity
+        use_loop_instructions = (
+            self.ffn_projection_schedule != FFN_PROJECTION_SCHEDULE_AFFINE_LOOP_V2
+            and max_k_tiles <= self.mram_tile_capacity
+        )
         workspace_elems = batch_size * (2 * inter_dim + max(hidden_size, inter_dim))
         workspace_rows = (workspace_elems + mlen - 1) // mlen
         workspace = self.alloc(
@@ -431,6 +444,32 @@ class ProgramTensorMixin:
             physical_shape=(workspace_rows, mlen),
         )
         workspace_base_address = self.get_vram_addr(workspace.name)
+        address_stats = summarize_ffn_address_optimization(
+            mode=self.ffn_address_schedule,
+            mlen=mlen,
+            blen=blen,
+            batch_rows=batch_size,
+            hidden_size=hidden_size,
+            intermediate_size=inter_dim,
+            max_k_tiles=max(1, self.mram_tile_capacity),
+        )
+        projection_shapes = (
+            (hidden_size, inter_dim),
+            (hidden_size, inter_dim),
+            (inter_dim, hidden_size),
+        )
+        projection_plans = tuple(
+            build_ffn_projection_plan(
+                schedule=self.ffn_projection_schedule,
+                mlen=mlen,
+                blen=blen,
+                batch_rows=batch_size,
+                k_size=k_size,
+                out_size=out_size,
+                max_k_tiles=max(1, self.mram_tile_capacity),
+            )
+            for k_size, out_size in projection_shapes
+        )
 
         isa_code = preload_addr_reg_asm(
             addr_reg_to_set=[1, 2, 3],
@@ -439,8 +478,13 @@ class ProgramTensorMixin:
         )
         isa_code += reset_reg_asm(alive_registers=[1, 2, 3])
 
-        def cost_summary():
-            return ffn_unrolled_cost_counts(
+        cost_summary_cache = {}
+
+        def cost_summary(mode=None):
+            selected_mode = mode or self.ffn_address_schedule
+            if selected_mode in cost_summary_cache:
+                return cost_summary_cache[selected_mode]
+            summary = ffn_unrolled_cost_counts(
                 mlen=mlen,
                 vlen=mlen,
                 blen=blen,
@@ -454,9 +498,110 @@ class ProgramTensorMixin:
                 up_weight_hbm_base=w_up.hbm_addr,
                 down_weight_hbm_base=w_down.hbm_addr,
                 hbm_prefetch_amount=self.hbm_m_prefetch_amount,
+                ffn_address_schedule=selected_mode,
             )
+            cost_summary_cache[selected_mode] = summary
+            return summary
 
-        if getattr(self, "_emission_mode", "asm") == "cost" and not use_loop_instructions:
+        current_summary = cost_summary()
+        legacy_address_summary = cost_summary(FFN_ADDRESS_SCHEDULE_LEGACY)
+        address_opcodes = {
+            "S_ADDI_INT",
+            "S_ADD_INT",
+            "S_LUI_INT",
+            "C_LOOP_START",
+            "C_LOOP_END",
+            "C_AGU_CONFIG",
+            "C_LOOP_START_AGU",
+        }
+        address_cycles_after = sum(
+            current_summary.dynamic.get(opcode, 0) for opcode in address_opcodes
+        )
+        address_cycles_before = sum(
+            legacy_address_summary.dynamic.get(opcode, 0)
+            for opcode in address_opcodes
+        )
+        compatibility_plans = tuple(
+            build_ffn_projection_plan(
+                schedule=FFN_PROJECTION_SCHEDULE_LEGACY_AUTO_V1,
+                mlen=mlen,
+                blen=blen,
+                batch_rows=batch_size,
+                k_size=k_size,
+                out_size=out_size,
+                max_k_tiles=max(1, self.mram_tile_capacity),
+            )
+            for k_size, out_size in projection_shapes
+        )
+        semantic_match = all(
+            candidate.semantic_census() == compatibility.semantic_census()
+            for candidate, compatibility in zip(
+                projection_plans, compatibility_plans, strict=True
+            )
+        )
+        guard_passed = semantic_match and address_cycles_after <= address_cycles_before
+        selected_projection_schedule = (
+            self.ffn_projection_schedule
+            if guard_passed
+            else FFN_PROJECTION_SCHEDULE_LEGACY_AUTO_V1
+        )
+        if not guard_passed:
+            use_loop_instructions = max_k_tiles <= self.mram_tile_capacity
+        address_stats.update(
+            {
+                "ffn_address_cycles_before": address_cycles_before,
+                "ffn_address_cycles_after": (
+                    address_cycles_after if guard_passed else address_cycles_before
+                ),
+                "ffn_schedule_fallback_count": int(not guard_passed),
+            }
+        )
+        self.record_ffn_projection_metadata(
+            {
+                "ffn_loop_plan_version": FFN_LOOP_PLAN_VERSION,
+                "ffn_explicit_loop_depth": max(
+                    plan.explicit_loop_depth for plan in projection_plans
+                ),
+                "ffn_agu_streams_by_axis": dict(
+                    projection_plans[0].agu_streams_by_axis
+                ),
+                "ffn_schedule_guard_status": (
+                    "structural_invariants_passed"
+                    if guard_passed
+                    else "compatibility_fallback"
+                ),
+                "ffn_schedule_fallback_reason": (
+                    None
+                    if guard_passed
+                    else "semantic_census_mismatch"
+                    if not semantic_match
+                    else "address_control_work_regression"
+                ),
+                "ffn_legacy_template_bypassed": bool(
+                    selected_projection_schedule
+                    == FFN_PROJECTION_SCHEDULE_AFFINE_LOOP_V2
+                ),
+            }
+        )
+        if self.ffn_address_schedule != FFN_ADDRESS_SCHEDULE_LEGACY:
+            legacy_summary = cost_summary(FFN_ADDRESS_SCHEDULE_LEGACY)
+            address_stats["ffn_large_immediate_chunks_avoided"] = max(
+                0,
+                legacy_summary.dynamic.get("S_ADDI_INT", 0)
+                - current_summary.dynamic.get("S_ADDI_INT", 0),
+            )
+        address_stats["ffn_residual_address_opcodes"] = (
+            current_summary.dynamic.get("S_ADDI_INT", 0)
+            + current_summary.dynamic.get("S_ADD_INT", 0)
+        )
+        self.record_ffn_address_stats(address_stats)
+
+        if (
+            getattr(self, "_emission_mode", "asm") == "cost"
+            and not use_loop_instructions
+            and selected_projection_schedule
+            != FFN_PROJECTION_SCHEDULE_AFFINE_LOOP_V2
+        ):
             self.emit(isa_code)
             counts = cost_summary()
             schedule = ffn_unrolled_cost_schedule(
@@ -469,6 +614,7 @@ class ProgramTensorMixin:
                 activation_base_address=activation_base_address,
                 workspace_base_address=workspace_base_address,
                 matrix_sram_size=self.mram_tile_capacity * self.mlen,
+                ffn_address_schedule=self.ffn_address_schedule,
             )
             self.emit_cost_schedule(
                 static_opcodes=counts.static,
@@ -486,7 +632,7 @@ class ProgramTensorMixin:
             seq_len=1,
             hidden_size=hidden_size,
             intermediate_size=inter_dim,
-            alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            alive_registers=list(range(1, 16)),
             gate_weight_hbm_offset_reg=1,
             up_weight_hbm_offset_reg=2,
             down_weight_hbm_offset_reg=3,
@@ -495,6 +641,8 @@ class ProgramTensorMixin:
             use_loop_instructions=use_loop_instructions,
             matrix_sram_size=self.mram_tile_capacity * self.mlen,
             workspace_base_address=workspace_base_address,
+            ffn_address_schedule=self.ffn_address_schedule,
+            ffn_projection_schedule=selected_projection_schedule,
         )
 
         self.emit(isa_code)
