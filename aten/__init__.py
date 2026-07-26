@@ -29,6 +29,7 @@ from compiler.aten.cost_emitter import (  # noqa: E402, F401
     CompositeSink,
     CostSink,
     CostTrace,
+    EnergyAction,
 )
 from compiler.aten.plena import (  # noqa: E402, F401
     FPVar,
@@ -40,3 +41,18 @@ from compiler.aten.plena import (  # noqa: E402, F401
     VRAMMatrixVar,
 )
 from compiler.aten.ops.registry import OpRegistry, Backend  # noqa: E402, F401
+from compiler.aten.plena.schedule_options import (
+    CURRENT_DSE_PROFILE,
+    RTL_VALIDATION_PROFILE,
+    CompilerScheduleOptions,
+    compiler_schedule_profile,
+    compiler_schedule_profile_kwargs,
+)
+
+__all__ = [
+    "CURRENT_DSE_PROFILE",
+    "RTL_VALIDATION_PROFILE",
+    "CompilerScheduleOptions",
+    "compiler_schedule_profile",
+    "compiler_schedule_profile_kwargs",
+]
