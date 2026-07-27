@@ -209,14 +209,27 @@ def test_gqa_row_interleaving_preserves_arithmetic_and_dma_work() -> None:
     assert not interleaved.schedule_unavailable_reasons
 
 
-def test_affine_summary_matches_detailed_ideal_work() -> None:
+@pytest.mark.parametrize(
+    ("seq_len", "mram_tile_capacity"),
+    (
+        (39, 2),
+        (65, 6),
+    ),
+)
+def test_affine_summary_matches_detailed_ideal_work(
+    seq_len: int,
+    mram_tile_capacity: int,
+) -> None:
     hardware = CompilerCostHardware(
-        **{**_tiny_packed_hardware().__dict__, "mram_tile_capacity": 2}
+        **{
+            **_tiny_packed_hardware().__dict__,
+            "mram_tile_capacity": mram_tile_capacity,
+        }
     )
     common = dict(
         model_config=_tiny_packed_qwen3(),
         hardware_config=hardware,
-        seq_len=39,
+        seq_len=seq_len,
         batch_size=1,
         num_layers=1,
         vector_scalar_schedule="rtl-v4",

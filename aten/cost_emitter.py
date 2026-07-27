@@ -2105,38 +2105,80 @@ def optimize_cost_trace_loop_agu(
         ] = {}
         best: tuple[int, int, int] | None = None
         best_savings = 0
-        for start_index in range(len(instructions) - 1):
-            max_period = min(
-                AGU_REPEAT_MAX_PERIOD,
-                (len(instructions) - start_index) // 2,
-            )
-            for period in range(1, max_period + 1):
-                block = instructions[start_index : start_index + period]
-                block_keys = keys[start_index : start_index + period]
-                if block_keys != keys[start_index + period : start_index + 2 * period]:
+        instruction_count = len(instructions)
+        max_global_period = min(
+            AGU_REPEAT_MAX_PERIOD,
+            instruction_count // 2,
+        )
+        for period in range(1, max_global_period + 1):
+            # A repeated block of width ``period`` exists at ``start`` iff
+            # keys[start:start+period] equals the following block. Scan the
+            # equivalent element-wise condition keys[i] == keys[i+period]
+            # once per period. Within one equality run, starts separated by a
+            # full period have the same block and strictly fewer repeats, so
+            # only the first start for each phase can improve the optimum.
+            compare_limit = instruction_count - period
+            compare_index = 0
+            while compare_index < compare_limit:
+                if keys[compare_index] != keys[compare_index + period]:
+                    compare_index += 1
                     continue
-                repeat_count = 2
+                run_start = compare_index
+                compare_index += 1
                 while (
-                    start_index + (repeat_count + 1) * period <= len(instructions)
-                    and block_keys
-                    == keys[start_index + repeat_count * period : start_index + (repeat_count + 1) * period]
+                    compare_index < compare_limit
+                    and keys[compare_index]
+                    == keys[compare_index + period]
                 ):
-                    repeat_count += 1
-                cached_removal = removable_cache.get(block_keys)
-                if cached_removal is None:
-                    candidates = candidate_groups(list(block))
-                    removed = sum(len(indices) for _, _, indices in candidates)
-                    candidate_count = len(candidates)
-                    removable_cache[block_keys] = (
-                        removed,
-                        candidate_count,
+                    compare_index += 1
+                run_end = compare_index
+                if run_end - run_start < period:
+                    continue
+                last_candidate = min(
+                    run_start + period,
+                    run_end - period + 1,
+                )
+                for start_index in range(run_start, last_candidate):
+                    repeat_count = (
+                        1 + (run_end - start_index) // period
                     )
-                else:
-                    removed, candidate_count = cached_removal
-                savings = repeat_count * removed - (candidate_count + 2)
-                if savings > best_savings:
-                    best_savings = savings
-                    best = start_index, period, repeat_count
+                    if repeat_count < 2:
+                        continue
+                    block = instructions[
+                        start_index : start_index + period
+                    ]
+                    block_keys = keys[
+                        start_index : start_index + period
+                    ]
+                    cached_removal = removable_cache.get(block_keys)
+                    if cached_removal is None:
+                        candidates = candidate_groups(list(block))
+                        removed = sum(
+                            len(indices)
+                            for _, _, indices in candidates
+                        )
+                        candidate_count = len(candidates)
+                        removable_cache[block_keys] = (
+                            removed,
+                            candidate_count,
+                        )
+                    else:
+                        removed, candidate_count = cached_removal
+                    savings = (
+                        repeat_count * removed - (candidate_count + 2)
+                    )
+                    candidate = (start_index, period, repeat_count)
+                    if (
+                        savings > best_savings
+                        or (
+                            savings == best_savings
+                            and savings > 0
+                            and best is not None
+                            and candidate[:2] < best[:2]
+                        )
+                    ):
+                        best_savings = savings
+                        best = candidate
         return best
 
     def refold_sequence(

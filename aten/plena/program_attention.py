@@ -902,24 +902,62 @@ class ProgramAttentionMixin:
         rows, cols = layout.physical_shape or layout.full_shape
         total_elements = rows * cols
 
+        def immediate_shape(value: int) -> tuple[str, ...]:
+            return tuple(
+                line.split(maxsplit=1)[0]
+                for line in load_large_int(1, value)
+            )
+
+        instruction_census: dict[
+            tuple[tuple[str, ...], tuple[str, ...]],
+            list[object],
+        ] = {}
         for row_idx, destination in tiles:
             hbm_offset = layout.get_sub_block(row_idx, 0).hbm_offset
+            shape_key = (
+                immediate_shape(destination),
+                immediate_shape(hbm_offset),
+            )
+            entry = instruction_census.get(shape_key)
+            if entry is None:
+                instruction_census[shape_key] = [
+                    row_idx,
+                    destination,
+                    1,
+                ]
+            else:
+                entry[2] = int(entry[2]) + 1
+
+        for shape_key, (
+            representative_row,
+            representative_destination,
+            repetitions,
+        ) in instruction_census.items():
+            row_idx = int(representative_row)
+            destination = int(representative_destination)
             key = (
-                "packed_kv_prefetch_instruction_v1",
+                "packed_kv_prefetch_instruction_v2",
                 self.mlen,
                 self.hbm_m_prefetch_amount,
-                layout.hbm_base_addr,
                 rows * cols,
                 cols,
-                destination,
-                hbm_offset,
+                *shape_key,
             )
-            if not self.replay_cost_summary_template(key):
+            repetitions = int(repetitions)
+            if not self.replay_cost_summary_template(
+                key,
+                count=repetitions,
+            ):
                 with self.cost_summary_template(key):
                     self._emit_packed_kv_prefetch(
                         input_var,
                         ((row_idx, destination),),
                         record_dma=False,
+                    )
+                if repetitions > 1:
+                    assert self.replay_cost_summary_template(
+                        key,
+                        count=repetitions - 1,
                     )
 
         first_row = row_indices[0]
@@ -967,21 +1005,19 @@ class ProgramAttentionMixin:
         q_idx: int,
         k_mram_address: int,
         s_base_address: int,
+        summary_repetitions: int = 1,
     ) -> None:
         """Emit packed QK^T against a K tile already resident in MRAM."""
         q_base = self.get_vram_addr(Q_group.name) + q_idx * self.mlen * self.mlen
-        immediate_shape = lambda value: tuple(
-            line.split(maxsplit=1)[0] for line in load_large_int(1, value)
+        template_key = self._packed_qkt_from_mram_template_key(
+            q_base=q_base,
+            k_mram_address=k_mram_address,
+            s_base_address=s_base_address,
         )
-        template_key = (
-            "packed_qkt_from_mram_v1",
-            self.mlen,
-            self.blen,
-            immediate_shape(q_base),
-            immediate_shape(k_mram_address),
-            immediate_shape(s_base_address),
-        )
-        if self.replay_cost_summary_template(template_key):
+        if self.replay_cost_summary_template(
+            template_key,
+            count=summary_repetitions,
+        ):
             return
         with self.cost_summary_template(template_key):
             self._emit_packed_qkt_from_mram_body(
@@ -989,6 +1025,35 @@ class ProgramAttentionMixin:
                 k_mram_address=k_mram_address,
                 s_base_address=s_base_address,
             )
+        if summary_repetitions > 1:
+            assert self.replay_cost_summary_template(
+                template_key,
+                count=summary_repetitions - 1,
+            )
+
+    def _packed_qkt_from_mram_template_key(
+        self,
+        *,
+        q_base: int,
+        k_mram_address: int,
+        s_base_address: int,
+    ) -> tuple[object, ...]:
+        """Return the exact cost shape of one memory-free packed QK kernel."""
+
+        def immediate_shape(value: int) -> tuple[str, ...]:
+            return tuple(
+                line.split(maxsplit=1)[0]
+                for line in load_large_int(1, value)
+            )
+
+        return (
+            "packed_qkt_from_mram_v2",
+            self.mlen,
+            self.blen,
+            immediate_shape(q_base),
+            immediate_shape(k_mram_address),
+            immediate_shape(s_base_address),
+        )
 
     def _emit_packed_qkt_from_mram_body(
         self,
@@ -1876,6 +1941,9 @@ class ProgramAttentionMixin:
         summary_head_census: dict[
             tuple[object, ...], list[object]
         ] = {}
+        summary_qk_census: dict[
+            tuple[object, ...], list[object]
+        ] = {}
 
         try:
             for q_block in range(num_q_blocks):
@@ -1937,9 +2005,305 @@ class ProgramAttentionMixin:
                     self.record_gqa_pipeline_stats(
                         {
                             "gqa_pipeline_fallback_reason":
-                                "mram_tile_capacity_lt_2"
+                            "mram_tile_capacity_lt_2"
                         }
                     )
+                if (
+                    self.cost_affine_summary_enabled()
+                    and kv_residency_plan is not None
+                ):
+                    # The unordered CostEmitter summary needs only a finite
+                    # census of exact kernel shapes.  Enumerating every
+                    # causal Q/K/head pair first made long-context compile
+                    # time quadratic even though those pairs were later
+                    # merged into the same templates.
+                    processed_count = len(processed_k_blocks)
+                    resident_count = min(
+                        kv_residency_plan.resident_prefix_blocks,
+                        processed_count,
+                    )
+                    streaming_start = resident_count
+                    streaming_count = processed_count - resident_count
+                    if streaming_count:
+                        streaming_blocks = tuple(
+                            range(streaming_start, processed_count)
+                        )
+                        k_tiles = tuple(
+                            (
+                                k_idx + block,
+                                kv_residency_plan.k_address(block),
+                            )
+                            for block in streaming_blocks
+                        )
+                        v_tiles = tuple(
+                            (
+                                k_idx + block,
+                                kv_residency_plan.v_address(block),
+                            )
+                            for block in streaming_blocks
+                        )
+                        affine_kv_summary = (
+                            self._emit_packed_kv_prefetch_affine_summary(
+                                K,
+                                k_tiles,
+                            )
+                            and self._emit_packed_kv_prefetch_affine_summary(
+                                V,
+                                v_tiles,
+                            )
+                        )
+                        if not affine_kv_summary:
+                            raise ValueError(
+                                "affine CostEmitter summary requires "
+                                "contiguous streaming K/V blocks"
+                            )
+                        self._packed_attention_stats[
+                            "kv_tile_load_count"
+                        ] += 2 * streaming_count
+                        self._packed_attention_stats[
+                            "kv_cache_misses"
+                        ] += 2 * streaming_count
+                        if double_buffered_kv:
+                            self.record_gqa_pipeline_stats(
+                                {
+                                    "gqa_dma_overlap_eligible_occurrences":
+                                        streaming_count
+                                }
+                            )
+                    if resident_count:
+                        self._packed_attention_stats[
+                            "kv_cache_hits"
+                        ] += 2 * resident_count
+
+                    stats = self._packed_attention_stats
+                    stats["qk_compute_count"] += processed_count
+                    stats["ideal_qk_compute_count"] += processed_count
+
+                    q_base = (
+                        self.get_vram_addr(Q_group.name)
+                        + q_block * mlen * mlen
+                    )
+
+                    def add_qk_class(
+                        block: int,
+                        repetitions: int,
+                    ) -> None:
+                        if repetitions <= 0:
+                            return
+                        k_address = kv_residency_plan.k_address(block)
+                        qkt_key = self._packed_qkt_from_mram_template_key(
+                            q_base=q_base,
+                            k_mram_address=k_address,
+                            s_base_address=scratch_base_address,
+                        )
+                        qkt_entry = summary_qk_census.get(qkt_key)
+                        if qkt_entry is None:
+                            summary_qk_census[qkt_key] = [
+                                q_block,
+                                k_address,
+                                repetitions,
+                            ]
+                        else:
+                            qkt_entry[2] = (
+                                int(qkt_entry[2]) + repetitions
+                            )
+
+                    # Resident addresses can cross immediate-encoding
+                    # boundaries, so retain one lightweight classification
+                    # per resident block. All streamed blocks share one MRAM
+                    # slot and therefore one exact QK instruction shape.
+                    for block in range(resident_count):
+                        add_qk_class(block, 1)
+                    if streaming_count:
+                        add_qk_class(streaming_start, streaming_count)
+
+                    q_head_kernel_census: dict[
+                        tuple[object, ...], list[object]
+                    ] = {}
+                    valid_mask_cache: dict[
+                        tuple[int, bool], VRAMMatrixVar | None
+                    ] = {}
+
+                    def add_head_class(
+                        block: int,
+                        repetitions: int,
+                    ) -> None:
+                        if repetitions <= 0:
+                            return
+                        block_cols = min(
+                            mlen,
+                            active_k_cols - block * mlen,
+                        )
+                        apply_causal_mask = (
+                            causal_mask is not None
+                            and block == q_block
+                        )
+                        valid_mask_key = (
+                            block_cols,
+                            apply_causal_mask,
+                        )
+                        if valid_mask_key not in valid_mask_cache:
+                            valid_mask_cache[valid_mask_key] = (
+                                self._valid_col_mask_for_tile(
+                                    block_cols,
+                                    causal_mask=causal_mask,
+                                    apply_causal_mask=(
+                                        apply_causal_mask
+                                    ),
+                                    causal_mask_covers_padding=(
+                                        seq_len <= mlen
+                                        and active_k_cols <= mlen
+                                    ),
+                                )
+                            )
+                        valid_col_mask = valid_mask_cache[
+                            valid_mask_key
+                        ]
+                        softmax_valid_cols = (
+                            None
+                            if valid_col_mask is not None
+                            or (
+                                isinstance(
+                                    causal_mask,
+                                    VRAMMatrixVar,
+                                )
+                                and apply_causal_mask
+                            )
+                            else block_cols
+                        )
+                        first_block = block == 0
+                        last_block = block == processed_count - 1
+                        v_mram_address = (
+                            kv_residency_plan.v_address(block)
+                        )
+                        kernel_class = (
+                            first_block,
+                            last_block,
+                            softmax_valid_cols,
+                            valid_col_mask is not None,
+                            isinstance(causal_mask, VRAMMatrixVar)
+                            and apply_causal_mask,
+                            causal_mask is True
+                            and apply_causal_mask,
+                            tuple(
+                                line.split(maxsplit=1)[0]
+                                for line in load_large_int(
+                                    1,
+                                    v_mram_address,
+                                )
+                            ),
+                        )
+                        class_entry = q_head_kernel_census.get(
+                            kernel_class
+                        )
+                        if class_entry is None:
+                            q_head_kernel_census[kernel_class] = [
+                                {
+                                    "causal_mask": causal_mask,
+                                    "valid_col_mask": valid_col_mask,
+                                    "apply_causal_mask":
+                                        apply_causal_mask,
+                                    "softmax_valid_cols":
+                                        softmax_valid_cols,
+                                    "first_block": first_block,
+                                    "last_block": last_block,
+                                    "physical_k_idx": k_idx + block,
+                                    "v_mram_address":
+                                        v_mram_address,
+                                },
+                                repetitions,
+                            ]
+                        else:
+                            class_entry[1] = (
+                                int(class_entry[1]) + repetitions
+                            )
+
+                    for block in range(resident_count):
+                        add_head_class(block, 1)
+
+                    if streaming_count:
+                        special_streaming = {
+                            block
+                            for block in (
+                                streaming_start,
+                                processed_count - 1,
+                                num_k_blocks - 1,
+                            )
+                            if streaming_start
+                            <= block
+                            < processed_count
+                        }
+                        for block in sorted(special_streaming):
+                            add_head_class(block, 1)
+                        ordinary_streaming_count = (
+                            streaming_count - len(special_streaming)
+                        )
+                        if ordinary_streaming_count:
+                            representative = next(
+                                block
+                                for block in range(
+                                    streaming_start,
+                                    processed_count,
+                                )
+                                if block not in special_streaming
+                            )
+                            add_head_class(
+                                representative,
+                                ordinary_streaming_count,
+                            )
+
+                    for class_kwargs, repetitions in (
+                        q_head_kernel_census.values()
+                    ):
+                        for head, s_head in enumerate(s_views):
+                            output_block_base, output_lane = (
+                                head_outputs[head]
+                            )
+                            head_kwargs = dict(
+                                s_block=s_head,
+                                pv_matrix=pv,
+                                softmax_scale=softmax_scale,
+                                state_head=head,
+                                output_block_base=output_block_base,
+                                output_lane=output_lane,
+                                head_slot_dim=head_slot_dim,
+                                rows=rows,
+                                scratch_address=pack_scratch_addr,
+                                scratch_rows=pack_scratch_rows,
+                                row_ranges=active_ranges,
+                                active_rows=active_rows,
+                                **class_kwargs,
+                            )
+                            template_key = (
+                                self._packed_kmajor_head_template_key(
+                                    **head_kwargs
+                                )
+                            )
+                            entry = summary_head_census.get(template_key)
+                            if entry is None:
+                                summary_head_census[template_key] = [
+                                    head_kwargs,
+                                    int(repetitions),
+                                ]
+                            else:
+                                entry[1] = (
+                                    int(entry[1])
+                                    + int(repetitions)
+                                )
+
+                    for head, (
+                        output_block_base,
+                        output_lane,
+                    ) in enumerate(head_outputs):
+                        self._final_scale_packed_o_lane(
+                            output_base_address=output_block_base,
+                            head_slot=output_lane,
+                            state_head=head,
+                            rows=rows,
+                            row_ranges=active_ranges,
+                        )
+                    continue
+
                 summary_streaming_blocks = tuple(
                     block
                     for block in processed_k_blocks
@@ -1973,6 +2337,12 @@ class ProgramAttentionMixin:
                         self._packed_attention_stats["kv_cache_misses"] += (
                             2 * len(summary_streaming_blocks)
                         )
+                q_head_kernel_census: dict[
+                    tuple[object, ...], list[object]
+                ] = {}
+                valid_mask_cache: dict[
+                    tuple[int, bool], VRAMMatrixVar | None
+                ] = {}
                 for processed_index, k_block in enumerate(processed_k_blocks):
                     block_cols = min(mlen, active_k_cols - k_block * mlen)
                     physical_k_idx = k_idx + k_block
@@ -1983,12 +2353,7 @@ class ProgramAttentionMixin:
                     if block_resident:
                         stats = self._packed_attention_stats
                         stats["kv_cache_hits"] += 2
-                        self._emit_packed_qkt_from_mram(
-                            Q_group=Q_group,
-                            q_idx=q_block,
-                            k_mram_address=kv_residency_plan.k_address(k_block),
-                            s_base_address=scratch_base_address,
-                        )
+                        qkt_mram_address = kv_residency_plan.k_address(k_block)
                     elif kv_residency_plan is not None:
                         if not affine_kv_summary:
                             self._emit_packed_kv_prefetch(
@@ -2000,12 +2365,7 @@ class ProgramAttentionMixin:
                                     ),
                                 ),
                             )
-                        self._emit_packed_qkt_from_mram(
-                            Q_group=Q_group,
-                            q_idx=q_block,
-                            k_mram_address=kv_residency_plan.k_address(k_block),
-                            s_base_address=scratch_base_address,
-                        )
+                        qkt_mram_address = kv_residency_plan.k_address(k_block)
                     elif resident_k_mram is None:
                         self._emit_packed_qkt_to_s(
                             Q_group=Q_group,
@@ -2014,13 +2374,36 @@ class ProgramAttentionMixin:
                             k_idx=physical_k_idx,
                             s_base_address=scratch_base_address,
                         )
+                        qkt_mram_address = None
                     else:
-                        self._emit_packed_qkt_from_mram(
-                            Q_group=Q_group,
-                            q_idx=q_block,
-                            k_mram_address=resident_k_mram[k_block],
-                            s_base_address=scratch_base_address,
-                        )
+                        qkt_mram_address = resident_k_mram[k_block]
+                    if qkt_mram_address is not None:
+                        if self.cost_affine_summary_enabled():
+                            q_base = (
+                                self.get_vram_addr(Q_group.name)
+                                + q_block * mlen * mlen
+                            )
+                            qkt_key = self._packed_qkt_from_mram_template_key(
+                                q_base=q_base,
+                                k_mram_address=qkt_mram_address,
+                                s_base_address=scratch_base_address,
+                            )
+                            entry = summary_qk_census.get(qkt_key)
+                            if entry is None:
+                                summary_qk_census[qkt_key] = [
+                                    q_block,
+                                    qkt_mram_address,
+                                    1,
+                                ]
+                            else:
+                                entry[2] = int(entry[2]) + 1
+                        else:
+                            self._emit_packed_qkt_from_mram(
+                                Q_group=Q_group,
+                                q_idx=q_block,
+                                k_mram_address=qkt_mram_address,
+                                s_base_address=scratch_base_address,
+                            )
                     stats = self._packed_attention_stats
                     stats["qk_compute_count"] += 1
                     stats["ideal_qk_compute_count"] += 1
@@ -2063,14 +2446,20 @@ class ProgramAttentionMixin:
                     apply_causal_mask = (
                         causal_mask is not None and k_block == q_block
                     )
-                    valid_col_mask = self._valid_col_mask_for_tile(
-                        block_cols,
-                        causal_mask=causal_mask,
-                        apply_causal_mask=apply_causal_mask,
-                        causal_mask_covers_padding=(
-                            seq_len <= mlen and active_k_cols <= mlen
-                        ),
-                    )
+                    valid_mask_key = (block_cols, apply_causal_mask)
+                    if valid_mask_key not in valid_mask_cache:
+                        valid_mask_cache[valid_mask_key] = (
+                            self._valid_col_mask_for_tile(
+                                block_cols,
+                                causal_mask=causal_mask,
+                                apply_causal_mask=apply_causal_mask,
+                                causal_mask_covers_padding=(
+                                    seq_len <= mlen
+                                    and active_k_cols <= mlen
+                                ),
+                            )
+                        )
+                    valid_col_mask = valid_mask_cache[valid_mask_key]
                     softmax_valid_cols = (
                         None
                         if valid_col_mask is not None
@@ -2082,6 +2471,40 @@ class ProgramAttentionMixin:
                     )
                     first_block = processed_index == 0
                     last_block = processed_index + 1 == len(processed_k_blocks)
+                    if self.cost_affine_summary_enabled():
+                        kernel_class = (
+                            first_block,
+                            last_block,
+                            softmax_valid_cols,
+                            valid_col_mask is not None,
+                            isinstance(causal_mask, VRAMMatrixVar)
+                            and apply_causal_mask,
+                            causal_mask is True and apply_causal_mask,
+                            tuple(
+                                line.split(maxsplit=1)[0]
+                                for line in load_large_int(
+                                    1, v_mram_address
+                                )
+                            ),
+                        )
+                        class_entry = q_head_kernel_census.get(kernel_class)
+                        if class_entry is None:
+                            q_head_kernel_census[kernel_class] = [
+                                {
+                                    "causal_mask": causal_mask,
+                                    "valid_col_mask": valid_col_mask,
+                                    "apply_causal_mask": apply_causal_mask,
+                                    "softmax_valid_cols": softmax_valid_cols,
+                                    "first_block": first_block,
+                                    "last_block": last_block,
+                                    "physical_k_idx": physical_k_idx,
+                                    "v_mram_address": v_mram_address,
+                                },
+                                1,
+                            ]
+                        else:
+                            class_entry[1] = int(class_entry[1]) + 1
+                        continue
                     for head, s_head in enumerate(s_views):
                         output_block_base, output_lane = head_outputs[head]
                         head_kwargs = dict(
@@ -2106,24 +2529,9 @@ class ProgramAttentionMixin:
                             row_ranges=active_ranges,
                             active_rows=active_rows,
                         )
-                        if self.cost_affine_summary_enabled():
-                            template_key = (
-                                self._packed_kmajor_head_template_key(
-                                    **head_kwargs
-                                )
-                            )
-                            entry = summary_head_census.get(template_key)
-                            if entry is None:
-                                summary_head_census[template_key] = [
-                                    head_kwargs,
-                                    1,
-                                ]
-                            else:
-                                entry[1] = int(entry[1]) + 1
-                        else:
-                            self._emit_packed_kmajor_head_kernel(
-                                **head_kwargs
-                            )
+                        self._emit_packed_kmajor_head_kernel(
+                            **head_kwargs
+                        )
 
                     if (
                         double_buffered_kv
@@ -2138,6 +2546,45 @@ class ProgramAttentionMixin:
                             {"gqa_dma_overlap_eligible_occurrences": 1}
                         )
 
+                if self.cost_affine_summary_enabled():
+                    for class_kwargs, repetitions in (
+                        q_head_kernel_census.values()
+                    ):
+                        for head, s_head in enumerate(s_views):
+                            output_block_base, output_lane = (
+                                head_outputs[head]
+                            )
+                            head_kwargs = dict(
+                                s_block=s_head,
+                                pv_matrix=pv,
+                                softmax_scale=softmax_scale,
+                                state_head=head,
+                                output_block_base=output_block_base,
+                                output_lane=output_lane,
+                                head_slot_dim=head_slot_dim,
+                                rows=rows,
+                                scratch_address=pack_scratch_addr,
+                                scratch_rows=pack_scratch_rows,
+                                row_ranges=active_ranges,
+                                active_rows=active_rows,
+                                **class_kwargs,
+                            )
+                            template_key = (
+                                self._packed_kmajor_head_template_key(
+                                    **head_kwargs
+                                )
+                            )
+                            entry = summary_head_census.get(template_key)
+                            if entry is None:
+                                summary_head_census[template_key] = [
+                                    head_kwargs,
+                                    int(repetitions),
+                                ]
+                            else:
+                                entry[1] = (
+                                    int(entry[1]) + int(repetitions)
+                                )
+
                 for head, (output_block_base, output_lane) in enumerate(
                     head_outputs
                 ):
@@ -2148,6 +2595,16 @@ class ProgramAttentionMixin:
                         rows=rows,
                         row_ranges=active_ranges,
                     )
+            for q_block, qkt_mram_address, repetitions in (
+                summary_qk_census.values()
+            ):
+                self._emit_packed_qkt_from_mram(
+                    Q_group=Q_group,
+                    q_idx=int(q_block),
+                    k_mram_address=int(qkt_mram_address),
+                    s_base_address=scratch_base_address,
+                    summary_repetitions=int(repetitions),
+                )
             for head_kwargs, repetitions in summary_head_census.values():
                 self._emit_packed_kmajor_head_kernel(
                     **head_kwargs,

@@ -328,49 +328,101 @@ def _best_exact_repeat(
     affine address generation.
     """
 
-    signatures = [_instruction_signature(item) for item in instructions]
+    signatures = tuple(
+        _instruction_signature(item) for item in instructions
+    )
+    removable_cache: dict[
+        tuple[tuple[str, tuple[str, ...]], ...],
+        tuple[int, int],
+    ] = {}
     best: tuple[int, int, int] | None = None
     best_savings = 0
-    for start in range(len(instructions) - 1):
-        max_period = min(
-            AGU_REPEAT_MAX_PERIOD,
-            (len(instructions) - start) // 2,
-        )
-        for period in range(1, max_period + 1):
-            block_signatures = signatures[start : start + period]
-            if block_signatures != signatures[start + period : start + 2 * period]:
+    instruction_count = len(instructions)
+    max_global_period = min(
+        AGU_REPEAT_MAX_PERIOD,
+        instruction_count // 2,
+    )
+    for period in range(1, max_global_period + 1):
+        compare_limit = instruction_count - period
+        compare_index = 0
+        while compare_index < compare_limit:
+            if signatures[compare_index] != signatures[
+                compare_index + period
+            ]:
+                compare_index += 1
                 continue
-            repeat_count = 2
+            run_start = compare_index
+            compare_index += 1
             while (
-                start + (repeat_count + 1) * period <= len(instructions)
-                and block_signatures
-                == signatures[
-                    start + repeat_count * period :
-                    start + (repeat_count + 1) * period
-                ]
+                compare_index < compare_limit
+                and signatures[compare_index]
+                == signatures[compare_index + period]
             ):
-                repeat_count += 1
-            probe = _Loop(
-                start=_Instruction(
-                    text=f"C_LOOP_START gp0, {repeat_count}",
-                    opcode="C_LOOP_START",
-                    args=("gp0", str(repeat_count)),
-                ),
-                body=list(instructions[start : start + period]),
-                end=_Instruction(
-                    text="C_LOOP_END gp0",
-                    opcode="C_LOOP_END",
-                    args=("gp0",),
-                ),
+                compare_index += 1
+            run_end = compare_index
+            if run_end - run_start < period:
+                continue
+            # Starts separated by one full period have the same candidate
+            # body and strictly fewer repetitions. Only the first start for
+            # each phase can therefore improve the optimum.
+            last_candidate = min(
+                run_start + period,
+                run_end - period + 1,
             )
-            candidates = _candidate_groups(probe)[:AGU_MAX_STREAMS]
-            removed = sum(len(chain) for _, _, chain in candidates)
-            # One bind per stream plus LOOP_LEN and LOOP_START_AGU execute once
-            # for the reconstructed run. The static marker is never dispatched.
-            savings = repeat_count * removed - (len(candidates) + 2)
-            if savings > best_savings:
-                best_savings = savings
-                best = start, period, repeat_count
+            for start in range(run_start, last_candidate):
+                repeat_count = 1 + (run_end - start) // period
+                if repeat_count < 2:
+                    continue
+                block_signatures = signatures[start : start + period]
+                cached = removable_cache.get(block_signatures)
+                if cached is None:
+                    probe = _Loop(
+                        start=_Instruction(
+                            text=(
+                                f"C_LOOP_START gp0, {repeat_count}"
+                            ),
+                            opcode="C_LOOP_START",
+                            args=("gp0", str(repeat_count)),
+                        ),
+                        body=list(
+                            instructions[start : start + period]
+                        ),
+                        end=_Instruction(
+                            text="C_LOOP_END gp0",
+                            opcode="C_LOOP_END",
+                            args=("gp0",),
+                        ),
+                    )
+                    candidates = _candidate_groups(probe)[
+                        :AGU_MAX_STREAMS
+                    ]
+                    cached = (
+                        sum(
+                            len(chain)
+                            for _, _, chain in candidates
+                        ),
+                        len(candidates),
+                    )
+                    removable_cache[block_signatures] = cached
+                removed, candidate_count = cached
+                # One bind per stream plus LOOP_LEN and LOOP_START_AGU execute
+                # once. The static marker is never dispatched.
+                savings = (
+                    repeat_count * removed
+                    - (candidate_count + 2)
+                )
+                candidate = (start, period, repeat_count)
+                if (
+                    savings > best_savings
+                    or (
+                        savings == best_savings
+                        and savings > 0
+                        and best is not None
+                        and candidate[:2] < best[:2]
+                    )
+                ):
+                    best_savings = savings
+                    best = candidate
     return best
 
 
