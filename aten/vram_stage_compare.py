@@ -12,6 +12,7 @@ import json
 import re
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -551,7 +552,11 @@ def compare_stages(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("vram", nargs="?", default="transactional_emulator/vram_dump.bin")
-    parser.add_argument("build", nargs="?", default="/tmp/smolvlm2_1layer_f32regs")
+    parser.add_argument(
+        "build",
+        nargs="?",
+        default=str(Path(tempfile.gettempdir()) / "smolvlm2_1layer_f32regs"),
+    )
     parser.add_argument("layer_idx", nargs="?", type=int, default=None)
     parser.add_argument("--hidden", type=int, default=576)
     parser.add_argument("--inter", type=int, default=1536)

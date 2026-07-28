@@ -19,6 +19,7 @@ Usage:
 """
 
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def run_sliced_emulator_check(
     # Resolve build directory
     if build_dir is None:
         safe_name = model_id.replace("/", "_")
-        build_dir = str(Path("/tmp") / f"aten_sliced_{safe_name}_sl{seq_len}_l{layer_idx}")
+        build_dir = str(Path(tempfile.gettempdir()) / f"aten_sliced_{safe_name}_sl{seq_len}_l{layer_idx}")
     build_path = Path(build_dir)
 
     # ------------------------------------------------------------------
@@ -335,7 +336,10 @@ def main():
         "--inter-dim", type=int, default=128, help="FFN intermediate dimension clipped to sim limits (default: 128)"
     )
     parser.add_argument(
-        "--build-dir", type=str, default=None, help="Build directory for sim artifacts (default: /tmp/aten_sliced_...)"
+        "--build-dir",
+        type=str,
+        default=None,
+        help="Build directory for sim artifacts (default: system temporary directory)",
     )
     parser.add_argument("--trust-remote-code", action="store_true", help="Trust remote code for HF model loading")
     parser.add_argument("--partial-load", action="store_true", help="Load only needed weight shards (for large models)")
