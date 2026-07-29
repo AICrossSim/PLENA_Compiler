@@ -12,6 +12,102 @@ GptOssFPConstants = tuple[FPVar, FPVar, FPVar, FPVar, FPVar]
 ExpertWeights = tuple[InputVar, InputVar, InputVar]
 ExpertBiases = tuple[VRAMMatrixVar | None, VRAMMatrixVar | None, VRAMMatrixVar | None]
 
+# ============================================================================
+# Stage markers
+# ============================================================================
+
+#: Prefix of the explicit stage marker comment. The emulator's stage profiler
+#: (``transactional_emulator/src/stage_profile.rs``) keys on this exact string.
+MOE_STAGE_MARKER_PREFIX = "@stage="
+
+#: Every stage name the emulator's ``StageKind`` understands.
+#:
+#: This exists because stage attribution used to be an *undeclared* cross-repo
+#: contract: the emulator substring-matched prose like ``"GPT-OSS gather token
+#: rows"`` out of the emitted comments. Any rewording here silently reclassified
+#: instructions, and there was no way at all to introduce a stage the substring
+#: table did not already know about -- which is what made shared experts
+#: unmeasurable before this module gained them.
+#:
+#: Marker emission is validated against this set, so a typo fails at ASM-gen time
+#: instead of quietly collapsing a region into ``other``.
+MOE_STAGES: frozenset[str] = frozenset(
+    {
+        "router_topk",
+        "accumulator_init",
+        "gather",
+        "expert_weight_address",
+        "expert_weight_prefetch",
+        "expert_projection",
+        "expert_activation",
+        "expert_bias",
+        "expert_route_weight",
+        "scatter_combine",
+        "shared_expert_projection",
+        "shared_expert_activation",
+        "shared_expert_gate",
+    }
+)
+
+
+# ============================================================================
+# V_TOPK routing policy
+# ============================================================================
+
+#: ``rmask`` value that makes V_TOPK read its shape from ``C_SET_TOPK_REG``
+#: instead of the two-entry hardwired table.
+_TOPK_POLICY_REGISTER_RMASK = 15
+
+#: Bit position of ``num_experts`` inside the packed ``C_SET_TOPK_REG`` value.
+#: Must match ``AcceleratorRegFile::topk_policy`` in the emulator.
+_TOPK_POLICY_EXPERT_SHIFT = 8
+
+#: Widest packed policy that still fits one ``S_ADDI_INT`` 22-bit immediate.
+_TOPK_POLICY_MAX_PACKED = (1 << 22) - 1
+
+
+def _pack_topk_policy(num_experts: int, top_k: int) -> int:
+    """Pack ``(num_experts, top_k)`` for ``C_SET_TOPK_REG``.
+
+    Layout is ``(num_experts << 8) | top_k``. The emulator unpacks it in
+    ``AcceleratorRegFile::topk_policy``; nothing but the unit tests on either side
+    checks that the two agree, so the bounds are asserted here rather than left to
+    produce a silently truncated policy.
+    """
+    if not 0 < top_k <= num_experts:
+        raise ValueError(f"top_k={top_k} must be in [1, num_experts={num_experts}]")
+    if top_k >= (1 << _TOPK_POLICY_EXPERT_SHIFT):
+        raise ValueError(
+            f"top_k={top_k} does not fit {_TOPK_POLICY_EXPERT_SHIFT} bits; the C_SET_TOPK_REG packing bounds it at 255"
+        )
+    packed = (num_experts << _TOPK_POLICY_EXPERT_SHIFT) | top_k
+    if packed > _TOPK_POLICY_MAX_PACKED:
+        raise ValueError(
+            f"num_experts={num_experts} packs to {packed}, past the 22-bit S_ADDI_INT "
+            f"immediate; C_SET_TOPK_REG tops out at {_TOPK_POLICY_MAX_PACKED >> _TOPK_POLICY_EXPERT_SHIFT} experts"
+        )
+    return packed
+
+
+def moe_stage_marker(stage: str, detail: str = "") -> str:
+    """Format the explicit stage marker comment for ``stage``.
+
+    The marker is *authoritative and sticky*: once a program contains any marker,
+    the emulator stops applying its legacy substring rules entirely and every
+    instruction is attributed to the most recent marker. So a marker must be
+    emitted whenever the stage changes, and must not be emitted mid-stage.
+
+    The corollary is that work done inside a general-purpose helper called from a
+    marked region -- ``linear_projection``'s HBM weight prefetch, for instance --
+    is attributed to the enclosing marker rather than to
+    ``expert_weight_prefetch``. That is why the routed path marks its own dynamic
+    prefetch explicitly; the shared path deliberately does not, folding weight
+    traffic into ``shared_expert_projection`` where it belongs.
+    """
+    if stage not in MOE_STAGES:
+        raise ValueError(f"unknown MoE stage {stage!r}; expected one of {sorted(MOE_STAGES)}")
+    return f"{MOE_STAGE_MARKER_PREFIX}{stage}" + (f" {detail}" if detail else "")
+
 
 class ProgramRoutedMoeMixin:
     """Routed-MoE v0 emit helpers used by GPT-OSS and Qwen bring-up.
@@ -44,7 +140,7 @@ class ProgramRoutedMoeMixin:
         row_in_block = row_idx % self.mlen
         return self.get_vram_tile_addr(matrix.name, row_block, tile_col_idx) + row_in_block * self.mlen
 
-    def gpt_oss_router_logits_bf16_v0(
+    def moe_router_logits_bf16_v0(
         self,
         x: VRAMMatrixVar,
         router_weight_rows: VRAMMatrixVar,
@@ -52,6 +148,7 @@ class ProgramRoutedMoeMixin:
         rows: int,
         hidden: int,
         num_experts: int,
+        policy_name: str = "gpt_oss",
         name: str = "gpt_oss_router_logits",
     ) -> VRAMMatrixVar:
         """Emit high-precision GPT-OSS router logits using BF16 vector dot products.
@@ -73,8 +170,7 @@ class ProgramRoutedMoeMixin:
             raise ValueError(f"router hidden={hidden} exceeds x width={x.shape[1]}")
         if num_experts > router_weight_rows.shape[0] or hidden > router_weight_rows.shape[1]:
             raise ValueError(
-                "router_weight_rows must have shape at least "
-                f"({num_experts}, {hidden}), got {router_weight_rows.shape}"
+                f"router_weight_rows must have shape at least ({num_experts}, {hidden}), got {router_weight_rows.shape}"
             )
 
         expert_blocks = math.ceil(num_experts / self.mlen)
@@ -103,7 +199,10 @@ class ProgramRoutedMoeMixin:
         fp_acc = self.allocate_fp_reg(1)[0]
         try:
             asm = IsaBuilder().comment(
-                f"GPT-OSS router BF16 vector-dot logits: rows={rows}, hidden={hidden}, experts={num_experts}"
+                moe_stage_marker(
+                    "router_topk",
+                    f"[{policy_name}] BF16 vector-dot logits: rows={rows}, hidden={hidden}, experts={num_experts}",
+                )
             )
             asm.instr("S_ADDI_INT", gp(gp_scratch), gp(0), scratch_addr)
             fp_base = fp_scratch.address
@@ -162,6 +261,7 @@ class ProgramRoutedMoeMixin:
         expert_blocks: int,
         logical_logit_rows: int,
         physical_logit_rows: int,
+        policy_name: str = "gpt_oss",
         name: str,
         label: str,
     ) -> VRAMMatrixVar:
@@ -186,7 +286,10 @@ class ProgramRoutedMoeMixin:
         gp_dst, gp_src = self._reg.allocate_gp(2)
         try:
             asm = IsaBuilder().comment(
-                f"Qwen router {label} logits pack: rows={rows}, experts={num_experts}, blocks={expert_blocks}"
+                moe_stage_marker(
+                    "router_topk",
+                    f"[{policy_name}] {label} logits pack: rows={rows}, experts={num_experts}, blocks={expert_blocks}",
+                )
             )
             for token_idx in range(rows):
                 for expert_block in range(expert_blocks):
@@ -355,7 +458,7 @@ class ProgramRoutedMoeMixin:
             label="packed-skinny",
         )
 
-    def gpt_oss_router_topk_softmax_v0(
+    def moe_router_select_v0(
         self,
         logits: VRAMMatrixVar,
         *,
@@ -364,7 +467,8 @@ class ProgramRoutedMoeMixin:
         indices_int_base: int,
         num_experts: int = 32,
         top_k: int = 4,
-        name: str = "gpt_oss_router_topk",
+        policy_name: str = "gpt_oss",
+        name: str = "moe_router_select",
     ) -> None:
         """Emit V_TOPK for one router-logit row.
 
@@ -373,6 +477,10 @@ class ProgramRoutedMoeMixin:
         ids to INT SRAM, and stores the softmax-over-selected weights to FP
         SRAM.  The instruction intentionally keeps router/top-k on the BF16
         path and does not touch MX scale state.
+
+        ``(num_experts, top_k)`` is arbitrary. The two hardwired ``rmask``
+        policies are used when they match exactly; every other shape goes through
+        ``C_SET_TOPK_REG`` and ``rmask=15``.
         """
         if token_idx < 0 or token_idx >= logits.shape[0]:
             raise ValueError(f"token_idx={token_idx} outside logits rows={logits.shape[0]}")
@@ -387,16 +495,35 @@ class ProgramRoutedMoeMixin:
                 f"V_TOPK expects token {token_idx} to occupy {expert_blocks} contiguous logit rows, "
                 f"got logits shape={logits.shape}"
             )
+        if top_k < 1 or top_k > num_experts:
+            raise ValueError(f"top_k={top_k} must be in [1, num_experts={num_experts}]")
+
+        # The fixed rmask table is preferred where it applies so existing GPT-OSS
+        # and Qwen3 programs keep emitting byte-identical ASM.
         policy_rmask = {(32, 4): 0, (128, 8): 1}.get((num_experts, top_k))
+        packed_policy = None
         if policy_rmask is None:
-            raise NotImplementedError(f"V_TOPK policy unsupported for num_experts={num_experts}, top_k={top_k}")
+            policy_rmask = _TOPK_POLICY_REGISTER_RMASK
+            packed_policy = _pack_topk_policy(num_experts, top_k)
 
         gp_weights, gp_logits, gp_indices = self._reg.allocate_gp(3)
         try:
             asm = IsaBuilder().comment(
-                f"Routed-MoE V_TOPK {name}: token={token_idx}, experts={num_experts}, top_k={top_k}, "
-                f"weights_fp={weights_fp_base}, indices_int={indices_int_base}"
+                moe_stage_marker(
+                    "router_topk",
+                    f"[{policy_name}] V_TOPK {name}: token={token_idx}, experts={num_experts}, "
+                    f"top_k={top_k}, weights_fp={weights_fp_base}, indices_int={indices_int_base}",
+                )
             )
+            if packed_policy is not None:
+                # C_SET_TOPK_REG is sticky, so a single-policy program only needs it
+                # once -- but it is re-emitted per token anyway. Skipping it would
+                # require tracking the live register value across every other emitter
+                # that might run in between, and two scalar instructions are nothing
+                # beside the (hidden/MLEN * num_experts) vector ops the router already
+                # spends per token.
+                asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), packed_policy)
+                asm.instr("C_SET_TOPK_REG", gp(gp_weights))
             asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), weights_fp_base)
             asm.instr(
                 "S_ADDI_INT",
@@ -430,8 +557,10 @@ class ProgramRoutedMoeMixin:
         if per_expert_stride <= 0:
             raise ValueError(f"{name}: per_expert_stride must be positive, got {per_expert_stride}")
         asm.comment(
-            f"{name}: expert_id_to_weight_base pair={pair_idx}, "
-            f"table_base={table_base}, stride={per_expert_stride}"
+            moe_stage_marker(
+                "expert_weight_address",
+                f"{name}: pair={pair_idx}, table_base={table_base}, stride={per_expert_stride}",
+            )
         )
         asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
         asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
@@ -456,15 +585,17 @@ class ProgramRoutedMoeMixin:
     ) -> None:
         """Emit expert-id -> HBM-base lookup through an IntSRAM base table."""
         asm.comment(
-            f"{name}: expert_id_to_weight_base_table pair={pair_idx}, "
-            f"base_table_int={expert_base_table_int_base}"
+            moe_stage_marker(
+                "expert_weight_address",
+                f"{name}: table lookup pair={pair_idx}, base_table_int={expert_base_table_int_base}",
+            )
         )
         asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
         asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
         asm.instr("S_LD_INT", gp(gp_base), gp(gp_expert), expert_base_table_int_base)
         asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(0), gp(gp_base))
 
-    def gpt_oss_expert_id_to_weight_base_v0(
+    def moe_expert_id_to_weight_base_v0(
         self,
         *,
         expert_indices_int_base: int,
@@ -502,7 +633,7 @@ class ProgramRoutedMoeMixin:
         finally:
             self._reg.free_gp([gp_table, gp_expert, gp_stride, gp_offset, gp_base])
 
-    def _gpt_oss_dynamic_load_sub_matrix_col_v0(
+    def _moe_dynamic_load_sub_matrix_col_v0(
         self,
         *,
         weight_template: InputVar,
@@ -535,8 +666,10 @@ class ProgramRoutedMoeMixin:
         addr_reg = self._reg.allocate_addr(1)[0]
         try:
             asm = IsaBuilder().comment(
-                f"GPT-OSS dynamic HBM weight prefetch: template={weight_template.name}, "
-                f"pair={pair_idx}, col={col_idx}"
+                moe_stage_marker(
+                    "expert_weight_prefetch",
+                    f"dynamic HBM weight prefetch: template={weight_template.name}, pair={pair_idx}, col={col_idx}",
+                )
             )
             if expert_base_table_int_base is None:
                 self._emit_expert_id_to_weight_base_v0(
@@ -582,7 +715,7 @@ class ProgramRoutedMoeMixin:
             )
             self._reg.free_addr([addr_reg])
 
-    def gpt_oss_dynamic_vram_sub_projection_to_v0(
+    def moe_dynamic_vram_sub_projection_to_v0(
         self,
         vram_matrix: VRAMMatrixVar,
         vram_row_idx: int,
@@ -610,7 +743,7 @@ class ProgramRoutedMoeMixin:
         self._ensure_hbm_sub_matrix_registered(weight_template)
         if auto_reset_mram:
             super().reset_mram()
-        self._gpt_oss_dynamic_load_sub_matrix_col_v0(
+        self._moe_dynamic_load_sub_matrix_col_v0(
             weight_template=weight_template,
             col_idx=weight_col_idx,
             expert_indices_int_base=expert_indices_int_base,
@@ -621,6 +754,17 @@ class ProgramRoutedMoeMixin:
             k_block_start=k_block_start,
             k_block_count=k_block_count,
             name=name,
+        )
+        # The helper above marked `expert_weight_prefetch`. Markers are sticky, so
+        # hand the stage back before the GEMM -- otherwise every matmul instruction
+        # in this tile is billed to weight prefetch. This is the one place the two
+        # stages meet, which is why the boundary is drawn here rather than inside
+        # `vram_sub_projection_to` (a general-purpose helper shared with non-MoE
+        # programs, which must stay marker-free).
+        self._emit(
+            IsaBuilder().comment(
+                moe_stage_marker("expert_projection", f"{name}: pair={pair_idx}, col={weight_col_idx}")
+            )
         )
         super().vram_sub_projection_to(
             vram_mat_name=vram_matrix.name,
@@ -634,7 +778,7 @@ class ProgramRoutedMoeMixin:
             k_block_count=k_block_count,
         )
 
-    def gpt_oss_dynamic_linear_projection_v0(
+    def moe_dynamic_linear_projection_v0(
         self,
         input_var: VRAMMatrixVar,
         weight_template: InputVar,
@@ -680,7 +824,7 @@ class ProgramRoutedMoeMixin:
         )
 
         def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split) -> None:
-            self.gpt_oss_dynamic_vram_sub_projection_to_v0(
+            self.moe_dynamic_vram_sub_projection_to_v0(
                 input_var,
                 row_idx,
                 weight_template,
@@ -717,7 +861,7 @@ class ProgramRoutedMoeMixin:
         self.free_tensor(temp)
         return output
 
-    def gpt_oss_add_dynamic_expert_bias_v0(
+    def moe_add_dynamic_expert_bias_v0(
         self,
         dst: VRAMMatrixVar,
         bias_table: VRAMMatrixVar,
@@ -741,7 +885,9 @@ class ProgramRoutedMoeMixin:
 
         gp_table, gp_expert, gp_stride, gp_expert_offset, gp_src_base, gp_src, gp_dst = self._reg.allocate_gp(7)
         try:
-            asm = IsaBuilder().comment(f"GPT-OSS dynamic expert bias add {name}: pair={pair_idx}, rows={rows}")
+            asm = IsaBuilder().comment(
+                moe_stage_marker("expert_bias", f"dynamic expert bias add {name}: pair={pair_idx}, rows={rows}")
+            )
             asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
             asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
             asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), expert_row_stride)
@@ -758,7 +904,7 @@ class ProgramRoutedMoeMixin:
         finally:
             self._reg.free_gp([gp_table, gp_expert, gp_stride, gp_expert_offset, gp_src_base, gp_src, gp_dst])
 
-    def gpt_oss_materialize_topk_route_weight_v0(
+    def moe_materialize_topk_route_weight_v0(
         self,
         *,
         weights_fp_base: int,
@@ -767,6 +913,7 @@ class ProgramRoutedMoeMixin:
         hidden: int,
         zero_row: FPVar | None = None,
         fp_scratch: FPVar | None = None,
+        policy_name: str = "gpt_oss",
         name: str = "gpt_oss_device_route_weight",
     ) -> VRAMMatrixVar:
         """Expand device V_TOPK scalar weight into a VRAM route matrix."""
@@ -775,11 +922,13 @@ class ProgramRoutedMoeMixin:
         if hidden % self.mlen != 0:
             raise ValueError(f"{name}: hidden={hidden} must be divisible by MLEN={self.mlen}")
         route = self.alloc(name, rows=rows, cols=hidden, strict=False, physical_shape=(self.blen, hidden))
-        self.gpt_oss_true_zero_vram_rows_v0(
+        self.moe_true_zero_vram_rows_v0(
             route,
             rows=list(range(self.blen)),
             hidden=hidden,
             zero_row=zero_row,
+            policy_name=policy_name,
+            stage="expert_route_weight",
             name=f"{name}_zero",
         )
         fp_scratch = fp_scratch or self.fp_var(f"{name}_fp_row", size=self.mlen)
@@ -790,7 +939,10 @@ class ProgramRoutedMoeMixin:
             self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
             for col_block in range(hidden // self.mlen):
                 asm = IsaBuilder().comment(
-                    f"GPT-OSS materialize route weight pair={pair_idx}, col_block={col_block}"
+                    moe_stage_marker(
+                        "expert_route_weight",
+                        f"[{policy_name}] materialize route weight pair={pair_idx}, col_block={col_block}",
+                    )
                 )
                 asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), self._vram_matrix_row_addr(route, 0, col_block))
                 asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_scratch.address)
@@ -800,7 +952,7 @@ class ProgramRoutedMoeMixin:
             self._reg.free_gp([gp_dst, gp_fp])
         return route
 
-    def gpt_oss_materialize_route_weights_for_active_rows_v0(
+    def moe_materialize_route_weights_for_active_rows_v0(
         self,
         *,
         weights_fp_base: int,
@@ -810,13 +962,21 @@ class ProgramRoutedMoeMixin:
         hidden: int,
         zero_row: FPVar | None = None,
         fp_scratch: FPVar | None = None,
-        name: str = "gpt_oss_device_route_weights_grouped",
+        policy_name: str = "gpt_oss",
+        stage: str = "expert_route_weight",
+        name: str = "moe_device_row_weights_grouped",
     ) -> VRAMMatrixVar:
-        """Expand selected scalar route weights into specific active VRAM rows."""
+        """Expand selected scalar per-row FP weights into specific active VRAM rows.
+
+        ``stage`` exists because this broadcast is not exclusive to routing. The
+        shared-expert sigmoid gate produces the same thing -- one FP scalar per
+        token, broadcast across hidden -- and reuses this emitter. Without the
+        parameter every gate instruction bills to ``expert_route_weight``, which is
+        both wrong and specifically misleading: a program with no routing at all
+        would appear to spend time computing route weights.
+        """
         if len(pair_indices) != len(active_rows):
-            raise ValueError(
-                f"{name}: pair_indices={len(pair_indices)} active_rows={len(active_rows)} length mismatch"
-            )
+            raise ValueError(f"{name}: pair_indices={len(pair_indices)} active_rows={len(active_rows)} length mismatch")
         if rows <= 0:
             raise ValueError(f"{name}: rows must be positive")
         if hidden % self.mlen != 0:
@@ -828,11 +988,13 @@ class ProgramRoutedMoeMixin:
             raise ValueError(f"{name}: active rows {active_list} exceed physical rows={physical_rows}")
 
         route = self.alloc(name, rows=rows, cols=hidden, strict=False, physical_shape=(physical_rows, hidden))
-        self.gpt_oss_true_zero_vram_rows_v0(
+        self.moe_true_zero_vram_rows_v0(
             route,
             rows=list(range(physical_rows)),
             hidden=hidden,
             zero_row=zero_row,
+            policy_name=policy_name,
+            stage=stage,
             name=f"{name}_zero",
         )
         fp_scratch = fp_scratch or self.fp_var(f"{name}_fp_row", size=self.mlen)
@@ -843,7 +1005,11 @@ class ProgramRoutedMoeMixin:
                 self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
                 for col_block in range(hidden // self.mlen):
                     asm = IsaBuilder().comment(
-                        f"GPT-OSS materialize route weight pair={pair_idx}, active_row={active_row}, col_block={col_block}"
+                        moe_stage_marker(
+                            stage,
+                            f"[{policy_name}] materialize row weight pair={pair_idx}, "
+                            f"active_row={active_row}, col_block={col_block}",
+                        )
                     )
                     asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), self._vram_matrix_row_addr(route, active_row, col_block))
                     asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_scratch.address)
@@ -853,7 +1019,7 @@ class ProgramRoutedMoeMixin:
             self._reg.free_gp([gp_dst, gp_fp])
         return route
 
-    def gpt_oss_dynamic_expert_pair_v0(
+    def moe_dynamic_expert_pair_v0(
         self,
         x: VRAMMatrixVar,
         weights: ExpertWeights,
@@ -869,8 +1035,9 @@ class ProgramRoutedMoeMixin:
         constants: GptOssFPConstants,
         zero_row: FPVar | None = None,
         route_fp_scratch: FPVar | None = None,
+        policy_name: str = "gpt_oss",
         activation_policy: str = "gpt_oss_clamp_gated",
-        name: str = "gpt_oss_dynamic_expert_pair",
+        name: str = "moe_dynamic_expert_pair",
     ) -> VRAMMatrixVar:
         """Run one routed pair using true expert id from device V_TOPK output."""
         w_gate, w_up, w_down = weights
@@ -879,7 +1046,7 @@ class ProgramRoutedMoeMixin:
         gate_stride, up_stride, down_stride = weight_table_strides
         projection_rows = max(self.mlen, x.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
 
-        gate = self.gpt_oss_dynamic_linear_projection_v0(
+        gate = self.moe_dynamic_linear_projection_v0(
             x,
             w_gate,
             expert_indices_int_base=expert_indices_int_base,
@@ -889,7 +1056,7 @@ class ProgramRoutedMoeMixin:
             name=f"{name}_gate",
             physical_shape=(projection_rows, w_gate.physical_shape[1]),
         )
-        up = self.gpt_oss_dynamic_linear_projection_v0(
+        up = self.moe_dynamic_linear_projection_v0(
             x,
             w_up,
             expert_indices_int_base=expert_indices_int_base,
@@ -900,7 +1067,7 @@ class ProgramRoutedMoeMixin:
             physical_shape=(projection_rows, w_up.physical_shape[1]),
         )
         if gate_bias_table is not None:
-            self.gpt_oss_add_dynamic_expert_bias_v0(
+            self.moe_add_dynamic_expert_bias_v0(
                 gate,
                 gate_bias_table,
                 expert_indices_int_base=expert_indices_int_base,
@@ -910,7 +1077,7 @@ class ProgramRoutedMoeMixin:
                 name=f"{name}_gate_bias",
             )
         if up_bias_table is not None:
-            self.gpt_oss_add_dynamic_expert_bias_v0(
+            self.moe_add_dynamic_expert_bias_v0(
                 up,
                 up_bias_table,
                 expert_indices_int_base=expert_indices_int_base,
@@ -928,7 +1095,7 @@ class ProgramRoutedMoeMixin:
             activation_policy=activation_policy,
             name=name,
         )
-        out = self.gpt_oss_dynamic_linear_projection_v0(
+        out = self.moe_dynamic_linear_projection_v0(
             hidden,
             w_down,
             expert_indices_int_base=expert_indices_int_base,
@@ -939,7 +1106,7 @@ class ProgramRoutedMoeMixin:
             physical_shape=(projection_rows, w_down.physical_shape[1]),
         )
         if down_bias_table is not None:
-            self.gpt_oss_add_dynamic_expert_bias_v0(
+            self.moe_add_dynamic_expert_bias_v0(
                 out,
                 down_bias_table,
                 expert_indices_int_base=expert_indices_int_base,
@@ -948,19 +1115,25 @@ class ProgramRoutedMoeMixin:
                 width=w_down.physical_shape[1],
                 name=f"{name}_down_bias",
             )
-        route = self.gpt_oss_materialize_topk_route_weight_v0(
+        route = self.moe_materialize_topk_route_weight_v0(
             weights_fp_base=weights_fp_base,
             pair_idx=pair_idx,
             rows=rows,
             hidden=w_down.physical_shape[1],
             zero_row=zero_row,
             fp_scratch=route_fp_scratch,
+            policy_name=policy_name,
             name=f"{name}_route",
         )
+        # Re-mark: `vram_mul` is a general-purpose helper with no marker of its own,
+        # and under marker-authoritative classification an unmarked comment inherits
+        # the previous stage. Without this the route-weight multiply would be billed
+        # to whatever `moe_materialize_topk_route_weight_v0` left current.
+        self._emit(IsaBuilder().comment(moe_stage_marker("expert_route_weight", f"[{policy_name}] apply {name}")))
         self.vram_mul(out, route, num_rows=rows)
         return out
 
-    def gpt_oss_gather_token_rows_from_hbm_v0(
+    def moe_gather_token_rows_from_hbm_v0(
         self,
         x_input: InputVar,
         *,
@@ -968,6 +1141,7 @@ class ProgramRoutedMoeMixin:
         pair_count: int,
         hidden: int,
         zero_row: FPVar | None = None,
+        policy_name: str = "gpt_oss",
         name: str = "gpt_oss_gathered_x",
     ) -> VRAMMatrixVar:
         """Gather routed token rows from HBM into compact BF16 VRAM rows.
@@ -1010,7 +1184,11 @@ class ProgramRoutedMoeMixin:
         addr_reg = self._reg.allocate_addr(1)[0]
         try:
             asm = IsaBuilder().comment(
-                f"GPT-OSS gather token rows from HBM: pairs={pair_count}, hidden={hidden}, slot_rows={self.blen}"
+                moe_stage_marker(
+                    "gather",
+                    f"[{policy_name}] gather token rows from HBM: pairs={pair_count}, "
+                    f"hidden={hidden}, slot_rows={self.blen}",
+                )
             )
             asm.instr("S_ADDI_INT", gp(gp_table), gp(0), token_offsets_int_base)
             asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), x_rows * x_cols)
@@ -1037,35 +1215,36 @@ class ProgramRoutedMoeMixin:
             self._reg.free_addr([addr_reg])
 
         padding_rows = [
-            pair_idx * self.blen + pad_idx
-            for pair_idx in range(pair_count)
-            for pad_idx in range(1, self.blen)
+            pair_idx * self.blen + pad_idx for pair_idx in range(pair_count) for pad_idx in range(1, self.blen)
         ]
         if padding_rows:
             # Same true-FP-zero clear used by the VRAM gather path; keep it in one place.
-            self.gpt_oss_true_zero_vram_rows_v0(
+            self.moe_true_zero_vram_rows_v0(
                 gathered,
                 rows=padding_rows,
                 hidden=hidden,
                 zero_row=zero_row,
+                policy_name=policy_name,
+                stage="gather",
                 name=f"{name}_pad_zero",
             )
 
         return gathered
 
-    def gpt_oss_gather_token_rows_from_vram_v0(
+    def moe_gather_token_rows_from_vram_v0(
         self,
         x: VRAMMatrixVar,
         *,
         token_indices: Sequence[int],
         hidden: int,
         zero_row: FPVar | None = None,
+        policy_name: str = "gpt_oss",
         name: str = "gpt_oss_gathered_x_vram",
     ) -> VRAMMatrixVar:
         """Copy routed token rows from BF16 VRAM into BLEN-row pair slots.
 
         This is the decoder-block counterpart to
-        :meth:`gpt_oss_gather_token_rows_from_hbm_v0`.  A real block feeds MoE
+        :meth:`moe_gather_token_rows_from_hbm_v0`.  A real block feeds MoE
         from the VRAM-resident post-attention RMSNorm output, so this helper
         must not emit HBM prefetches, ``C_SET_SCALE_REG``, or activation
         quantization.  Each routed pair still owns one BLEN-row slot to match
@@ -1095,11 +1274,13 @@ class ProgramRoutedMoeMixin:
             physical_shape=(physical_rows, hidden),
         )
 
-        self.gpt_oss_true_zero_vram_rows_v0(
+        self.moe_true_zero_vram_rows_v0(
             gathered,
             rows=list(range(physical_rows)),
             hidden=hidden,
             zero_row=zero_row,
+            policy_name=policy_name,
+            stage="gather",
             name=f"{name}_zero",
         )
 
@@ -1107,7 +1288,11 @@ class ProgramRoutedMoeMixin:
         gp_dst, gp_src = self._reg.allocate_gp(2)
         try:
             asm = IsaBuilder().comment(
-                f"GPT-OSS gather token rows from VRAM: pairs={pair_count}, hidden={hidden}, slot_rows={self.blen}"
+                moe_stage_marker(
+                    "gather",
+                    f"[{policy_name}] gather token rows from VRAM: pairs={pair_count}, "
+                    f"hidden={hidden}, slot_rows={self.blen}",
+                )
             )
             for pair_idx, token_idx in enumerate(token_list):
                 active_row = pair_idx * self.blen
@@ -1124,14 +1309,16 @@ class ProgramRoutedMoeMixin:
 
         return gathered
 
-    def gpt_oss_true_zero_vram_rows_v0(
+    def moe_true_zero_vram_rows_v0(
         self,
         matrix: VRAMMatrixVar,
         *,
         rows: Sequence[int],
         hidden: int,
         zero_row: FPVar | None = None,
-        name: str = "gpt_oss_zero_rows",
+        policy_name: str = "gpt_oss",
+        stage: str = "accumulator_init",
+        name: str = "moe_zero_rows",
     ) -> None:
         """Clear selected VRAM rows by mapping a true FP zero row.
 
@@ -1139,6 +1326,13 @@ class ProgramRoutedMoeMixin:
         contain NaNs, and ``NaN * 0`` remains NaN.  This helper writes real
         zeros through ``S_MAP_V_FP`` and is therefore safe for gather padding
         and scatter accumulators.
+
+        ``stage`` exists because the same clear serves three different phases --
+        zeroing the combine accumulator, clearing gather padding rows, and
+        zeroing a route-weight tile. The emulator previously had to guess between
+        them from the *preceding* comment's stage, a stateful rule that could not
+        express "this clear belongs to the shared branch" at all. The caller knows;
+        it now says so.
         """
         if hidden % self.mlen != 0:
             raise ValueError(f"zero hidden={hidden} must be divisible by MLEN={self.mlen}")
@@ -1152,7 +1346,9 @@ class ProgramRoutedMoeMixin:
         fp_zero_row = zero_row or self.fp_var(f"{name}_zero_row", size=self.mlen)
         gp_fp, gp_dst, gp_loop = self._reg.allocate_gp(3)
         try:
-            asm = IsaBuilder().comment(f"GPT-OSS true-zero VRAM rows {row_list} in {matrix.name}")
+            asm = IsaBuilder().comment(
+                moe_stage_marker(stage, f"[{policy_name}] true-zero VRAM rows {row_list} in {matrix.name}")
+            )
             asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_zero_row.address)
             asm.instr("C_LOOP_START", gp(gp_loop), self.mlen)
             asm.instr("S_ST_FP", fp(0), gp(gp_fp), 0)
@@ -1170,7 +1366,7 @@ class ProgramRoutedMoeMixin:
         finally:
             self._reg.free_gp([gp_fp, gp_dst, gp_loop])
 
-    def gpt_oss_scatter_add_active_rows_v0(
+    def moe_scatter_add_active_rows_v0(
         self,
         dst: VRAMMatrixVar,
         src: VRAMMatrixVar,
@@ -1178,6 +1374,7 @@ class ProgramRoutedMoeMixin:
         token_indices: Sequence[int],
         active_rows: Sequence[int],
         hidden: int,
+        policy_name: str = "gpt_oss",
         name: str = "gpt_oss_scatter_add",
     ) -> None:
         """Add routed active slot rows into final token rows in VRAM.
@@ -1202,7 +1399,12 @@ class ProgramRoutedMoeMixin:
         num_col_blocks = hidden // self.mlen
         gp_dst, gp_src = self._reg.allocate_gp(2)
         try:
-            asm = IsaBuilder().comment(f"GPT-OSS VRAM scatter-add {name}: {len(token_list)} active rows")
+            asm = IsaBuilder().comment(
+                moe_stage_marker(
+                    "scatter_combine",
+                    f"[{policy_name}] VRAM scatter-add {name}: {len(token_list)} active rows",
+                )
+            )
             for token_idx, active_row in zip(token_list, active_list, strict=True):
                 for col_block in range(num_col_blocks):
                     dst_addr = self._vram_matrix_row_addr(dst, token_idx, col_block)
@@ -1304,7 +1506,7 @@ class ProgramRoutedMoeMixin:
         self.vram_mul(up, gate, num_rows=rows)
         return up
 
-    def gpt_oss_expert_v0(
+    def moe_expert_v0(
         self,
         x: VRAMMatrixVar,
         weights: ExpertWeights,
@@ -1357,7 +1559,7 @@ class ProgramRoutedMoeMixin:
             self.vram_add(out, down_bias, num_rows=rows)
         return out
 
-    def gpt_oss_moe_fixed_routing_v0(
+    def moe_fixed_routing_v0(
         self,
         x: VRAMMatrixVar,
         experts: Sequence[ExpertWeights],
@@ -1384,7 +1586,7 @@ class ProgramRoutedMoeMixin:
         acc: VRAMMatrixVar | None = None
         for idx, (weights, route) in enumerate(zip(experts, route_weights, strict=True)):
             biases = None if expert_biases is None else expert_biases[idx]
-            expert_out = self.gpt_oss_expert_v0(
+            expert_out = self.moe_expert_v0(
                 x,
                 weights,
                 biases=biases,
@@ -1411,9 +1613,23 @@ class ProgramRoutedMoeMixin:
         intermediate: int,
         constants: GptOssFPConstants,
         activation_policy: str = "gpt_oss_clamp_gated",
+        policy_name: str = "gpt_oss",
+        stage: str = "expert_activation",
         name: str,
     ) -> VRAMMatrixVar:
-        """Generic substrate wrapper for expert activation backends."""
+        """Generic substrate wrapper for expert activation backends.
+
+        ``stage`` lets the shared branch bill its activation to
+        ``shared_expert_activation`` while running the identical backend. The two
+        branches use the same math, so the only thing distinguishing them in the
+        profile is which marker is live.
+        """
+        # Both backends are built entirely from general-purpose tile helpers
+        # (`tile_row_exp`, `vram_mul`, ...) that emit their own unmarked comments.
+        # One marker here covers the whole region.
+        self._emit(
+            IsaBuilder().comment(moe_stage_marker(stage, f"[{policy_name}] {activation_policy} {name}: rows={rows}"))
+        )
         if activation_policy == "gpt_oss_clamp_gated":
             return self.gpt_oss_clamp_gated_activation_v0(
                 gate,
@@ -1439,4 +1655,40 @@ class ProgramRoutedMoeMixin:
         )
 
 
-__all__ = ["ProgramRoutedMoeMixin"]
+# ============================================================================
+# Deprecated aliases
+# ============================================================================
+
+#: Pre-generalization method names, kept so in-flight callers (and the GPT-OSS
+#: bring-up tests that predate the rename) keep working. Each maps to the
+#: identically-behaving ``moe_*`` method; the defaults preserve GPT-OSS behaviour,
+#: so an aliased call emits what it always did.
+_DEPRECATED_METHOD_ALIASES = {
+    "gpt_oss_router_logits_bf16_v0": "moe_router_logits_bf16_v0",
+    "gpt_oss_router_topk_softmax_v0": "moe_router_select_v0",
+    "gpt_oss_expert_v0": "moe_expert_v0",
+    "gpt_oss_dynamic_expert_pair_v0": "moe_dynamic_expert_pair_v0",
+    "gpt_oss_dynamic_linear_projection_v0": "moe_dynamic_linear_projection_v0",
+    "gpt_oss_dynamic_vram_sub_projection_to_v0": "moe_dynamic_vram_sub_projection_to_v0",
+    "gpt_oss_expert_id_to_weight_base_v0": "moe_expert_id_to_weight_base_v0",
+    "gpt_oss_add_dynamic_expert_bias_v0": "moe_add_dynamic_expert_bias_v0",
+    "gpt_oss_materialize_topk_route_weight_v0": "moe_materialize_topk_route_weight_v0",
+    "gpt_oss_materialize_route_weights_for_active_rows_v0": ("moe_materialize_route_weights_for_active_rows_v0"),
+    "gpt_oss_gather_token_rows_from_hbm_v0": "moe_gather_token_rows_from_hbm_v0",
+    "gpt_oss_gather_token_rows_from_vram_v0": "moe_gather_token_rows_from_vram_v0",
+    "gpt_oss_scatter_add_active_rows_v0": "moe_scatter_add_active_rows_v0",
+    "gpt_oss_true_zero_vram_rows_v0": "moe_true_zero_vram_rows_v0",
+    "gpt_oss_moe_fixed_routing_v0": "moe_fixed_routing_v0",
+}
+
+for _old, _new in _DEPRECATED_METHOD_ALIASES.items():
+    setattr(ProgramRoutedMoeMixin, _old, getattr(ProgramRoutedMoeMixin, _new))
+del _old, _new
+
+
+__all__ = [
+    "MOE_STAGES",
+    "MOE_STAGE_MARKER_PREFIX",
+    "ProgramRoutedMoeMixin",
+    "moe_stage_marker",
+]
