@@ -31,6 +31,9 @@ jobs:
           fi
           echo "All Python files parse OK"
 
+      - name: Run the top-k policy encoding guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_topk_policy_encoding.py -v
+
   unit-tests:
     name: Generator unit tests
     runs-on: ubuntu-latest

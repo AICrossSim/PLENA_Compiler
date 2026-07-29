@@ -323,8 +323,15 @@ index. `rmask` selects the routed-MoE policy:
   `FP_MEM[gp_reg<rd> + 0..3]` / `INT_MEM[gp_reg<rs2> + 0..3]`.
 - `rmask=1`: scan 128 logits, select top-8, and write weights/indices to
   `FP_MEM[gp_reg<rd> + 0..7]` / `INT_MEM[gp_reg<rs2> + 0..7]`.
+- `rmask=15`: take `(num_experts, top_k)` from the `TOPK_POLICY` control
+  register instead of a fixed table. See `C_SET_TOPK_REG`.
 
 Weights are softmax-over-selected logits.
+
+Every other production MoE shape — Qwen2-MoE 60/top-4, DeepSeek-V2-Lite 64/top-6,
+DeepSeek-V3 256/top-8, Llama-4 Scout 16/top-1 — needs `rmask=15`: a table entry
+per model would make every new architecture an ISA change. `rmask` values `2..14`
+are reserved and trap.
 
 This is a correctness-first v0 linear scan. Bitonic/performance top-k remains a
 future optimization.
@@ -420,6 +427,15 @@ V_RED_MAX f1, gp2, 0   ; f1 = max(f1, max(Vector[gp2]))
 **Format:** `S_ADDI_INT rd, rs1, imm`
 
 **Operation:** `gp_reg<rd> = gp_reg<rs1> + imm`
+
+**Description:**
+
+`imm` is the unsigned 18-bit `IMM_2_WIDTH` field at bits 14..32 (range
+`0..262143`) — *not* the 22-bit `IMM_WIDTH` field that `S_LUI_INT` and
+`C_LOOP_START` carry. A larger constant needs an `S_LUI_INT` + `S_ADDI_INT`
+pair; the compiler's `IsaBuilder` emits one automatically
+(`legalize_large_immediates`), and the assembler rejects an unlegalized wide
+immediate rather than truncating it.
 
 **Example:**
 ```asm
@@ -705,6 +721,33 @@ C_SET_STRIDE_REG gp4               ; STRIDE_SIZE = 128
 **Description:**
 
 Set the vector mask register for masked vector operations.
+
+### C_SET_TOPK_REG
+
+**Format:** `C_SET_TOPK_REG rd`
+
+**Operation:** `TOPK_POLICY = gp_reg<rd>`
+
+**Description:**
+
+Set the routed-MoE top-k policy consumed by `V_TOPK rmask=15`. The register holds
+both fields packed as `(num_experts << 8) | top_k`.
+
+The 8-bit shift keeps the packed value inside a single `S_ADDI_INT` immediate
+(18 bits, see `S_ADDI_INT`) for up to 1023 experts; wider shapes still work via
+a legalized `S_LUI_INT` + `S_ADDI_INT` pair. The shift also caps `top_k` at 255.
+
+Like the other `C_SET_*_REG` control registers this is sticky: it persists until
+overwritten, so a program with one routing policy sets it once. `V_TOPK` traps if
+`rmask=15` is executed while the register is unset, rather than silently routing
+with `top_k=0`.
+
+**Example:**
+```asm
+S_ADDI_INT gp4, gp0, 16390         ; (64 << 8) | 6  -- DeepSeek-V2-Lite
+C_SET_TOPK_REG gp4                 ; TOPK_POLICY = 64 experts, top-6
+V_TOPK gp1, gp2, gp3, 15           ; route one token under that policy
+```
 
 ### C_BREAK
 
