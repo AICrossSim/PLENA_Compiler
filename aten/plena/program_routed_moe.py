@@ -34,6 +34,13 @@ MOE_STAGE_MARKER_PREFIX = "@stage="
 MOE_STAGES: frozenset[str] = frozenset(
     {
         "router_topk",
+        # The MoE sublayer's input preparation, before any routing happens:
+        # zeroing the residual buffer, copying the post-attention hidden state
+        # into it, and the input RMSNorm with its norm-weight multiply. Distinct
+        # from `accumulator_init`, which is the combine accumulator only -- these
+        # rows are a residual copy that is added back *after* the experts run,
+        # and the work scales with rows x hidden rather than with the accumulator.
+        "residual_setup",
         "accumulator_init",
         "gather",
         "expert_weight_address",
@@ -346,6 +353,19 @@ class ProgramRoutedMoeMixin:
         logical_logit_rows = rows if expert_blocks == 1 else rows * expert_blocks
         physical_logit_rows = max(self.blen, math.ceil(logical_logit_rows / self.blen) * self.blen)
 
+        # Router logits are routing cost, same as the vector-dot path's. Without
+        # this the whole projection inherits whatever marker preceded the call,
+        # since `linear_projection_bf16*` is a general helper with no marker of
+        # its own -- which billed the router GEMM to the MoE input setup.
+        self._emit(
+            IsaBuilder().comment(
+                moe_stage_marker(
+                    "router_topk",
+                    f"[qwen3] BF16 matrix logits: rows={rows}, hidden={hidden}, experts={num_experts}",
+                )
+            )
+        )
+
         old_capacity = self.mram_tile_capacity
         self.mram_tile_capacity = mram_tile_capacity
         try:
@@ -424,6 +444,18 @@ class ProgramRoutedMoeMixin:
                 "router_weight_packed_skinny physical width is too small for "
                 f"{expert_blocks} output blocks: got {router_weight_packed_skinny.physical_shape}"
             )
+
+        # As in the matrix path above: the packed-skinny projection helper emits
+        # no marker of its own, so without this the router GEMM is billed to
+        # whichever stage the caller happened to be in.
+        self._emit(
+            IsaBuilder().comment(
+                moe_stage_marker(
+                    "router_topk",
+                    f"[qwen3] packed-skinny BF16 logits: rows={rows}, hidden={hidden}, experts={num_experts}",
+                )
+            )
+        )
 
         matrix_logits = self.alloc(
             f"{name}_matrix",
