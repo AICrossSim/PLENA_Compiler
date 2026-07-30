@@ -72,6 +72,41 @@ def _functions(path: pathlib.Path):
             yield node
 
 
+def _callee_name(func: ast.expr) -> str | None:
+    """The bare name a call resolves to, for ``f(...)`` and ``obj.f(...)`` alike."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _is_moe_callee(name: str) -> bool:
+    """Whether *name*'s ``stage=`` argument means a MoE attribution stage.
+
+    ``stage`` is not a reserved word. The attention emitters take one too --
+    ``qkt_multiply(stage="decode")`` selects prefill vs decode and has nothing
+    to do with MoE attribution -- so matching every ``stage=`` keyword in the
+    tree reports those as unknown stage names. Match on the callee instead.
+
+    ``moe_stage_marker`` is covered by the ``moe_`` prefix.
+    """
+    return name.startswith(("moe_", "gpt_oss_"))
+
+
+def _moe_stage_arguments(tree: ast.AST):
+    """Yield ``(callee, keyword)`` for every literal ``stage=`` on a MoE callee."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = _callee_name(node.func)
+        if callee is None or not _is_moe_callee(callee):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "stage" and isinstance(keyword.value, ast.Constant):
+                yield callee, keyword
+
+
 def _defaulted_stage_params(func) -> list[tuple[ast.arg, ast.expr]]:
     """Every ``stage`` parameter of *func* that carries a default, with it.
 
@@ -140,22 +175,45 @@ def test_stage_arguments_are_declared_moe_stages() -> None:
     test actually emits. A typo on a rarely-exercised branch would otherwise
     reach the emulator, land in ``unresolved_stage_markers``, and leave that
     region inheriting the previous marker.
+
+    Scoped to MoE callees by :func:`_is_moe_callee`, so an unrelated emitter
+    that happens to take a ``stage`` argument is not reported as a bad stage
+    name.
     """
     declared = _declared_moe_stages()
     offenders: list[str] = []
     for path in _python_sources():
         tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            for keyword in node.keywords:
-                if keyword.arg != "stage" or not isinstance(keyword.value, ast.Constant):
-                    continue
-                if keyword.value.value not in declared:
-                    offenders.append(f"{path.name}:{node.lineno} stage={keyword.value.value!r}")
+        for callee, keyword in _moe_stage_arguments(tree):
+            if keyword.value.value not in declared:
+                offenders.append(
+                    f"{path.name}:{keyword.value.lineno} {callee}(stage={keyword.value.value!r})"
+                )
 
     assert not offenders, (
         "these call sites pass a stage name that is not in MOE_STAGES:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_non_moe_stage_arguments_are_not_flagged() -> None:
+    """``stage=`` on an unrelated emitter is not a MoE stage name.
+
+    The attention path calls ``qkt_multiply(stage="decode")``, where ``stage``
+    selects prefill vs decode. A matcher keyed on the argument name alone
+    reports that as an unknown MoE stage -- a false positive on correct code,
+    which is how a lint gets suppressed and then ignored.
+    """
+    tree = ast.parse(
+        'qkt_multiply(d=16, stage="decode", mlen=4)\n'
+        'attention_softmax(stage="attn_input")\n'
+        'builder.flash_attention(stage="prefill")\n'
+        'moe_expert_activation_v0(builder, stage="expert_activation")\n'
+    )
+    matched = [(callee, keyword.value.value) for callee, keyword in _moe_stage_arguments(tree)]
+
+    assert matched == [("moe_expert_activation_v0", "expert_activation")], (
+        "the stage-argument matcher is not scoped to MoE callees; it picked up "
+        f"{matched}"
     )
 
 
