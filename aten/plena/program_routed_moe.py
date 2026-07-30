@@ -963,7 +963,7 @@ class ProgramRoutedMoeMixin:
         zero_row: FPVar | None = None,
         fp_scratch: FPVar | None = None,
         policy_name: str = "gpt_oss",
-        stage: str = "expert_route_weight",
+        stage: str,
         name: str = "moe_device_row_weights_grouped",
     ) -> VRAMMatrixVar:
         """Expand selected scalar per-row FP weights into specific active VRAM rows.
@@ -974,6 +974,12 @@ class ProgramRoutedMoeMixin:
         parameter every gate instruction bills to ``expert_route_weight``, which is
         both wrong and specifically misleading: a program with no routing at all
         would appear to spend time computing route weights.
+
+        It is deliberately **required**. A default is what produced that exact bug:
+        the shared gate reused this emitter, inherited ``expert_route_weight``, and
+        999 instructions were misattributed with nothing failing. Under sticky
+        marker attribution a wrong stage is silent -- the totals still add up -- so
+        the omission has to be caught where it is written, not where it is read.
         """
         if len(pair_indices) != len(active_rows):
             raise ValueError(f"{name}: pair_indices={len(pair_indices)} active_rows={len(active_rows)} length mismatch")
@@ -1093,6 +1099,7 @@ class ProgramRoutedMoeMixin:
             intermediate=intermediate,
             constants=constants,
             activation_policy=activation_policy,
+            stage="expert_activation",
             name=name,
         )
         out = self.moe_dynamic_linear_projection_v0(
@@ -1317,7 +1324,7 @@ class ProgramRoutedMoeMixin:
         hidden: int,
         zero_row: FPVar | None = None,
         policy_name: str = "gpt_oss",
-        stage: str = "accumulator_init",
+        stage: str,
         name: str = "moe_zero_rows",
     ) -> None:
         """Clear selected VRAM rows by mapping a true FP zero row.
@@ -1333,6 +1340,11 @@ class ProgramRoutedMoeMixin:
         them from the *preceding* comment's stage, a stateful rule that could not
         express "this clear belongs to the shared branch" at all. The caller knows;
         it now says so.
+
+        Required rather than defaulted, because this is the emitter where a default
+        does the most damage: it serves the most stages and has the most call sites,
+        so ``accumulator_init`` silently absorbed every caller that forgot. Omitting
+        it is now a TypeError at emit time instead of a wrong number in a profile.
         """
         if hidden % self.mlen != 0:
             raise ValueError(f"zero hidden={hidden} must be divisible by MLEN={self.mlen}")
@@ -1614,7 +1626,7 @@ class ProgramRoutedMoeMixin:
         constants: GptOssFPConstants,
         activation_policy: str = "gpt_oss_clamp_gated",
         policy_name: str = "gpt_oss",
-        stage: str = "expert_activation",
+        stage: str,
         name: str,
     ) -> VRAMMatrixVar:
         """Generic substrate wrapper for expert activation backends.
@@ -1623,6 +1635,9 @@ class ProgramRoutedMoeMixin:
         ``shared_expert_activation`` while running the identical backend. The two
         branches use the same math, so the only thing distinguishing them in the
         profile is which marker is live.
+
+        Required rather than defaulted for exactly that reason: when the marker is
+        the *only* thing separating two branches, a default silently merges them.
         """
         # Both backends are built entirely from general-purpose tile helpers
         # (`tile_row_exp`, `vram_mul`, ...) that emit their own unmarked comments.
