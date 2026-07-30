@@ -72,6 +72,30 @@ def _functions(path: pathlib.Path):
             yield node
 
 
+def _defaulted_stage_params(func) -> list[tuple[ast.arg, ast.expr]]:
+    """Every ``stage`` parameter of *func* that carries a default, with it.
+
+    Keyword-only defaults sit in ``kw_defaults`` positionally aligned with
+    ``kwonlyargs`` (``None`` where there is no default). Positional defaults sit
+    in ``defaults``, right-aligned against ``posonlyargs + args``, hence the
+    padding.
+    """
+    args = func.args
+    defaulted = [
+        (arg, default)
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults)
+        if arg.arg == "stage" and default is not None
+    ]
+    positional = args.posonlyargs + args.args
+    padding = len(positional) - len(args.defaults)
+    defaulted += [
+        (arg, args.defaults[index - padding])
+        for index, arg in enumerate(positional)
+        if arg.arg == "stage" and index >= padding
+    ]
+    return defaulted
+
+
 def _declared_moe_stages() -> set[str]:
     """Parse ``MOE_STAGES`` out of ``program_routed_moe.py``."""
     tree = ast.parse(ROUTED_MOE_SOURCE.read_text(), filename=str(ROUTED_MOE_SOURCE))
@@ -99,21 +123,7 @@ def test_stage_parameters_have_no_default() -> None:
     offenders: list[str] = []
     for path in _python_sources():
         for func in _functions(path):
-            args = func.args
-            defaulted = [
-                (arg, default)
-                for arg, default in zip(args.kwonlyargs, args.kw_defaults)
-                if arg.arg == "stage" and default is not None
-            ]
-            # Positional `stage` params: line them up with their trailing defaults.
-            positional = args.posonlyargs + args.args
-            padding = len(positional) - len(args.defaults)
-            defaulted += [
-                (arg, args.defaults[index - padding])
-                for index, arg in enumerate(positional)
-                if arg.arg == "stage" and index >= padding
-            ]
-            for arg, default in defaulted:
+            for _arg, default in _defaulted_stage_params(func):
                 offenders.append(f"{path.name}:{func.lineno} {func.name}(stage={ast.unparse(default)})")
 
     assert not offenders, (
@@ -179,34 +189,30 @@ def test_every_test_file_here_is_wired_into_ci() -> None:
     )
 
 
-def test_guard_would_catch_a_defaulted_stage_parameter() -> None:
+def test_guard_would_catch_a_defaulted_stage_parameter(tmp_path: pathlib.Path) -> None:
     """The lint above is only worth having if it can fail. Prove it does.
 
     Without this, a refactor that broke the AST walk (a renamed field, a missed
     argument category) would leave both tests passing over zero findings.
+
+    Driven through ``_functions`` and ``_defaulted_stage_params`` -- the same
+    two helpers the real lint uses -- against a fixture written to disk. A
+    self-check that reimplements the walk it is checking proves only that the
+    copy agrees with itself, which is exactly the bug it is meant to catch.
     """
-    module = ast.parse(
+    fixture = tmp_path / "fixture.py"
+    fixture.write_text(
         "def emit(self, x, *, policy: str = 'p', stage: str = 'gather', name: str) -> None: ...\n"
         "def emit_positional(self, stage: str = 'gather') -> None: ...\n"
+        "async def emit_async(self, *, stage: str = 'gather') -> None: ...\n"
         "def emit_ok(self, x, *, stage: str, name: str) -> None: ...\n"
+        "async def emit_async_ok(self, *, stage: str) -> None: ...\n"
+        "def emit_no_stage(self, x: str = 'y') -> None: ...\n"
     )
-    found = []
-    for func in (node for node in ast.walk(module) if isinstance(node, ast.FunctionDef)):
-        args = func.args
-        hits = [
-            arg
-            for arg, default in zip(args.kwonlyargs, args.kw_defaults)
-            if arg.arg == "stage" and default is not None
-        ]
-        positional = args.posonlyargs + args.args
-        padding = len(positional) - len(args.defaults)
-        hits += [
-            arg for index, arg in enumerate(positional) if arg.arg == "stage" and index >= padding
-        ]
-        if hits:
-            found.append(func.name)
 
-    assert found == ["emit", "emit_positional"], (
+    found = sorted(func.name for func in _functions(fixture) if _defaulted_stage_params(func))
+
+    assert found == ["emit", "emit_async", "emit_positional"], (
         f"the AST walk no longer detects defaulted stage parameters, so "
         f"test_stage_parameters_have_no_default cannot fail; detected {found}"
     )
