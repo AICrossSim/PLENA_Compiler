@@ -107,6 +107,62 @@ def _moe_stage_arguments(tree: ast.AST):
                 yield callee, keyword
 
 
+#: Callables that pre-bind arguments, turning a required parameter into a
+#: supplied one at the binding site rather than in a signature.
+_PARTIAL_BINDERS = frozenset({"partial", "partialmethod"})
+
+
+def _stage_defaulting_lambdas(tree: ast.AST):
+    """Yield lambdas that give ``stage`` a default.
+
+    :func:`_functions` walks ``def`` and ``async def`` only. A lambda carries
+    the same ``arguments`` node and the same failure mode, and nothing was
+    looking at it.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Lambda) and _defaulted_stage_params(node):
+            yield node
+
+
+def _stage_binding_calls(tree: ast.AST):
+    """Yield ``functools.partial``-style calls that pre-bind ``stage``.
+
+    ``partial(emit, stage="gather")`` hands back a callable whose ``stage`` is
+    already supplied. Every call through it omits the argument and is billed to
+    whatever the binding site chose -- a default by another route, with exactly
+    the consequence the required parameter exists to prevent.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _callee_name(node.func) in _PARTIAL_BINDERS and any(
+            keyword.arg == "stage" for keyword in node.keywords
+        ):
+            yield node
+
+
+def _stage_injecting_decorators(tree: ast.AST):
+    """Yield ``(func, decorator)`` for decorators handed a ``stage=`` argument.
+
+    Catches the declared shape, ``@with_stage(stage="gather")``. A decorator
+    that injects a stage without naming it in its own call -- reading it from a
+    closure, a registry or an attribute -- is not detectable without resolving
+    what the decorator does, which is well beyond a source lint.
+
+    TODO: if such a decorator is ever introduced, the check has to become a
+    convention (an explicit allowlist of stage-injecting decorators) rather than
+    a deeper analysis.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Call) and any(
+                keyword.arg == "stage" for keyword in decorator.keywords
+            ):
+                yield node, decorator
+
+
 def _defaulted_stage_params(func) -> list[tuple[ast.arg, ast.expr]]:
     """Every ``stage`` parameter of *func* that carries a default, with it.
 
@@ -166,6 +222,61 @@ def test_stage_parameters_have_no_default() -> None:
         "silently billed to the wrong stage instead of failing:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_stage_defaults_are_not_reintroduced_indirectly() -> None:
+    """A ``def`` signature is not the only way to supply ``stage``.
+
+    :func:`test_stage_parameters_have_no_default` walks ``def`` and ``async
+    def``. Three constructs get a stage in without one, each leaving call sites
+    that never name it -- the exact condition the required parameter exists to
+    prevent, reached by a route the lint did not look at.
+    """
+    offenders: list[str] = []
+    for path in _python_sources():
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in _stage_defaulting_lambdas(tree):
+            offenders.append(f"{path.name}:{node.lineno} lambda with a defaulted `stage`")
+        for node in _stage_binding_calls(tree):
+            offenders.append(
+                f"{path.name}:{node.lineno} {_callee_name(node.func)}(..., stage=...) pre-binds `stage`"
+            )
+        for func, decorator in _stage_injecting_decorators(tree):
+            offenders.append(
+                f"{path.name}:{decorator.lineno} @{_callee_name(decorator.func)}(stage=...) on {func.name}"
+            )
+
+    assert not offenders, (
+        "these supply `stage` without a signature default, so callers still never "
+        "have to name one:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_guard_would_catch_an_indirectly_supplied_stage(tmp_path: pathlib.Path) -> None:
+    """Prove the three indirect checks can fail.
+
+    Same reasoning as the signature self-check: a lint that has never fired is
+    indistinguishable from one that cannot.
+    """
+    tree = ast.parse(
+        "emit_gather = lambda rows, *, stage='gather': None\n"
+        "emit_clean = lambda rows, *, stage: None\n"
+        "bound = functools.partial(emit, stage='gather')\n"
+        "bound_method = partialmethod(emit, stage='gather')\n"
+        "bound_clean = functools.partial(emit, rows=[0])\n"
+        "@with_stage(stage='gather')\n"
+        "def decorated(self) -> None: ...\n"
+        "@some_other_decorator(name='x')\n"
+        "def undecorated(self) -> None: ...\n"
+    )
+
+    lambdas = [node.lineno for node in _stage_defaulting_lambdas(tree)]
+    bindings = [_callee_name(node.func) for node in _stage_binding_calls(tree)]
+    decorated = [func.name for func, _decorator in _stage_injecting_decorators(tree)]
+
+    assert lambdas == [1], f"defaulted-stage lambdas not detected; found {lambdas}"
+    assert bindings == ["partial", "partialmethod"], f"partial bindings not detected; found {bindings}"
+    assert decorated == ["decorated"], f"stage-injecting decorators not detected; found {decorated}"
 
 
 def test_stage_arguments_are_declared_moe_stages() -> None:
