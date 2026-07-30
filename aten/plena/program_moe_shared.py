@@ -85,8 +85,24 @@ def fused_shared_intermediate(moe_intermediate_size: int, n_shared_experts: int)
     ``moe_intermediate_size * n_shared_experts`` whose weights are the shared
     experts concatenated along the intermediate axis. Because SwiGLU is applied
     elementwise along that axis and the down projection sums over it, the fused
-    MLP is exactly equal to the sum of the individual shared experts -- no
-    approximation.
+    MLP equals the sum of the individual shared experts **in exact real
+    arithmetic**. The fusion is an algebraic identity, not an approximation.
+
+    It is not bit-identical as emitted, for two separate reasons:
+
+    - The down projection reduces over the whole concatenated axis in one pass,
+      where the unfused form does ``n_shared_experts`` reductions and adds the
+      results. Floating-point addition is not associative, so the roundings
+      differ even in a format with no quantisation involved.
+    - Expert weights are stored MXFP8 (e4m3 elements, one e8m0 scale per block
+      of 8 along that axis). If ``moe_intermediate_size`` is not a multiple of
+      that block, the fused tensor's blocks straddle expert boundaries, so a
+      block's scale is chosen from values belonging to two different experts and
+      the quantised weights themselves differ -- not just their sum.
+
+    Both are small, and neither makes the fusion wrong. But "exactly equal" is a
+    claim about the emitted program that the emitted program does not make, and
+    a bit-exactness test written against it would fail for correct reasons.
     """
     if n_shared_experts < 1:
         raise ValueError(f"n_shared_experts must be >= 1, got {n_shared_experts}")
