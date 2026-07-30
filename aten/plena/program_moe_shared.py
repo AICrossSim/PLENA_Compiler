@@ -39,11 +39,8 @@ profile cannot answer what fraction of MoE time is architecturally dense.
 (token, expert) pair at a time in a BLEN-row slot, re-fetching expert weights per
 pair -- ``moe_gather_token_rows_from_hbm_v0`` calls this "intentionally wasteful
 but keeps the first L2 correctness path exact". The shared path has no such
-constraint and runs as a plain batched projection over all rows. A shared-vs-routed
-cycle ratio measured today therefore reflects *the routed lowering's per-pair
-overhead* at least as much as it reflects the architecture. It is a valid
-measurement of this compiler's output; it is not a statement about MoE hardware in
-general.
+constraint. :data:`SHARED_VS_ROUTED_NOTE` states the consequence, and is the
+canonical wording that travels with the measurement into the profile JSON.
 """
 
 from __future__ import annotations
@@ -58,6 +55,26 @@ from compiler.aten.plena.program_routed_moe import (
     moe_stage_marker,
 )
 from compiler.aten.plena.vars import FPVar, VRAMMatrixVar
+
+#: The caveat that has to travel with any shared-vs-routed ratio.
+#:
+#: Canonical here, and carried into the emulator's stage-profile JSON, where
+#: consumers actually read it. `SHARED_VS_ROUTED_NOTE` in
+#: `transactional_emulator/src/stage_profile.rs` holds the same text, and a test
+#: there parses this constant and asserts the two are byte-identical.
+#:
+#: Two failure modes, not one. A caveat that lives only in compiler source is a
+#: caveat nobody applies, since the JSON is what gets read. A caveat restated by
+#: hand in two repositories is one that quietly stops matching. Declaring it once
+#: and checking the copy is what avoids both.
+SHARED_VS_ROUTED_NOTE = (
+    "The routed lowering processes one (token, expert) pair per BLEN-row slot "
+    "and re-fetches expert weights per pair, while the shared expert runs as a "
+    "plain batched projection over all rows. A shared-vs-routed cycle ratio "
+    "therefore reflects the routed lowering's per-pair overhead at least as "
+    "much as it reflects the architecture. It is a valid measurement of this "
+    "compiler's output; it is not a statement about MoE hardware in general."
+)
 
 
 def fused_shared_intermediate(moe_intermediate_size: int, n_shared_experts: int) -> int:
