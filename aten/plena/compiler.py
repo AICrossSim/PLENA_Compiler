@@ -8,6 +8,7 @@ from pathlib import Path
 from compiler.aten.plena.isa_compiler import IsaCompiler
 from compiler.aten.plena.program_attention import ProgramAttentionMixin
 from compiler.aten.plena.program_fp_tile_ops import ProgramFPTileOpsMixin
+from compiler.aten.plena.program_moe_shared import ProgramMoeSharedMixin
 from compiler.aten.plena.program_routed_moe import ProgramRoutedMoeMixin
 from compiler.aten.plena.program_matrix_ops import ProgramMatrixOpsMixin
 from compiler.aten.plena.program_tensors import ProgramTensorMixin
@@ -58,6 +59,9 @@ class PlenaCompiler(
     ProgramFPTileOpsMixin,
     ProgramMatrixOpsMixin,
     ProgramRoutedMoeMixin,
+    # After ProgramRoutedMoeMixin: the shared-expert emitters call into the routed
+    # substrate (moe_expert_activation_v0, moe_materialize_route_weights_*).
+    ProgramMoeSharedMixin,
     ProgramAttentionMixin,
     IsaCompiler,
 ):
