@@ -94,17 +94,35 @@ def _is_moe_callee(name: str) -> bool:
     return name.startswith(("moe_", "gpt_oss_"))
 
 
+#: Callees taking the stage name as their *first positional* argument.
+#:
+#: ``moe_stage_marker(stage, detail)`` is the function that actually emits a
+#: marker, and all 19 call sites under ``aten/plena`` pass the stage
+#: positionally. Matching only ``stage=`` keywords left the one construct that
+#: produces a marker completely uncovered -- the lint could not have caught the
+#: typo it exists to catch.
+_POSITIONAL_STAGE_CALLEES = frozenset({"moe_stage_marker"})
+
+
 def _moe_stage_arguments(tree: ast.AST):
-    """Yield ``(callee, keyword)`` for every literal ``stage=`` on a MoE callee."""
+    """Yield ``(callee, constant)`` for every literal stage name on a MoE callee.
+
+    Covers both spellings: a ``stage=`` keyword argument, and the first
+    positional argument of the callees in :data:`_POSITIONAL_STAGE_CALLEES`.
+    """
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         callee = _callee_name(node.func)
         if callee is None or not _is_moe_callee(callee):
             continue
+        if callee in _POSITIONAL_STAGE_CALLEES and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                yield callee, first
         for keyword in node.keywords:
             if keyword.arg == "stage" and isinstance(keyword.value, ast.Constant):
-                yield callee, keyword
+                yield callee, keyword.value
 
 
 #: Callables that pre-bind arguments, turning a required parameter into a
@@ -295,11 +313,9 @@ def test_stage_arguments_are_declared_moe_stages() -> None:
     offenders: list[str] = []
     for path in _python_sources():
         tree = ast.parse(path.read_text(), filename=str(path))
-        for callee, keyword in _moe_stage_arguments(tree):
-            if keyword.value.value not in declared:
-                offenders.append(
-                    f"{path.name}:{keyword.value.lineno} {callee}(stage={keyword.value.value!r})"
-                )
+        for callee, constant in _moe_stage_arguments(tree):
+            if constant.value not in declared:
+                offenders.append(f"{path.name}:{constant.lineno} {callee}({constant.value!r})")
 
     assert not offenders, (
         "these call sites pass a stage name that is not in MOE_STAGES:\n  " + "\n  ".join(offenders)
@@ -319,12 +335,21 @@ def test_non_moe_stage_arguments_are_not_flagged() -> None:
         'attention_softmax(stage="attn_input")\n'
         'builder.flash_attention(stage="prefill")\n'
         'moe_expert_activation_v0(builder, stage="expert_activation")\n'
+        'moe_stage_marker("gather", f"detail {x}")\n'
     )
-    matched = [(callee, keyword.value.value) for callee, keyword in _moe_stage_arguments(tree)]
+    matched = [(callee, constant.value) for callee, constant in _moe_stage_arguments(tree)]
 
-    assert matched == [("moe_expert_activation_v0", "expert_activation")], (
-        "the stage-argument matcher is not scoped to MoE callees; it picked up "
-        f"{matched}"
+    assert sorted(matched) == [
+        ("moe_expert_activation_v0", "expert_activation"),
+        ("moe_stage_marker", "gather"),
+    ], f"the stage-argument matcher is wrong; it picked up {matched}"
+
+    # The positional form is the one every real marker uses. Guard it explicitly:
+    # matching keywords alone left all 19 `moe_stage_marker` call sites uncovered.
+    typo = ast.parse('moe_stage_marker("gathr", "detail")\n')
+    assert [c.value for _callee, c in _moe_stage_arguments(typo)] == ["gathr"], (
+        "a positional stage name is invisible to the matcher, so the lint cannot "
+        "see the construct that actually emits a marker"
     )
 
 
