@@ -1,6 +1,10 @@
 name: CI
 
 on:
+  # Stacked branches target a parent branch rather than main, so the
+  # pull_request trigger below never fires for them. Manual dispatch is what
+  # lets a stacked PR's guards be run before it retargets main.
+  workflow_dispatch:
   pull_request:
     branches: [main]
   push:
@@ -30,6 +34,24 @@ jobs:
             exit 1
           fi
           echo "All Python files parse OK"
+
+  # Deliberately not `needs: syntax-check`: this reads sources with `ast` and
+  # finishes in seconds, so there is no reason to queue it behind anything.
+  moe-stage-guard:
+    name: MoE stage-attribution guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # No torch and no checkpoint: the guard only parses source. pyyaml is
+      # needed solely because collecting anything under `aten/tests/` imports
+      # `aten/__init__.py`, which pulls in the op registry.
+      - name: Install dependencies
+        run: pip install pytest pyyaml
+      - name: Run the stage-attribution guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_attribution.py -v
 
       - name: Run the top-k policy encoding guard
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_topk_policy_encoding.py -v
