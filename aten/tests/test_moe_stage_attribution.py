@@ -32,6 +32,24 @@ import pytest
 PLENA_DIR = pathlib.Path(__file__).resolve().parents[1] / "plena"
 ROUTED_MOE_SOURCE = PLENA_DIR / "program_routed_moe.py"
 
+TESTS_DIR = pathlib.Path(__file__).resolve().parent
+CI_WORKFLOW = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+
+#: Test files in this directory that no CI job runs yet.
+#:
+#: Every one of them imports torch and some want a real checkpoint, so wiring
+#: them up is its own piece of work. Pinning the set is what stops a *newly
+#: added* unwired file from hiding among them.
+_UNWIRED_TESTS = frozenset(
+    {
+        "test_bf16_numerical_stability.py",
+        "test_gpt_oss_moe_assertions.py",
+        "test_gpt_oss_moe_reference.py",
+        "test_plena_compiler.py",
+        "test_quantization_ablation.py",
+    }
+)
+
 
 def _python_sources() -> list[pathlib.Path]:
     sources = sorted(PLENA_DIR.rglob("*.py"))
@@ -505,12 +523,38 @@ def test_non_moe_stage_arguments_are_not_flagged() -> None:
         ("moe_stage_marker", "gather"),
     ], f"the stage-argument matcher is wrong; it picked up {matched}"
 
-    # The positional form is the one every real marker uses. Guard it explicitly:
-    # matching keywords alone left all 19 `moe_stage_marker` call sites uncovered.
+
     typo = ast.parse('moe_stage_marker("gathr", "detail")\n')
     assert [c.value for _callee, c in _moe_stage_arguments(typo)] == ["gathr"], (
         "a positional stage name is invisible to the matcher, so the lint cannot "
         "see the construct that actually emits a marker"
+    )
+
+
+def test_every_test_file_here_is_wired_into_ci() -> None:
+    """A guard no job runs is worth exactly nothing.
+
+    A new file under ``aten/tests`` has to be named by a workflow, or else
+    declared unwired on purpose.
+
+    Matched as a substring of the workflow text rather than by parsing the job
+    graph, so a file named in a commented-out step would count as covered.
+    """
+    workflow = CI_WORKFLOW.read_text()
+    present = {path.name for path in TESTS_DIR.glob("test_*.py")}
+    assert present, f"no test files found under {TESTS_DIR}; this guard would pass vacuously"
+
+    unwired = sorted(name for name in present if name not in workflow and name not in _UNWIRED_TESTS)
+    assert not unwired, (
+        "these test files are in the tree but no CI job runs them, so they cannot "
+        f"fail anything:\n  " + "\n  ".join(unwired) + f"\nadd a step to {CI_WORKFLOW.name} "
+        "or, if that is deliberate, add them to _UNWIRED_TESTS with a reason"
+    )
+
+    stale = sorted(name for name in _UNWIRED_TESTS if name not in present or name in workflow)
+    assert not stale, (
+        "_UNWIRED_TESTS names files that are now wired into CI or no longer exist; "
+        f"drop them so the exemption list keeps meaning something:\n  " + "\n  ".join(stale)
     )
 
 
