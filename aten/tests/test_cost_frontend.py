@@ -32,6 +32,7 @@ def test_dense_shape_frontend_uses_real_compiler_schedule():
         CompilerHardwareSpec(mlen=64, blen=4),
         seq_len=16,
         batch_size=1,
+        num_layers=1,
         include_assembly=True,
     )
     counts = result.trace.dynamic_opcode_counts
@@ -98,12 +99,17 @@ def test_production_routes_must_use_summary_backend():
 def test_dense_summary_is_opcode_and_dma_exact(seq_len):
     hardware = CompilerHardwareSpec(mlen=64, blen=4, mram_tile_capacity=2)
     detailed = compile_dense_decoder_trace(
-        _dense_model(), hardware, seq_len=seq_len, cost_trace_granularity="detailed"
+        _dense_model(),
+        hardware,
+        seq_len=seq_len,
+        num_layers=1,
+        cost_trace_granularity="detailed",
     )
     summary = compile_dense_decoder_trace(
         _dense_model(),
         hardware,
         seq_len=seq_len,
+        num_layers=1,
         cost_trace_granularity=COST_TRACE_GRANULARITY_SUMMARY,
     )
 
@@ -111,6 +117,49 @@ def test_dense_summary_is_opcode_and_dma_exact(seq_len):
     assert _dma_occurrences(summary) == _dma_occurrences(detailed)
     assert summary.trace.metadata["materialized_dynamic_instructions"] == 0
     assert summary.trace.metadata["ordered_schedule_available"] is False
+
+
+def test_dense_summary_materializes_model_layer_repeat():
+    hardware = CompilerHardwareSpec(mlen=64, blen=4, mram_tile_capacity=2)
+    one = compile_dense_decoder_trace(
+        _dense_model(),
+        hardware,
+        seq_len=16,
+        num_layers=1,
+        cost_trace_granularity=COST_TRACE_GRANULARITY_SUMMARY,
+    )
+    three = compile_dense_decoder_trace(
+        _dense_model(),
+        hardware,
+        seq_len=16,
+        num_layers=3,
+        cost_trace_granularity=COST_TRACE_GRANULARITY_SUMMARY,
+    )
+
+    def stage_counts(result, prefix):
+        counts = {}
+        for item in result.trace.instructions:
+            if item.stage.startswith(prefix):
+                counts[item.opcode] = counts.get(item.opcode, 0) + item.multiplicity
+        return counts
+
+    assert stage_counts(three, "decoder/layer") == {
+        opcode: 3 * count
+        for opcode, count in stage_counts(one, "decoder/layer").items()
+    }
+    assert stage_counts(three, "global/setup") == stage_counts(one, "global/setup")
+    assert three.trace.metadata["layer_scaling_required"] is False
+
+
+def test_dense_detailed_rejects_implicit_multilayer_expansion():
+    with pytest.raises(ValueError, match="use summary mode"):
+        compile_dense_decoder_trace(
+            _dense_model(),
+            CompilerHardwareSpec(mlen=64, blen=4),
+            seq_len=16,
+            num_layers=2,
+            cost_trace_granularity="detailed",
+        )
 
 
 def test_routed_moe_summary_matches_detailed_without_route_objects():

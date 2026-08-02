@@ -10,6 +10,7 @@ and DMA work.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -17,6 +18,7 @@ import json
 from typing import Any
 
 import compiler.aten.ops as ops
+from compiler.aten.isa_builder import RepeatAxis
 from compiler.aten.model_extract import ModelConfig
 from compiler.aten.ops.registry import Backend, OpRegistry
 from compiler.aten.plena import PlenaCompiler
@@ -277,6 +279,11 @@ def compile_dense_decoder_trace(
     layers = model.num_hidden_layers if num_layers is None else int(num_layers)
     if layers <= 0:
         raise ValueError("num_layers must be positive")
+    if cost_trace_granularity == COST_TRACE_GRANULARITY_DETAILED and layers != 1:
+        raise ValueError(
+            "detailed dense tracing materializes one decoder layer; "
+            "use summary mode for an exact symbolic multi-layer trace"
+        )
 
     OpRegistry.load().set_backend(Backend.PLENA)
     mlen, blen = hardware.mlen, hardware.blen
@@ -356,48 +363,58 @@ def compile_dense_decoder_trace(
         physical_shape=(physical_rows, padded_hidden),
     )
     scale = 1.0 / math.sqrt(model.head_dim)
-    with program.cost_stage("decoder/layer/attention"):
-        if head_packing is not None:
-            current = _emit_packed_attention_block(
-                program,
-                current,
-                layer_inputs,
-                (r_input, cos, sin),
-                causal_mask,
-                scratch,
-                scale,
-                0,
-                padded_seq,
-                model.head_dim,
-                model.num_key_value_heads,
-                ratio,
-                head_packing,
-                batch_size=batch_size,
-                rows_per_batch=rows_per_batch,
-                active_seq_len_per_batch=seq_len,
-            )
-        else:
-            current = _emit_attention_block(
-                program,
-                current,
-                layer_inputs,
-                (r_input, cos, sin),
-                causal_mask,
-                scratch,
-                scale,
-                0,
-                padded_seq,
-                padded_head_dim,
-                total_q_dim,
-                model.num_attention_heads,
-                model.num_key_value_heads,
-                ratio,
-                batch_size=batch_size,
-                rows_per_batch=rows_per_batch,
-                active_seq_len_per_batch=seq_len,
-            )
-    with program.cost_stage("decoder/layer/ffn"):
-        current = _emit_ffn_block(program, current, layer_inputs, scratch)
+    layer_repeat = (
+        program.cost_repeat_region(
+            layers,
+            axis=RepeatAxis.from_mapping("decoder_layer", layers, {}),
+            kind="model-layer",
+        )
+        if cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY
+        else nullcontext(program)
+    )
+    with layer_repeat:
+        with program.cost_stage("decoder/layer/attention"):
+            if head_packing is not None:
+                current = _emit_packed_attention_block(
+                    program,
+                    current,
+                    layer_inputs,
+                    (r_input, cos, sin),
+                    causal_mask,
+                    scratch,
+                    scale,
+                    0,
+                    padded_seq,
+                    model.head_dim,
+                    model.num_key_value_heads,
+                    ratio,
+                    head_packing,
+                    batch_size=batch_size,
+                    rows_per_batch=rows_per_batch,
+                    active_seq_len_per_batch=seq_len,
+                )
+            else:
+                current = _emit_attention_block(
+                    program,
+                    current,
+                    layer_inputs,
+                    (r_input, cos, sin),
+                    causal_mask,
+                    scratch,
+                    scale,
+                    0,
+                    padded_seq,
+                    padded_head_dim,
+                    total_q_dim,
+                    model.num_attention_heads,
+                    model.num_key_value_heads,
+                    ratio,
+                    batch_size=batch_size,
+                    rows_per_batch=rows_per_batch,
+                    active_seq_len_per_batch=seq_len,
+                )
+        with program.cost_stage("decoder/layer/ffn"):
+            current = _emit_ffn_block(program, current, layer_inputs, scratch)
     with program.cost_stage("decoder/final_norm"):
         ops.rms_norm(program, current, eps_offset=3, reci_hid_offset=4)
 
@@ -406,7 +423,8 @@ def compile_dense_decoder_trace(
         model_type=model.model_type,
         representative_layer_count=1,
         requested_layer_count=layers,
-        layer_scaling_required=layers != 1,
+        layer_scaling_required=False,
+        layer_scaling_semantics="symbolic-repeat-materialized",
         seq_len=seq_len,
         batch_size=batch_size,
         materialized_block_pair_count=(
