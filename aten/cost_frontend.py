@@ -20,6 +20,10 @@ import compiler.aten.ops as ops
 from compiler.aten.model_extract import ModelConfig
 from compiler.aten.ops.registry import Backend, OpRegistry
 from compiler.aten.plena import PlenaCompiler
+from compiler.aten.plena.cost_kernels import (
+    projection_hbm_base_cost_summary,
+    router_topk_cost_summary,
+)
 from compiler.aten.plena_frontend import (
     AttentionHeadPacking,
     LayerInputVars,
@@ -27,7 +31,12 @@ from compiler.aten.plena_frontend import (
     _emit_ffn_block,
     _emit_packed_attention_block,
 )
-from compiler.aten.program_sink import CostTrace
+from compiler.aten.program_sink import (
+    COST_TRACE_GRANULARITIES,
+    COST_TRACE_GRANULARITY_DETAILED,
+    COST_TRACE_GRANULARITY_SUMMARY,
+    CostTrace,
+)
 
 
 def _ceil(value: int, multiple: int) -> int:
@@ -250,6 +259,7 @@ def compile_dense_decoder_trace(
     num_layers: int | None = None,
     compiler_hash: str = "unknown",
     include_assembly: bool = False,
+    cost_trace_granularity: str = COST_TRACE_GRANULARITY_DETAILED,
 ) -> CompilerTraceResult:
     """Lower one representative dense layer through the production compiler."""
     model = DecoderModelSpec.load(model_config)
@@ -257,6 +267,13 @@ def compile_dense_decoder_trace(
     hardware.validate()
     if seq_len <= 0 or batch_size <= 0:
         raise ValueError("seq_len and batch_size must be positive")
+    if cost_trace_granularity not in COST_TRACE_GRANULARITIES:
+        raise ValueError(
+            f"unsupported cost_trace_granularity {cost_trace_granularity!r}; "
+            f"expected one of {COST_TRACE_GRANULARITIES}"
+        )
+    if include_assembly and cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY:
+        raise ValueError("summary cost tracing cannot materialize full assembly")
     layers = model.num_hidden_layers if num_layers is None else int(num_layers)
     if layers <= 0:
         raise ValueError("num_layers must be positive")
@@ -300,6 +317,8 @@ def compile_dense_decoder_trace(
         hbm_v_writeback_amount=hardware.hbm_v_writeback_amount,
         cost_trace=True,
         compiler_hash=compiler_hash,
+        cost_trace_granularity=cost_trace_granularity,
+        emit_assembly=include_assembly,
     )
     layer_inputs = _register_dense_layer_inputs(
         program,
@@ -390,6 +409,9 @@ def compile_dense_decoder_trace(
         layer_scaling_required=layers != 1,
         seq_len=seq_len,
         batch_size=batch_size,
+        materialized_block_pair_count=(
+            0 if cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY else None
+        ),
         hardware={
             "mlen": mlen,
             "blen": blen,
@@ -422,23 +444,34 @@ def compile_routed_moe_trace(
     compiler_hash: str = "unknown",
     include_assembly: bool = False,
     max_detailed_routes: int = 4096,
+    cost_trace_granularity: str = COST_TRACE_GRANULARITY_DETAILED,
 ) -> CompilerTraceResult:
     """Meter main's routed expert/gather/scatter path for an explicit histogram.
 
-    This detailed backend intentionally rejects production route counts; the
-    algebraically compressed backend added in the next layer lowers each bucket
-    shape once.  It never invents a balanced runtime routing policy.
+    Detailed mode materializes small validation routes. Summary mode chunks
+    routes to the fixed main FPRAM capacity and lowers each distinct bucket
+    shape once. Neither mode invents a runtime routing distribution.
     """
     model = DecoderModelSpec.load(model_config)
     model.validate()
     hardware.validate()
+    if cost_trace_granularity not in COST_TRACE_GRANULARITIES:
+        raise ValueError(
+            f"unsupported cost_trace_granularity {cost_trace_granularity!r}; "
+            f"expected one of {COST_TRACE_GRANULARITIES}"
+        )
+    if include_assembly and cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY:
+        raise ValueError("summary cost tracing cannot materialize full assembly")
     if model.num_experts <= 0 or model.moe_intermediate_size is None:
         raise ValueError("routed-MoE tracing requires num_experts and moe_intermediate_size")
     if len(routing.routes_per_expert) != model.num_experts:
         raise ValueError("routing histogram expert count does not match the model")
     if routing.top_k != model.experts_per_token:
         raise ValueError("routing histogram top_k does not match the model")
-    if sum(routing.routes_per_expert) > max_detailed_routes:
+    if (
+        cost_trace_granularity == COST_TRACE_GRANULARITY_DETAILED
+        and sum(routing.routes_per_expert) > max_detailed_routes
+    ):
         raise ValueError("routing histogram is too large for detailed mode; use summary mode")
 
     OpRegistry.load().set_backend(Backend.PLENA)
@@ -454,6 +487,8 @@ def compile_routed_moe_trace(
         hbm_v_writeback_amount=hardware.hbm_v_writeback_amount,
         cost_trace=True,
         compiler_hash=compiler_hash,
+        cost_trace_granularity=cost_trace_granularity,
+        emit_assembly=include_assembly,
     )
     x_input = program.input(
         "moe_x", (physical_tokens, hidden), memory_role="activation"
@@ -473,12 +508,19 @@ def compile_routed_moe_trace(
     ]
     with program.cost_stage("decoder/moe/input"):
         x = program.load_batch(x_input, name="moe_x")
-    # Main's routed helpers reserve FPRAM address zero for the true-zero row.
-    zero_row = program.fp_var("moe_zero_row", size=mlen)
     max_expert_rows = max(1, max(routing.routes_per_expert) * blen)
-    one = program.fp_var("moe_one", size=max_expert_rows)
-    neg_one = program.fp_var("moe_neg_one", size=max_expert_rows)
-    constants = (zero_row, zero_row, zero_row, one, neg_one)
+    summary_mode = cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY
+    if summary_mode:
+        # Production histograms can exceed the fixed main FPRAM.  V_TOPK uses
+        # the true-zero row as reusable scratch; every later true-zero helper
+        # rewrites that row before consuming it. Expert activation state is
+        # allocated after the router and chunked to the remaining capacity.
+        zero_row = program.fp_var("moe_zero_row", size=mlen)
+        one = neg_one = None
+    else:
+        zero_row = program.fp_var("moe_zero_row", size=mlen)
+        one = program.fp_var("moe_one", size=max_expert_rows)
+        neg_one = program.fp_var("moe_neg_one", size=max_expert_rows)
     with program.cost_stage("decoder/moe/router"):
         logits = program.qwen3_router_logits_matrix_bf16_rowpacked_v0(
             x,
@@ -489,18 +531,61 @@ def compile_routed_moe_trace(
             mram_tile_capacity=hardware.mram_tile_capacity,
             name="router_logits",
         )
-        weights = program.fp_var("router_topk_weights", size=routing.token_count * routing.top_k)
-        indices = 0
-        for token in range(routing.token_count):
-            program.gpt_oss_router_topk_softmax_v0(
-                logits,
-                token_idx=token,
-                weights_fp_base=weights.address + token * routing.top_k,
-                indices_int_base=indices + token * routing.top_k,
-                num_experts=model.num_experts,
-                top_k=routing.top_k,
-                name=f"token{token}",
+        weights = (
+            None
+            if summary_mode
+            else program.fp_var(
+                "router_topk_weights",
+                size=routing.token_count * routing.top_k,
             )
+        )
+        weights_fp_base = zero_row.address if summary_mode else weights.address
+        indices = 0
+        if summary_mode:
+            expert_blocks = math.ceil(model.num_experts / mlen)
+            topk_summary = router_topk_cost_summary(
+                token_count=routing.token_count,
+                top_k=routing.top_k,
+                weights_fp_base=weights_fp_base,
+                indices_int_base=indices,
+                logits_base=program._vram_matrix_row_addr(logits, 0, 0),
+                logits_token_stride=expert_blocks * mlen,
+                weights_stride=0,
+                indices_stride=0,
+            )
+            program.emit_cost_opcode_counts(
+                topk_summary.opcodes,
+                provenance="main-router-topk-v0",
+            )
+        else:
+            for token in range(routing.token_count):
+                program.gpt_oss_router_topk_softmax_v0(
+                    logits,
+                    token_idx=token,
+                    weights_fp_base=weights_fp_base + token * routing.top_k,
+                    indices_int_base=indices + token * routing.top_k,
+                    num_experts=model.num_experts,
+                    top_k=routing.top_k,
+                    name=f"token{token}",
+                )
+
+    if summary_mode:
+        fpram_capacity = program.fpram_allocator.total_size
+        if mlen >= fpram_capacity:
+            raise MemoryError(
+                f"routed MoE requires a {mlen}-entry true-zero row in "
+                f"main's {fpram_capacity}-entry FPRAM"
+            )
+        max_constant_rows = ((fpram_capacity - mlen) // (2 * blen)) * blen
+        if max_constant_rows <= 0:
+            raise MemoryError("main FPRAM cannot hold routed activation constants")
+        max_constant_rows = min(max_expert_rows, max_constant_rows)
+        one = program.fp_var("moe_one", size=max_constant_rows)
+        neg_one = program.fp_var("moe_neg_one", size=max_constant_rows)
+    else:
+        max_constant_rows = max_expert_rows
+    assert zero_row is not None and one is not None and neg_one is not None
+    constants = (zero_row, zero_row, zero_row, one, neg_one)
 
     accumulator = program.alloc(
         "moe_accumulator",
@@ -510,44 +595,72 @@ def compile_routed_moe_trace(
         physical_shape=(physical_tokens, hidden),
     )
     with program.cost_stage("decoder/moe/combine_init"):
-        program.gpt_oss_true_zero_vram_rows_v0(
-            accumulator,
-            rows=range(physical_tokens),
-            hidden=hidden,
-            zero_row=zero_row,
-            name="accumulator_zero",
-        )
-
-    route_cursor = 0
-    for expert, route_count in enumerate(routing.routes_per_expert):
-        if route_count == 0:
-            continue
-        token_indices = [
-            (route_cursor + route) % routing.token_count for route in range(route_count)
-        ]
-        route_cursor += route_count
-        with program.cost_stage("decoder/moe/dispatch"):
-            gathered = program.gpt_oss_gather_token_rows_from_vram_v0(
-                x,
-                token_indices=token_indices,
+        if cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY:
+            program.gpt_oss_true_zero_vram_rows_summary_v0(
+                accumulator,
+                row_start=0,
+                row_step=1,
+                row_count=physical_tokens,
                 hidden=hidden,
                 zero_row=zero_row,
-                name=f"expert{expert}_gather",
+                name="accumulator_zero",
             )
+        else:
+            program.gpt_oss_true_zero_vram_rows_v0(
+                accumulator,
+                rows=range(physical_tokens),
+                hidden=hidden,
+                zero_row=zero_row,
+                name="accumulator_zero",
+            )
+
+    def lower_expert(
+        expert: int,
+        route_count: int,
+        route_start: int,
+        token_indices: list[int] | None,
+        chunk_index: int | None,
+    ) -> None:
+        expert_label = (
+            f"expert{expert}"
+            if chunk_index is None
+            else f"expert{expert}_chunk{chunk_index}"
+        )
+        with program.cost_stage("decoder/moe/dispatch"):
+            if cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY:
+                gathered = program.gpt_oss_gather_token_rows_from_vram_summary_v0(
+                    x,
+                    route_start=route_start,
+                    route_count=route_count,
+                    token_count=routing.token_count,
+                    hidden=hidden,
+                    zero_row=zero_row,
+                    name=f"{expert_label}_gather",
+                )
+            else:
+                assert token_indices is not None
+                gathered = program.gpt_oss_gather_token_rows_from_vram_v0(
+                    x,
+                    token_indices=token_indices,
+                    hidden=hidden,
+                    zero_row=zero_row,
+                    name=f"{expert_label}_gather",
+                )
         projection_rows = max(mlen, route_count * blen)
         with program.cost_stage("decoder/moe/expert"):
             gate = program.linear_projection(
                 gathered,
                 expert_weights[expert][0],
-                name=f"expert{expert}_gate_out",
+                name=f"{expert_label}_gate_out",
                 physical_shape=(projection_rows, intermediate),
             )
             up = program.linear_projection(
                 gathered,
                 expert_weights[expert][1],
-                name=f"expert{expert}_up_out",
+                name=f"{expert_label}_up_out",
                 physical_shape=(projection_rows, intermediate),
             )
+            program.free_tensor(gathered)
             hidden_out = program.moe_expert_activation_v0(
                 gate,
                 up,
@@ -555,38 +668,192 @@ def compile_routed_moe_trace(
                 intermediate=intermediate,
                 constants=constants,
                 activation_policy="standard_swiglu",
-                name=f"expert{expert}",
+                name=expert_label,
             )
             expert_out = program.linear_projection(
                 hidden_out,
                 expert_weights[expert][2],
-                name=f"expert{expert}_down_out",
+                name=f"{expert_label}_down_out",
                 physical_shape=(projection_rows, hidden),
             )
+            program.free_tensor(hidden_out)
             route_scale = program.alloc(
-                f"expert{expert}_route_scale",
+                f"{expert_label}_route_scale",
                 projection_rows,
                 hidden,
                 strict=False,
                 physical_shape=(projection_rows, hidden),
             )
             program.vram_mul(expert_out, route_scale, num_rows=route_count * blen)
+            program.free_tensor(route_scale)
         with program.cost_stage("decoder/moe/combine"):
-            program.gpt_oss_scatter_add_active_rows_v0(
-                accumulator,
-                expert_out,
-                token_indices=token_indices,
-                active_rows=[route * blen for route in range(route_count)],
-                hidden=hidden,
-                name=f"expert{expert}_scatter",
+            if cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY:
+                program.gpt_oss_scatter_add_active_rows_summary_v0(
+                    accumulator,
+                    expert_out,
+                    route_start=route_start,
+                    route_count=route_count,
+                    token_count=routing.token_count,
+                    hidden=hidden,
+                    name=f"{expert_label}_scatter",
+                )
+            else:
+                assert token_indices is not None
+                program.gpt_oss_scatter_add_active_rows_v0(
+                    accumulator,
+                    expert_out,
+                    token_indices=token_indices,
+                    active_rows=[route * blen for route in range(route_count)],
+                    hidden=hidden,
+                    name=f"{expert_label}_scatter",
+                )
+        program.free_tensor(expert_out)
+
+    route_cursor = 0
+    expert_chunk_count = 0
+    max_routes_per_chunk = max(1, max_constant_rows // blen)
+    expert_templates: dict[tuple[object, ...], tuple[int, int]] = {}
+
+    def emit_expert_projection_base_cost(expert: int, route_count: int) -> None:
+        projection_rows = max(mlen, route_count * blen)
+        row_blocks = math.ceil(projection_rows / mlen)
+        hidden_tiles = hidden // mlen
+        intermediate_tiles = intermediate // mlen
+        hidden_chunks = math.ceil(hidden_tiles / hardware.mram_tile_capacity)
+        intermediate_chunks = math.ceil(
+            intermediate_tiles / hardware.mram_tile_capacity
+        )
+        gate, up, down = expert_weights[expert]
+        summary = projection_hbm_base_cost_summary(
+            [
+                (
+                    program.get_hbm_layout(gate.name).hbm_base_addr,
+                    row_blocks * intermediate_tiles * hidden_chunks,
+                ),
+                (
+                    program.get_hbm_layout(up.name).hbm_base_addr,
+                    row_blocks * intermediate_tiles * hidden_chunks,
+                ),
+                (
+                    program.get_hbm_layout(down.name).hbm_base_addr,
+                    row_blocks * hidden_tiles * intermediate_chunks,
+                ),
+            ]
+        )
+        with program.cost_stage("decoder/moe/expert"):
+            program.emit_cost_opcode_counts(
+                summary.opcodes,
+                provenance="main-routed-expert-hbm-base-v0",
             )
 
+    for expert, route_count in enumerate(routing.routes_per_expert):
+        remaining = route_count
+        chunk_index = 0
+        while remaining:
+            chunk_routes = (
+                min(remaining, max_routes_per_chunk)
+                if summary_mode
+                else remaining
+            )
+            token_indices: list[int] | None = None
+            if not summary_mode:
+                token_indices = [
+                    (route_cursor + route) % routing.token_count
+                    for route in range(chunk_routes)
+                ]
+            emitted_chunk_index = (
+                chunk_index if summary_mode and route_count > chunk_routes else None
+            )
+            if summary_mode:
+                emit_expert_projection_base_cost(expert, chunk_routes)
+                template_key = (
+                    "routed-expert-chunk-v2",
+                    chunk_routes,
+                    hidden,
+                    intermediate,
+                    mlen,
+                    blen,
+                )
+                representative = expert_templates.get(template_key)
+                if representative is None:
+                    program._suppress_summary_projection_hbm_base = True
+                    try:
+                        with program.cost_summary_template(template_key):
+                            lower_expert(
+                                expert,
+                                chunk_routes,
+                                route_cursor,
+                                token_indices,
+                                emitted_chunk_index,
+                            )
+                    finally:
+                        program._suppress_summary_projection_hbm_base = False
+                    representative_base = program.get_hbm_layout(
+                        expert_weights[expert][0].name
+                    ).hbm_base_addr
+                    expert_templates[template_key] = (expert, representative_base)
+                else:
+                    _representative_expert, representative_base = representative
+                    replay_base = program.get_hbm_layout(
+                        expert_weights[expert][0].name
+                    ).hbm_base_addr
+                    if not program.replay_cost_summary_template(
+                        template_key,
+                        dma_address_delta_bytes=replay_base - representative_base,
+                    ):
+                        raise RuntimeError(
+                            f"missing routed expert template {template_key!r}"
+                        )
+            else:
+                lower_expert(
+                    expert,
+                    chunk_routes,
+                    route_cursor,
+                    token_indices,
+                    emitted_chunk_index,
+                )
+            route_cursor += chunk_routes
+            remaining -= chunk_routes
+            chunk_index += 1
+            expert_chunk_count += 1
+
     trace = program.get_cost_trace(
-        frontend="shape-only-routed-moe-detailed-v1",
+        frontend=(
+            "shape-only-routed-moe-summary-v1"
+            if summary_mode
+            else "shape-only-routed-moe-detailed-v1"
+        ),
         model_type=model.model_type,
         routing_label=routing.label,
         routing_histogram=list(routing.routes_per_expert),
-        route_object_count=sum(routing.routes_per_expert),
+        route_object_count=(
+            0
+            if cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY
+            else sum(routing.routes_per_expert)
+        ),
+        expanded_route_equivalent=sum(routing.routes_per_expert),
+        expert_template_count=(
+            len(expert_templates) if summary_mode else 0
+        ),
+        expert_chunk_count=expert_chunk_count,
+        max_routes_per_chunk=max_routes_per_chunk,
+        route_storage_mode=(
+            "streamed-histogram-scratch"
+            if summary_mode
+            else "materialized-main-fpram"
+        ),
+        routing_semantics="explicit-expert-count-histogram",
+        routing_order_semantics=(
+            "affine-symbolic-routes"
+            if summary_mode
+            else "deterministic-validation-fixture"
+        ),
+        route_weight_semantics="shape-only-main-lowering",
+        summary_fidelity=(
+            "exact-algebraic-final-schedule"
+            if summary_mode
+            else "ordered-final-schedule"
+        ),
     )
     return CompilerTraceResult(
         trace=trace,
@@ -595,7 +862,11 @@ def compile_routed_moe_trace(
             "model": model,
             "hardware": hardware,
             "routing": routing,
-            "trace_mode": "detailed",
+            "trace_mode": (
+                "summary"
+                if cost_trace_granularity == COST_TRACE_GRANULARITY_SUMMARY
+                else "detailed"
+            ),
         },
     )
 

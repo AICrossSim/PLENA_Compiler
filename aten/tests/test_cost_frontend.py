@@ -7,6 +7,11 @@ from compiler.aten.cost_frontend import (
     compile_dense_decoder_trace,
     compile_routed_moe_trace,
 )
+from compiler.aten.program_sink import COST_TRACE_GRANULARITY_SUMMARY
+
+
+def _dma_occurrences(result):
+    return sum(event.multiplicity for event in result.trace.dma_events)
 
 
 def _dense_model():
@@ -87,3 +92,81 @@ def test_production_routes_must_use_summary_backend():
             CompilerHardwareSpec(mlen=64, blen=4),
             routing,
         )
+
+
+@pytest.mark.parametrize("seq_len", [16, 96])
+def test_dense_summary_is_opcode_and_dma_exact(seq_len):
+    hardware = CompilerHardwareSpec(mlen=64, blen=4, mram_tile_capacity=2)
+    detailed = compile_dense_decoder_trace(
+        _dense_model(), hardware, seq_len=seq_len, cost_trace_granularity="detailed"
+    )
+    summary = compile_dense_decoder_trace(
+        _dense_model(),
+        hardware,
+        seq_len=seq_len,
+        cost_trace_granularity=COST_TRACE_GRANULARITY_SUMMARY,
+    )
+
+    assert summary.trace.dynamic_opcode_counts == detailed.trace.dynamic_opcode_counts
+    assert _dma_occurrences(summary) == _dma_occurrences(detailed)
+    assert summary.trace.metadata["materialized_dynamic_instructions"] == 0
+    assert summary.trace.metadata["ordered_schedule_available"] is False
+
+
+def test_routed_moe_summary_matches_detailed_without_route_objects():
+    model = DecoderModelSpec(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=32,
+        model_type="qwen3_moe",
+        num_experts=32,
+        experts_per_token=4,
+        moe_intermediate_size=64,
+    )
+    hardware = CompilerHardwareSpec(mlen=32, blen=4, mram_tile_capacity=2)
+    routing = RoutingHistogram.balanced(token_count=5, top_k=4, num_experts=32)
+    detailed = compile_routed_moe_trace(model, hardware, routing)
+    summary = compile_routed_moe_trace(
+        model,
+        hardware,
+        routing,
+        cost_trace_granularity=COST_TRACE_GRANULARITY_SUMMARY,
+    )
+
+    assert summary.trace.dynamic_opcode_counts == detailed.trace.dynamic_opcode_counts
+    assert _dma_occurrences(summary) == _dma_occurrences(detailed)
+    assert summary.trace.metadata["route_object_count"] == 0
+    assert summary.trace.metadata["expert_template_count"] > 0
+
+
+def test_routed_moe_summary_chunks_to_main_fpram_capacity():
+    model = DecoderModelSpec(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=64,
+        model_type="qwen3_moe",
+        num_experts=32,
+        experts_per_token=4,
+        moe_intermediate_size=64,
+    )
+    routing = RoutingHistogram.skewed(
+        token_count=121,
+        top_k=4,
+        num_experts=32,
+        hot_fraction=0.5,
+    )
+    summary = compile_routed_moe_trace(
+        model,
+        CompilerHardwareSpec(mlen=64, blen=4),
+        routing,
+        cost_trace_granularity=COST_TRACE_GRANULARITY_SUMMARY,
+    )
+
+    assert summary.trace.metadata["route_object_count"] == 0
+    assert summary.trace.metadata["expert_chunk_count"] > model.num_experts
+    assert summary.trace.metadata["route_storage_mode"] == "streamed-histogram-scratch"
+    assert summary.trace.metadata["max_routes_per_chunk"] == 120

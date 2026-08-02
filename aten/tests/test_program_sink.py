@@ -99,3 +99,14 @@ def test_unknown_opcode_fails_closed():
     sink = SymbolicCostSink()
     with pytest.raises(ValueError, match="unknown final-schedule opcode"):
         sink.consume(schedule.finalized())
+
+
+def test_hbm_opcode_without_dma_geometry_fails_closed():
+    schedule = IsaBuilder().stage(
+        "decoder/test",
+        IsaBuilder().instr("H_PREFETCH_M", gp(1), gp(2), "a0", 1, 0),
+    )
+    sink = SymbolicCostSink()
+    sink.consume(schedule.finalized())
+    with pytest.raises(ValueError, match="incomplete final-schedule DMA coverage"):
+        sink.finish()

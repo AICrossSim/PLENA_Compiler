@@ -6,6 +6,11 @@ import math
 from collections.abc import Sequence
 
 from compiler.aten.isa_builder import IsaBuilder, addr as areg, fp, gp
+from compiler.aten.plena.cost_kernels import (
+    routed_row_copy_cost_summary,
+    standard_swiglu_cost_summary,
+    true_zero_rows_cost_summary,
+)
 from compiler.aten.plena.vars import FPVar, InputVar, VRAMMatrixVar
 
 GptOssFPConstants = tuple[FPVar, FPVar, FPVar, FPVar, FPVar]
@@ -1124,6 +1129,76 @@ class ProgramRoutedMoeMixin:
 
         return gathered
 
+    def gpt_oss_gather_token_rows_from_vram_summary_v0(
+        self,
+        x: VRAMMatrixVar,
+        *,
+        route_start: int,
+        route_count: int,
+        token_count: int,
+        hidden: int,
+        zero_row: FPVar | None = None,
+        name: str = "gpt_oss_gathered_x_vram",
+    ) -> VRAMMatrixVar:
+        """Census an affine routed gather without materializing route objects."""
+        if not self.cost_summary_enabled:
+            raise RuntimeError("summary routed gather requires summary cost tracing")
+        self._ensure_vram_sub_matrix_registered(x)
+        if hidden % self.mlen != 0:
+            raise ValueError(f"VRAM gather hidden={hidden} must be divisible by MLEN={self.mlen}")
+        if hidden > x.shape[1]:
+            raise ValueError(f"VRAM gather hidden={hidden} exceeds x width={x.shape[1]}")
+        if route_count <= 0 or token_count <= 0:
+            raise ValueError("route_count and token_count must be positive")
+        if token_count > x.physical_shape[0]:
+            raise ValueError(
+                f"VRAM gather token_count={token_count} exceeds x physical rows={x.physical_shape[0]}"
+            )
+
+        logical_rows = route_count * self.blen
+        physical_rows = max(self.blen, math.ceil(logical_rows / self.blen) * self.blen)
+        gathered = self.alloc(
+            name,
+            rows=logical_rows,
+            cols=hidden,
+            strict=False,
+            physical_shape=(physical_rows, hidden),
+        )
+        fp_zero_row = zero_row or self.fp_var(f"{name}_zero_row", size=self.mlen)
+        zero_summary = true_zero_rows_cost_summary(
+            mlen=self.mlen,
+            matrix_base=self._vram_matrix_row_addr(gathered, 0, 0),
+            matrix_physical_rows=gathered.physical_shape[0],
+            hidden=hidden,
+            fp_zero_base=fp_zero_row.address,
+            row_start=0,
+            row_step=1,
+            row_count=physical_rows,
+        )
+        self.emit_cost_opcode_counts(
+            zero_summary.opcodes,
+            provenance="main-routed-true-zero-v0",
+        )
+        gather_summary = routed_row_copy_cost_summary(
+            opcode="V_ADD_VV",
+            mlen=self.mlen,
+            hidden=hidden,
+            route_start=route_start,
+            route_count=route_count,
+            token_count=token_count,
+            slot_rows=self.blen,
+            dst_base=self._vram_matrix_row_addr(gathered, 0, 0),
+            dst_physical_rows=gathered.physical_shape[0],
+            src_base=self._vram_matrix_row_addr(x, 0, 0),
+            src_physical_rows=x.physical_shape[0],
+            token_is_destination=False,
+        )
+        self.emit_cost_opcode_counts(
+            gather_summary.opcodes,
+            provenance="main-routed-vram-gather-v0",
+        )
+        return gathered
+
     def gpt_oss_true_zero_vram_rows_v0(
         self,
         matrix: VRAMMatrixVar,
@@ -1170,6 +1245,45 @@ class ProgramRoutedMoeMixin:
         finally:
             self._reg.free_gp([gp_fp, gp_dst, gp_loop])
 
+    def gpt_oss_true_zero_vram_rows_summary_v0(
+        self,
+        matrix: VRAMMatrixVar,
+        *,
+        row_start: int,
+        row_step: int,
+        row_count: int,
+        hidden: int,
+        zero_row: FPVar | None = None,
+        name: str = "gpt_oss_zero_rows",
+    ) -> None:
+        """Census an affine true-zero row run without expanding row indices."""
+        if not self.cost_summary_enabled:
+            raise RuntimeError("summary true-zero requires summary cost tracing")
+        if row_count <= 0:
+            return
+        if row_start < 0 or row_step <= 0:
+            raise ValueError("summary true-zero requires a nonnegative start and positive step")
+        last_row = row_start + (row_count - 1) * row_step
+        if last_row >= matrix.physical_shape[0]:
+            raise ValueError(
+                f"zero row {last_row} exceeds physical rows={matrix.physical_shape[0]}"
+            )
+        fp_zero_row = zero_row or self.fp_var(f"{name}_zero_row", size=self.mlen)
+        summary = true_zero_rows_cost_summary(
+            mlen=self.mlen,
+            matrix_base=self._vram_matrix_row_addr(matrix, 0, 0),
+            matrix_physical_rows=matrix.physical_shape[0],
+            hidden=hidden,
+            fp_zero_base=fp_zero_row.address,
+            row_start=row_start,
+            row_step=row_step,
+            row_count=row_count,
+        )
+        self.emit_cost_opcode_counts(
+            summary.opcodes,
+            provenance="main-routed-true-zero-v0",
+        )
+
     def gpt_oss_scatter_add_active_rows_v0(
         self,
         dst: VRAMMatrixVar,
@@ -1213,6 +1327,51 @@ class ProgramRoutedMoeMixin:
             self._emit(asm)
         finally:
             self._reg.free_gp([gp_dst, gp_src])
+
+    def gpt_oss_scatter_add_active_rows_summary_v0(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        *,
+        route_start: int,
+        route_count: int,
+        token_count: int,
+        hidden: int,
+        name: str = "gpt_oss_scatter_add",
+    ) -> None:
+        """Census affine scatter-add rows without route or active-row lists."""
+        del name
+        if not self.cost_summary_enabled:
+            raise RuntimeError("summary routed scatter requires summary cost tracing")
+        if route_count <= 0 or token_count <= 0:
+            raise ValueError("route_count and token_count must be positive")
+        if token_count > dst.physical_shape[0]:
+            raise ValueError(
+                f"scatter token_count={token_count} exceeds dst physical rows={dst.physical_shape[0]}"
+            )
+        required_src_rows = (route_count - 1) * self.blen + 1
+        if required_src_rows > src.physical_shape[0]:
+            raise ValueError(
+                f"scatter requires {required_src_rows} source rows, got {src.physical_shape[0]}"
+            )
+        summary = routed_row_copy_cost_summary(
+            opcode="V_ADD_VV",
+            mlen=self.mlen,
+            hidden=hidden,
+            route_start=route_start,
+            route_count=route_count,
+            token_count=token_count,
+            slot_rows=self.blen,
+            dst_base=self._vram_matrix_row_addr(dst, 0, 0),
+            dst_physical_rows=dst.physical_shape[0],
+            src_base=self._vram_matrix_row_addr(src, 0, 0),
+            src_physical_rows=src.physical_shape[0],
+            token_is_destination=True,
+        )
+        self.emit_cost_opcode_counts(
+            summary.opcodes,
+            provenance="main-routed-vram-scatter-v0",
+        )
 
     def gpt_oss_clamp_gated_activation_v0(
         self,
@@ -1281,7 +1440,6 @@ class ProgramRoutedMoeMixin:
         """
         self._validate_standard_swiglu_constants(constants, rows)
         _, _unused_pos, _unused_neg, one, neg_one = constants
-        active_rows = list(range(rows))
         physical_rows = max(self.mlen, math.ceil(rows / self.mlen) * self.mlen)
         num_col_blocks = math.ceil(intermediate / self.mlen)
         sigmoid = self.alloc(
@@ -1292,6 +1450,28 @@ class ProgramRoutedMoeMixin:
             strict=False,
         )
 
+        if self.cost_summary_enabled:
+            summary = standard_swiglu_cost_summary(
+                mlen=self.mlen,
+                sigmoid_base=self._vram_matrix_row_addr(sigmoid, 0, 0),
+                sigmoid_physical_rows=sigmoid.physical_shape[0],
+                intermediate=intermediate,
+                rows=rows,
+                one_fp_base=one.address,
+                neg_one_fp_base=neg_one.address,
+            )
+            self.emit_cost_opcode_counts(
+                summary.opcodes,
+                provenance="main-standard-swiglu-v0",
+            )
+            self.vram_add(sigmoid, gate, num_rows=rows)
+            self.vram_mul(gate, sigmoid, num_rows=rows)
+            self.vram_mul(up, gate, num_rows=rows)
+            self.free_tensor(sigmoid)
+            self.free_tensor(gate)
+            return up
+
+        active_rows = list(range(rows))
         self.vram_fill_zero(sigmoid, rows=active_rows)
         self.vram_add(sigmoid, gate, num_rows=rows)
 
@@ -1302,6 +1482,8 @@ class ProgramRoutedMoeMixin:
             self.tile_row_reci(sigmoid, rows=active_rows, tile_col_idx=col_block)
         self.vram_mul(gate, sigmoid, num_rows=rows)
         self.vram_mul(up, gate, num_rows=rows)
+        self.free_tensor(sigmoid)
+        self.free_tensor(gate)
         return up
 
     def gpt_oss_expert_v0(

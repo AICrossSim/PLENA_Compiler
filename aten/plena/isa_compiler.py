@@ -18,9 +18,11 @@ from compiler.aten.plena.isa_emit import IsaEmitMixin
 from compiler.aten.plena.isa_fp_ops import IsaFPOpsMixin
 from compiler.aten.plena.isa_matrix import IsaMatrixMixin
 from compiler.aten.plena.isa_tile_rows import IsaTileRowMixin
+from compiler.aten.plena.cost_kernels import normalization_cost_summary
 from compiler.aten.plena.memory_state import MemoryStateMixin
 from compiler.aten.plena.registers import RegisterAllocator
 from compiler.aten.program_sink import SymbolicCostSink
+from compiler.aten.program_sink import COST_TRACE_GRANULARITY_DETAILED
 from compiler.aten.isa_builder import DmaTransfer, RepeatAxis
 
 
@@ -50,6 +52,8 @@ class IsaCompiler(
         cost_trace: bool = False,
         compiler_hash: str = "unknown",
         default_cost_stage: str | None = None,
+        cost_trace_granularity: str = COST_TRACE_GRANULARITY_DETAILED,
+        emit_assembly: bool = True,
     ):
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
         super().__init__(
@@ -63,8 +67,13 @@ class IsaCompiler(
         self.generated_code = ""
         self.unroll_attention = unroll_loops
         self._cost_stage_stack: list[str] = []
+        self._emit_assembly = bool(emit_assembly)
         self._symbolic_cost_sink = (
-            SymbolicCostSink(compiler_hash=compiler_hash, default_stage=default_cost_stage)
+            SymbolicCostSink(
+                compiler_hash=compiler_hash,
+                default_stage=default_cost_stage,
+                granularity=cost_trace_granularity,
+            )
             if cost_trace
             else None
         )
@@ -397,6 +406,21 @@ class IsaCompiler(
             scratchpad_vram_addr = self.vram_allocator.allocate(vlen, name=temp_scratchpad_name)
 
         try:
+            if self.cost_summary_enabled:
+                summary = normalization_cost_summary(
+                    mode=mode,
+                    activation_base=tensor_info.vram_addr,
+                    scratchpad_base=scratchpad_vram_addr,
+                    vlen=vlen,
+                    batch_size=batch_size,
+                    hidden_dim=hidden_dim,
+                    unroll=self._unroll,
+                )
+                self.emit_cost_opcode_counts(
+                    summary.opcodes,
+                    provenance=f"main-{mode}-norm-v1",
+                )
+                return ""
             isa_code = (
                 f"; Normalize ({mode}) {tensor_name}, "
                 f"logical=({logical_batch_size}, {logical_hidden_dim}) "

@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from compiler.aten.isa_builder import AsmInput, IsaBuilder, Sequence, Stage, final_sequence, render_asm
+from compiler.aten.isa_builder import (
+    AsmInput,
+    IsaBuilder,
+    RepeatAxis,
+    Sequence,
+    Stage,
+    final_sequence,
+    render_asm,
+)
 from compiler.aten.plena.registers import RegisterAllocator
 
 
@@ -44,8 +52,9 @@ class IsaEmitMixin:
 
     def _emit(self, isa_code: AsmInput) -> str:
         """Append ISA text to the output buffer and return it."""
-        rendered = render_asm(isa_code)
-        self._code_chunks.append(rendered)
+        rendered = render_asm(isa_code) if getattr(self, "_emit_assembly", True) else ""
+        if rendered:
+            self._code_chunks.append(rendered)
         sink = getattr(self, "_symbolic_cost_sink", None)
         if sink is not None:
             schedule = final_sequence(isa_code)
@@ -97,6 +106,87 @@ class IsaEmitMixin:
                 sink.record_dma(transfer, multiplicity=multiplicity, axes=tuple(axes))
             finally:
                 sink.end_stage(stage)
+
+    @property
+    def cost_summary_enabled(self) -> bool:
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        return bool(sink is not None and sink.summary_enabled)
+
+    @contextmanager
+    def cost_repeat_region(
+        self,
+        count: int,
+        *,
+        axis: RepeatAxis | None = None,
+        kind: str = "compiler-summary",
+    ):
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is None or not sink.summary_enabled:
+            raise RuntimeError("cost_repeat_region requires summary cost tracing")
+        sink.begin_repeat(count, axis, kind)
+        try:
+            yield self
+        finally:
+            sink.end_repeat(count, axis, kind)
+
+    @contextmanager
+    def suppress_cost_dma(self):
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is None:
+            yield self
+            return
+        sink.begin_dma_suppression()
+        try:
+            yield self
+        finally:
+            sink.end_dma_suppression()
+
+    @contextmanager
+    def cost_summary_template(self, key: tuple[object, ...]):
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is None or not sink.summary_enabled:
+            yield self
+            return
+        sink.begin_template(key)
+        try:
+            yield self
+        finally:
+            sink.end_template(key)
+
+    def replay_cost_summary_template(
+        self,
+        key: tuple[object, ...],
+        *,
+        count: int = 1,
+        axes: tuple[RepeatAxis, ...] = (),
+        dma_address_delta_bytes: int = 0,
+    ) -> bool:
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        return bool(
+            sink is not None
+            and sink.summary_enabled
+            and sink.replay_template(
+                key,
+                count=count,
+                axes=axes,
+                dma_address_delta_bytes=dma_address_delta_bytes,
+            )
+        )
+
+    def emit_cost_opcode_counts(self, counts, *, provenance: str) -> None:
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is None:
+            raise RuntimeError("cost tracing is not enabled")
+        stage_stack = getattr(self, "_cost_stage_stack", ())
+        if not stage_stack:
+            sink.add_opcode_counts(counts, provenance=provenance)
+            return
+        stage = "/".join(stage_stack)
+        sink.begin_stage(stage)
+        try:
+            sink.add_opcode_counts(counts, provenance=provenance)
+        finally:
+            sink.end_stage(stage)
 
     # ------------------------------------------------------------------
     # FP Register management

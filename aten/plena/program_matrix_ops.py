@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import math
 
+from compiler.aten.plena.cost_kernels import (
+    bf16_stream_k_accum_cost_summary,
+    linear_projection_cost_summary,
+)
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -350,6 +354,82 @@ class ProgramMatrixOpsMixin:
             physical_shape=(physical_rows, physical_out_features),
         )
 
+        if self.cost_summary_enabled:
+            chunks = list(_iter_k_chunks(num_k_tiles, max_k_tiles))
+            temp = self.alloc(f"{name}_temp", mlen, mlen) if len(chunks) > 1 else None
+            input_layout = self.get_vram_layout(input_var.name)
+            weight_layout = self.get_hbm_layout(weight_var.name)
+            output_layout = self.get_vram_layout(output.name)
+            weight_rows, weight_cols = (
+                weight_layout.physical_shape or weight_layout.full_shape
+            )
+            row_loop_counts = []
+            for row_idx in range(num_row_blocks):
+                block = input_layout.get_row_blocks(row_idx)[0]
+                valid_rows = block.valid_shape[0] if block.valid_shape else mlen
+                row_loop_counts.append(max(1, math.ceil(valid_rows / self.blen)))
+            hbm_offsets = [
+                [
+                    block.hbm_offset
+                    for block in weight_layout.get_col_blocks(col_idx)
+                ]
+                for col_idx in range(num_col_blocks)
+            ]
+            precision = _matrix_precision_code(matrix_precision)
+            dma_prototypes = [
+                self._matrix_dma_transfer(
+                    name=weight_var.name,
+                    layout=weight_layout,
+                    row_idx=0,
+                    col_idx=col_idx,
+                    precision=precision,
+                    set_scale=set_scale,
+                    hbm_element_bytes=hbm_element_bytes,
+                )
+                for col_idx in range(num_col_blocks)
+            ]
+            summary = linear_projection_cost_summary(
+                mlen=mlen,
+                blen=self.blen,
+                full_batch=input_layout.physical_shape[0],
+                hbm_base=weight_layout.hbm_base_addr,
+                hbm_rows=weight_rows,
+                hbm_cols=weight_cols,
+                input_base=input_layout.vram_base_addr,
+                input_physical_rows=input_layout.physical_shape[0],
+                output_base=output_layout.vram_base_addr,
+                output_physical_rows=output_layout.physical_shape[0],
+                temp_base=(
+                    self.get_vram_layout(temp.name).vram_base_addr
+                    if temp is not None
+                    else None
+                ),
+                num_row_blocks=num_row_blocks,
+                num_col_blocks=num_col_blocks,
+                chunks=chunks,
+                row_loop_counts=row_loop_counts,
+                hbm_offsets=hbm_offsets,
+                dma_prototypes=dma_prototypes,
+                include_hbm_base_setup=not getattr(
+                    self,
+                    "_suppress_summary_projection_hbm_base",
+                    False,
+                ),
+            )
+            self.emit_cost_opcode_counts(
+                summary.opcodes,
+                provenance="main-linear-projection-v1",
+            )
+            for stream in summary.dma_streams:
+                self.record_dma(
+                    stream.transfer,
+                    multiplicity=stream.multiplicity,
+                    axes=stream.axes,
+                )
+            if temp is not None:
+                self.free_tensor(temp)
+            return output
+
         def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split):
             self.vram_sub_projection_to(
                 input_var,
@@ -435,6 +515,75 @@ class ProgramMatrixOpsMixin:
             strict=False,
             physical_shape=(physical_rows, physical_out_features),
         )
+
+        if self.cost_summary_enabled and num_k_tiles > max_tiles:
+            self._ensure_vram_sub_matrix_registered(input_var)
+            self._ensure_hbm_sub_matrix_registered(weight_var)
+            self._ensure_vram_sub_matrix_registered(output)
+            input_layout = self.get_vram_layout(input_var.name)
+            weight_layout = self.get_hbm_layout(weight_var.name)
+            chunks = list(_iter_k_chunks(num_k_tiles, max_tiles))
+            row_loop_counts: list[int] = []
+            input_vram_bases: list[list[int]] = []
+            output_tile_bases: list[list[int]] = []
+            for row_idx in range(num_row_blocks):
+                blocks = input_layout.get_row_blocks(row_idx)
+                valid_rows = blocks[0].valid_shape[0] if blocks[0].valid_shape else mlen
+                row_loop_counts.append(
+                    min(mlen // self.blen, max(1, math.ceil(valid_rows / self.blen)))
+                )
+                input_vram_bases.append([block.vram_addr for block in blocks])
+                output_tile_bases.append(
+                    [
+                        self.get_vram_tile_addr(output.name, row_idx, col_idx)
+                        for col_idx in range(num_col_blocks)
+                    ]
+                )
+            hbm_offsets = [
+                [
+                    weight_layout.get_sub_block(k_idx, col_idx).hbm_offset
+                    for k_idx in range(num_k_tiles)
+                ]
+                for col_idx in range(num_col_blocks)
+            ]
+            dma_prototypes = [
+                self._matrix_dma_transfer(
+                    name=weight_var.name,
+                    layout=weight_layout,
+                    row_idx=0,
+                    col_idx=col_idx,
+                    precision=_matrix_precision_code("keyvalue"),
+                    set_scale=False,
+                    hbm_element_bytes=2,
+                )
+                for col_idx in range(num_col_blocks)
+            ]
+            summary = bf16_stream_k_accum_cost_summary(
+                mlen=mlen,
+                blen=self.blen,
+                hbm_base=weight_layout.hbm_base_addr,
+                hbm_cols=weight_layout.physical_shape[1],
+                full_batch=input_layout.physical_shape[0],
+                output_physical_rows=output.physical_shape[0],
+                input_vram_bases=input_vram_bases,
+                output_tile_bases=output_tile_bases,
+                row_loop_counts=row_loop_counts,
+                chunks=chunks,
+                hbm_offsets=hbm_offsets,
+                dma_prototypes=dma_prototypes,
+                hbm_element_bytes=2,
+            )
+            self.emit_cost_opcode_counts(
+                summary.opcodes,
+                provenance="main-bf16-stream-k-accum-v1",
+            )
+            for stream in summary.dma_streams:
+                self.record_dma(
+                    stream.transfer,
+                    multiplicity=stream.multiplicity,
+                    axes=stream.axes,
+                )
+            return output
 
         if num_k_tiles <= max_tiles:
             for col_idx in range(num_col_blocks):

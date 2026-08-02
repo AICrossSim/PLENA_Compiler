@@ -80,6 +80,8 @@ class PlenaCompiler(
         cost_trace: bool = False,
         compiler_hash: str = "unknown",
         default_cost_stage: str | None = None,
+        cost_trace_granularity: str = "detailed",
+        emit_assembly: bool = True,
     ):
         """
         Args:
@@ -111,6 +113,8 @@ class PlenaCompiler(
             cost_trace=cost_trace,
             compiler_hash=compiler_hash,
             default_cost_stage=default_cost_stage,
+            cost_trace_granularity=cost_trace_granularity,
+            emit_assembly=emit_assembly,
         )
         if hbm_v_prefetch_amount is None:
             hbm_v_prefetch_amount = _behavior_config_value("HBM_V_Prefetch_Amount", 4)

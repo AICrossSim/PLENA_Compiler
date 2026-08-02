@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
+from compiler.aten.isa_builder import DmaTransfer, RepeatAxis
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
 
 
@@ -277,6 +278,34 @@ class ProgramAttentionMixin:
         # seq_len) this is 0.
         q_offset = kv_seq_len - seq_len
 
+        if self.cost_summary_enabled:
+            if q_offset != 0:
+                raise ValueError(
+                    "affine attention summary currently requires prefill geometry "
+                    "with seq_len == kv_seq_len"
+                )
+            return self._flash_attention_mha_summary(
+                Q=Q,
+                K=K,
+                V=V,
+                O=O,
+                S_block=S_block,
+                PV=PV,
+                scale=scale,
+                causal_mask=causal_mask,
+                valid_col_masks=valid_col_masks,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                head_dim=head_dim,
+                q_rows_per_batch=q_rows_per_batch,
+                k_rows_per_batch=k_rows_per_batch,
+                k_row_blocks_per_batch=k_row_blocks_per_batch,
+                q_base=q_base,
+                o_base=o_base,
+                q_batch_stride=q_batch_stride,
+                o_batch_stride=o_batch_stride,
+            )
+
         for batch_idx in range(batch_size):
             if batch_size == 1 and total_q_rows == seq_len:
                 Q_batch = Q
@@ -363,6 +392,346 @@ class ProgramAttentionMixin:
             self.free_tensor(mask)
 
         return O
+
+    def _flash_attention_mha_summary(
+        self,
+        *,
+        Q: VRAMMatrixVar,
+        K: InputVar,
+        V: InputVar,
+        O: VRAMMatrixVar,
+        S_block: VRAMMatrixVar,
+        PV: VRAMMatrixVar,
+        scale: float,
+        causal_mask: VRAMMatrixVar | None,
+        valid_col_masks: dict[int, VRAMMatrixVar],
+        batch_size: int,
+        seq_len: int,
+        head_dim: int,
+        q_rows_per_batch: int,
+        k_rows_per_batch: int,
+        k_row_blocks_per_batch: int,
+        q_base: int,
+        o_base: int,
+        q_batch_stride: int,
+        o_batch_stride: int,
+    ) -> VRAMMatrixVar:
+        """Algebraically meter main's causal MHA block schedule.
+
+        The production primitives are emitted once per full/tail kernel class.
+        Their final schedules are replayed by exact multiplicity.  K/V address
+        streams remain one affine descriptor per query block, so the trace is
+        O(sequence tiles) rather than O(causal Q/K pairs).
+        """
+
+        mlen = self.mlen
+        num_blocks = math.ceil(seq_len / mlen)
+        tail_rows = seq_len - (num_blocks - 1) * mlen
+        has_tail = tail_rows != mlen
+        full_blocks = num_blocks - int(has_tail)
+        stage = "/".join(getattr(self, "_cost_stage_stack", ())) or "global"
+
+        if batch_size == 1 and Q.shape[0] == seq_len:
+            q_sample = Q
+            o_sample = O
+        else:
+            q_sample = self.alloc_at(
+                "_mha_summary_Q",
+                seq_len,
+                head_dim,
+                q_base,
+                physical_shape=Q.physical_shape,
+            )
+            o_sample = self.alloc_at(
+                "_mha_summary_O",
+                seq_len,
+                head_dim,
+                o_base,
+                physical_shape=O.physical_shape,
+            )
+
+        def replay_or_emit(key, count, emitter):
+            if count <= 0:
+                return
+            full_key = (stage, *key)
+            if self.replay_cost_summary_template(full_key, count=count):
+                return
+            with self.cost_summary_template(full_key):
+                with self.suppress_cost_dma():
+                    emitter()
+            if count > 1:
+                if not self.replay_cost_summary_template(full_key, count=count - 1):
+                    raise RuntimeError(f"failed to replay attention template {full_key!r}")
+
+        def emit_init(q_idx: int, rows: int):
+            self.init_online_softmax(q_idx, o_sample, rows=rows)
+
+        def emit_final(q_idx: int, rows: int):
+            self.final_scale_o(q_idx, o_sample, rows=rows)
+
+        replay_or_emit(
+            ("mha-init", mlen, head_dim, mlen),
+            batch_size * full_blocks,
+            lambda: emit_init(0, mlen),
+        )
+        replay_or_emit(
+            ("mha-final", mlen, head_dim, mlen),
+            batch_size * full_blocks,
+            lambda: emit_final(0, mlen),
+        )
+        if has_tail:
+            replay_or_emit(
+                ("mha-init", mlen, head_dim, tail_rows),
+                batch_size,
+                lambda: emit_init(full_blocks, tail_rows),
+            )
+            replay_or_emit(
+                ("mha-final", mlen, head_dim, tail_rows),
+                batch_size,
+                lambda: emit_final(full_blocks, tail_rows),
+            )
+
+        def emit_pair(
+            *,
+            q_idx: int,
+            k_idx: int,
+            rows: int,
+            cols: int,
+            diagonal: bool,
+        ):
+            self.vram_sub_projection_T_to(
+                q_sample,
+                q_idx,
+                K,
+                k_idx,
+                S_block,
+                target_row_idx=0,
+                target_col_idx=0,
+            )
+            valid_mask = valid_col_masks.get(cols)
+            if valid_mask is not None:
+                self.vram_add(S_block, valid_mask, num_rows=rows)
+            if diagonal and causal_mask is not None:
+                self.vram_add(S_block, causal_mask)
+            self.online_softmax_block(
+                S_block,
+                scale,
+                rows=rows,
+                valid_cols=None if valid_mask is not None else cols,
+            )
+            self.compute_pv(S_block, V, 0, PV, head_dim, rows=rows)
+            self.scale_o_row(o_sample, q_idx, rows=rows)
+            self.vram_add(
+                o_sample,
+                PV,
+                dst_row_offset=q_idx * mlen,
+                num_rows=rows,
+            )
+
+        if causal_mask is not None:
+            replay_or_emit(
+                ("mha-pair", mlen, self.blen, head_dim, mlen, mlen, False),
+                batch_size * full_blocks * max(0, full_blocks - 1) // 2,
+                lambda: emit_pair(
+                    q_idx=0, k_idx=0, rows=mlen, cols=mlen, diagonal=False
+                ),
+            )
+            replay_or_emit(
+                ("mha-pair", mlen, self.blen, head_dim, mlen, mlen, True),
+                batch_size * full_blocks,
+                lambda: emit_pair(
+                    q_idx=0, k_idx=0, rows=mlen, cols=mlen, diagonal=True
+                ),
+            )
+            if has_tail:
+                replay_or_emit(
+                    ("mha-pair", mlen, self.blen, head_dim, tail_rows, mlen, False),
+                    batch_size * full_blocks,
+                    lambda: emit_pair(
+                        q_idx=full_blocks,
+                        k_idx=0,
+                        rows=tail_rows,
+                        cols=mlen,
+                        diagonal=False,
+                    ),
+                )
+                replay_or_emit(
+                    ("mha-pair", mlen, self.blen, head_dim, tail_rows, tail_rows, True),
+                    batch_size,
+                    lambda: emit_pair(
+                        q_idx=full_blocks,
+                        k_idx=full_blocks,
+                        rows=tail_rows,
+                        cols=tail_rows,
+                        diagonal=True,
+                    ),
+                )
+        else:
+            replay_or_emit(
+                ("mha-pair", mlen, self.blen, head_dim, mlen, mlen, False),
+                batch_size * full_blocks * full_blocks,
+                lambda: emit_pair(
+                    q_idx=0, k_idx=0, rows=mlen, cols=mlen, diagonal=False
+                ),
+            )
+            if has_tail:
+                replay_or_emit(
+                    ("mha-pair", mlen, self.blen, head_dim, mlen, tail_rows, False),
+                    batch_size * full_blocks,
+                    lambda: emit_pair(
+                        q_idx=0,
+                        k_idx=full_blocks,
+                        rows=mlen,
+                        cols=tail_rows,
+                        diagonal=False,
+                    ),
+                )
+                replay_or_emit(
+                    ("mha-pair", mlen, self.blen, head_dim, tail_rows, mlen, False),
+                    batch_size * full_blocks,
+                    lambda: emit_pair(
+                        q_idx=full_blocks,
+                        k_idx=0,
+                        rows=tail_rows,
+                        cols=mlen,
+                        diagonal=False,
+                    ),
+                )
+                replay_or_emit(
+                    ("mha-pair", mlen, self.blen, head_dim, tail_rows, tail_rows, False),
+                    batch_size,
+                    lambda: emit_pair(
+                        q_idx=full_blocks,
+                        k_idx=full_blocks,
+                        rows=tail_rows,
+                        cols=tail_rows,
+                        diagonal=False,
+                    ),
+                )
+
+        self._record_mha_summary_dma(
+            K=K,
+            V=V,
+            batch_size=batch_size,
+            num_blocks=num_blocks,
+            head_dim=head_dim,
+            k_row_blocks_per_batch=k_row_blocks_per_batch,
+            causal=causal_mask is not None,
+        )
+        for mask in valid_col_masks.values():
+            self.free_tensor(mask)
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is not None:
+            sink.record_symbolic_lineage(
+                "mha-census-v1",
+                {
+                    "batch_size": batch_size,
+                    "num_blocks": num_blocks,
+                    "full_blocks": full_blocks,
+                    "tail_rows": tail_rows,
+                    "causal": causal_mask is not None,
+                },
+            )
+        return O
+
+    def _record_mha_summary_dma(
+        self,
+        *,
+        K: InputVar,
+        V: InputVar,
+        batch_size: int,
+        num_blocks: int,
+        head_dim: int,
+        k_row_blocks_per_batch: int,
+        causal: bool,
+    ) -> None:
+        """Record exact affine K/V HBM streams for the compressed MHA census."""
+
+        self._ensure_hbm_sub_matrix_registered(K)
+        self._ensure_hbm_sub_matrix_registered(V)
+        k_layout = self.get_hbm_layout(K.name)
+        v_layout = self.get_hbm_layout(V.name)
+        k_rows, k_cols = k_layout.physical_shape or k_layout.full_shape
+        v_rows, v_cols = v_layout.physical_shape or v_layout.full_shape
+        k_col_blocks = max(1, math.ceil(head_dim / self.mlen))
+        v_col_blocks = max(1, math.ceil(head_dim / self.mlen))
+        block_element_delta = self.mlen * k_cols
+        block_scale_delta = block_element_delta // 8
+
+        for batch_idx in range(batch_size):
+            base_block = batch_idx * k_row_blocks_per_batch
+            for q_idx in range(num_blocks):
+                visible = q_idx + 1 if causal else num_blocks
+                k_transfer = self._matrix_dma_transfer(
+                    name=K.name,
+                    layout=k_layout,
+                    row_idx=base_block,
+                    col_idx=0,
+                    precision=0,
+                    set_scale=True,
+                    hbm_element_bytes=1,
+                )
+                self.record_dma(
+                    k_transfer,
+                    multiplicity=visible * k_col_blocks,
+                    axes=(
+                        RepeatAxis.from_mapping(
+                            "visible_k_block",
+                            visible,
+                            {
+                                "element_base_bytes": block_element_delta,
+                                "scale_base_bytes": block_scale_delta,
+                            },
+                        ),
+                        RepeatAxis.from_mapping(
+                            "k_head_column",
+                            k_col_blocks,
+                            {
+                                "element_base_bytes": self.mlen,
+                                "scale_base_bytes": self.mlen // 8,
+                            },
+                        ),
+                    ),
+                )
+                v_offset = base_block * self.mlen * v_cols
+                self.record_dma(
+                    DmaTransfer(
+                        opcode="H_PREFETCH_M",
+                        direction="read",
+                        role=V.memory_role,
+                        element_base_bytes=v_layout.hbm_base_addr + v_offset,
+                        scale_base_bytes=(
+                            v_layout.hbm_base_addr
+                            + v_rows * v_cols
+                            + v_offset // 8
+                        ),
+                        dim=self.mlen,
+                        amount=1,
+                        stride_bytes=v_cols,
+                        rstride=1,
+                        precision="matrix_kv",
+                        memory_object=V.name,
+                    ),
+                    multiplicity=visible * v_col_blocks,
+                    axes=(
+                        RepeatAxis.from_mapping(
+                            "visible_v_block",
+                            visible,
+                            {
+                                "element_base_bytes": self.mlen * v_cols,
+                                "scale_base_bytes": self.mlen * v_cols // 8,
+                            },
+                        ),
+                        RepeatAxis.from_mapping(
+                            "v_head_column",
+                            v_col_blocks,
+                            {
+                                "element_base_bytes": self.mlen,
+                                "scale_base_bytes": self.mlen // 8,
+                            },
+                        ),
+                    ),
+                )
 
     def _flash_attention_gqa_fused(
         self,

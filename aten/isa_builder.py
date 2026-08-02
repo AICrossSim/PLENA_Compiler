@@ -101,8 +101,8 @@ class DmaTransfer:
             raise ValueError(f"DMA opcode must start with H_, got {self.opcode!r}")
         if self.direction not in {"read", "write"}:
             raise ValueError(f"DMA direction must be read/write, got {self.direction!r}")
-        if not self.role:
-            raise ValueError("DMA role must be non-empty")
+        if self.role not in {"weight", "activation", "kv", "integer", "output"}:
+            raise ValueError(f"unsupported DMA semantic role {self.role!r}")
         for name in ("element_base_bytes", "dim", "amount", "stride_bytes", "rstride", "write_amount"):
             if int(getattr(self, name)) < 0:
                 raise ValueError(f"DmaTransfer.{name} must be nonnegative")

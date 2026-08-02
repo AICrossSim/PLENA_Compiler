@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from compiler.asm_templates._imm import load_large_int
+from compiler.aten.isa_builder import DmaTransfer, RepeatAxis
 
 
 class IsaAttentionMixin:
@@ -918,7 +919,44 @@ class IsaAttentionMixin:
         self.register_allocator.free_gp(gp_regs)
         self.register_allocator.free_addr(addr_regs)
 
-        return self._emit(isa_code)
+        rendered = self._emit(isa_code)
+        num_v_col_blocks = max(1, math.ceil(head_dim / self.mlen))
+        role = getattr(getattr(self, "_inputs", {}).get(v_sub_matrix), "memory_role", "kv")
+        rows_total, cols_total = v_layout.physical_shape or v_layout.full_shape
+        self.record_dma(
+            DmaTransfer(
+                opcode="H_PREFETCH_M",
+                direction="read",
+                role=role,
+                element_base_bytes=(v_layout.hbm_base_addr + v_hbm_offset)
+                * v_hbm_element_bytes,
+                scale_base_bytes=(
+                    v_layout.hbm_base_addr
+                    + rows_total * cols_total
+                    + v_hbm_offset // 8
+                )
+                * v_hbm_element_bytes,
+                dim=self.mlen,
+                amount=1,
+                stride_bytes=physical_head_dim * v_hbm_element_bytes,
+                rstride=1,
+                precision="matrix_kv",
+                element_bytes=v_hbm_element_bytes,
+                memory_object=v_sub_matrix,
+            ),
+            multiplicity=num_v_col_blocks,
+            axes=(
+                RepeatAxis.from_mapping(
+                    "v_column_block",
+                    num_v_col_blocks,
+                    {
+                        "element_base_bytes": self.mlen * v_hbm_element_bytes,
+                        "scale_base_bytes": self.mlen * v_hbm_element_bytes // 8,
+                    },
+                ),
+            ),
+        )
+        return rendered
 
     def warm_v_prefetch(self, v_sub_matrix: str, k_idx: int, v_hbm_element_bytes: int = 1) -> str:
         """Prefetch V[k_idx] into MSRAM ONCE (High precision) before the per-head P@V

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from compiler.asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
+from compiler.aten.plena.cost_kernels import ffn_unrolled_cost_summary
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -146,6 +147,7 @@ class ProgramTensorMixin:
         precision: int = 0,
         hbm_element_bytes: int = 1,
         real_data_ratio: float | None = None,
+        memory_role: str | None = None,
     ) -> InputVar:
         """
         Write tensor from VRAM back to HBM.
@@ -168,6 +170,7 @@ class ProgramTensorMixin:
             h, w = tensor_var.physical_shape
             hbm_size = self.hbm_tensor_size(h * w)
 
+        resolved_role = memory_role or ("activation" if precision == 0 else "kv")
         super().store_to_hbm(
             tensor_name=tensor_var.name,  # internal name for symbol table lookup
             hbm_addr=hbm_addr,
@@ -177,7 +180,7 @@ class ProgramTensorMixin:
             precision=precision,
             hbm_element_bytes=hbm_element_bytes,
             hbm_real_data_ratio=real_data_ratio,
-            memory_role="activation" if precision == 0 else "kv",
+            memory_role=resolved_role,
         )
 
         var = InputVar(
@@ -188,7 +191,7 @@ class ProgramTensorMixin:
             hbm_size,
             display_name=display_name,
             physical_shape=tensor_var.physical_shape,
-            memory_role="activation" if precision == 0 else "kv",
+            memory_role=resolved_role,
         )
         self._inputs[internal_name] = var
         return var
@@ -444,26 +447,80 @@ class ProgramTensorMixin:
             addr_reg_val=[w_gate.hbm_addr, w_up.hbm_addr, w_down.hbm_addr],
         )
         isa_code += reset_reg_asm(alive_registers=[1, 2, 3])
-        isa_code += ffn_asm(
+        self.emit(isa_code)
+        gate_layout = self.get_hbm_layout(w_gate.name)
+        up_layout = self.get_hbm_layout(w_up.name)
+        down_layout = self.get_hbm_layout(w_down.name)
+        summary = ffn_unrolled_cost_summary(
             mlen=mlen,
             vlen=mlen,
             blen=blen,
-            batch=batch_size,
-            seq_len=1,
+            batch_rows=batch_size,
             hidden_size=hidden_size,
             intermediate_size=inter_dim,
-            alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            gate_weight_hbm_offset_reg=1,
-            up_weight_hbm_offset_reg=2,
-            down_weight_hbm_offset_reg=3,
-            const_one_fp_address=5,
-            activation_base_address=activation_base_address,
-            use_loop_instructions=use_loop_instructions,
+            activation_base=activation_base_address,
+            workspace_base=workspace_base_address,
             matrix_sram_size=self.mram_capacity_elems,
-            workspace_base_address=workspace_base_address,
+            gate_weight_dma=self._matrix_dma_transfer(
+                name=w_gate.name,
+                layout=gate_layout,
+                row_idx=0,
+                col_idx=0,
+                precision=0,
+                set_scale=True,
+                hbm_element_bytes=1,
+            ),
+            up_weight_dma=self._matrix_dma_transfer(
+                name=w_up.name,
+                layout=up_layout,
+                row_idx=0,
+                col_idx=0,
+                precision=0,
+                set_scale=True,
+                hbm_element_bytes=1,
+            ),
+            down_weight_dma=self._matrix_dma_transfer(
+                name=w_down.name,
+                layout=down_layout,
+                row_idx=0,
+                col_idx=0,
+                precision=0,
+                set_scale=True,
+                hbm_element_bytes=1,
+            ),
         )
-
-        self.emit(isa_code)
+        if self.cost_summary_enabled:
+            self.emit_cost_opcode_counts(
+                summary.opcodes,
+                provenance="main-ffn-unrolled-v1",
+            )
+        else:
+            self.emit(
+                ffn_asm(
+                    mlen=mlen,
+                    vlen=mlen,
+                    blen=blen,
+                    batch=batch_size,
+                    seq_len=1,
+                    hidden_size=hidden_size,
+                    intermediate_size=inter_dim,
+                    alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                    gate_weight_hbm_offset_reg=1,
+                    up_weight_hbm_offset_reg=2,
+                    down_weight_hbm_offset_reg=3,
+                    const_one_fp_address=5,
+                    activation_base_address=activation_base_address,
+                    use_loop_instructions=use_loop_instructions,
+                    matrix_sram_size=self.mram_capacity_elems,
+                    workspace_base_address=workspace_base_address,
+                )
+            )
+        for stream in summary.dma_streams:
+            self.record_dma(
+                stream.transfer,
+                multiplicity=stream.multiplicity,
+                axes=stream.axes,
+            )
         self.free_tensor(workspace)
         return input_var
 
