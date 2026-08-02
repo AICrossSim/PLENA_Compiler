@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from compiler.aten.isa_builder import AsmInput, IsaBuilder, render_asm
+from contextlib import contextmanager
+
+from compiler.aten.isa_builder import AsmInput, IsaBuilder, Sequence, Stage, final_sequence, render_asm
 from compiler.aten.plena.registers import RegisterAllocator
 
 
@@ -44,6 +46,13 @@ class IsaEmitMixin:
         """Append ISA text to the output buffer and return it."""
         rendered = render_asm(isa_code)
         self._code_chunks.append(rendered)
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is not None:
+            schedule = final_sequence(isa_code)
+            stage_stack = getattr(self, "_cost_stage_stack", ())
+            if stage_stack:
+                schedule = Sequence((Stage("/".join(stage_stack), schedule),))
+            sink.consume(schedule)
         return rendered
 
     def emit(self, isa_code: AsmInput) -> str:
@@ -53,6 +62,41 @@ class IsaEmitMixin:
     def emit_comment(self, text: str) -> str:
         """Append one assembly comment line."""
         return self._emit(IsaBuilder().comment(text))
+
+    @contextmanager
+    def cost_stage(self, stage_path: str):
+        """Assign opaque hierarchical ownership to subsequently emitted ISA."""
+        if not stage_path or stage_path.startswith("/") or stage_path.endswith("/"):
+            raise ValueError(f"invalid stage path {stage_path!r}")
+        self._cost_stage_stack.append(stage_path)
+        try:
+            yield self
+        finally:
+            popped = self._cost_stage_stack.pop()
+            if popped != stage_path:
+                raise RuntimeError("cost stage stack corrupted")
+
+    def get_cost_trace(self, **metadata):
+        """Finalize the compiler-assisted trace without affecting ASM output."""
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is None:
+            raise RuntimeError("cost tracing was not enabled for this compiler")
+        return sink.finish(**metadata)
+
+    def record_dma(self, transfer, *, multiplicity: int = 1, axes=()) -> None:
+        """Attach exact compiler-owned DMA geometry to the active stage."""
+        sink = getattr(self, "_symbolic_cost_sink", None)
+        if sink is not None:
+            stage_stack = getattr(self, "_cost_stage_stack", ())
+            if not stage_stack:
+                sink.record_dma(transfer, multiplicity=multiplicity, axes=tuple(axes))
+                return
+            stage = "/".join(stage_stack)
+            sink.begin_stage(stage)
+            try:
+                sink.record_dma(transfer, multiplicity=multiplicity, axes=tuple(axes))
+            finally:
+                sink.end_stage(stage)
 
     # ------------------------------------------------------------------
     # FP Register management

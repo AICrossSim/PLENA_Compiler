@@ -57,6 +57,26 @@ def test_symbolic_sink_counts_hardware_loops_without_expansion():
     assert trace.metadata["materialized_schedule_leaves"] == 3
 
 
+def test_legacy_loop_text_is_refolded_before_cost_collection():
+    schedule = IsaBuilder().stage(
+        "decoder/legacy",
+        IsaBuilder().raw(
+            "C_LOOP_START gp6, 7\n"
+            "V_ADD_VV gp1, gp2, gp3, 0\n"
+            "C_LOOP_END gp6\n"
+        ),
+    )
+    sink = SymbolicCostSink()
+    # final_sequence is normally called by IsaEmitMixin; exercise that path by
+    # emitting the raw body as a standalone final schedule.
+    from compiler.aten.isa_builder import final_sequence
+
+    sink.consume(final_sequence(schedule))
+    assert sink.finish().dynamic_opcode_counts == Counter(
+        {"C_LOOP_START": 1, "V_ADD_VV": 7, "C_LOOP_END": 7}
+    )
+
+
 def test_dma_metadata_fails_closed_without_a_stage():
     dma = DmaTransfer(
         opcode="H_PREFETCH_M",

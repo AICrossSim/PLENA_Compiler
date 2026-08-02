@@ -19,6 +19,7 @@ class ProgramTensorMixin:
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float | None = None,
+        memory_role: str = "activation",
     ) -> InputVar:
         """
         Declare an input tensor (in HBM).
@@ -54,6 +55,7 @@ class ProgramTensorMixin:
             hbm_size,
             prestaged_vram_addr=prestaged_vram_addr,
             physical_shape=physical_shape,
+            memory_role=memory_role,
         )
         self._inputs[name] = var
         super().add_hbm_object(
@@ -119,6 +121,7 @@ class ProgramTensorMixin:
                 vram_object_name=internal_name,
                 vlen=self.mlen,
                 preload_len=self.hbm_v_prefetch_amount,
+                memory_role=input_var.memory_role,
             )
 
         var = VRAMMatrixVar(
@@ -174,6 +177,7 @@ class ProgramTensorMixin:
             precision=precision,
             hbm_element_bytes=hbm_element_bytes,
             hbm_real_data_ratio=real_data_ratio,
+            memory_role="activation" if precision == 0 else "kv",
         )
 
         var = InputVar(
@@ -184,6 +188,7 @@ class ProgramTensorMixin:
             hbm_size,
             display_name=display_name,
             physical_shape=tensor_var.physical_shape,
+            memory_role="activation" if precision == 0 else "kv",
         )
         self._inputs[internal_name] = var
         return var

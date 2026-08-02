@@ -363,6 +363,82 @@ def render_asm(value: AsmInput) -> str:
     return value.render()
 
 
+def final_sequence(value: AsmInput) -> Sequence:
+    """Normalize typed or legacy emission into one legalized final schedule."""
+    if isinstance(value, IsaBuilder):
+        return fold_rendered_hardware_loops(value.finalized())
+    # Other Renderable implementations are uncommon and have no structured
+    # metadata contract.  Parse their final spelling exactly like legacy ASM.
+    rendered = value if isinstance(value, str) else value.render()
+    parsed = parse_legacy_asm(rendered)
+    return fold_rendered_hardware_loops(
+        Sequence(tuple(legalize_large_immediates(parsed.items)))
+    )
+
+
+def fold_rendered_hardware_loops(sequence: Sequence) -> Sequence:
+    """Recover symbolic loop nodes from finalized legacy instruction text.
+
+    Existing templates already contain the authoritative loop boundaries.  A
+    stack parser is sufficient to preserve them without reconstructing any
+    tensor-level operation.  Rendering the result is byte-identical.
+    """
+
+    def fold_items(items: tuple[AsmItem, ...]) -> tuple[AsmItem, ...]:
+        output: list[AsmItem] = []
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, str):
+                output.extend(fold_items(parse_legacy_asm(item).items))
+                index += 1
+                continue
+            if isinstance(item, Sequence):
+                output.append(Sequence(fold_items(item.items)))
+                index += 1
+                continue
+            if isinstance(item, Stage):
+                output.append(Stage(item.path, Sequence(fold_items(item.body.items))))
+                index += 1
+                continue
+            if isinstance(item, CompileTimeRepeat):
+                output.append(
+                    CompileTimeRepeat(item.count, Sequence(fold_items(item.body.items)), axis=item.axis)
+                )
+                index += 1
+                continue
+            if not (isinstance(item, Instr) and item.opcode == "C_LOOP_START"):
+                output.append(item)
+                index += 1
+                continue
+            if len(item.args) != 2 or not isinstance(item.args[1], int):
+                raise ValueError(f"C_LOOP_START requires (register, immediate count), got {item.args!r}")
+            loop_register, count = item.args
+            depth = 1
+            cursor = index + 1
+            while cursor < len(items) and depth:
+                candidate = items[cursor]
+                if isinstance(candidate, Instr) and candidate.opcode == "C_LOOP_START":
+                    depth += 1
+                elif isinstance(candidate, Instr) and candidate.opcode == "C_LOOP_END":
+                    depth -= 1
+                cursor += 1
+            if depth:
+                raise ValueError("unmatched C_LOOP_START in finalized assembly")
+            end = items[cursor - 1]
+            assert isinstance(end, Instr)
+            if end.args and end.args[0] != loop_register:
+                raise ValueError(
+                    f"loop register mismatch: start={loop_register!r}, end={end.args[0]!r}"
+                )
+            body = Sequence(fold_items(items[index + 1 : cursor - 1]))
+            output.append(HardwareLoop(loop_register=loop_register, count=count, body=body))
+            index = cursor
+        return tuple(output)
+
+    return Sequence(fold_items(sequence.items))
+
+
 def instr_from_rendered_line(line: str) -> Instr:
     """Parse one already-legal instruction without changing its spelling."""
     stripped = line.strip()
@@ -486,6 +562,8 @@ __all__ = [
     "addr",
     "as_sequence",
     "fp",
+    "final_sequence",
+    "fold_rendered_hardware_loops",
     "gp",
     "legalize_large_immediates",
     "parse_legacy_asm",

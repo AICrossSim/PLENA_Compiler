@@ -77,6 +77,9 @@ class PlenaCompiler(
         mram_tile_capacity: int = 4,
         hbm_v_prefetch_amount: int | None = None,
         hbm_v_writeback_amount: int | None = None,
+        cost_trace: bool = False,
+        compiler_hash: str = "unknown",
+        default_cost_stage: str | None = None,
     ):
         """
         Args:
@@ -105,6 +108,9 @@ class PlenaCompiler(
             real_data_ratio=real_data_ratio,
             unroll_loops=unroll_loops,
             mram_tile_capacity=mram_tile_capacity,
+            cost_trace=cost_trace,
+            compiler_hash=compiler_hash,
+            default_cost_stage=default_cost_stage,
         )
         if hbm_v_prefetch_amount is None:
             hbm_v_prefetch_amount = _behavior_config_value("HBM_V_Prefetch_Amount", 4)

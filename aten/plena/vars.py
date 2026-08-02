@@ -69,11 +69,15 @@ class InputVar(TensorVar):
         display_name: str | None = None,
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
+        memory_role: str = "activation",
     ):
         super().__init__(program, name, "input", shape, display_name=display_name, physical_shape=physical_shape)
         self.hbm_addr = hbm_addr
         self.hbm_size = hbm_size
         self.prestaged_vram_addr = prestaged_vram_addr
+        if not memory_role:
+            raise ValueError("InputVar.memory_role must be non-empty")
+        self.memory_role = memory_role
 
 
 class FPVar:

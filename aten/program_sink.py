@@ -77,7 +77,10 @@ class CostTrace:
 
     @property
     def dynamic_opcode_counts(self) -> Counter[str]:
-        return Counter({item.opcode: item.multiplicity for item in self.instructions})
+        result: Counter[str] = Counter()
+        for item in self.instructions:
+            result[item.opcode] += item.multiplicity
+        return result
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -185,14 +188,25 @@ class SymbolicCostSink:
             self.emit_dma(instruction.dma)
 
     def emit_dma(self, transfer: DmaTransfer) -> None:
+        self.record_dma(transfer)
+
+    def record_dma(
+        self,
+        transfer: DmaTransfer,
+        *,
+        multiplicity: int = 1,
+        axes: tuple[RepeatAxis, ...] = (),
+    ) -> None:
         if transfer.opcode not in {"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V"}:
             raise ValueError(f"unsupported DMA opcode {transfer.opcode!r}")
+        if multiplicity < 0:
+            raise ValueError("DMA multiplicity must be nonnegative")
         self._dmas.append(
             TraceDma(
                 stage=self.stage,
                 transfer=transfer,
-                multiplicity=self.multiplier,
-                repeat_axes=tuple(self._axis_stack) + transfer.axes,
+                multiplicity=self.multiplier * multiplicity,
+                repeat_axes=tuple(self._axis_stack) + axes + transfer.axes,
             )
         )
 

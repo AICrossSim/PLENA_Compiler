@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from compiler.asm_templates import (
     layer_norm_asm,
     preload_act_asm,
@@ -18,6 +20,8 @@ from compiler.aten.plena.isa_matrix import IsaMatrixMixin
 from compiler.aten.plena.isa_tile_rows import IsaTileRowMixin
 from compiler.aten.plena.memory_state import MemoryStateMixin
 from compiler.aten.plena.registers import RegisterAllocator
+from compiler.aten.program_sink import SymbolicCostSink
+from compiler.aten.isa_builder import DmaTransfer, RepeatAxis
 
 
 class IsaCompiler(
@@ -43,6 +47,9 @@ class IsaCompiler(
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
         mram_tile_capacity: int = 4,
+        cost_trace: bool = False,
+        compiler_hash: str = "unknown",
+        default_cost_stage: str | None = None,
     ):
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
         super().__init__(
@@ -55,6 +62,12 @@ class IsaCompiler(
         self.register_allocator = RegisterAllocator()
         self.generated_code = ""
         self.unroll_attention = unroll_loops
+        self._cost_stage_stack: list[str] = []
+        self._symbolic_cost_sink = (
+            SymbolicCostSink(compiler_hash=compiler_hash, default_stage=default_cost_stage)
+            if cost_trace
+            else None
+        )
 
     def load_batch(
         self,
@@ -62,6 +75,7 @@ class IsaCompiler(
         vram_object_name: str,
         vlen: int = 64,
         preload_len: int | None = None,
+        memory_role: str = "activation",
     ) -> str:
         """
         Load a Batch tensor from HBM to VRAM.
@@ -121,7 +135,58 @@ class IsaCompiler(
         self.register_allocator.free_gp(gp_regs_for_preload)
         self.register_allocator.free_addr([addr_reg])
 
-        return self._emit(isa_code)
+        rendered = self._emit(isa_code)
+        if h == 1:
+            stream_count = math.ceil(w / (vlen * preload_len))
+            axes = (
+                RepeatAxis.from_mapping(
+                    "hidden_prefetch",
+                    stream_count,
+                    {
+                        "element_base_bytes": vlen * preload_len,
+                        "scale_base_bytes": vlen * preload_len // 8,
+                    },
+                ),
+            )
+            rstride = 0
+        else:
+            hidden_blocks = math.ceil(w / vlen)
+            batch_blocks = math.ceil(h / preload_len)
+            stream_count = hidden_blocks * batch_blocks
+            axes = (
+                RepeatAxis.from_mapping(
+                    "hidden_block",
+                    hidden_blocks,
+                    {"element_base_bytes": vlen, "scale_base_bytes": vlen // 8},
+                ),
+                RepeatAxis.from_mapping(
+                    "batch_block",
+                    batch_blocks,
+                    {
+                        "element_base_bytes": w * preload_len,
+                        "scale_base_bytes": w * preload_len // 8,
+                    },
+                ),
+            )
+            rstride = 1
+        self.record_dma(
+            DmaTransfer(
+                opcode="H_PREFETCH_V",
+                direction="read",
+                role=memory_role,
+                element_base_bytes=hbm_addr,
+                scale_base_bytes=hbm_addr + size,
+                dim=vlen,
+                amount=preload_len,
+                stride_bytes=w,
+                rstride=rstride,
+                precision=memory_role,
+                memory_object=hbm_object_name,
+            ),
+            multiplicity=stream_count,
+            axes=axes,
+        )
+        return rendered
 
     def store_to_hbm(
         self,
@@ -134,6 +199,7 @@ class IsaCompiler(
         store_amount: int | None = None,  # HBM_V_Writeback_Amount
         hbm_element_bytes: int = 1,
         hbm_real_data_ratio: float | None = None,
+        memory_role: str = "activation",
     ) -> str:
         """
         Write tensor from VRAM back to HBM.
@@ -220,7 +286,64 @@ class IsaCompiler(
                 real_data_ratio=hbm_real_data_ratio or self.real_data_ratio,
             )
 
-        return self._emit(isa_code)
+        rendered = self._emit(isa_code)
+        total_elements = batch_size * hidden_size
+        if batch_size == 1:
+            stream_count = math.ceil(hidden_size / (vlen * store_amount))
+            axes = (
+                RepeatAxis.from_mapping(
+                    "hidden_store",
+                    stream_count,
+                    {
+                        "element_base_bytes": vlen * store_amount * hbm_element_bytes,
+                        "scale_base_bytes": vlen * store_amount * hbm_element_bytes // 8,
+                    },
+                ),
+            )
+            rstride = 0
+        else:
+            hidden_blocks = math.ceil(hidden_size / vlen)
+            batch_blocks = math.ceil(batch_size / store_amount)
+            stream_count = hidden_blocks * batch_blocks
+            axes = (
+                RepeatAxis.from_mapping(
+                    "hidden_block",
+                    hidden_blocks,
+                    {
+                        "element_base_bytes": vlen * hbm_element_bytes,
+                        "scale_base_bytes": vlen * hbm_element_bytes // 8,
+                    },
+                ),
+                RepeatAxis.from_mapping(
+                    "batch_block",
+                    batch_blocks,
+                    {
+                        "element_base_bytes": hidden_size * store_amount * hbm_element_bytes,
+                        "scale_base_bytes": hidden_size * store_amount * hbm_element_bytes // 8,
+                    },
+                ),
+            )
+            rstride = 1
+        self.record_dma(
+            DmaTransfer(
+                opcode="H_STORE_V",
+                direction="write",
+                role=memory_role,
+                element_base_bytes=hbm_addr * hbm_element_bytes,
+                scale_base_bytes=(hbm_addr + total_elements) * hbm_element_bytes,
+                dim=vlen,
+                amount=store_amount,
+                stride_bytes=hidden_size * hbm_element_bytes,
+                rstride=rstride,
+                write_amount=store_amount,
+                precision=memory_role,
+                element_bytes=hbm_element_bytes,
+                memory_object=hbm_object_name or tensor_name,
+            ),
+            multiplicity=stream_count,
+            axes=axes,
+        )
+        return rendered
 
     def normalize(
         self,

@@ -7,10 +7,47 @@ import math
 from compiler.asm_templates._imm import load_large_int
 from compiler.asm_templates import preload_addr_reg_asm
 from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl
-from compiler.aten.isa_builder import IsaBuilder, addr as areg, gp
+from compiler.aten.isa_builder import DmaTransfer, IsaBuilder, RepeatAxis, addr as areg, gp
 
 
 class IsaMatrixMixin:
+    def _matrix_dma_transfer(
+        self,
+        *,
+        name: str,
+        layout,
+        row_idx: int,
+        col_idx: int,
+        precision: int,
+        set_scale: bool,
+        hbm_element_bytes: int,
+    ) -> DmaTransfer:
+        rows, cols = layout.physical_shape or layout.full_shape
+        block = layout.get_sub_block(row_idx, col_idx)
+        role = getattr(getattr(self, "_inputs", {}).get(name), "memory_role", None)
+        if role is None:
+            role = "weight" if precision == 0 else "kv"
+        element_offset = block.hbm_offset * hbm_element_bytes
+        scale_base = None
+        if set_scale:
+            scale_base = (
+                layout.hbm_base_addr + rows * cols + block.hbm_offset // 8
+            ) * hbm_element_bytes
+        return DmaTransfer(
+            opcode="H_PREFETCH_M",
+            direction="read",
+            role=role,
+            element_base_bytes=layout.hbm_base_addr * hbm_element_bytes + element_offset,
+            scale_base_bytes=scale_base,
+            dim=self.mlen,
+            amount=1,
+            stride_bytes=cols * hbm_element_bytes,
+            rstride=1,
+            precision="weight" if precision == 0 else "matrix_kv",
+            element_bytes=hbm_element_bytes,
+            memory_object=name,
+        )
+
     def _emit_hbm_matrix_load(self, layout, gp_count: int, build_body) -> str:
         gp_regs = self.register_allocator.allocate_gp(gp_count)
         gp_for_addr = self.register_allocator.allocate_gp(2)
@@ -741,7 +778,7 @@ class IsaMatrixMixin:
             total_size = num_col_blocks * block_size
             mram_start_addr = self.mram_allocator.allocate(f"{name}[{row_idx}][:]", total_size)
 
-        return self._emit_hbm_matrix_load(
+        rendered = self._emit_hbm_matrix_load(
             layout,
             3,
             lambda addr_reg, gp_regs: self.load_row_sub_matrices_asm(
@@ -755,6 +792,29 @@ class IsaMatrixMixin:
                 hbm_element_bytes=hbm_element_bytes,
             ),
         )
+        first_col = 0
+        axis = RepeatAxis.from_mapping(
+            "matrix_col_block",
+            num_col_blocks,
+            {
+                "element_base_bytes": self.mlen * hbm_element_bytes,
+                "scale_base_bytes": self.mlen * hbm_element_bytes // 8,
+            },
+        )
+        self.record_dma(
+            self._matrix_dma_transfer(
+                name=name,
+                layout=layout,
+                row_idx=row_idx,
+                col_idx=first_col,
+                precision=precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
+            ),
+            multiplicity=num_col_blocks,
+            axes=(axis,),
+        )
+        return rendered
 
     def load_sub_matrix(
         self,
@@ -773,7 +833,7 @@ class IsaMatrixMixin:
         if mram_dest_addr is None:
             mram_dest_addr = self.mram_allocator.allocate(f"{name}[{row_idx}][{col_idx}]", block_size)
 
-        return self._emit_hbm_matrix_load(
+        rendered = self._emit_hbm_matrix_load(
             layout,
             3,
             lambda addr_reg, gp_regs: self.load_sub_matrix_asm(
@@ -788,6 +848,18 @@ class IsaMatrixMixin:
                 hbm_element_bytes=hbm_element_bytes,
             ),
         )
+        self.record_dma(
+            self._matrix_dma_transfer(
+                name=name,
+                layout=layout,
+                row_idx=row_idx,
+                col_idx=col_idx,
+                precision=precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
+            )
+        )
+        return rendered
 
     def load_sub_matrix_col(
         self,
@@ -813,7 +885,7 @@ class IsaMatrixMixin:
             total_size = effective_count * block_size
             mram_start_addr = self.mram_allocator.allocate(f"{name}[:][{col_idx}]", total_size)
 
-        return self._emit_hbm_matrix_load(
+        rendered = self._emit_hbm_matrix_load(
             layout,
             3,
             lambda addr_reg, gp_regs: self.load_col_sub_matrices_asm(
@@ -829,6 +901,29 @@ class IsaMatrixMixin:
                 hbm_element_bytes=hbm_element_bytes,
             ),
         )
+        effective_count = k_block_count if k_block_count is not None else num_row_blocks
+        axis = RepeatAxis.from_mapping(
+            "matrix_k_block",
+            effective_count,
+            {
+                "element_base_bytes": self.mlen * layout.physical_shape[1] * hbm_element_bytes,
+                "scale_base_bytes": self.mlen * layout.physical_shape[1] * hbm_element_bytes // 8,
+            },
+        )
+        self.record_dma(
+            self._matrix_dma_transfer(
+                name=name,
+                layout=layout,
+                row_idx=k_block_start,
+                col_idx=col_idx,
+                precision=precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
+            ),
+            multiplicity=effective_count,
+            axes=(axis,),
+        )
+        return rendered
 
     def allocate_vram_matrix(
         self,
