@@ -146,7 +146,13 @@ class SymbolicCostSink:
     _suppress_dma_depth: int = 0
     _templates: dict[tuple[Any, ...], CostTraceFragment] = field(default_factory=dict)
     _capture_stack: list[
-        tuple[tuple[Any, ...], dict[tuple[Any, ...], int], int]
+        tuple[
+            tuple[Any, ...],
+            dict[tuple[Any, ...], int],
+            int,
+            int,
+            tuple[RepeatAxis, ...],
+        ]
     ] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -328,17 +334,32 @@ class SymbolicCostSink:
             raise RuntimeError("nested summary-template capture is unsupported")
         if key in self._templates:
             raise ValueError(f"summary template {key!r} already exists")
+        if self.multiplier == 0:
+            raise ValueError("cannot capture a summary template in a zero-count repeat")
         snapshot = {item_key: item.multiplicity for item_key, item in self._instructions.items()}
-        self._capture_stack.append((key, snapshot, len(self._dmas)))
+        self._capture_stack.append(
+            (
+                key,
+                snapshot,
+                len(self._dmas),
+                self.multiplier,
+                tuple(self._axis_stack),
+            )
+        )
 
     def end_template(self, key: tuple[Any, ...]) -> None:
         if not self._capture_stack or self._capture_stack[-1][0] != key:
             raise ValueError(f"unbalanced summary template {key!r}")
-        _, before, dma_start = self._capture_stack.pop()
+        _, before, dma_start, capture_multiplier, capture_axes = self._capture_stack.pop()
         instructions: list[TraceInstruction] = []
         for item_key, item in self._instructions.items():
             delta = item.multiplicity - before.get(item_key, 0)
             if delta:
+                if delta % capture_multiplier:
+                    raise ValueError(
+                        f"summary template {key!r} instruction multiplicity {delta} "
+                        f"is not divisible by enclosing repeat {capture_multiplier}"
+                    )
                 instructions.append(
                     TraceInstruction(
                         stage=item.stage,
@@ -347,12 +368,32 @@ class SymbolicCostSink:
                         variant=item.variant,
                         active=item.active,
                         sram=item.sram,
-                        multiplicity=delta,
+                        multiplicity=delta // capture_multiplier,
                     )
                 )
+        dma_events: list[TraceDma] = []
+        for event in self._dmas[dma_start:]:
+            if event.multiplicity % capture_multiplier:
+                raise ValueError(
+                    f"summary template {key!r} DMA multiplicity {event.multiplicity} "
+                    f"is not divisible by enclosing repeat {capture_multiplier}"
+                )
+            if event.repeat_axes[: len(capture_axes)] != capture_axes:
+                raise ValueError(
+                    f"summary template {key!r} DMA axes do not preserve the "
+                    "enclosing repeat prefix"
+                )
+            dma_events.append(
+                TraceDma(
+                    stage=event.stage,
+                    transfer=event.transfer,
+                    multiplicity=event.multiplicity // capture_multiplier,
+                    repeat_axes=event.repeat_axes[len(capture_axes) :],
+                )
+            )
         self._templates[key] = CostTraceFragment(
             instructions=tuple(instructions),
-            dma_events=tuple(self._dmas[dma_start:]),
+            dma_events=tuple(dma_events),
         )
 
     def replay_template(

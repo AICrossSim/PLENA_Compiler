@@ -5,6 +5,7 @@ import pytest
 from compiler.aten.isa_builder import (
     ActiveDimensions,
     DmaTransfer,
+    Instr,
     IsaBuilder,
     RepeatAxis,
     SramActivity,
@@ -110,3 +111,34 @@ def test_hbm_opcode_without_dma_geometry_fails_closed():
     sink.consume(schedule.finalized())
     with pytest.raises(ValueError, match="incomplete final-schedule DMA coverage"):
         sink.finish()
+
+
+def test_summary_template_replay_normalizes_enclosing_repeat():
+    dma = DmaTransfer(
+        opcode="H_PREFETCH_M",
+        direction="read",
+        role="weight",
+        element_base_bytes=0,
+        scale_base_bytes=4096,
+        dim=64,
+        amount=4,
+        stride_bytes=4096,
+    )
+    layer_axis = RepeatAxis.from_mapping("layer", 3, {"hbm": 8192})
+    sink = SymbolicCostSink(granularity="affine-block-summary-v1")
+    sink.begin_stage("decoder/layer")
+    sink.begin_repeat(3, layer_axis, "model-layer")
+    sink.begin_template(("projection",))
+    sink.emit_instruction(Instr("M_MM"))
+    sink.emit_instruction(Instr("H_PREFETCH_M", dma=dma))
+    sink.end_template(("projection",))
+    assert sink.replay_template(("projection",), count=4)
+    sink.end_repeat(3, layer_axis, "model-layer")
+    sink.end_stage("decoder/layer")
+
+    trace = sink.finish()
+    assert trace.dynamic_opcode_counts == Counter(
+        {"M_MM": 15, "H_PREFETCH_M": 15}
+    )
+    assert sum(event.multiplicity for event in trace.dma_events) == 15
+    assert all(event.repeat_axes == (layer_axis,) for event in trace.dma_events)
