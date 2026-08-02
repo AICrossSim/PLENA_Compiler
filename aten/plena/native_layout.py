@@ -30,6 +30,9 @@ PACKED_QK_SCHEDULES = frozenset(
         PACKED_QK_SCHEDULE_HEAD_MAJOR_V1,
     }
 )
+COMPACT_STATS_LANE_TIERS = (4, 8, 16, 32, 64)
+COMPACT_STATS_LANE_POLICY_AUTO_V1 = "auto-tiered-v1"
+COMPACT_STATS_LANE_POLICY_FIXED_16_V1 = "fixed-16-v1"
 
 
 def _ceil_to_multiple(value: int, multiple: int) -> int:
@@ -285,6 +288,72 @@ class AttentionHeadPacking:
             "execution_head_lane_utilization": self.execution_head_lane_utilization,
             "compact": self.compact,
         }
+
+
+@dataclass(frozen=True)
+class CompactStatsPlan:
+    """Hardware lane tier required by packed Q/K normalization."""
+
+    policy: str
+    required_segments: int
+    configured_lanes: int
+    maximum_supported_lanes: int = COMPACT_STATS_LANE_TIERS[-1]
+    fallback_reason: str | None = None
+
+    @property
+    def utilization(self) -> float:
+        return min(self.required_segments, self.configured_lanes) / self.configured_lanes
+
+    def metadata(self) -> dict[str, int | float | str | None]:
+        return {
+            "compact_stats_lane_policy": self.policy,
+            "compact_stats_required_segments": self.required_segments,
+            "compact_stats_lanes": self.configured_lanes,
+            "compact_stats_utilization": self.utilization,
+            "compact_stats_fallback_reason": self.fallback_reason,
+        }
+
+
+def build_compact_stats_plan(
+    *,
+    vlen: int,
+    hlen: int,
+    num_attention_heads: int,
+    vector_scalar_schedule: str,
+) -> CompactStatsPlan:
+    if min(vlen, hlen, num_attention_heads) <= 0:
+        raise ValueError(
+            "VLEN, HLEN, and num_attention_heads must be positive"
+        )
+    if vlen % hlen:
+        raise ValueError(f"HLEN={hlen} must divide VLEN={vlen}")
+    required = min(num_attention_heads, vlen // hlen)
+    fallback_reason = None
+    if vector_scalar_schedule == "rtl-v5":
+        configured = next(
+            (
+                tier
+                for tier in COMPACT_STATS_LANE_TIERS
+                if tier >= required
+            ),
+            COMPACT_STATS_LANE_TIERS[-1],
+        )
+        if required > configured:
+            fallback_reason = "required_segments_exceed_64"
+        elif required > 32 and required < vlen // hlen:
+            fallback_reason = "partial_mask_exceeds_32_bits"
+        policy = COMPACT_STATS_LANE_POLICY_AUTO_V1
+    else:
+        configured = 16
+        if required > configured:
+            fallback_reason = "fixed_16_lane_compatibility_fallback"
+        policy = COMPACT_STATS_LANE_POLICY_FIXED_16_V1
+    return CompactStatsPlan(
+        policy=policy,
+        required_segments=required,
+        configured_lanes=configured,
+        fallback_reason=fallback_reason,
+    )
 
 
 @dataclass(frozen=True)

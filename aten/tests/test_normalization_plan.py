@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import Counter
 import math
 
+import pytest
+
 from compiler.aten.plena.normalization_plan import (
     build_active_row_rms_norm,
     build_grouped_segmented_rms_norm,
@@ -226,6 +228,70 @@ def test_rtl_v4_grouped_norm_falls_back_for_more_than_16_segments() -> None:
     assert lowering.metadata["segment_parallel_fallback_blocks"] == 1
     assert lowering.metadata["segment_parallel_fallback_segments"] == 32
     assert lowering.metadata["segment_parallel_requested_rtl_v4"] == 1
+
+
+@pytest.mark.parametrize("mlen,lanes", [(4096, 32), (8192, 64)])
+def test_rtl_v5_grouped_norm_uses_auto_scaled_compact_tier(
+    mlen: int, lanes: int
+) -> None:
+    lowering = build_grouped_segmented_rms_norm(
+        name=f"q_norm_rtl_v5_{lanes}",
+        tensor_base_address=1024,
+        scratch_base_address=4 * mlen,
+        physical_rows=4,
+        physical_cols=mlen,
+        mlen=mlen,
+        hlen=128,
+        segments=tuple((0, lane) for lane in range(lanes)),
+        active_row_ranges=((0, 4),),
+        gp_src=1,
+        gp_scratch=2,
+        gp_mask=3,
+        gp_loop=4,
+        gp_stats=5,
+        rtl_v3=True,
+        rtl_v5=True,
+        compact_stats_lanes=lanes,
+    )
+
+    assert lowering.dynamic_opcodes == _dynamic_histogram(lowering.rendered_asm)
+    assert lowering.dynamic_opcodes["V_RED_SUM_SEGS"] == 4
+    assert lowering.dynamic_opcodes["V_STAT_MUL_F"] == 4
+    assert lowering.dynamic_opcodes["V_STAT_ADD_F"] == 4
+    assert lowering.dynamic_opcodes["V_STAT_RSQRT"] == 4
+    assert lowering.dynamic_opcodes["S_LD_VLANE_FP"] == 0
+    assert lowering.dynamic_opcodes["S_ST_VLANE_FP"] == 0
+    assert lowering.dynamic_opcodes["V_RED_SUM_SEG"] == 0
+    assert lowering.metadata["compact_stats_lanes"] == lanes
+    assert lowering.metadata["compact_stats_required_segments"] == lanes
+    assert lowering.metadata.get("segment_parallel_fallback_blocks", 0) == 0
+
+
+def test_rtl_v5_partial_block_above_lane_31_falls_back_explicitly() -> None:
+    lowering = build_grouped_segmented_rms_norm(
+        name="q_norm_rtl_v5_partial_40",
+        tensor_base_address=1024,
+        scratch_base_address=32768,
+        physical_rows=2,
+        physical_cols=8192,
+        mlen=8192,
+        hlen=128,
+        segments=tuple((0, lane) for lane in range(40)),
+        active_row_ranges=((0, 2),),
+        gp_src=1,
+        gp_scratch=2,
+        gp_mask=3,
+        gp_loop=4,
+        gp_stats=5,
+        rtl_v5=True,
+        compact_stats_lanes=64,
+    )
+    assert lowering.dynamic_opcodes["V_STAT_RSQRT"] == 0
+    assert lowering.dynamic_opcodes["V_RED_SUM_SEG"] == 80
+    assert (
+        lowering.metadata["compact_stats_fallback_reason"]
+        == "partial_mask_exceeds_32_bits"
+    )
 
 
 def test_rtl_v3_split_k_norm_emits_one_multi_reduction_for_all_heads() -> None:

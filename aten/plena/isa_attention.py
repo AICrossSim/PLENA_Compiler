@@ -93,6 +93,7 @@ class IsaAttentionMixin:
             "rtl-v2",
             "rtl-v3",
             "rtl-v4",
+            "rtl-v5",
         }
 
         lines = []
@@ -555,10 +556,11 @@ class IsaAttentionMixin:
         if getattr(self, "vector_scalar_schedule", "legacy") not in {
             "rtl-v3",
             "rtl-v4",
+            "rtl-v5",
         }:
             raise ValueError(
                 "row-interleaved-v1 requires vector_scalar_schedule='rtl-v3' "
-                "or 'rtl-v4'"
+                "'rtl-v4', or 'rtl-v5'"
             )
 
         timing: GQATimingProfile = getattr(self, "gqa_timing_profile", None)
@@ -869,6 +871,7 @@ class IsaAttentionMixin:
             "rtl-v2",
             "rtl-v3",
             "rtl-v4",
+            "rtl-v5",
         }:
             return None
         plan = getattr(self, "_native_sequence_packing", None)
@@ -1004,6 +1007,7 @@ class IsaAttentionMixin:
             "rtl-v2",
             "rtl-v3",
             "rtl-v4",
+            "rtl-v5",
         }
 
         lines = []
@@ -1122,6 +1126,7 @@ class IsaAttentionMixin:
             "rtl-v2",
             "rtl-v3",
             "rtl-v4",
+            "rtl-v5",
         }
 
         lines = [

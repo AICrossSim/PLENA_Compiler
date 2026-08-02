@@ -18,6 +18,9 @@ from compiler.aten.agu import (
     optimize_agu_assembly,
 )
 from compiler.aten.plena.native_layout import (
+    COMPACT_STATS_LANE_POLICY_AUTO_V1,
+    COMPACT_STATS_LANE_POLICY_FIXED_16_V1,
+    COMPACT_STATS_LANE_TIERS,
     FP_CONSTANT_NUM_DEFAULT,
     PACKED_QK_SCHEDULES,
     PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
@@ -120,7 +123,8 @@ class PlenaCompiler(
         packed_attention_schedule: str = "direct-first-block-v1",
         softmax_state_schedule: str = SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
         packed_qk_schedule: str = PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
-        vector_scalar_schedule: str = "rtl-v3",
+        vector_scalar_schedule: str = "rtl-v5",
+        compact_stats_lanes: int | None = None,
         selector_schedule: str = "legacy",
         reduction_output_mode: str = "accumulate-v1",
         gqa_pipeline_schedule: str | None = None,
@@ -218,6 +222,7 @@ class PlenaCompiler(
             int(fp_sram_depth) if fp_sram_depth is not None else _behavior_config_value("FP_SRAM_DEPTH", 0)
         )
         if vector_scalar_schedule not in {
+            "rtl-v5",
             "rtl-v4",
             "rtl-v3",
             "rtl-v2",
@@ -225,11 +230,36 @@ class PlenaCompiler(
             "legacy",
         }:
             raise ValueError(
-                "vector_scalar_schedule must be 'rtl-v4', 'rtl-v3', "
+                "vector_scalar_schedule must be 'rtl-v5', 'rtl-v4', 'rtl-v3', "
                 "'rtl-v2', 'compiler-v1', or 'legacy', got "
                 f"{vector_scalar_schedule!r}"
             )
         self.vector_scalar_schedule = vector_scalar_schedule
+        if compact_stats_lanes is None:
+            compact_stats_lanes = (
+                next(
+                    tier
+                    for tier in COMPACT_STATS_LANE_TIERS
+                    if tier >= min(64, max(1, mlen // max(1, self.hlen)))
+                )
+                if vector_scalar_schedule == "rtl-v5"
+                else 16
+            )
+        if compact_stats_lanes not in COMPACT_STATS_LANE_TIERS:
+            raise ValueError(
+                "compact_stats_lanes must be one of "
+                f"{COMPACT_STATS_LANE_TIERS}, got {compact_stats_lanes}"
+            )
+        if vector_scalar_schedule != "rtl-v5" and compact_stats_lanes != 16:
+            raise ValueError(
+                "non-rtl-v5 schedules require fixed compact_stats_lanes=16"
+            )
+        self.compact_stats_lanes = int(compact_stats_lanes)
+        self.compact_stats_lane_policy = (
+            COMPACT_STATS_LANE_POLICY_AUTO_V1
+            if vector_scalar_schedule == "rtl-v5"
+            else COMPACT_STATS_LANE_POLICY_FIXED_16_V1
+        )
         if selector_schedule not in {"hoisted-v1", "legacy"}:
             raise ValueError(f"selector_schedule must be 'hoisted-v1' or 'legacy', got {selector_schedule!r}")
         if reduction_output_mode not in {"overwrite-v1", "accumulate-v1"}:
@@ -247,9 +277,14 @@ class PlenaCompiler(
             raise ValueError(
                 f"gqa_pipeline_schedule must be 'row-interleaved-v1' or 'row-serial', got {gqa_pipeline_schedule!r}"
             )
-        if gqa_pipeline_schedule == "row-interleaved-v1" and vector_scalar_schedule not in {"rtl-v3", "rtl-v4"}:
+        if gqa_pipeline_schedule == "row-interleaved-v1" and vector_scalar_schedule not in {
+            "rtl-v3",
+            "rtl-v4",
+            "rtl-v5",
+        }:
             raise ValueError(
-                "gqa_pipeline_schedule='row-interleaved-v1' requires vector_scalar_schedule='rtl-v3' or 'rtl-v4'"
+                "gqa_pipeline_schedule='row-interleaved-v1' requires "
+                "vector_scalar_schedule='rtl-v3', 'rtl-v4', or 'rtl-v5'"
             )
         self.gqa_pipeline_schedule = gqa_pipeline_schedule
         if address_generation_mode not in {
@@ -303,7 +338,7 @@ class PlenaCompiler(
         self.gqa_timing_profile = (
             GQATimingProfile.load(gqa_timing_calibration) if gqa_pipeline_schedule == "row-interleaved-v1" else None
         )
-        self._vector_scalar_stats: dict[str, int] = {
+        self._vector_scalar_stats: dict[str, object] = {
             "segmented_norm_square_ops_elided": 0,
             "segmented_norm_copy_ops_elided": 0,
             "segmented_norm_constant_loads_elided": 0,
@@ -334,6 +369,11 @@ class PlenaCompiler(
             "selector_setup_instructions": 0,
             "neutral_accumulator_setups_before": 0,
             "neutral_accumulator_setups_elided": 0,
+            "compact_stats_lane_policy": self.compact_stats_lane_policy,
+            "compact_stats_lanes": self.compact_stats_lanes,
+            "compact_stats_required_segments": 0,
+            "compact_stats_utilization": 0.0,
+            "compact_stats_fallback_reason": None,
         }
         self._packed_attention_stats: dict[str, int] = {
             "softmax_first_block_specialized_count": 0,
@@ -474,18 +514,53 @@ class PlenaCompiler(
             else:
                 self._gqa_pipeline_stats[key] = value
 
-    def record_vector_scalar_stats(self, values: dict[str, int]) -> None:
+    def record_vector_scalar_stats(self, values: dict[str, object]) -> None:
         """Accumulate metadata emitted by shared normalization/mask plans."""
 
+        max_fields = {
+            "scalar_modulo_schedule_width",
+            "compact_stats_lanes",
+            "compact_stats_required_segments",
+            "compact_stats_utilization",
+        }
+        stable_fields = {
+            "compact_stats_lane_policy",
+        }
         for key, value in values.items():
             if key not in self._vector_scalar_stats:
                 self._vector_scalar_stats[key] = 0
-            if key == "scalar_modulo_schedule_width":
-                self._vector_scalar_stats[key] = max(self._vector_scalar_stats[key], int(value))
+            if key in stable_fields:
+                existing = self._vector_scalar_stats.get(key)
+                if existing not in {None, value}:
+                    raise ValueError(
+                        f"inconsistent vector/scalar metadata {key}: "
+                        f"{existing!r} vs {value!r}"
+                    )
+                self._vector_scalar_stats[key] = value
+            elif key == "compact_stats_fallback_reason":
+                if value:
+                    self._vector_scalar_stats[key] = str(value)
+            elif key in max_fields:
+                self._vector_scalar_stats[key] = max(
+                    float(self._vector_scalar_stats.get(key, 0)),
+                    float(value),
+                )
+                if key != "compact_stats_utilization":
+                    self._vector_scalar_stats[key] = int(
+                        self._vector_scalar_stats[key]
+                    )
+            elif isinstance(value, bool):
+                self._vector_scalar_stats[key] = bool(
+                    self._vector_scalar_stats.get(key, False)
+                ) or value
+            elif isinstance(value, int):
+                self._vector_scalar_stats[key] = (
+                    int(self._vector_scalar_stats.get(key, 0)) + value
+                )
             else:
-                self._vector_scalar_stats[key] += int(value)
+                self._vector_scalar_stats[key] = value
 
-    def vector_scalar_stats(self) -> dict[str, int | str]:
+    def vector_scalar_stats(self) -> dict[str, object]:
         return {
             "vector_scalar_schedule": self.vector_scalar_schedule,
             "selector_schedule": self.selector_schedule,

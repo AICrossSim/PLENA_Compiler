@@ -5,6 +5,7 @@ import pytest
 from compiler.aten.plena.native_layout import (
     SequencePackingPlan,
     build_attention_head_packing,
+    build_compact_stats_plan,
 )
 
 
@@ -15,6 +16,67 @@ def test_qwen32b_sequence_packing_keeps_physical_rows_constant(mlen, pack_factor
     assert plan.attention_group_count == groups
     assert plan.compile_seq_rows == 8192
     assert len(set(plan.active_physical_rows())) == 16 * 482
+
+
+@pytest.mark.parametrize(
+    "vlen,expected_lanes",
+    [
+        (256, 4),
+        (512, 4),
+        (1024, 8),
+        (2048, 16),
+        (4096, 32),
+        (8192, 64),
+    ],
+)
+def test_qwen32b_compact_stats_lane_tier_scales_with_vlen(
+    vlen, expected_lanes
+):
+    plan = build_compact_stats_plan(
+        vlen=vlen,
+        hlen=128,
+        num_attention_heads=64,
+        vector_scalar_schedule="rtl-v5",
+    )
+    assert plan.required_segments == min(64, vlen // 128)
+    assert plan.configured_lanes == expected_lanes
+    assert plan.policy == "auto-tiered-v1"
+
+
+def test_rtl_v4_keeps_fixed_16_lane_compatibility():
+    plan = build_compact_stats_plan(
+        vlen=8192,
+        hlen=128,
+        num_attention_heads=64,
+        vector_scalar_schedule="rtl-v4",
+    )
+    assert plan.required_segments == 64
+    assert plan.configured_lanes == 16
+    assert plan.policy == "fixed-16-v1"
+    assert plan.fallback_reason == "fixed_16_lane_compatibility_fallback"
+
+
+def test_rtl_v5_reports_explicit_fallback_above_64_segments():
+    plan = build_compact_stats_plan(
+        vlen=16384,
+        hlen=128,
+        num_attention_heads=128,
+        vector_scalar_schedule="rtl-v5",
+    )
+    assert plan.required_segments == 128
+    assert plan.configured_lanes == 64
+    assert plan.fallback_reason == "required_segments_exceed_64"
+
+
+def test_rtl_v5_reports_partial_mask_fallback_above_lane_31():
+    plan = build_compact_stats_plan(
+        vlen=8192,
+        hlen=128,
+        num_attention_heads=40,
+        vector_scalar_schedule="rtl-v5",
+    )
+    assert plan.configured_lanes == 64
+    assert plan.fallback_reason == "partial_mask_exceeds_32_bits"
 
 
 @pytest.mark.parametrize(

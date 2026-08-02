@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 import math
-from typing import Iterable
+from typing import Any, Iterable
 
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.cost_emitter import (
@@ -29,7 +29,7 @@ class StructuredNormalizationLowering:
     static_opcodes: Counter[str]
     dynamic_opcodes: Counter[str]
     schedule: ScheduleSequence
-    metadata: dict[str, int]
+    metadata: dict[str, Any]
 
 
 class _PlanBuilder:
@@ -153,6 +153,8 @@ def build_grouped_segmented_rms_norm(
     rtl_v2: bool = False,
     rtl_v3: bool = False,
     rtl_v4: bool = False,
+    rtl_v5: bool = False,
+    compact_stats_lanes: int = 16,
 ) -> StructuredNormalizationLowering:
     """Normalize packed head lanes while sharing vector preparation work.
 
@@ -165,27 +167,39 @@ def build_grouped_segmented_rms_norm(
 
     if mlen <= 0 or hlen <= 0 or mlen % hlen:
         raise ValueError(f"HLEN must divide MLEN, got HLEN={hlen}, MLEN={mlen}")
-    if (rtl_v2 or rtl_v3 or rtl_v4) and hlen & (hlen - 1):
+    if (rtl_v2 or rtl_v3 or rtl_v4 or rtl_v5) and hlen & (hlen - 1):
         raise ValueError(f"RTL segment reduction requires power-of-two HLEN, got {hlen}")
+    if compact_stats_lanes not in {4, 8, 16, 32, 64}:
+        raise ValueError(
+            "compact_stats_lanes must be one of 4,8,16,32,64, got "
+            f"{compact_stats_lanes}"
+        )
     segment_width_log2 = int(math.log2(hlen))
     segments_per_block = mlen // hlen
     requested_rtl_v3 = bool(rtl_v3)
     requested_rtl_v4 = bool(rtl_v4)
+    requested_rtl_v5 = bool(rtl_v5)
+    compact_simd = bool(rtl_v4 or rtl_v5)
     segment_parallel_fallback = bool(
-        (rtl_v3 or rtl_v4) and segments_per_block > 16
+        (rtl_v3 or compact_simd) and segments_per_block > compact_stats_lanes
+    )
+    segment_parallel_fallback_reason = (
+        "segments_exceed_configured_lanes"
+        if segment_parallel_fallback
+        else None
     )
     if segment_parallel_fallback:
-        # The compact-stat datapath has exactly 16 output lanes.  Wider vector
-        # words remain legal by using the existing per-segment reduction path;
-        # silently treating all 32+ segments as compact would fabricate RTL
-        # capability and corrupt the upper lanes.
+        # Wider vector words remain legal through the existing per-segment
+        # path; never fabricate a compact lane that the configured RTL lacks.
         rtl_v2 = True
         rtl_v3 = False
         rtl_v4 = False
-    if rtl_v3 or rtl_v4:
+        rtl_v5 = False
+        compact_simd = False
+    if rtl_v3 or compact_simd:
         if gp_stats is None:
             raise ValueError(
-                "rtl-v3/rtl-v4 grouped RMSNorm requires a compact-stats GP register"
+                "segment-parallel grouped RMSNorm requires a compact-stats GP register"
             )
     if physical_cols <= 0 or physical_cols % mlen:
         raise ValueError(
@@ -205,11 +219,29 @@ def build_grouped_segmented_rms_norm(
             lanes.append(lane)
     if not grouped:
         return _PlanBuilder().finish(metadata={})
+    if (
+        rtl_v5
+        and any(
+            lanes != list(range(segments_per_block))
+            and any(lane >= 32 for lane in lanes)
+            for lanes in grouped.values()
+        )
+    ):
+        # The current Vector mask register is 32 bits. Full 64-segment blocks
+        # run unmasked, but a partial block that reaches lane 32 cannot be
+        # represented without inventing wider control hardware.
+        segment_parallel_fallback = True
+        segment_parallel_fallback_reason = "partial_mask_exceeds_32_bits"
+        rtl_v2 = True
+        rtl_v3 = False
+        rtl_v4 = False
+        rtl_v5 = False
+        compact_simd = False
 
     builder = _PlanBuilder()
     builder.comment(f"=== Grouped segmented Q/K RMSNorm: {name} ===")
     builder.raw_instructions(load_large_int(gp_scratch, scratch_base_address))
-    if rtl_v3 or rtl_v4:
+    if rtl_v3 or compact_simd:
         builder.raw_instructions(load_large_int(gp_stats, scratch_base_address + mlen))
     builder.instruction("S_LD_FP", "f2", "gp0", inverse_head_dim_slot)
     builder.instruction("S_LD_FP", "f3", "gp0", epsilon_slot)
@@ -217,10 +249,12 @@ def build_grouped_segmented_rms_norm(
     active_rows = sum(end - start for start, end in ranges)
     for block, lanes in grouped.items():
         block_base = tensor_base_address + block * physical_rows * mlen
-        if rtl_v3 or rtl_v4:
-            block_mask = sum(1 << lane for lane in lanes)
-            builder.instruction("S_ADDI_INT", f"gp{gp_mask}", "gp0", block_mask)
-            builder.instruction("C_SET_V_MASK_REG", f"gp{gp_mask}")
+        full_active_block = lanes == list(range(segments_per_block))
+        if rtl_v3 or compact_simd:
+            if not full_active_block:
+                block_mask = sum(1 << lane for lane in lanes)
+                builder.instruction("S_ADDI_INT", f"gp{gp_mask}", "gp0", block_mask)
+                builder.instruction("C_SET_V_MASK_REG", f"gp{gp_mask}")
         for range_idx, (start, end) in enumerate(ranges):
             builder.raw_instructions(
                 load_large_int(gp_src, block_base + start * mlen)
@@ -244,17 +278,17 @@ def build_grouped_segmented_rms_norm(
                 f"gp{gp_scratch}",
                 0,
             )
-            if rtl_v3 or rtl_v4:
+            if rtl_v3 or compact_simd:
                 body.instruction(
                     "V_RED_SUM_SEGS",
                     f"gp{gp_stats}",
                     f"gp{gp_scratch}",
                     segment_width_log2,
                 )
-                if rtl_v4:
+                if compact_simd:
                     if lanes != list(range(len(lanes))):
                         raise ValueError(
-                            "rtl-v4 compact statistics require contiguous lanes "
+                            "compact statistics require contiguous lanes "
                             f"starting at zero, got {lanes}"
                         )
                     body.instruction(
@@ -312,9 +346,9 @@ def build_grouped_segmented_rms_norm(
                     f"gp{gp_src}",
                     f"gp{gp_stats}",
                     segment_width_log2,
-                    1,
+                    int(not full_active_block),
                 )
-            for lane_idx, lane in enumerate(() if (rtl_v3 or rtl_v4) else lanes):
+            for lane_idx, lane in enumerate(() if (rtl_v3 or compact_simd) else lanes):
                 mask = 1 << lane
                 if rtl_v2:
                     body.instruction("S_ADDI_INT", f"gp{gp_mask}", "gp0", lane)
@@ -399,34 +433,39 @@ def build_grouped_segmented_rms_norm(
                 "scalar_rsqrt_emitted": active_rows * segment_count,
             }
         )
-    if rtl_v3 or rtl_v4:
+    if rtl_v3 or compact_simd:
         metadata.update(
             {
                 "multi_segment_reductions_emitted": active_rows * len(grouped),
                 "single_segment_reductions_elided": active_rows
                 * (segment_count - len(grouped)),
                 "compact_stats_lane_loads": (
-                    0 if rtl_v4 else active_rows * segment_count
+                    0 if compact_simd else active_rows * segment_count
                 ),
                 "compact_stats_lane_stores": (
-                    0 if rtl_v4 else active_rows * segment_count
+                    0 if compact_simd else active_rows * segment_count
                 ),
                 "compact_stats_lane_loads_before": active_rows * segment_count,
                 "compact_stats_lane_stores_before": active_rows * segment_count,
                 "compact_lane_selectors_before": 2 * active_rows * segment_count,
                 "compact_lane_selectors_remaining": (
-                    0 if rtl_v4 else 2 * active_rows * segment_count
+                    0 if compact_simd else 2 * active_rows * segment_count
                 ),
                 "segment_broadcast_ops": active_rows * len(grouped),
-                "scalar_modulo_schedule_width": 0 if rtl_v4 else 8,
+                "scalar_modulo_schedule_width": 0 if compact_simd else 8,
                 "compact_stat_simd_ops": (
-                    3 * active_rows * len(grouped) if rtl_v4 else 0
+                    3 * active_rows * len(grouped) if compact_simd else 0
                 ),
                 "compact_scalar_chain_ops_elided": (
-                    5 * active_rows * segment_count if rtl_v4 else 0
+                    5 * active_rows * segment_count if compact_simd else 0
                 ),
                 "compact_lane_selectors_elided": (
-                    2 * active_rows * segment_count if rtl_v4 else 0
+                    2 * active_rows * segment_count if compact_simd else 0
+                ),
+                "compact_stats_lanes": compact_stats_lanes,
+                "compact_stats_required_segments": segments_per_block,
+                "compact_stats_utilization": (
+                    segments_per_block / compact_stats_lanes
                 ),
             }
         )
@@ -437,6 +476,10 @@ def build_grouped_segmented_rms_norm(
                 "segment_parallel_fallback_segments": segment_count,
                 "segment_parallel_requested_rtl_v3": int(requested_rtl_v3),
                 "segment_parallel_requested_rtl_v4": int(requested_rtl_v4),
+                "segment_parallel_requested_rtl_v5": int(requested_rtl_v5),
+                "compact_stats_fallback_reason": (
+                    segment_parallel_fallback_reason
+                ),
             }
         )
     return builder.finish(metadata=metadata)
@@ -460,6 +503,8 @@ def build_split_head_segmented_rms_norm(
     inverse_head_dim_slot: int = 6,
     epsilon_slot: int = 3,
     rtl_v4: bool = False,
+    rtl_v5: bool = False,
+    compact_stats_lanes: int = 16,
 ) -> StructuredNormalizationLowering:
     """Normalize separate head tensors with one segmented reduction per row.
 
@@ -486,10 +531,12 @@ def build_split_head_segmented_rms_norm(
         raise ValueError(f"HLEN must divide MLEN, got HLEN={hlen}, MLEN={mlen}")
     if hlen & (hlen - 1):
         raise ValueError(f"RTL segment reduction requires power-of-two HLEN, got {hlen}")
-    if len(addresses) > min(16, mlen // hlen):
+    compact_simd = rtl_v4 or rtl_v5
+    if len(addresses) > min(compact_stats_lanes, mlen // hlen):
         raise ValueError(
             "split-head RMSNorm cannot pack all heads into one vector word: "
-            f"heads={len(addresses)}, capacity={min(16, mlen // hlen)}"
+            f"heads={len(addresses)}, "
+            f"capacity={min(compact_stats_lanes, mlen // hlen)}"
         )
 
     ranges = _validate_active_row_ranges(physical_rows, active_row_ranges)
@@ -540,7 +587,7 @@ def build_split_head_segmented_rms_norm(
             segment_width_log2,
         )
 
-        if rtl_v4:
+        if compact_simd:
             body.instruction(
                 "V_STAT_MUL_F",
                 f"gp{gp_stats}",
@@ -618,20 +665,23 @@ def build_split_head_segmented_rms_norm(
             "multi_segment_reductions_emitted": active_rows,
             "single_segment_reductions_elided": active_rows * (head_count - 1),
             "compact_stats_lane_loads": active_rows * head_count,
-            "compact_stats_lane_stores": 0 if rtl_v4 else active_rows * head_count,
+            "compact_stats_lane_stores": 0 if compact_simd else active_rows * head_count,
             "compact_stats_lane_loads_before": active_rows * head_count,
             "compact_stats_lane_stores_before": active_rows * head_count,
             "compact_lane_selectors_before": 2 * active_rows * head_count,
             "compact_lane_selectors_remaining": (
-                active_rows * head_count if rtl_v4 else 2 * active_rows * head_count
+                active_rows * head_count if compact_simd else 2 * active_rows * head_count
             ),
-            "compact_stat_simd_ops": 3 * active_rows if rtl_v4 else 0,
+            "compact_stat_simd_ops": 3 * active_rows if compact_simd else 0,
             "compact_scalar_chain_ops_elided": (
-                4 * active_rows * head_count if rtl_v4 else 0
+                4 * active_rows * head_count if compact_simd else 0
             ),
             "compact_lane_selectors_elided": (
-                active_rows * head_count if rtl_v4 else 0
+                active_rows * head_count if compact_simd else 0
             ),
+            "compact_stats_lanes": compact_stats_lanes,
+            "compact_stats_required_segments": head_count,
+            "compact_stats_utilization": head_count / compact_stats_lanes,
             "segment_broadcast_ops": 0,
             "split_head_vector_scale_ops": active_rows * head_count,
             "split_head_pack_ops": active_rows * head_count * 2,

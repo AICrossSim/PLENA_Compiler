@@ -63,3 +63,9 @@ def test_pipeline_schedule_requires_rtl_v3() -> None:
         gqa_pipeline_schedule="row-interleaved-v1",
     )
     assert rtl_v4.gqa_pipeline_schedule == "row-interleaved-v1"
+
+    rtl_v5 = PlenaCompiler(
+        vector_scalar_schedule="rtl-v5",
+        gqa_pipeline_schedule="row-interleaved-v1",
+    )
+    assert rtl_v5.gqa_pipeline_schedule == "row-interleaved-v1"

@@ -121,6 +121,58 @@ def _arithmetic_opcodes(trace) -> dict[str, int]:
     }
 
 
+def test_cost_frontend_uses_shared_auto_compact_stats_tier() -> None:
+    trace = compile_native_decoder_cost_trace(
+        model_config=_tiny_packed_qwen3(),
+        hardware_config=CompilerCostHardware(
+            **{
+                **_tiny_packed_hardware().__dict__,
+                "compact_stats_lanes": 4,
+            }
+        ),
+        seq_len=7,
+        batch_size=1,
+        num_layers=1,
+        vector_scalar_schedule="rtl-v5",
+        use_cache=False,
+    )
+    assert trace.metadata["hardware"]["compact_stats_lanes"] == 4
+    assert trace.metadata["compact_stats"]["compact_stats_lanes"] == 4
+    assert trace.metadata["compact_stats"]["compact_stats_required_segments"] == 4
+    compact_actions = [
+        action
+        for action in trace.energy_actions
+        if action.action.startswith("compact_stats_")
+    ]
+    assert compact_actions
+    assert {action.total_lanes for action in compact_actions} == {4}
+    assert all(
+        0 < action.active_lanes <= action.total_lanes
+        for action in compact_actions
+    )
+    assert {
+        action.activity_fidelity for action in compact_actions
+    } == {"exact_compact_lanes"}
+
+
+def test_cost_frontend_rejects_mismatched_compact_stats_tier() -> None:
+    with pytest.raises(ValueError, match="does not match the shared planner"):
+        compile_native_decoder_cost_trace(
+            model_config=_tiny_packed_qwen3(),
+            hardware_config=CompilerCostHardware(
+                **{
+                    **_tiny_packed_hardware().__dict__,
+                    "compact_stats_lanes": 16,
+                }
+            ),
+            seq_len=7,
+            batch_size=1,
+            num_layers=1,
+            vector_scalar_schedule="rtl-v5",
+            use_cache=False,
+        )
+
+
 def test_affine_ffn_projection_preserves_matrix_and_dma_work() -> None:
     common = dict(
         model_config=_tiny_packed_qwen3(),
@@ -668,7 +720,7 @@ def test_energy_action_lineage_rejects_missing_structural_family() -> None:
         _finalize_energy_action_lineage(trace)
 
 
-def test_qwen3_target_default_vector_scalar_schedule_is_rtl_v3() -> None:
+def test_qwen3_target_default_vector_scalar_schedule_is_rtl_v5() -> None:
     clear_cost_trace_cache()
     common = {
         "seq_len": 482,
@@ -684,19 +736,19 @@ def test_qwen3_target_default_vector_scalar_schedule_is_rtl_v3() -> None:
     explicit = compile_native_decoder_cost_trace(
         _qwen3_32b(),
         _target_hardware(),
-        vector_scalar_schedule="rtl-v3",
+        vector_scalar_schedule="rtl-v5",
         **common,
     )
 
-    assert default.metadata["vector_scalar_schedule"] == "rtl-v3"
+    assert default.metadata["vector_scalar_schedule"] == "rtl-v5"
     assert default.metadata["packed_attention"]["gqa_pipeline_schedule"] == (
         "row-interleaved-v1"
     )
     assert default.static_opcodes == explicit.static_opcodes
     assert default.dynamic_opcodes == explicit.dynamic_opcodes
     assert default.dynamic_opcodes["V_RED_SUM_SEGS"] > 0
-    assert default.dynamic_opcodes["S_LD_VLANE_FP"] > 0
-    assert default.dynamic_opcodes["S_ST_VLANE_FP"] > 0
+    assert default.dynamic_opcodes["V_STAT_RSQRT"] > 0
+    assert default.dynamic_opcodes.get("S_ST_VLANE_FP", 0) == 0
 
 
 def test_packed_attention_optimized_schedule_preserves_compute_and_dma_geometry() -> None:

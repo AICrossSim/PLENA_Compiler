@@ -81,6 +81,7 @@ from compiler.aten.plena.native_layout import (
     SOFTMAX_STATE_SCHEDULES,
     SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
     build_attention_head_packing,
+    build_compact_stats_plan,
     build_softmax_state_layout,
 )
 from compiler.aten.plena.normalization_plan import (
@@ -1173,7 +1174,8 @@ def _emit_segmented_head_rms_norm(
     physical_rows, physical_cols = tensor.physical_shape
     vector_scalar_schedule = getattr(prog, "vector_scalar_schedule", "legacy")
     rtl_v4 = vector_scalar_schedule == "rtl-v4"
-    rtl_v3 = vector_scalar_schedule in {"rtl-v3", "rtl-v4"}
+    rtl_v5 = vector_scalar_schedule == "rtl-v5"
+    rtl_v3 = vector_scalar_schedule in {"rtl-v3", "rtl-v4", "rtl-v5"}
     scratch = prog.alloc(
         f"{name}_square_scratch",
         1,
@@ -1203,6 +1205,8 @@ def _emit_segmented_head_rms_norm(
             rtl_v2=getattr(prog, "vector_scalar_schedule", "legacy") == "rtl-v2",
             rtl_v3=rtl_v3,
             rtl_v4=rtl_v4,
+            rtl_v5=rtl_v5,
+            compact_stats_lanes=getattr(prog, "compact_stats_lanes", 16),
         )
         prog.record_vector_scalar_stats(lowering.metadata)
         if getattr(prog, "_cost_sink", None) is None:
@@ -1302,9 +1306,10 @@ def _emit_split_k_norm_rtl_v3(
     physical_rows = k_heads[0].physical_shape[0]
     if any(head.physical_shape[0] != physical_rows for head in k_heads):
         raise ValueError("all K heads must have the same physical row count")
-    if len(k_heads) > min(16, prog.mlen // prog.hlen):
+    compact_stats_lanes = getattr(prog, "compact_stats_lanes", 16)
+    if len(k_heads) > min(compact_stats_lanes, prog.mlen // prog.hlen):
         raise ValueError(
-            "rtl-v3 split K normalization supports at most one vector word of "
+            "split K normalization supports at most one compact-stat word of "
             f"heads, got heads={len(k_heads)}, MLEN={prog.mlen}, HLEN={prog.hlen}"
         )
 
@@ -1334,6 +1339,8 @@ def _emit_split_k_norm_rtl_v3(
             gp_index=gp_index,
             gp_loop=gp_loop,
             rtl_v4=getattr(prog, "vector_scalar_schedule", "legacy") == "rtl-v4",
+            rtl_v5=getattr(prog, "vector_scalar_schedule", "legacy") == "rtl-v5",
+            compact_stats_lanes=compact_stats_lanes,
         )
         prog.record_vector_scalar_stats(lowering.metadata)
         if getattr(prog, "_cost_sink", None) is None:
@@ -1533,9 +1540,14 @@ def _emit_kv_stores(
         prog.free_tensor(V_h)
 
     use_split_k_norm = (
-        getattr(prog, "vector_scalar_schedule", "legacy") in {"rtl-v3", "rtl-v4"}
+        getattr(prog, "vector_scalar_schedule", "legacy")
+        in {"rtl-v3", "rtl-v4", "rtl-v5"}
         and layer_inputs.k_norm is not None
-        and num_kv_heads <= min(16, prog.mlen // prog.hlen)
+        and num_kv_heads
+        <= min(
+            getattr(prog, "compact_stats_lanes", 16),
+            prog.mlen // prog.hlen,
+        )
     )
     if use_split_k_norm:
         # Materialize all heads first so their statistics can share one
@@ -4457,7 +4469,7 @@ def compile_native_hf_decoder(
     packed_attention_schedule: str = "direct-first-block-v1",
     softmax_state_schedule: str = SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
     packed_qk_schedule: str = PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
-    vector_scalar_schedule: str = "rtl-v3",
+    vector_scalar_schedule: str = "rtl-v5",
     selector_schedule: str = "legacy",
     reduction_output_mode: str = "accumulate-v1",
     gqa_pipeline_schedule: str | None = None,
@@ -4514,6 +4526,7 @@ def compile_native_hf_decoder(
     if packed_qk_schedule not in PACKED_QK_SCHEDULES:
         raise ValueError(f"packed_qk_schedule must be one of {sorted(PACKED_QK_SCHEDULES)}, got {packed_qk_schedule!r}")
     if vector_scalar_schedule not in {
+        "rtl-v5",
         "rtl-v4",
         "rtl-v3",
         "rtl-v2",
@@ -4521,7 +4534,7 @@ def compile_native_hf_decoder(
         "legacy",
     }:
         raise ValueError(
-            "vector_scalar_schedule must be 'rtl-v4', 'rtl-v3', 'rtl-v2', "
+            "vector_scalar_schedule must be 'rtl-v5', 'rtl-v4', 'rtl-v3', 'rtl-v2', "
             "'compiler-v1', or 'legacy', got "
             f"{vector_scalar_schedule!r}"
         )
@@ -4550,13 +4563,24 @@ def compile_native_hf_decoder(
             f"ffn_projection_schedule must be one of {FFN_PROJECTION_SCHEDULES}, got {ffn_projection_schedule!r}"
         )
     if gqa_pipeline_schedule is None:
-        gqa_pipeline_schedule = "row-interleaved-v1" if vector_scalar_schedule in {"rtl-v3", "rtl-v4"} else "row-serial"
+        gqa_pipeline_schedule = (
+            "row-interleaved-v1"
+            if vector_scalar_schedule in {"rtl-v3", "rtl-v4", "rtl-v5"}
+            else "row-serial"
+        )
     if gqa_pipeline_schedule not in {"row-interleaved-v1", "row-serial"}:
         raise ValueError(
             f"gqa_pipeline_schedule must be 'row-interleaved-v1' or 'row-serial', got {gqa_pipeline_schedule!r}"
         )
-    if gqa_pipeline_schedule == "row-interleaved-v1" and vector_scalar_schedule not in {"rtl-v3", "rtl-v4"}:
-        raise ValueError("row-interleaved-v1 requires vector_scalar_schedule='rtl-v3' or 'rtl-v4'")
+    if gqa_pipeline_schedule == "row-interleaved-v1" and vector_scalar_schedule not in {
+        "rtl-v3",
+        "rtl-v4",
+        "rtl-v5",
+    }:
+        raise ValueError(
+            "row-interleaved-v1 requires vector_scalar_schedule='rtl-v3', "
+            "'rtl-v4', or 'rtl-v5'"
+        )
 
     model_cfg = extract_model_config(model)
     root = find_model_root(model)
@@ -4662,6 +4686,12 @@ def compile_native_hf_decoder(
         )
     else:
         head_packing = None
+    compact_stats_plan = build_compact_stats_plan(
+        vlen=mlen,
+        hlen=(hlen if hlen is not None else mlen),
+        num_attention_heads=num_heads,
+        vector_scalar_schedule=vector_scalar_schedule,
+    )
     softmax_state_layout = build_softmax_state_layout(
         mlen=mlen,
         active_broadcast_heads=(head_packing.broadcast_amount if head_packing is not None else 1),
@@ -5025,6 +5055,7 @@ def compile_native_hf_decoder(
         softmax_state_schedule=softmax_state_schedule,
         packed_qk_schedule=packed_qk_schedule,
         vector_scalar_schedule=vector_scalar_schedule,
+        compact_stats_lanes=compact_stats_plan.configured_lanes,
         selector_schedule=selector_schedule,
         reduction_output_mode=reduction_output_mode,
         gqa_pipeline_schedule=gqa_pipeline_schedule,
@@ -5363,6 +5394,7 @@ def compile_native_hf_decoder(
         ),
         **prog.packed_attention_stats(),
         **prog.vector_scalar_stats(),
+        **compact_stats_plan.metadata(),
         "logical_token_rows": sequence_packing.logical_active_rows,
         "physical_token_rows": sequence_packing.compile_seq_rows,
         "sequence_row_utilization": sequence_packing.row_utilization,

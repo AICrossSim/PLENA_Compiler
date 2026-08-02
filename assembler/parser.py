@@ -378,16 +378,26 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             elif opcode in _COMPACT_STAT_ALIASES:
                 # Syntax: V_STAT_* gpDst, gpSrc, fScalar, segment_count.
                 # Compact operations reuse V_ALU_VSEG with funct1[3] set.
-                # Unlike ordinary VSEG, rstride stores count-1 rather than
-                # log2(segment width).
+                # The legacy encoding keeps count-1 for 1..16 lanes.  Extended
+                # 32/64-lane tiers set funct1[2] and store log2(tier), preserving
+                # all existing binaries.
                 segment_count = rstride
-                if segment_count is None or not 1 <= segment_count <= 16:
+                if segment_count is None or not 1 <= segment_count <= 64:
                     raise ValueError(
-                        "compact-stat segment_count must be in [1, 16], got "
+                        "compact-stat segment_count must be in [1, 64], got "
                         f"{segment_count}"
                     )
-                rstride = segment_count - 1
-                funct1 = 0x8 | _COMPACT_STAT_ALIASES[opcode]
+                if segment_count <= 16:
+                    rstride = segment_count - 1
+                    funct1 = 0x8 | _COMPACT_STAT_ALIASES[opcode]
+                elif segment_count in {32, 64}:
+                    rstride = segment_count.bit_length() - 1
+                    funct1 = 0xC | _COMPACT_STAT_ALIASES[opcode]
+                else:
+                    raise ValueError(
+                        "extended compact-stat segment_count must be a "
+                        f"supported power-of-two tier (32 or 64), got {segment_count}"
+                    )
                 opcode = "V_ALU_VSEG"
 
             instructions.append(Instruction(opcode, rd, rs1, rs2, rstride, funct1, funct2, imm))

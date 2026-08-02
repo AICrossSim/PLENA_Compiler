@@ -57,6 +57,27 @@ class TestVectorRmaskHandling(unittest.TestCase):
         self.assertEqual((encoded >> 18) & 0xF, 15)
         self.assertEqual((encoded >> 22) & 0xF, 0xA)
 
+    def test_extended_compact_stat_alias_uses_log2_tier_encoding(self):
+        for lanes, encoded_log2 in ((32, 5), (64, 6)):
+            with self.subTest(lanes=lanes):
+                asm_path = f"/tmp/plena_test_compact_stats_{lanes}.asm"
+                with open(asm_path, "w") as f:
+                    f.write(f"V_STAT_RSQRT gp1, gp2, f0, {lanes}\n")
+
+                instruction = parse_asm_file(asm_path)[0]
+                encoded = self.asm._convert_to_binary(instruction)
+                self.assertEqual((encoded >> 18) & 0xF, encoded_log2)
+                self.assertEqual((encoded >> 22) & 0xF, 0xE)
+
+    def test_compact_stat_alias_rejects_unsupported_extended_counts(self):
+        for lanes in (17, 24, 48, 65):
+            with self.subTest(lanes=lanes):
+                asm_path = f"/tmp/plena_test_compact_stats_invalid_{lanes}.asm"
+                with open(asm_path, "w") as f:
+                    f.write(f"V_STAT_RSQRT gp1, gp2, f0, {lanes}\n")
+                with self.assertRaisesRegex(ValueError, "compact-stat"):
+                    parse_asm_file(asm_path)
+
     def test_reduction_overwrite_alias_sets_funct_bit(self):
         asm_path = "/tmp/plena_test_reduction_overwrite.asm"
         with open(asm_path, "w") as f:

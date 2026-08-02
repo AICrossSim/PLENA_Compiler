@@ -153,7 +153,7 @@ class ProgramAttentionMixin:
         if (
             getattr(self, "_cost_sink", None) is not None
             and getattr(self, "vector_scalar_schedule", "legacy")
-            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4"}
+            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5"}
         ):
             self._active_cost_stage = "global/valid_col_mask"
         try:
@@ -196,7 +196,7 @@ class ProgramAttentionMixin:
             return None
         if (
             getattr(self, "vector_scalar_schedule", "legacy")
-            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4"}
+            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5"}
             and isinstance(causal_mask, VRAMMatrixVar)
             and apply_causal_mask
             and causal_mask_covers_padding

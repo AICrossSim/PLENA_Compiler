@@ -72,6 +72,7 @@ from compiler.aten.plena.native_layout import (
     SOFTMAX_STATE_SCHEDULES,
     SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
     build_attention_head_packing,
+    build_compact_stats_plan,
     build_softmax_state_layout,
 )
 from compiler.aten.plena_frontend import (
@@ -109,6 +110,7 @@ class CompilerCostHardware:
     hbm_v_writeback_amount: int
     hbm_channels: int = 128
     fp_sram_depth: int | None = None
+    compact_stats_lanes: int | None = None
     fp_constant_num: int = FP_CONSTANT_NUM_DEFAULT
     kv_residency_policy: str = "raw-tiles"
 
@@ -1518,6 +1520,33 @@ def _finalize_energy_action_lineage(trace: CostTrace) -> dict[str, Any]:
     }
 
 
+def _annotate_compact_stats_energy_actions(
+    trace: CostTrace,
+    *,
+    configured_lanes: int,
+) -> None:
+    """Preserve logical and physically clocked compact-SIMD lane counts."""
+
+    remapped: list[EnergyAction] = []
+    for action in trace.energy_actions:
+        if action.action.startswith("compact_stats_"):
+            active_lanes = int(action.segment_count)
+            if not 0 < active_lanes <= configured_lanes:
+                raise ValueError(
+                    "invalid compact-stat EnergyAction lane geometry: "
+                    f"active={active_lanes}, configured={configured_lanes}, "
+                    f"action={action.action}"
+                )
+            action = replace(
+                action,
+                active_lanes=active_lanes,
+                total_lanes=configured_lanes,
+                activity_fidelity="exact_compact_lanes",
+            )
+        remapped.append(action)
+    trace.energy_actions = remapped
+
+
 def clear_cost_trace_cache() -> None:
     """Clear the small in-process cache used by DSE warm evaluations."""
     _ONE_LAYER_TRACE_CACHE.clear()
@@ -1680,7 +1709,7 @@ def compile_native_decoder_cost_trace(
     packed_attention_schedule: str = "direct-first-block-v1",
     softmax_state_schedule: str = SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
     packed_qk_schedule: str = PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
-    vector_scalar_schedule: str = "rtl-v3",
+    vector_scalar_schedule: str = "rtl-v5",
     selector_schedule: str = "legacy",
     reduction_output_mode: str = "accumulate-v1",
     gqa_pipeline_schedule: str | None = None,
@@ -1724,6 +1753,7 @@ def compile_native_decoder_cost_trace(
     if packed_qk_schedule not in PACKED_QK_SCHEDULES:
         raise ValueError(f"packed_qk_schedule must be one of {sorted(PACKED_QK_SCHEDULES)}, got {packed_qk_schedule!r}")
     if vector_scalar_schedule not in {
+        "rtl-v5",
         "rtl-v4",
         "rtl-v3",
         "rtl-v2",
@@ -1731,7 +1761,7 @@ def compile_native_decoder_cost_trace(
         "legacy",
     }:
         raise ValueError(
-            "vector_scalar_schedule must be 'rtl-v4', 'rtl-v3', 'rtl-v2', "
+            "vector_scalar_schedule must be 'rtl-v5', 'rtl-v4', 'rtl-v3', 'rtl-v2', "
             "'compiler-v1', or 'legacy', got "
             f"{vector_scalar_schedule!r}"
         )
@@ -1760,13 +1790,24 @@ def compile_native_decoder_cost_trace(
             f"cost_trace_granularity must be one of {sorted(COST_TRACE_GRANULARITIES)}, got {cost_trace_granularity!r}"
         )
     if gqa_pipeline_schedule is None:
-        gqa_pipeline_schedule = "row-interleaved-v1" if vector_scalar_schedule in {"rtl-v3", "rtl-v4"} else "row-serial"
+        gqa_pipeline_schedule = (
+            "row-interleaved-v1"
+            if vector_scalar_schedule in {"rtl-v3", "rtl-v4", "rtl-v5"}
+            else "row-serial"
+        )
     if gqa_pipeline_schedule not in {"row-interleaved-v1", "row-serial"}:
         raise ValueError(
             f"gqa_pipeline_schedule must be 'row-interleaved-v1' or 'row-serial', got {gqa_pipeline_schedule!r}"
         )
-    if gqa_pipeline_schedule == "row-interleaved-v1" and vector_scalar_schedule not in {"rtl-v3", "rtl-v4"}:
-        raise ValueError("row-interleaved-v1 requires vector_scalar_schedule='rtl-v3' or 'rtl-v4'")
+    if gqa_pipeline_schedule == "row-interleaved-v1" and vector_scalar_schedule not in {
+        "rtl-v3",
+        "rtl-v4",
+        "rtl-v5",
+    }:
+        raise ValueError(
+            "row-interleaved-v1 requires vector_scalar_schedule='rtl-v3', "
+            "'rtl-v4', or 'rtl-v5'"
+        )
     if moe_routing_mode not in {"static-indices", "fixed-balanced"}:
         raise ValueError(f"moe_routing_mode must be 'static-indices' or 'fixed-balanced', got {moe_routing_mode!r}")
     if moe_lowering_schedule not in MOE_LOWERING_SCHEDULES:
@@ -1900,6 +1941,26 @@ def compile_native_decoder_cost_trace(
         layer_idx=layer_idx,
         native_layout_mode=native_layout_mode,
     )
+    compact_stats_plan = build_compact_stats_plan(
+        vlen=hardware.vlen,
+        hlen=hardware.hlen,
+        num_attention_heads=model.num_heads,
+        vector_scalar_schedule=vector_scalar_schedule,
+    )
+    if (
+        hardware.compact_stats_lanes is not None
+        and hardware.compact_stats_lanes != compact_stats_plan.configured_lanes
+    ):
+        raise ValueError(
+            "hardware compact_stats_lanes does not match the shared planner: "
+            f"configured={hardware.compact_stats_lanes}, "
+            f"derived={compact_stats_plan.configured_lanes}"
+        )
+    if hardware.compact_stats_lanes is None:
+        hardware = replace(
+            hardware,
+            compact_stats_lanes=compact_stats_plan.configured_lanes,
+        )
     registry = OpRegistry.load()
     registry.set_backend(Backend.PLENA)
     prog = PlenaCompiler(
@@ -1917,6 +1978,7 @@ def compile_native_decoder_cost_trace(
         softmax_state_schedule=softmax_state_schedule,
         packed_qk_schedule=packed_qk_schedule,
         vector_scalar_schedule=vector_scalar_schedule,
+        compact_stats_lanes=compact_stats_plan.configured_lanes,
         selector_schedule=selector_schedule,
         reduction_output_mode=reduction_output_mode,
         gqa_pipeline_schedule=gqa_pipeline_schedule,
@@ -2194,6 +2256,7 @@ def compile_native_decoder_cost_trace(
             },
             "packed_attention": prog.packed_attention_stats(),
             "vector_scalar_optimization": prog.vector_scalar_stats(),
+            "compact_stats": compact_stats_plan.metadata(),
             # Keep the selected lowering mode at the trace root as well as in
             # the optimization counters.  Timing consumers must be able to
             # select the rtl-v3 scoreboard without reverse-engineering an
@@ -2344,6 +2407,10 @@ def compile_native_decoder_cost_trace(
                 one_layer.parallel_kernel_census
             ),
         }
+    )
+    _annotate_compact_stats_energy_actions(
+        one_layer,
+        configured_lanes=compact_stats_plan.configured_lanes,
     )
     one_layer.metadata["energy_action_lineage"] = (
         _finalize_energy_action_lineage(one_layer)

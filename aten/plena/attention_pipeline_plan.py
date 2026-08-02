@@ -26,10 +26,10 @@ DEFAULT_GQA_TIMING_ENV = "PLENA_GQA_TIMING_CALIBRATION"
 def _default_timing_candidates() -> tuple[Path, ...]:
     source = Path(__file__).resolve()
     return (
-        Path.cwd() / "transactional_emulator/calibration/rtl_opcode_timing_v4.json",
+        Path.cwd() / "transactional_emulator/calibration/rtl_opcode_timing_v5.json",
         Path.cwd() / "transactional_emulator/calibration/rtl_opcode_timing_v3.json",
         source.parents[3]
-        / "transactional_emulator/calibration/rtl_opcode_timing_v4.json",
+        / "transactional_emulator/calibration/rtl_opcode_timing_v5.json",
         source.parents[3]
         / "transactional_emulator/calibration/rtl_opcode_timing_v3.json",
     )
@@ -67,7 +67,7 @@ class GQATimingProfile:
         schema_version = int(data.get("schema_version", 0))
         model = str(data.get("model", ""))
         if schema_version < 3 or not any(
-            marker in model for marker in ("rtl_v3", "rtl_v4")
+            marker in model for marker in ("rtl_v3", "rtl_v4", "rtl_v5")
         ):
             raise ValueError(
                 "GQA pipeline scheduling requires a compatible RTL-v3-or-later "
