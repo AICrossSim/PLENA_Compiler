@@ -89,6 +89,7 @@ class Instruction:
         self.funct2 = funct2
         self.imm = imm
         self.rmask = rstride
+        self.rflag = rflag
 
     def __repr__(self):
         return f"Instruction(opcode='{self.opcode}', rd='{self.rd}', rs1='{self.rs1}', rs2='{self.rs2}', rstride = '{self.rstride}', funct1={self.funct1}, funct2={self.funct2}, imm={self.imm}, rflag={self.rflag})"
