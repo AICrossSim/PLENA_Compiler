@@ -44,7 +44,6 @@ _UNWIRED_TESTS = frozenset(
     {
         "test_bf16_numerical_stability.py",
         "test_gpt_oss_moe_assertions.py",
-        "test_gpt_oss_moe_reference.py",
         "test_plena_compiler.py",
         "test_quantization_ablation.py",
     }
