@@ -68,7 +68,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers
+          pip install transformers pytest
+      # golden_b is excluded: it imports plena_quant from the sibling
+      # PLENA_Tools checkout, which is not available in this workflow.
+      - name: Run assembler tests and GPT-OSS reference cross-check
+        run: |
+          PYTHONPATH=. python3 -m pytest -q \
+            assembler/tests \
+            aten/tests/test_gpt_oss_moe_reference.py \
+            -m 'not slow' -k 'not golden_b'
       - name: Run parser tests
         run: |
           PYTHONPATH=. python3 generator/tests/test_llm_parser.py

@@ -10,8 +10,8 @@ Coverage:
   * cluster_guard skip (no lane_axes / D >= MLEN) → no-op
   * Outside cluster body: refs not rewritten
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_view
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_view
 """
 
 from __future__ import annotations

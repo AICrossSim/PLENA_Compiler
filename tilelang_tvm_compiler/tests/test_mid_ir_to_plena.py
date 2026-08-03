@@ -17,8 +17,8 @@ Coverage:
   * Auto-dump to build_dir creates <name>.midir.txt
   * cluster_guard skip → still produces an HLIRModule
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_to_plena
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_to_plena
 """
 
 from __future__ import annotations

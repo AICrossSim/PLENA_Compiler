@@ -1,10 +1,9 @@
 """Run flash_attention_min through the new mid_ir pipeline end-to-end
 and print the resulting HLIR.
 
-Usage:
+Usage (from the repository root):
     nix develop --command bash -c '
-        PYTHONPATH=compiler .venv/bin/python -m \\
-            tilelang_tvm_compiler.scripts.run_flash_attention_midir
+        .venv/bin/python -m tilelang_tvm_compiler.scripts.run_flash_attention_midir
     '
 
 Or with the .venv-tvm Python — but that one doesn't have tilelang

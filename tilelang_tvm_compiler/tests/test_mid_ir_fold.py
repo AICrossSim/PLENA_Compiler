@@ -10,8 +10,8 @@ Coverage:
   * zero fill (constant 0.0 / 0)
   * blockIdx grid wrappers preserved as For(thread_tag=...)
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_fold
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_fold
 """
 
 from __future__ import annotations

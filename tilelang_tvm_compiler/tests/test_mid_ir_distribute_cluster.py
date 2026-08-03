@@ -10,8 +10,8 @@ Coverage:
     inner stays as-is
   * Cluster with no unroll For at all → no change
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_distribute_cluster
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_distribute_cluster
 """
 
 from __future__ import annotations

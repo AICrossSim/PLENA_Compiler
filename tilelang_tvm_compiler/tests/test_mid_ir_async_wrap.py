@@ -9,8 +9,8 @@ Coverage:
   * Multiple consecutive can_async ops → multiple Async regions
   * BufferRef indices NOT rewritten — that's the next (view) pass
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_async_wrap
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_async_wrap
 """
 
 from __future__ import annotations

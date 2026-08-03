@@ -1,8 +1,7 @@
 """Standalone tests for ExprMaterializer.
 
-Run:
-    LD_LIBRARY_PATH="" \\
-    python -m tilelang_tvm_compiler.tests.test_expr_materializer
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_expr_materializer
 
 These tests do NOT touch the BTMM pipeline -- they exercise expr lowering
 in isolation so we can iterate on it before wiring it into Pass 3.

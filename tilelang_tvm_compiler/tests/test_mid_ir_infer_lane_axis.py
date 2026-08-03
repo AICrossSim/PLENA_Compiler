@@ -14,8 +14,8 @@ Coverage:
   * Manual override preserved
   * Grid var with extent NOT multiple of LANE → not eligible
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_infer_lane_axis
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_infer_lane_axis
 """
 
 from __future__ import annotations

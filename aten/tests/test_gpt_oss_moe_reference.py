@@ -11,7 +11,6 @@ import sys
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS_DIR)))
@@ -139,17 +138,23 @@ def test_golden_a_matches_hf_gpt_oss_mlp_tiny():
         hf_mlp.experts.down_proj_bias.copy_(down_b)
 
         router_result = hf_mlp.router(x)
+        if not isinstance(router_result, tuple):
+            raise AssertionError(
+                f"unsupported GptOssTopKRouter result type: {type(router_result)!r}"
+            )
         if len(router_result) == 3:
             # transformers >=5.1 returns full logits followed by compact
             # (tokens, top_k) scores and indices.
             hf_router_logits, hf_scores, hf_indices = router_result
+            hf_dense_scores = None
             hf_expert_out = hf_mlp.experts(x, hf_indices, hf_scores)
             hf_mlp_out, hf_mlp_scores = hf_mlp(x.unsqueeze(0))
         elif len(router_result) == 2:
             # transformers 4.x returns a dense (tokens, num_experts) score
-            # matrix. Experts consume that dense matrix and a batched input.
+            # matrix and the top-k indices, never the raw logits. Experts
+            # consume that dense matrix and a batched input.
             hf_dense_scores, hf_indices = router_result
-            hf_router_logits = F.linear(x, hf_mlp.router.weight, hf_mlp.router.bias)
+            hf_router_logits = None
             hf_scores = hf_dense_scores.gather(1, hf_indices)
             hf_expert_out = hf_mlp.experts(
                 x.unsqueeze(0),
@@ -157,7 +162,7 @@ def test_golden_a_matches_hf_gpt_oss_mlp_tiny():
                 routing_weights=hf_dense_scores,
             ).squeeze(0)
             hf_mlp_out, hf_mlp_dense_scores = hf_mlp(x.unsqueeze(0))
-            hf_mlp_scores = hf_mlp_dense_scores.squeeze(0).gather(1, hf_indices)
+            hf_mlp_scores = hf_mlp_dense_scores.gather(1, hf_indices)
         else:
             raise AssertionError(
                 f"unsupported GptOssTopKRouter result length: {len(router_result)}"
@@ -170,7 +175,13 @@ def test_golden_a_matches_hf_gpt_oss_mlp_tiny():
     )
 
     assert torch.equal(golden.topk_indices, hf_indices)
-    assert torch.allclose(golden.router_logits, hf_router_logits, atol=1e-6, rtol=1e-6)
+    if hf_router_logits is not None:
+        assert torch.allclose(golden.router_logits, hf_router_logits, atol=1e-6, rtol=1e-6)
+    if hf_dense_scores is not None:
+        golden_dense = torch.zeros_like(hf_dense_scores).scatter(
+            1, golden.topk_indices, golden.topk_weights
+        )
+        assert torch.allclose(golden_dense, hf_dense_scores, atol=1e-6, rtol=1e-6)
     assert torch.allclose(golden.topk_weights, hf_scores, atol=1e-6, rtol=1e-6)
     assert torch.allclose(golden.topk_weights, hf_mlp_scores, atol=1e-6, rtol=1e-6)
     assert torch.allclose(golden.output, hf_expert_out, atol=1e-6, rtol=1e-6)

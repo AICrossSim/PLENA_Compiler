@@ -12,8 +12,8 @@ Coverage:
   * Multi-axis lane fusion: two axes both split
   * Extent not divisible → SplitError
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_split
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_split
 """
 
 from __future__ import annotations

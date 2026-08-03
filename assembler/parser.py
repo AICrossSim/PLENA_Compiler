@@ -310,9 +310,12 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Parse and print one PLENA assembly file.")
-    parser.add_argument("asm_file", type=Path)
-    args = parser.parse_args()
+    cli = argparse.ArgumentParser(description="Parse and print one PLENA assembly file.")
+    cli.add_argument("asm_file", type=Path, help="path to the .asm file to parse")
+    args = cli.parse_args()
+
+    if not args.asm_file.is_file():
+        cli.error(f"no such assembly file: {args.asm_file}")
 
     loaded_instr = parse_asm_file(str(args.asm_file))
     for instr in loaded_instr:

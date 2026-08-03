@@ -1,10 +1,8 @@
 """Structural tests for loop_slice_dma: validates Phase 7 dynamic-start
 slice + ExprMaterializer + register-sourced offset emit path.
 
-Run:
-    LD_LIBRARY_PATH="" \\
-    PYTHONPATH=/.../compiler \\
-    .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_loop_slice
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_loop_slice
 """
 
 from __future__ import annotations

@@ -10,8 +10,8 @@ Coverage:
   * Inside For: nested ops still get marked
   * Idempotency: mark(mark(x)) == mark(x)
 
-Run:
-    python -m tilelang_tvm_compiler.tests.test_mid_ir_mark
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_mid_ir_mark
 """
 
 from __future__ import annotations

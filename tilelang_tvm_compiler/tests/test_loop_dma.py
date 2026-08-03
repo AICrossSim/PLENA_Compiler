@@ -1,8 +1,7 @@
 """Structural tests for the loop_dma kernel: validates Phase 4 ForOp lowering.
 
-Run:
-    LD_LIBRARY_PATH="" \\
-    python -m tilelang_tvm_compiler.tests.test_loop_dma
+Run (from the repository root):
+    LD_LIBRARY_PATH="" .venv-tvm/bin/python -m tilelang_tvm_compiler.tests.test_loop_dma
 """
 
 from __future__ import annotations
