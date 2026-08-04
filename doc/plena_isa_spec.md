@@ -684,6 +684,11 @@ Triggers a breakpoint exception for debugging purposes. **Note:** Programs do no
 
 Start a hardware loop. The loop count is set by `imm`. The register `rd` is used internally by the hardware to track remaining iterations.
 
+When the optional loop address generator is enabled, a `C_SET_LOOP_STEP`
+instruction immediately before this instruction can move a self-relative tail
+update out of the repeated loop body. Existing loop binaries remain unchanged
+when the enhancement is disabled.
+
 **IMPORTANT:** The loop counter register `rd` does NOT contain the current iteration index. You must maintain your own index variable and increment it manually inside the loop.
 
 **Example:**
@@ -705,6 +710,28 @@ C_LOOP_END gp4                     ; End of loop
 **Description:**
 
 End of a hardware loop. If the loop counter (in register `rd`) is greater than 0, it decrements the counter and jumps back to the corresponding `C_LOOP_START`.
+
+### C_SET_LOOP_STEP
+
+**Format:** `C_SET_LOOP_STEP rd, imm`
+
+**Operation:** Configure `gp_reg<rd> += imm` at each matching `C_LOOP_END`.
+
+**Description:**
+
+Configure one loop-carried self-relative register update for the next
+`C_LOOP_START`. Up to four distinct registers can be configured for a loop.
+The configuration belongs to the innermost subsequently started loop, and
+nested loops retain independent step sets. This instruction is emitted only
+for the opt-in loop address-generator target.
+
+```asm
+S_ADDI_INT gp1, gp0, 0
+C_SET_LOOP_STEP gp1, 64
+C_LOOP_START gp2, 8
+  V_ADD_VV gp1, gp1, gp1
+C_LOOP_END gp2
+```
 
 ---
 
