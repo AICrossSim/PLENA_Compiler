@@ -1,4 +1,4 @@
-from utils.load_config import load_svh_settings
+from compiler.utils.load_config import load_svh_settings
 
 from .parser import load_isa_definitions, parse_asm_file
 
@@ -24,7 +24,9 @@ _IMM_RS1_RD_OPS = frozenset(
         "V_EXP_V",
     }
 )
-_IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"})
+_IMM_RD_OPS = frozenset(
+    {"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO", "C_SET_LOOP_STEP"}
+)
 _RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"})
 _RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"})
 _FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})
@@ -58,6 +60,11 @@ class AssemblyToBinary:
         :param isa_definition_file: Path to the ISA file
         """
         self.isa_definitions = load_isa_definitions(isa_definition_file)
+        if (
+            "V_SHFT_V" in self.isa_definitions
+            and "V_SHIFT_V" not in self.isa_definitions
+        ):
+            self.isa_definitions["V_SHIFT_V"] = self.isa_definitions["V_SHFT_V"]
         self.isa_definition_file = isa_definition_file
         config_settings = load_svh_settings(config_file)
         self.opcode_width = config_settings.get("OPCODE_WIDTH", 0)
@@ -91,8 +98,14 @@ class AssemblyToBinary:
         if instruction.opcode in _RMASK_VECTOR_OPS and rmask is None:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
+        if instruction.opcode in _RMASK_VECTOR_OPS and rs2 is None:
+            rs2 = 0
 
-        if instruction.opcode in _IMM_RS1_RD_OPS:
+        if instruction.opcode in _RMASK_VECTOR_OPS:
+            binary_instruction = (
+                (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+            )
+        elif instruction.opcode in _IMM_RS1_RD_OPS:
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
@@ -113,10 +126,6 @@ class AssemblyToBinary:
                 + (rs1 << (opw + ow))
                 + (rd << opw)
                 + opcode
-            )
-        elif instruction.opcode in _RMASK_VECTOR_OPS:
-            binary_instruction = (
-                (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
             )
         elif instruction.opcode in _RS2_RS1_RD_OPS:
             binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode

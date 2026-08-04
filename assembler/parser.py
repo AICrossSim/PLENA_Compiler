@@ -155,6 +155,8 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             if len(parts) < 1 or ";" in parts[0]:
                 continue  # Invalid line
             opcode = parts[0]
+            if opcode == "V_SHFT_V":
+                opcode = "V_SHIFT_V"
 
             # Handle instructions with no operands (e.g., C_BREAK)
             if len(parts) == 1:
@@ -303,15 +305,3 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             instructions.append(Instruction(opcode, rd, rs1, rs2, rstride, funct1, funct2, imm))
 
     return instructions
-
-
-if __name__ == "__main__":
-    # Example usage
-    # file_path = '/home/george/Coprocessor_for_Llama/src/definitions/operation.svh'
-    # enum_dict = load_isa_definitions(file_path)
-    # print(enum_dict)
-
-    asm_file_path = "/home/george/Coprocessor_for_Llama/src/system/test/benchmarks/fixed.asm"
-    loaded_instr = parse_asm_file(asm_file_path)
-    for instr in loaded_instr:
-        print(instr)

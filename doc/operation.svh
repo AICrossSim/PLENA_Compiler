@@ -41,7 +41,8 @@ typedef enum logic [3:0] {
     RECI_V_ELEMENT  = 4'h5,
     INNER_HADAMARD_TRANSFORM    = 4'h6,
     PREFIX_SCAN_V_ELEMENT       = 4'h7,
-    SHIFT_V_LANES_ELEMENT       = 4'h8   // renamed, use this everywhere
+    SHIFT_V_LANES_ELEMENT       = 4'h8,  // renamed, use this everywhere
+    RSUB_V_ELEMENT              = 4'h9   // reverse subtract: data_b - data_a (e.g. f0 - x = -x)
 } V_ELEMENT_OP;
 
 typedef enum logic [2:0] {
@@ -81,6 +82,7 @@ typedef enum logic [3:0] {
     COMP_ADDR_2   = 4'hB, // addr_port_2: rd and addr_port_1: rs1 + imm
     LOOP_INIT     = 4'hC, // Write immediate to rd (loop counter initialization)
     LOOP_DEC      = 4'hD, // Decrement rs1 and write back to rd (loop end)
+    LOOP_STEP_CFG = 4'hE, // Configure a loop-carried self-relative register step
     STALL_S_INT   = 4'h0
 } S_INT_OP;
 
@@ -91,7 +93,8 @@ typedef enum logic [2:0] {
     SET_SCALE_REG       = 3'h3,
     BREAK               = 3'h4,
     LOOP_START          = 3'h5,
-    LOOP_END            = 3'h6
+    LOOP_END            = 3'h6,
+    SET_V_MASK_REG      = 3'h7
 } C_OP;
 
 typedef enum logic [2:0] {
@@ -176,7 +179,8 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_PS_V                 = 6'h31,
     V_SHFT_V               = 6'h32,
     C_HADAMARD_TRANSFORM   = 6'h33,
-    C_BREAK                = 6'h34
+    C_BREAK                = 6'h34,
+    C_SET_LOOP_STEP        = 6'h35
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {
@@ -208,6 +212,8 @@ typedef struct {
     C_OP            c_op;
     H_OP            h_op;
     logic           m_transposed_read;
+    // Batched matrix ops reduce HLEN-wide heads independently.
+    logic           m_per_head;
     logic           v_broadcast_en;
     logic [instruction_pkg::FP_OPERAND_WIDTH - 1:0]         fps1;
     logic [instruction_pkg::FP_OPERAND_WIDTH - 1:0]         fps2;
@@ -215,11 +221,23 @@ typedef struct {
     logic [instruction_pkg::INT_OPERAND_WIDTH - 1:0]        gp_reg1;
     logic [instruction_pkg::INT_OPERAND_WIDTH - 1:0]        gp_reg2;
     logic [instruction_pkg::INT_OPERAND_WIDTH - 1:0]        gp_rstride;
+    // Batched MM_IC interprets gp_rd as a literal head selector.
     logic [instruction_pkg::INT_OPERAND_WIDTH - 1:0]        gp_rd;
     logic [configuration_pkg::ON_CHIP_ADDR_WIDTH - 1:0]     addr_1;
     logic [configuration_pkg::ON_CHIP_ADDR_WIDTH - 1:0]     addr_2;
+    // Resolved gp[rd] address (the WRITE destination). addr_1/addr_2 carry the
+    // rs1/rs2 READ addresses; a vector-vector element op that writes out-of-place
+    // (rd is neither source) has no read slot holding gp[rd], so it needs this
+    // third resolved address for its result write. Only consumed on the
+    // out-of-place vector-element write path; 0/unused for every other op.
+    logic [configuration_pkg::ON_CHIP_ADDR_WIDTH - 1:0]     addr_3;
     logic update_m_waddr;
     logic update_v_waddr;
+    // Low bits of the originating instruction's fetch PC. Stable across a PC-rewind
+    // replay (the rewind re-fetches the same address), so the addr_monitor can tell an
+    // op's OWN pending-write entry apart from a prior op's and never stall an in-place
+    // op on the write it inserted itself (the self-collision that deadlocks RMS loops).
+    logic [7:0] pc_tag;
 } OP_BUNDLE;
 
 `endif
