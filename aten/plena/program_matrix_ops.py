@@ -285,6 +285,22 @@ class ProgramMatrixOpsMixin:
         )
         return dst
 
+    def vram_broadcast_row_mul(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        *,
+        num_rows: int | None = None,
+    ) -> VRAMMatrixVar:
+        """Multiply destination rows and column blocks by one vector pattern."""
+
+        super().vram_matrix_mul_broadcast_row(
+            dst_matrix=dst.name,
+            src_matrix=src.name,
+            num_rows=num_rows,
+        )
+        return dst
+
     def vram_block_add_to(
         self,
         src1: TensorVar,

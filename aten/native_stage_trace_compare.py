@@ -165,7 +165,7 @@ def _packed_attention_expected(
                 scale,
                 precision,
                 causal=True,
-                matmul_scale=0.25,
+                matmul_scale=1.0,
             )
             out[:, group_start + lane_start:group_start + lane_end] = o_h
 

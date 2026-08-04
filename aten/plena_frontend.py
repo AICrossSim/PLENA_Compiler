@@ -34,6 +34,7 @@ from asm_templates._imm import add_large_int as _add_large_int_lines
 from asm_templates._imm import load_large_int as _load_large_int_lines
 from compiler.aten.ops.registry import Backend, OpRegistry
 from compiler.aten.plena import PlenaCompiler
+from compiler.aten.plena.packed_kv import PackedKVLayout, validate_selector_lowering
 from compiler.aten.reference import (
     ReferencePrecision,
     ScheduledReferenceConfig,
@@ -58,6 +59,7 @@ __all__ = [
 ]
 
 _IMM2_BOUND = 1 << 18  # S_ADDI_INT max immediate
+FULL_MODEL_DECODE_SCOPE = "full_model_decode_step_independent_request_batch"
 
 
 def _fix_large_immediates(isa_code: str) -> str:
@@ -105,6 +107,8 @@ class LayerInputVars:
     w_gate: Any
     w_up: Any
     w_down: Any
+    q_norm_pattern: Any | None = None
+    k_norm_pattern: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,146 @@ class AttentionHeadPacking:
     head_slot_dim: int
     group_width: int
     total_q_dim: int
+
+
+@dataclass(frozen=True)
+class DecoderRankPartition:
+    """Exact rank-local decoder dimensions for TP and round-robin KVP."""
+
+    tensor_parallel_degree: int
+    tensor_parallel_rank: int
+    kv_parallel_degree: int
+    kv_parallel_rank: int
+    kv_token_sharding: str
+    local_num_heads: int
+    local_num_kv_heads: int
+    local_inter_dim: int
+    query_head_start: int
+    query_head_end: int
+    kv_head_start: int
+    kv_head_end: int
+    local_decode_context_tokens: int | None
+    local_cache_position: int | None
+    owns_current_kv_token: bool
+    external_collectives: tuple[str, ...]
+
+
+def _decoder_rank_partition(
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    inter_dim: int,
+    tensor_parallel_degree: int,
+    tensor_parallel_rank: int,
+    kv_parallel_degree: int,
+    kv_parallel_rank: int,
+    kv_token_sharding: str,
+    decode_context_tokens: int | None,
+    external_packed_kv_cache: bool,
+) -> DecoderRankPartition:
+    """Validate a critical rank and derive all local dimensions exactly."""
+
+    coordinates = {
+        "tensor_parallel_degree": tensor_parallel_degree,
+        "tensor_parallel_rank": tensor_parallel_rank,
+        "kv_parallel_degree": kv_parallel_degree,
+        "kv_parallel_rank": kv_parallel_rank,
+    }
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in coordinates.values()):
+        raise TypeError("parallel degrees and ranks must be integers")
+    if tensor_parallel_degree <= 0 or kv_parallel_degree <= 0:
+        raise ValueError("parallel degrees must be positive")
+    if not 0 <= tensor_parallel_rank < tensor_parallel_degree:
+        raise ValueError("tensor_parallel_rank is outside tensor_parallel_degree")
+    if not 0 <= kv_parallel_rank < kv_parallel_degree:
+        raise ValueError("kv_parallel_rank is outside kv_parallel_degree")
+    if kv_token_sharding != "round_robin":
+        raise ValueError("KV token sharding must be round_robin")
+    if num_heads % tensor_parallel_degree:
+        raise ValueError("tensor parallelism must divide the query-head count")
+    if num_kv_heads % tensor_parallel_degree:
+        raise ValueError("tensor parallelism must divide the KV-head count")
+    if inter_dim % tensor_parallel_degree:
+        raise ValueError("tensor parallelism must divide the FFN intermediate width")
+    if (
+        tensor_parallel_degree > 1 or kv_parallel_degree > 1
+    ) and not (external_packed_kv_cache and decode_context_tokens is not None):
+        raise ValueError(
+            "distributed decoder lowering requires trace-only external PackedKV decode"
+        )
+
+    local_num_heads = num_heads // tensor_parallel_degree
+    local_num_kv_heads = num_kv_heads // tensor_parallel_degree
+    local_inter_dim = inter_dim // tensor_parallel_degree
+    query_head_start = tensor_parallel_rank * local_num_heads
+    kv_head_start = tensor_parallel_rank * local_num_kv_heads
+
+    local_context = None
+    local_cache_position = None
+    owns_current_token = False
+    if external_packed_kv_cache:
+        assert decode_context_tokens is not None
+        owner_rank = (decode_context_tokens - 1) % kv_parallel_degree
+        owns_current_token = kv_parallel_rank == owner_rank
+        if not owns_current_token:
+            raise ValueError(
+                "critical-rank lowering requires the KVP rank that owns the current token"
+            )
+        local_context = (
+            1
+            + (decode_context_tokens - 1 - kv_parallel_rank)
+            // kv_parallel_degree
+            if kv_parallel_rank < decode_context_tokens
+            else 0
+        )
+        if local_context <= 0:
+            raise ValueError("critical KVP rank has no local cache tokens")
+        local_cache_position = (decode_context_tokens - 1) // kv_parallel_degree
+        if local_cache_position != local_context - 1:
+            raise AssertionError("round-robin owner tail mapping is inconsistent")
+
+    collectives = []
+    if tensor_parallel_degree > 1:
+        collectives.extend(
+            (
+                "attention_output_all_reduce",
+                "ffn_down_output_all_reduce",
+            )
+        )
+    if kv_parallel_degree > 1:
+        collectives.append("attention_logsumexp_reduce")
+
+    return DecoderRankPartition(
+        tensor_parallel_degree=tensor_parallel_degree,
+        tensor_parallel_rank=tensor_parallel_rank,
+        kv_parallel_degree=kv_parallel_degree,
+        kv_parallel_rank=kv_parallel_rank,
+        kv_token_sharding=kv_token_sharding,
+        local_num_heads=local_num_heads,
+        local_num_kv_heads=local_num_kv_heads,
+        local_inter_dim=local_inter_dim,
+        query_head_start=query_head_start,
+        query_head_end=query_head_start + local_num_heads,
+        kv_head_start=kv_head_start,
+        kv_head_end=kv_head_start + local_num_kv_heads,
+        local_decode_context_tokens=local_context,
+        local_cache_position=local_cache_position,
+        owns_current_kv_token=owns_current_token,
+        external_collectives=tuple(collectives),
+    )
+
+
+@dataclass(frozen=True)
+class TensorShape:
+    """Shape-only tensor metadata used by trace-only decoder lowering."""
+
+    shape: tuple[int, ...]
+
+    def numel(self) -> int:
+        result = 1
+        for value in self.shape:
+            result *= value
+        return result
 
 
 @dataclass
@@ -534,6 +678,42 @@ def _pad_decoder_weights_for_tiles(
     )
 
 
+def _decoder_weight_shapes_for_trace(
+    model_cfg,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    padded_hidden: int,
+    padded_inter: int,
+    padded_head_dim: int,
+    head_packing: AttentionHeadPacking | None,
+) -> LayerWeights:
+    """Return exact padded weight shapes without materializing model tensors."""
+
+    if head_packing is not None:
+        query_width = num_kv_heads * head_packing.group_width
+        kv_width = head_packing.head_slot_dim
+    else:
+        query_width = num_heads * padded_head_dim
+        kv_width = padded_head_dim
+    return LayerWeights(
+        w_q=TensorShape((padded_hidden, query_width)),
+        w_o=TensorShape((query_width, padded_hidden)),
+        w_k_heads=[
+            TensorShape((padded_hidden, kv_width))
+            for _ in range(num_kv_heads)
+        ],
+        w_v_heads=[
+            TensorShape((padded_hidden, kv_width))
+            for _ in range(num_kv_heads)
+        ],
+        w_gate=TensorShape((padded_hidden, padded_inter)),
+        w_up=TensorShape((padded_hidden, padded_inter)),
+        w_down=TensorShape((padded_inter, padded_hidden)),
+        eps=model_cfg.eps,
+    )
+
+
 def _pad_vector(vector: torch.Tensor, cols: int) -> torch.Tensor:
     if vector.numel() > cols:
         raise ValueError(f"Cannot pad vector of length {vector.numel()} to {cols}")
@@ -687,6 +867,41 @@ def _save_residual_and_norm(prog, source, scratch):
     ops.rms_norm(prog, source, eps_offset=3, reci_hid_offset=4)
 
 
+def _load_qk_norm_patterns(prog, layer_inputs, layer_idx: int):
+    """Load compact Q/K affine patterns when the model uses per-head norm."""
+
+    q_pattern = layer_inputs.q_norm_pattern
+    k_pattern = layer_inputs.k_norm_pattern
+    if (q_pattern is None) != (k_pattern is None):
+        raise ValueError("Q/K norm lowering requires both affine patterns")
+    if q_pattern is None:
+        return None, None
+    return (
+        prog.load_batch(q_pattern, name=f"Q_norm_pattern_{layer_idx}"),
+        prog.load_batch(k_pattern, name=f"K_norm_pattern_{layer_idx}"),
+    )
+
+
+def _apply_segmented_qk_norm(
+    prog,
+    tensor,
+    affine_pattern,
+    *,
+    head_dim: int,
+) -> None:
+    """Normalize every packed head independently and apply its shared affine."""
+
+    if affine_pattern is None:
+        return
+    prog.segmented_affine_rms_norm(
+        tensor,
+        affine_pattern,
+        segment_width=head_dim,
+        eps_offset=3,
+        reci_segment_offset=6,
+    )
+
+
 def _add_residual(prog, target, scratch):
     prog.vram_add(target, scratch)
     return target
@@ -737,10 +952,59 @@ def _emit_kv_stores(
     checkpoint_recorder: StageCheckpointRecorder | None = None,
     active_seq_len: int | None = None,
     active_head_dim: int | None = None,
+    packed_cache_layout: PackedKVLayout | None = None,
+    packed_value_cache_layout: PackedKVLayout | None = None,
+    external_packed_cache: tuple[Any, Any] | None = None,
+    cache_position: int | None = None,
+    batch_size: int = 1,
+    rows_per_batch: int | None = None,
+    cache_rows_per_batch: int | None = None,
+    k_norm_pattern=None,
+    qk_norm_head_dim: int | None = None,
 ):
     rope_matrix, cos_var, sin_var = rope_inputs
     kv_stored = []
     active_seq_len = active_seq_len or current.shape[0]
+    packed_k = packed_v = pack_scratch = None
+    if packed_cache_layout is not None:
+        if packed_value_cache_layout is None:
+            raise ValueError("PackedKV lowering requires a value-cache layout")
+        if packed_cache_layout.kv_heads != num_kv_heads:
+            raise ValueError(
+                f"PackedKV layout has {packed_cache_layout.kv_heads} heads, "
+                f"expected {num_kv_heads}"
+            )
+        if physical_rows is None:
+            raise ValueError("PackedKV lowering requires an explicit physical row count")
+        packed_shape = (physical_rows, packed_cache_layout.mlen)
+        packed_k = prog.alloc(
+            f"K_packed_{layer_idx}",
+            current.shape[0],
+            packed_cache_layout.mlen,
+            strict=False,
+            physical_shape=packed_shape,
+        )
+        packed_v = prog.alloc(
+            f"V_packed_{layer_idx}",
+            current.shape[0],
+            packed_cache_layout.mlen,
+            strict=False,
+            physical_shape=packed_shape,
+        )
+        pack_scratch = prog.alloc(
+            f"KV_pack_scratch_{layer_idx}",
+            1,
+            packed_cache_layout.mlen,
+            strict=False,
+            physical_shape=(1, packed_cache_layout.mlen),
+        )
+        prog.vram_fill_zero(packed_k)
+        prog.vram_fill_zero(packed_v)
+        if external_packed_cache is not None:
+            if cache_position is None:
+                raise ValueError("external PackedKV cache requires a cache position")
+            if rows_per_batch is None or cache_rows_per_batch is None:
+                raise ValueError("external PackedKV cache requires independent batch slabs")
     for kv_h in range(num_kv_heads):
         kv_physical_shape = None
         if physical_rows is not None:
@@ -781,6 +1045,25 @@ def _emit_kv_stores(
                 semantic=f"V projection for KV head {kv_h}",
             )
 
+        if k_norm_pattern is not None:
+            if qk_norm_head_dim is None:
+                raise ValueError("K norm lowering requires the native head dimension")
+            _apply_segmented_qk_norm(
+                prog,
+                K_h,
+                k_norm_pattern,
+                head_dim=qk_norm_head_dim,
+            )
+            if checkpoint_recorder is not None:
+                checkpoint_recorder.record(
+                    prog,
+                    layer_idx=layer_idx,
+                    stage=f"k_norm_h{kv_h}",
+                    tensor=K_h,
+                    active_shape=(active_seq_len, checkpoint_cols),
+                    semantic=f"per-head RMS-normalized K projection for KV head {kv_h}",
+                )
+
         _apply_rope_projection(
             prog,
             K_h,
@@ -799,13 +1082,87 @@ def _emit_kv_stores(
                 semantic=f"K projection for KV head {kv_h} after RoPE",
             )
 
-        K_stored = prog.store(K_h, name=f"K_stored_{layer_idx}_h{kv_h}")
-        V_stored = prog.store(V_h, name=f"V_stored_{layer_idx}_h{kv_h}")
-        kv_stored.append((K_stored, V_stored))
+        if packed_cache_layout is None:
+            K_stored = prog.store(
+                K_h,
+                name=f"K_stored_{layer_idx}_h{kv_h}",
+                precision=1,
+                precision_role="key",
+            )
+            V_stored = prog.store(
+                V_h,
+                name=f"V_stored_{layer_idx}_h{kv_h}",
+                precision=1,
+                precision_role="value",
+            )
+            kv_stored.append((K_stored, V_stored))
+        else:
+            for source, target, layout in (
+                (K_h, packed_k, packed_cache_layout),
+                (V_h, packed_v, packed_value_cache_layout),
+            ):
+                prog._pack_o_head_to_output(
+                    o_head=source,
+                    output_base_address=prog.get_vram_addr(target.name),
+                    output_physical_rows=physical_rows,
+                    head_slot=kv_h,
+                    head_slot_dim=layout.head_dim,
+                    rows=current.shape[0],
+                    scratch_address=prog.get_vram_addr(pack_scratch.name),
+                )
 
         prog.free_tensor(K_h)
         prog.free_tensor(V_h)
 
+    if packed_cache_layout is not None:
+        if external_packed_cache is not None:
+            K_cache, V_cache = external_packed_cache
+            prog.append_packed_kv_batch(
+                packed_k,
+                K_cache,
+                cache_position=cache_position,
+                batch_size=batch_size,
+                source_rows_per_batch=rows_per_batch,
+                cache_rows_per_batch=cache_rows_per_batch,
+                packed_layout=packed_cache_layout,
+                role="key",
+            )
+            prog.append_packed_kv_batch(
+                packed_v,
+                V_cache,
+                cache_position=cache_position,
+                batch_size=batch_size,
+                source_rows_per_batch=rows_per_batch,
+                cache_rows_per_batch=cache_rows_per_batch,
+                packed_layout=packed_value_cache_layout,
+                role="value",
+            )
+            prog.free_tensor(packed_k)
+            prog.free_tensor(packed_v)
+            prog.free_tensor(pack_scratch)
+            return K_cache, V_cache
+        K_stored = prog.store(
+            packed_k,
+            name=f"K_packed_stored_{layer_idx}",
+            precision=1,
+            hbm_element_width=packed_cache_layout.element_bits,
+            hbm_block_size=packed_cache_layout.block_size,
+            hbm_scale_width=packed_cache_layout.scale_bits,
+            precision_role="key",
+        )
+        V_stored = prog.store(
+            packed_v,
+            name=f"V_packed_stored_{layer_idx}",
+            precision=1,
+            hbm_element_width=packed_value_cache_layout.element_bits,
+            hbm_block_size=packed_value_cache_layout.block_size,
+            hbm_scale_width=packed_value_cache_layout.scale_bits,
+            precision_role="value",
+        )
+        prog.free_tensor(packed_k)
+        prog.free_tensor(packed_v)
+        prog.free_tensor(pack_scratch)
+        return K_stored, V_stored
     return kv_stored
 
 
@@ -829,6 +1186,12 @@ def _emit_packed_attention_block(
     batch_size: int = 1,
     rows_per_batch: int | None = None,
     active_seq_len_per_batch: int | None = None,
+    packed_cache_layout: PackedKVLayout | None = None,
+    packed_value_cache_layout: PackedKVLayout | None = None,
+    external_packed_cache: tuple[Any, Any] | None = None,
+    cache_tokens: int | None = None,
+    cache_rows_per_batch: int | None = None,
+    kv_head_reuse: bool = True,
 ):
     active_seq_len = active_seq_len or seq_len
     active_hidden = active_hidden or current.shape[1]
@@ -841,6 +1204,17 @@ def _emit_packed_attention_block(
             f"rows_per_batch={rows_per_batch} cannot cover active_seq_len={active_seq_len_per_batch}"
         )
     total_physical_rows = batch_size * rows_per_batch if batch_size > 1 else max(prog.mlen, seq_len)
+    if packed_cache_layout is not None:
+        if packed_value_cache_layout is None:
+            raise ValueError("packed attention requires a value-cache layout")
+        for layout in (packed_cache_layout, packed_value_cache_layout):
+            validate_selector_lowering(
+                layout,
+                mlen=prog.mlen,
+                kv_heads=num_kv_heads,
+                head_dim=head_packing.head_slot_dim,
+                batch_size=batch_size,
+            )
     if checkpoint_recorder is not None:
         checkpoint_recorder.record(
             prog,
@@ -862,6 +1236,12 @@ def _emit_packed_attention_block(
             semantic="attention RMS-normalized input",
         )
 
+    q_norm_pattern, k_norm_pattern = _load_qk_norm_patterns(
+        prog,
+        layer_inputs,
+        layer_idx,
+    )
+
     q_physical_shape = (total_physical_rows, head_packing.total_q_dim)
     Q = _linear_projection(
         prog,
@@ -880,6 +1260,23 @@ def _emit_packed_attention_block(
             active_shape=(active_seq_len, head_packing.total_q_dim),
             semantic="packed Q projection before RoPE",
         )
+    if q_norm_pattern is not None:
+        _apply_segmented_qk_norm(
+            prog,
+            Q,
+            q_norm_pattern,
+            head_dim=head_dim,
+        )
+        if checkpoint_recorder is not None:
+            checkpoint_recorder.record(
+                prog,
+                layer_idx=layer_idx,
+                stage="q_norm",
+                tensor=Q,
+                active_shape=(active_seq_len, head_packing.total_q_dim),
+                semantic="per-head RMS-normalized packed Q projection",
+            )
+        prog.free_tensor(q_norm_pattern)
 
     O_full = prog.alloc(
         f"O_full_{layer_idx}",
@@ -902,7 +1299,18 @@ def _emit_packed_attention_block(
         checkpoint_recorder=checkpoint_recorder,
         active_seq_len=active_seq_len,
         active_head_dim=head_packing.head_slot_dim,
+        packed_cache_layout=packed_cache_layout,
+        packed_value_cache_layout=packed_value_cache_layout,
+        external_packed_cache=external_packed_cache,
+        cache_position=(cache_tokens - 1 if cache_tokens is not None else None),
+        batch_size=batch_size,
+        rows_per_batch=rows_per_batch,
+        cache_rows_per_batch=cache_rows_per_batch,
+        k_norm_pattern=k_norm_pattern,
+        qk_norm_head_dim=head_dim,
     )
+    if k_norm_pattern is not None:
+        prog.free_tensor(k_norm_pattern)
 
     scratch_rows = prog.mlen * (head_packing.broadcast_amount + ratio)
     attn_scratch = prog.alloc(
@@ -936,9 +1344,64 @@ def _emit_packed_attention_block(
                 f"Q_rot_{layer_idx}_g{kv_h}",
             )
             q_groups.append(Q_group)
+    elif packed_cache_layout is not None:
+        batch_q_stride = rows_per_batch * prog.mlen
+        for batch_idx in range(batch_size):
+            for kv_h in range(num_kv_heads):
+                Q_group = prog.alloc_at(
+                    f"Q_group{kv_h}_b{batch_idx}_{layer_idx}",
+                    active_seq_len_per_batch,
+                    prog.mlen,
+                    (
+                        q_full_addr
+                        + kv_h * q_group_stride
+                        + batch_idx * batch_q_stride
+                    ),
+                    physical_shape=(rows_per_batch, prog.mlen),
+                )
+                _apply_rope_projection(
+                    prog,
+                    Q_group,
+                    rope_matrix,
+                    cos_var,
+                    sin_var,
+                    f"Q_rot_{layer_idx}_g{kv_h}_b{batch_idx}",
+                )
+                prog.free_tensor(Q_group)
 
     roll_kv_groups = os.environ.get("PLENA_ROLL_KV_GROUPS", "1") != "0"
-    if batch_size == 1 and roll_kv_groups and num_kv_heads > 1:
+    if packed_cache_layout is not None:
+        K_packed, V_packed = kv_stored
+        attention_tokens = (
+            cache_tokens
+            if external_packed_cache is not None
+            else active_seq_len_per_batch
+        )
+        prog.flash_attention_packed_cache(
+            Q,
+            K_packed,
+            V_packed,
+            num_kv_heads=num_kv_heads,
+            group_heads=ratio,
+            head_slot_dim=head_packing.head_slot_dim,
+            output_base_address=o_full_addr,
+            scratch_base_address=attn_scratch_addr,
+            broadcast_amount=head_packing.broadcast_amount,
+            scale=scale,
+            causal_mask=(False if external_packed_cache is not None else causal_mask),
+            valid_cols=attention_tokens,
+            cache_position=(
+                attention_tokens - 1
+                if active_seq_len_per_batch == 1
+                else None
+            ),
+            batch_size=batch_size,
+            rows_per_batch=rows_per_batch,
+            query_rows_per_batch=active_seq_len_per_batch,
+            cache_rows_per_batch=cache_rows_per_batch,
+            kv_head_reuse=kv_head_reuse,
+        )
+    elif batch_size == 1 and roll_kv_groups and num_kv_heads > 1:
         prog.flash_attention_packed_groups_looped(
             Q,
             kv_stored,
@@ -1086,6 +1549,12 @@ def _emit_attention_block(
             semantic="attention RMS-normalized input",
         )
 
+    q_norm_pattern, k_norm_pattern = _load_qk_norm_patterns(
+        prog,
+        layer_inputs,
+        layer_idx,
+    )
+
     Q = _linear_projection(
         prog,
         current,
@@ -1103,6 +1572,23 @@ def _emit_attention_block(
             active_shape=(active_seq_len, total_q_dim),
             semantic="Q projection before per-head RoPE",
         )
+    if q_norm_pattern is not None:
+        _apply_segmented_qk_norm(
+            prog,
+            Q,
+            q_norm_pattern,
+            head_dim=head_dim,
+        )
+        if checkpoint_recorder is not None:
+            checkpoint_recorder.record(
+                prog,
+                layer_idx=layer_idx,
+                stage="q_norm",
+                tensor=Q,
+                active_shape=(active_seq_len, total_q_dim),
+                semantic="per-head RMS-normalized Q projection",
+            )
+        prog.free_tensor(q_norm_pattern)
 
     O_full = prog.alloc(
         f"O_full_{layer_idx}",
@@ -1132,7 +1618,11 @@ def _emit_attention_block(
         checkpoint_recorder=checkpoint_recorder,
         active_seq_len=active_seq_len,
         active_head_dim=head_dim,
+        k_norm_pattern=k_norm_pattern,
+        qk_norm_head_dim=head_dim,
     )
+    if k_norm_pattern is not None:
+        prog.free_tensor(k_norm_pattern)
 
     rope_matrix, cos_var, sin_var = rope_inputs
     q_h_phys = (total_physical_rows, head_dim) if batch_size > 1 else None
@@ -1644,19 +2134,41 @@ def _register_layer_inputs(
     layer_idx: int,
     weights: LayerWeights,
     physical_shapes: dict[str, tuple[int, int]] | None = None,
+    *,
+    qk_norm: bool = False,
 ) -> LayerInputVars:
     named_vars = {}
     w_k_heads = []
     w_v_heads = []
     physical_shapes = physical_shapes or {}
     for tensor_name, tensor in weights.tensor_entries(layer_idx):
-        var = prog.input(tensor_name, shape=tuple(tensor.shape), physical_shape=physical_shapes.get(tensor_name))
+        var = prog.input(
+            tensor_name,
+            shape=tuple(tensor.shape),
+            physical_shape=physical_shapes.get(tensor_name),
+            precision_role="weight",
+        )
         if tensor_name.startswith(f"W_k_{layer_idx}_h"):
             w_k_heads.append(var)
         elif tensor_name.startswith(f"W_v_{layer_idx}_h"):
             w_v_heads.append(var)
         else:
             named_vars[tensor_name[: tensor_name.rfind(f"_{layer_idx}")]] = var
+
+    q_norm_pattern = None
+    k_norm_pattern = None
+    if qk_norm:
+        pattern_shape = (prog.hbm_v_prefetch_amount, prog.mlen)
+        q_norm_pattern = prog.input(
+            f"W_q_norm_{layer_idx}",
+            shape=pattern_shape,
+            precision_role="weight",
+        )
+        k_norm_pattern = prog.input(
+            f"W_k_norm_{layer_idx}",
+            shape=pattern_shape,
+            precision_role="weight",
+        )
 
     return LayerInputVars(
         w_q=named_vars["W_q"],
@@ -1666,6 +2178,8 @@ def _register_layer_inputs(
         w_gate=named_vars["W_gate"],
         w_up=named_vars["W_up"],
         w_down=named_vars["W_down"],
+        q_norm_pattern=q_norm_pattern,
+        k_norm_pattern=k_norm_pattern,
     )
 
 
@@ -1847,7 +2361,7 @@ def _vision_position_ids(vision_model, *, batch_size: int, patches_h: int, patch
 def _pixel_values_to_raw_storage(pixel_values: torch.Tensor, *, w_padded: int) -> torch.Tensor:
     """Convert B=1 NCHW pixels to conv2d_plena's raw HBM row layout."""
     if pixel_values.shape[0] != 1:
-        raise NotImplementedError("native vision compile currently supports batch_size=1")
+        raise NotImplementedError("native vision compile supports batch_size=1")
     _, channels, height, width = pixel_values.shape
     if w_padded < width:
         raise ValueError(f"w_padded={w_padded} cannot cover image width {width}")
@@ -2149,7 +2663,10 @@ def _weight_physical_shapes_for_layer(
     return physical_shapes
 
 
-def _tensor_layout_metadata(prog, input_tensors: dict[str, torch.Tensor]) -> dict[str, dict[str, list[int] | int]]:
+def _tensor_layout_metadata(
+    prog,
+    input_tensors: dict[str, torch.Tensor],
+) -> dict[str, dict[str, Any]]:
     layouts = {}
     for name, tensor in input_tensors.items():
         hbm_layout = prog.hbm_matrices.get(name)
@@ -2168,6 +2685,10 @@ def _tensor_layout_metadata(prog, input_tensors: dict[str, torch.Tensor]) -> dic
             "logical_shape": list(hbm_layout.full_shape),
             "source_row_elements": source_shape[-1],
             "storage_row_elements": storage_shape[-1],
+            "precision_role": hbm_layout.precision_role,
+            "hbm_element_width": hbm_layout.hbm_element_width,
+            "hbm_block_size": hbm_layout.hbm_block_size,
+            "hbm_scale_width": hbm_layout.hbm_scale_width,
         }
     return layouts
 
@@ -2202,7 +2723,7 @@ def compile_native_hf_vision_encoder(
             print(message)
 
     if batch_size != 1:
-        raise NotImplementedError("native vision compile currently supports batch_size=1")
+        raise NotImplementedError("native vision compile supports batch_size=1")
     if seq_len <= 0:
         raise ValueError(f"seq_len must be positive, got {seq_len}")
 
@@ -2210,12 +2731,12 @@ def compile_native_hf_vision_encoder(
     model_cfg = extract_vision_config(model)
     if hidden_size is not None and hidden_size != model_cfg.hidden_size:
         raise ValueError(
-            f"compile_native_hf_vision_encoder currently supports native hidden size only: "
+            f"compile_native_hf_vision_encoder supports native hidden size only: "
             f"requested {hidden_size}, model has {model_cfg.hidden_size}"
         )
     if inter_dim is not None and inter_dim != model_cfg.inter_dim:
         raise ValueError(
-            f"compile_native_hf_vision_encoder currently supports native inter_dim only: "
+            f"compile_native_hf_vision_encoder supports native inter_dim only: "
             f"requested {inter_dim}, model has {model_cfg.inter_dim}"
         )
 
@@ -2623,7 +3144,6 @@ def compile_native_hf_vision_encoder(
         raise AssertionError(f"Vision compiler emitted {emitted_stage!r}, expected {output_stage!r}")
 
     isa_code = prog.compile()
-    isa_code = _fix_large_immediates(isa_code)
     lines = isa_code.splitlines()
     print(f"\nGenerated {len(lines)} lines of vision ISA code")
 
@@ -2880,6 +3400,25 @@ def compile_native_hf_decoder(
     component: str = "decoder",
     vision_stop_after: str | None = None,
     decoder_input_embeds: torch.Tensor | None = None,
+    packed_kv_layout: PackedKVLayout | None = None,
+    packed_value_layout: PackedKVLayout | None = None,
+    decode_context_tokens: int | None = None,
+    external_packed_kv_cache: bool = False,
+    trace_only: bool = False,
+    output_head_location: str | None = None,
+    weight_element_bits: int = 8,
+    weight_block_size: int = 8,
+    weight_scale_bits: int = 8,
+    weight_storage_format: str = "mxint",
+    kv_storage_format: str = "mxint",
+    key_storage_format: str | None = None,
+    value_storage_format: str | None = None,
+    tensor_parallel_degree: int = 1,
+    kv_parallel_degree: int = 1,
+    tensor_parallel_rank: int = 0,
+    kv_parallel_rank: int = 0,
+    kv_token_sharding: str = "round_robin",
+    kv_head_reuse: bool = True,
 ) -> dict:
     """Compile a HuggingFace decoder model at native dimensions to PLENA ISA metadata."""
     component = component.lower()
@@ -2912,16 +3451,52 @@ def compile_native_hf_decoder(
 
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if not isinstance(kv_head_reuse, bool):
+        raise TypeError("kv_head_reuse must be boolean")
+    if min(weight_element_bits, weight_block_size, weight_scale_bits) <= 0:
+        raise ValueError("weight storage widths and block size must be positive")
+    weight_storage_format = str(weight_storage_format).lower()
+    kv_storage_format = str(kv_storage_format).lower()
+    key_storage_format = str(key_storage_format or kv_storage_format).lower()
+    value_storage_format = str(value_storage_format or kv_storage_format).lower()
+    storage_formats = {"mxint", "mxfp"}
+    if weight_storage_format not in storage_formats:
+        raise ValueError("weight_storage_format must be 'mxint' or 'mxfp'")
+    if kv_storage_format not in storage_formats:
+        raise ValueError("kv_storage_format must be 'mxint' or 'mxfp'")
+    if key_storage_format not in storage_formats:
+        raise ValueError("key_storage_format must be 'mxint' or 'mxfp'")
+    if value_storage_format not in storage_formats:
+        raise ValueError("value_storage_format must be 'mxint' or 'mxfp'")
+    if packed_value_layout is not None and packed_kv_layout is None:
+        raise ValueError("packed_value_layout requires packed_kv_layout")
+    if external_packed_kv_cache:
+        if not trace_only:
+            raise ValueError("external PackedKV cache lowering is trace-only")
+        if packed_kv_layout is None:
+            raise ValueError("external PackedKV cache lowering requires a layout")
+        if seq_len != 1:
+            raise ValueError("external PackedKV cache lowering requires q_len=1")
+        if (
+            isinstance(decode_context_tokens, bool)
+            or not isinstance(decode_context_tokens, int)
+            or decode_context_tokens <= 1
+        ):
+            raise ValueError("decode context must include past tokens and the current token")
+        if not isinstance(output_head_location, str) or not output_head_location.strip():
+            raise ValueError("trace-only full-model decode requires explicit output-head ownership")
+    elif decode_context_tokens is not None:
+        raise ValueError("decode context is only valid with an external PackedKV cache")
 
     model_cfg = extract_model_config(model)
     if hidden_size is not None and hidden_size != model_cfg.hidden_size:
         raise ValueError(
-            f"compile_native_hf_decoder currently supports native hidden size only: "
+            f"compile_native_hf_decoder supports native hidden size only: "
             f"requested {hidden_size}, model has {model_cfg.hidden_size}"
         )
     if inter_dim is not None and inter_dim != model_cfg.inter_dim:
         raise ValueError(
-            f"compile_native_hf_decoder currently supports native inter_dim only: "
+            f"compile_native_hf_decoder supports native inter_dim only: "
             f"requested {inter_dim}, model has {model_cfg.inter_dim}"
         )
     hidden = model_cfg.hidden_size
@@ -2931,6 +3506,21 @@ def compile_native_hf_decoder(
     head_dim = model_cfg.head_dim
     total_q_dim = model_cfg.total_q_dim
     ratio = model_cfg.head_ratio
+    rank_partition = _decoder_rank_partition(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        inter_dim=inter,
+        tensor_parallel_degree=tensor_parallel_degree,
+        tensor_parallel_rank=tensor_parallel_rank,
+        kv_parallel_degree=kv_parallel_degree,
+        kv_parallel_rank=kv_parallel_rank,
+        kv_token_sharding=kv_token_sharding,
+        decode_context_tokens=decode_context_tokens,
+        external_packed_kv_cache=external_packed_kv_cache,
+    )
+    local_num_heads = rank_partition.local_num_heads
+    local_num_kv_heads = rank_partition.local_num_kv_heads
+    local_inter = rank_partition.local_inter_dim
     # Rows only need enough physical lanes for the matrix writeback group
     # (BLEN), not a full MLEN block. Columns/K dimensions still use MLEN
     # until the vector, norm, RoPE, and FFN templates learn true tail masks.
@@ -2959,6 +3549,7 @@ def compile_native_hf_decoder(
     checkpoint_rows = compile_seq_rows if batch_size > 1 else seq_len
     padded_hidden = _ceil_to_multiple(hidden, mlen)
     padded_inter = _ceil_to_multiple(inter, mlen)
+    local_padded_inter = _ceil_to_multiple(local_inter, mlen)
     padded_head_dim = _ceil_to_multiple(head_dim, mlen)
     if attention_head_packing is None:
         attention_head_packing = hlen is not None and broadcast_amount is not None and head_dim < mlen
@@ -2982,17 +3573,71 @@ def compile_native_hf_decoder(
             broadcast_amount=broadcast_amount,
             head_slot_dim=hlen,
             group_width=mlen,
-            total_q_dim=num_kv_heads * mlen,
+            total_q_dim=local_num_kv_heads * mlen,
         )
     else:
         head_packing = None
-    padded_total_q_dim = head_packing.total_q_dim if head_packing is not None else num_heads * padded_head_dim
+    if model_cfg.qk_norm:
+        if not trace_only:
+            raise NotImplementedError(
+                "native Q/K RMSNorm requires trace_only=True; "
+                "numeric reference and weight staging remain fail-closed"
+            )
+        if head_dim <= 0 or head_dim > mlen or mlen % head_dim:
+            raise ValueError(
+                "Q/K RMSNorm requires head_dim to divide MLEN so every head "
+                "maps to an exact vector-mask segment"
+            )
+        if mlen // head_dim > 32:
+            raise ValueError("Q/K RMSNorm exceeds the 32-segment vector mask")
+        if head_packing is not None and head_packing.head_slot_dim != head_dim:
+            raise ValueError(
+                "packed Q/K RMSNorm requires head_slot_dim == head_dim"
+            )
+    if packed_kv_layout is not None:
+        if head_packing is None:
+            raise ValueError("PackedKV requires attention_head_packing")
+        packed_value_layout = packed_value_layout or packed_kv_layout
+        for layout in (packed_kv_layout, packed_value_layout):
+            validate_selector_lowering(
+                layout,
+                mlen=mlen,
+                kv_heads=local_num_kv_heads,
+                head_dim=head_packing.head_slot_dim,
+                batch_size=batch_size,
+            )
+        key_geometry = (
+            packed_kv_layout.kv_heads,
+            packed_kv_layout.head_dim,
+            packed_kv_layout.mlen,
+            packed_kv_layout.block_size,
+            packed_kv_layout.scale_bits,
+        )
+        value_geometry = (
+            packed_value_layout.kv_heads,
+            packed_value_layout.head_dim,
+            packed_value_layout.mlen,
+            packed_value_layout.block_size,
+            packed_value_layout.scale_bits,
+        )
+        if key_geometry != value_geometry:
+            raise ValueError(
+                "PackedKV key/value layouts may differ only in element width"
+            )
+    else:
+        packed_value_layout = None
+    padded_total_q_dim = (
+        head_packing.total_q_dim
+        if head_packing is not None
+        else local_num_heads * padded_head_dim
+    )
     padding_enabled = (
         padded_seq_len != seq_len
         or rows_per_batch != seq_len
         or batch_size != 1
         or padded_hidden != hidden
         or padded_inter != inter
+        or local_padded_inter != local_inter
         or padded_head_dim != head_dim
         or head_packing is not None
     )
@@ -3018,12 +3663,21 @@ def compile_native_hf_decoder(
         f"  compile: batch_size={batch_size}, seq_len={seq_len}, mlen={mlen}, blen={blen}, "
         f"mram_tile_capacity={mram_tile_capacity}, total_q_dim={total_q_dim}"
     )
+    if tensor_parallel_degree > 1 or kv_parallel_degree > 1:
+        print(
+            "  rank: "
+            f"TP={tensor_parallel_rank}/{tensor_parallel_degree}, "
+            f"KVP={kv_parallel_rank}/{kv_parallel_degree}, "
+            f"local heads={local_num_heads}/{local_num_kv_heads}, "
+            f"local inter={local_inter}"
+        )
     if padding_enabled:
         print(
             "  tile padding: "
             f"seq_len={seq_len}->{padded_seq_len}, rows_per_batch={rows_per_batch}, "
             f"hidden={hidden}->{padded_hidden}, "
             f"inter={inter}->{padded_inter}, "
+            f"local_inter={local_inter}->{local_padded_inter}, "
             f"head_dim={head_dim}->{padded_head_dim}, "
             f"total_q_dim={total_q_dim}->{padded_total_q_dim}"
         )
@@ -3033,40 +3687,69 @@ def compile_native_hf_decoder(
             f"head_dim={head_dim}, hlen={head_packing.hlen}, "
             f"broadcast_amount={head_packing.broadcast_amount}, "
             f"group_width={head_packing.group_width}, "
-            f"q_groups={num_kv_heads}"
+            f"q_groups={local_num_kv_heads}"
         )
     print("=" * 80)
 
     # ----------------------------------------------------------- weights
-    print(f"\nExtracting weights from layers {layer_idx_start}..{layer_idx_start + n_layers - 1}...")
-    all_weights = []
-    for i in range(n_layers):
-        layer_module = layers[layer_idx_start + i]
-        w = extract_layer_weights(layer_module, model_cfg)
-        all_weights.append(w)
-        _verbose(
-            f"  Layer {i}: W_q={w.w_q.shape}, W_o={w.w_o.shape}, "
-            f"W_gate={w.w_gate.shape}, "
-            f"K_heads={len(w.w_k_heads)}x{w.w_k_heads[0].shape}, eps={w.eps}"
+    if trace_only:
+        print(
+            f"\nRegistering shape-only weights for layers "
+            f"{layer_idx_start}..{layer_idx_start + n_layers - 1}..."
         )
-    compile_weights = [
-        _pad_decoder_weights_for_tiles(
-            w,
+        shape_weights = _decoder_weight_shapes_for_trace(
             model_cfg,
+            num_heads=local_num_heads,
+            num_kv_heads=local_num_kv_heads,
             padded_hidden=padded_hidden,
-            padded_inter=padded_inter,
+            padded_inter=local_padded_inter,
             padded_head_dim=padded_head_dim,
             head_packing=head_packing,
         )
-        for w in all_weights
-    ]
+        all_weights = [shape_weights for _ in range(n_layers)]
+        compile_weights = all_weights
+    else:
+        print(
+            f"\nExtracting weights from layers "
+            f"{layer_idx_start}..{layer_idx_start + n_layers - 1}..."
+        )
+        all_weights = []
+        for i in range(n_layers):
+            layer_module = layers[layer_idx_start + i]
+            w = extract_layer_weights(layer_module, model_cfg)
+            all_weights.append(w)
+            _verbose(
+                f"  Layer {i}: W_q={w.w_q.shape}, W_o={w.w_o.shape}, "
+                f"W_gate={w.w_gate.shape}, "
+                f"K_heads={len(w.w_k_heads)}x{w.w_k_heads[0].shape}, eps={w.eps}"
+            )
+        compile_weights = [
+            _pad_decoder_weights_for_tiles(
+                w,
+                model_cfg,
+                padded_hidden=padded_hidden,
+                padded_inter=padded_inter,
+                padded_head_dim=padded_head_dim,
+                head_packing=head_packing,
+            )
+            for w in all_weights
+        ]
 
     eps = all_weights[0].eps
 
     torch.manual_seed(seed)
 
     decoder_input_source = "decoder_input_embeds" if decoder_input_embeds is not None else None
-    if decoder_input_embeds is not None:
+    if trace_only:
+        decoder_input_source = "trace_shape_only"
+        token_shape = (
+            (seq_len, hidden)
+            if batch_size == 1
+            else (batch_size, seq_len, hidden)
+        )
+        token_embeds = TensorShape(token_shape)
+        pos_weight = TensorShape(token_shape)
+    elif decoder_input_embeds is not None:
         token_embeds = decoder_input_embeds.detach().float()
         if token_embeds.dim() == 2:
             if batch_size != 1:
@@ -3116,136 +3799,162 @@ def compile_native_hf_decoder(
         token_embeds = torch.randn(seq_len, hidden) if batch_size == 1 else torch.randn(batch_size, seq_len, hidden)
         print(f"\nNo embed_tokens found; using random token_embeds: {token_embeds.shape}")
 
-    # Llama-style models use RoPE (not learned position embeddings).
-    # Set pos_weight to zeros so embedding_add is a no-op for position.
-    pos_weight = torch.zeros_like(token_embeds)
-    compile_token_embeds = _pad_batched_sequence_storage(
-        token_embeds,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
-        cols=padded_hidden,
-    )
-    compile_pos_weight = _pad_batched_sequence_storage(
-        pos_weight,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
-        cols=padded_hidden,
-    )
+    # Llama-style models use RoPE rather than learned position embeddings.
+    if trace_only:
+        compile_token_embeds = TensorShape((compile_seq_rows, padded_hidden))
+        compile_pos_weight = TensorShape((compile_seq_rows, padded_hidden))
+    else:
+        pos_weight = torch.zeros_like(token_embeds)
+        compile_token_embeds = _pad_batched_sequence_storage(
+            token_embeds,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            rows_per_batch=rows_per_batch,
+            cols=padded_hidden,
+        )
+        compile_pos_weight = _pad_batched_sequence_storage(
+            pos_weight,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            rows_per_batch=rows_per_batch,
+            cols=padded_hidden,
+        )
 
     _verbose(f"pos_weight: zeros {pos_weight.shape} (RoPE model; learned position add is a no-op)")
     for i in range(n_layers):
-        for kv_h in range(num_kv_heads):
+        for kv_h in range(local_num_kv_heads):
             _verbose(
                 f"  W_k_{i}_h{kv_h}: {all_weights[i].w_k_heads[kv_h].shape}, "
                 f"W_v_{i}_h{kv_h}: {all_weights[i].w_v_heads[kv_h].shape}"
             )
     print(f"attn_scale: {scale:.6f}")
 
-    R_matrix, cos_table, sin_table = make_rope_inputs(seq_len, model_cfg)
-    if head_packing is not None:
-        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = _pad_rope_inputs_for_head_slots(
-            R_matrix,
-            cos_table,
-            sin_table,
-            padded_seq_len=padded_seq_len,
-            group_width=head_packing.group_width,
-            head_slot_dim=head_packing.head_slot_dim,
-            broadcast_amount=head_packing.broadcast_amount,
-        )
-        rope_width = head_packing.group_width
+    rope_width = (
+        head_packing.group_width
+        if head_packing is not None
+        else padded_head_dim
+    )
+    if trace_only:
+        R_matrix = TensorShape((head_dim, head_dim))
+        cos_table = TensorShape((seq_len, head_dim))
+        sin_table = TensorShape((seq_len, head_dim))
+        compile_R_matrix = TensorShape((rope_width, rope_width))
+        compile_cos_table = TensorShape((compile_seq_rows, rope_width))
+        compile_sin_table = TensorShape((compile_seq_rows, rope_width))
     else:
-        compile_R_matrix, per_sequence_cos_table, per_sequence_sin_table = _pad_rope_inputs_for_tiles(
-            R_matrix,
-            cos_table,
-            sin_table,
-            padded_seq_len=padded_seq_len,
-            padded_head_dim=padded_head_dim,
+        rope_positions = decode_context_tokens or seq_len
+        R_matrix, full_cos_table, full_sin_table = make_rope_inputs(
+            rope_positions,
+            model_cfg,
         )
-        rope_width = padded_head_dim
-    compile_cos_table = _repeat_sequence_storage(
-        per_sequence_cos_table,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
-    )
-    compile_sin_table = _repeat_sequence_storage(
-        per_sequence_sin_table,
-        batch_size=batch_size,
-        seq_len=seq_len,
-        rows_per_batch=rows_per_batch,
-    )
+        cos_table = full_cos_table[-seq_len:]
+        sin_table = full_sin_table[-seq_len:]
+        if head_packing is not None:
+            (
+                compile_R_matrix,
+                per_sequence_cos_table,
+                per_sequence_sin_table,
+            ) = _pad_rope_inputs_for_head_slots(
+                R_matrix,
+                cos_table,
+                sin_table,
+                padded_seq_len=padded_seq_len,
+                group_width=head_packing.group_width,
+                head_slot_dim=head_packing.head_slot_dim,
+                broadcast_amount=head_packing.broadcast_amount,
+            )
+        else:
+            (
+                compile_R_matrix,
+                per_sequence_cos_table,
+                per_sequence_sin_table,
+            ) = _pad_rope_inputs_for_tiles(
+                R_matrix,
+                cos_table,
+                sin_table,
+                padded_seq_len=padded_seq_len,
+                padded_head_dim=padded_head_dim,
+            )
+        compile_cos_table = _repeat_sequence_storage(
+            per_sequence_cos_table,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            rows_per_batch=rows_per_batch,
+        )
+        compile_sin_table = _repeat_sequence_storage(
+            per_sequence_sin_table,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            rows_per_batch=rows_per_batch,
+        )
 
     golden_policy = ReferencePrecision.from_mode(golden_precision)
     reference_backend = reference_backend.lower()
-    print(f"\nComputing CPU golden reference ({golden_policy.label}, backend={reference_backend})")
-    if reference_backend == "scheduled":
-        scheduled_cfg = ScheduledReferenceConfig(
-            seq_len=seq_len,
-            padded_seq_len=padded_seq_len,
-            batch_size=batch_size,
-            rows_per_batch=rows_per_batch,
-            hidden_size=hidden,
-            padded_hidden_size=padded_hidden,
-            inter_dim=inter,
-            padded_inter_dim=padded_inter,
-            head_dim=head_dim,
-            padded_head_dim=padded_head_dim,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            mlen=mlen,
-            blen=blen,
-            max_k_tiles=mram_tile_capacity,
-            attention_head_packing=head_packing is not None,
-            head_slot_dim=head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
-            broadcast_amount=head_packing.broadcast_amount if head_packing is not None else None,
-            total_q_dim=padded_total_q_dim,
-        )
-        padded_golden_output = run_native_decoder_scheduled_reference(
-            compile_token_embeds,
-            compile_pos_weight,
-            compile_weights,
-            scheduled_cfg,
-            compile_R_matrix,
-            compile_cos_table,
-            compile_sin_table,
-            precision=golden_policy,
-            trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
-        )
-        golden_out = _compact_active_sequence_rows(
-            padded_golden_output,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            rows_per_batch=rows_per_batch,
-            cols=hidden,
-        )
-    elif reference_backend == "legacy":
-        if batch_size != 1:
-            raise NotImplementedError("legacy reference_backend does not support batch_size > 1")
-        golden_out = run_decoder_reference(
-            token_embeds,
-            pos_weight,
-            all_weights,
-            model_cfg,
-            R_matrix,
-            cos_table,
-            sin_table,
-            mlen=mlen,
-            max_k_tiles=mram_tile_capacity,
-            precision=golden_policy,
-            trace=lambda i, x: _verbose(f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"),
-        )
-        padded_golden_output = _pad_2d(golden_out, padded_seq_len, padded_hidden)
+    if trace_only:
+        golden_out = None
+        padded_golden_output = None
+        hf_ground_truth = None
     else:
-        raise ValueError("reference_backend must be 'scheduled' or 'legacy'")
-    print(f"  golden_out: {golden_out.shape}")
-    _verbose(f"  golden_out[0,:4]: {golden_out[0, :4].tolist()}")
-
-    print(f"\nComputing HF reference (float32, {n_layers} layer{'s' if n_layers != 1 else ''}, no quantization)")
-    with torch.no_grad():
-        if batch_size == 1:
-            hf_ground_truth = run_decoder_reference(
+        print(
+            f"\nComputing CPU golden reference "
+            f"({golden_policy.label}, backend={reference_backend})"
+        )
+        if reference_backend == "scheduled":
+            scheduled_cfg = ScheduledReferenceConfig(
+                seq_len=seq_len,
+                padded_seq_len=padded_seq_len,
+                batch_size=batch_size,
+                rows_per_batch=rows_per_batch,
+                hidden_size=hidden,
+                padded_hidden_size=padded_hidden,
+                inter_dim=inter,
+                padded_inter_dim=padded_inter,
+                head_dim=head_dim,
+                padded_head_dim=padded_head_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                mlen=mlen,
+                blen=blen,
+                max_k_tiles=mram_tile_capacity,
+                attention_head_packing=head_packing is not None,
+                head_slot_dim=(
+                    head_packing.head_slot_dim
+                    if head_packing is not None
+                    else padded_head_dim
+                ),
+                broadcast_amount=(
+                    head_packing.broadcast_amount
+                    if head_packing is not None
+                    else None
+                ),
+                total_q_dim=padded_total_q_dim,
+            )
+            padded_golden_output = run_native_decoder_scheduled_reference(
+                compile_token_embeds,
+                compile_pos_weight,
+                compile_weights,
+                scheduled_cfg,
+                compile_R_matrix,
+                compile_cos_table,
+                compile_sin_table,
+                precision=golden_policy,
+                trace=lambda i, x: _verbose(
+                    f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"
+                ),
+            )
+            golden_out = _compact_active_sequence_rows(
+                padded_golden_output,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                rows_per_batch=rows_per_batch,
+                cols=hidden,
+            )
+        elif reference_backend == "legacy":
+            if batch_size != 1:
+                raise NotImplementedError(
+                    "legacy reference_backend does not support batch_size > 1"
+                )
+            golden_out = run_decoder_reference(
                 token_embeds,
                 pos_weight,
                 all_weights,
@@ -3255,31 +3964,66 @@ def compile_native_hf_decoder(
                 sin_table,
                 mlen=mlen,
                 max_k_tiles=mram_tile_capacity,
-                precision=ReferencePrecision.from_mode("hf_fp32"),
-                trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
+                precision=golden_policy,
+                trace=lambda i, x: _verbose(
+                    f"  After layer {i}: X_gold[0,:4] = {x[0, :4].tolist()}"
+                ),
+            )
+            padded_golden_output = _pad_2d(
+                golden_out,
+                padded_seq_len,
+                padded_hidden,
             )
         else:
-            padded_hf_output = run_native_decoder_scheduled_reference(
-                compile_token_embeds,
-                compile_pos_weight,
-                compile_weights,
-                scheduled_cfg,
-                compile_R_matrix,
-                compile_cos_table,
-                compile_sin_table,
-                precision=ReferencePrecision.from_mode("hf_fp32"),
-                trace=lambda i, x: _verbose(f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"),
-            )
-            hf_ground_truth = _compact_active_sequence_rows(
-                padded_hf_output,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                rows_per_batch=rows_per_batch,
-                cols=hidden,
-            )
+            raise ValueError("reference_backend must be 'scheduled' or 'legacy'")
+        print(f"  golden_out: {golden_out.shape}")
+        _verbose(f"  golden_out[0,:4]: {golden_out[0, :4].tolist()}")
 
-    print(f"  hf_ground_truth: {hf_ground_truth.shape}")
-    _verbose(f"  hf_ground_truth[0,:4]: {hf_ground_truth[0, :4].tolist()}")
+        print(
+            f"\nComputing HF reference (float32, {n_layers} "
+            f"layer{'s' if n_layers != 1 else ''}, no quantization)"
+        )
+        with torch.no_grad():
+            if batch_size == 1:
+                hf_ground_truth = run_decoder_reference(
+                    token_embeds,
+                    pos_weight,
+                    all_weights,
+                    model_cfg,
+                    R_matrix,
+                    cos_table,
+                    sin_table,
+                    mlen=mlen,
+                    max_k_tiles=mram_tile_capacity,
+                    precision=ReferencePrecision.from_mode("hf_fp32"),
+                    trace=lambda i, x: _verbose(
+                        f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"
+                    ),
+                )
+            else:
+                padded_hf_output = run_native_decoder_scheduled_reference(
+                    compile_token_embeds,
+                    compile_pos_weight,
+                    compile_weights,
+                    scheduled_cfg,
+                    compile_R_matrix,
+                    compile_cos_table,
+                    compile_sin_table,
+                    precision=ReferencePrecision.from_mode("hf_fp32"),
+                    trace=lambda i, x: _verbose(
+                        f"  After layer {i}: X_hf[0,:4] = {x[0, :4].tolist()}"
+                    ),
+                )
+                hf_ground_truth = _compact_active_sequence_rows(
+                    padded_hf_output,
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    rows_per_batch=rows_per_batch,
+                    cols=hidden,
+                )
+
+        print(f"  hf_ground_truth: {hf_ground_truth.shape}")
+        _verbose(f"  hf_ground_truth[0,:4]: {hf_ground_truth[0, :4].tolist()}")
 
     # ----------------------------------------------------------- PLENA ISA
     print("\n--- PLENA Backend (ISA generation) ---")
@@ -3291,12 +4035,26 @@ def compile_native_hf_decoder(
         blen=blen,
         real_data_ratio=REAL_DATA_RATIO,
         mram_tile_capacity=mram_tile_capacity,
+        hbm_element_width=weight_element_bits,
+        hbm_block_size=weight_block_size,
+        hbm_scale_width=weight_scale_bits,
     )
     if hlen is not None:
         prog.hlen = hlen
     if broadcast_amount is not None:
         prog.broadcast_amount = broadcast_amount
     checkpoints = StageCheckpointRecorder(enabled=stage_checkpoints)
+    cache_rows_per_batch = None
+    if external_packed_kv_cache:
+        local_context_tokens = rank_partition.local_decode_context_tokens
+        assert local_context_tokens is not None
+        cache_rows_per_batch = _ceil_to_multiple(
+            max(
+                mlen,
+                local_context_tokens + prog.hbm_v_writeback_amount - 1,
+            ),
+            mlen,
+        )
 
     # Shared inputs
     sequence_physical_shape = (compile_seq_rows, padded_hidden)
@@ -3312,8 +4070,12 @@ def compile_native_hf_decoder(
 
     # Causal mask: (mlen, mlen) with 0 on/below diagonal, -inf above.
     # Bidirectional models (e.g. LLaDA) use an all-zero mask.
-    causal_mask_data = torch.zeros(mlen, mlen)
-    if model_cfg.model_type != "llada":
+    causal_mask_data = (
+        TensorShape((mlen, mlen))
+        if trace_only
+        else torch.zeros(mlen, mlen)
+    )
+    if not trace_only and model_cfg.model_type != "llada":
         causal_mask_data.masked_fill_(
             torch.triu(torch.ones(mlen, mlen), diagonal=1).bool(), float('-inf')
         )
@@ -3322,6 +4084,7 @@ def compile_native_hf_decoder(
 
     # Per-layer weight inputs (order determines HBM layout)
     layer_inputs = []
+    packed_cache_inputs = []
     for i in range(n_layers):
         layer_inputs.append(
             _register_layer_inputs(
@@ -3334,8 +4097,36 @@ def compile_native_hf_decoder(
                     head_packing=head_packing,
                     padded_head_dim=padded_head_dim,
                 ),
+                qk_norm=model_cfg.qk_norm,
             )
         )
+        if external_packed_kv_cache:
+            cache_physical_shape = (
+                batch_size * cache_rows_per_batch,
+                packed_kv_layout.mlen,
+            )
+            packed_cache_inputs.append(
+                (
+                    prog.input(
+                        f"K_cache_{i}",
+                        shape=cache_physical_shape,
+                        physical_shape=cache_physical_shape,
+                        hbm_element_width=packed_kv_layout.element_bits,
+                        hbm_block_size=packed_kv_layout.block_size,
+                        hbm_scale_width=packed_kv_layout.scale_bits,
+                        precision_role="key",
+                    ),
+                    prog.input(
+                        f"V_cache_{i}",
+                        shape=cache_physical_shape,
+                        physical_shape=cache_physical_shape,
+                        hbm_element_width=packed_value_layout.element_bits,
+                        hbm_block_size=packed_value_layout.block_size,
+                        hbm_scale_width=packed_value_layout.scale_bits,
+                        precision_role="value",
+                    ),
+                )
+            )
 
     # Load activations to VRAM
     X_batch = prog.load_batch(x_input, name="X")
@@ -3380,7 +4171,7 @@ def compile_native_hf_decoder(
                 i,
                 padded_seq_len,
                 head_dim,
-                num_kv_heads,
+                local_num_kv_heads,
                 ratio,
                 head_packing,
                 checkpoints,
@@ -3389,6 +4180,16 @@ def compile_native_hf_decoder(
                 batch_size=batch_size,
                 rows_per_batch=rows_per_batch,
                 active_seq_len_per_batch=seq_len,
+                packed_cache_layout=packed_kv_layout,
+                packed_value_cache_layout=packed_value_layout,
+                external_packed_cache=(
+                    packed_cache_inputs[i]
+                    if external_packed_kv_cache
+                    else None
+                ),
+                cache_tokens=rank_partition.local_decode_context_tokens,
+                cache_rows_per_batch=cache_rows_per_batch,
+                kv_head_reuse=kv_head_reuse,
             )
         else:
             current_after_attn = _emit_attention_block(
@@ -3403,8 +4204,8 @@ def compile_native_hf_decoder(
                 padded_seq_len,
                 padded_head_dim,
                 padded_total_q_dim,
-                num_heads,
-                num_kv_heads,
+                local_num_heads,
+                local_num_kv_heads,
                 ratio,
                 checkpoints,
                 checkpoint_rows,
@@ -3437,8 +4238,8 @@ def compile_native_hf_decoder(
         semantic="decoder final RMS norm output",
     )
 
-    isa_code = prog.compile()
-    isa_code = _fix_large_immediates(isa_code)
+    compilation_artifact = prog.compile_with_trace()
+    isa_code = compilation_artifact.assembly
     lines = isa_code.splitlines()
     print(f"\nGenerated {len(lines)} lines of ISA code")
 
@@ -3457,6 +4258,24 @@ def compile_native_hf_decoder(
         for name, tensor in compile_weights[i].tensor_entries(i):
             input_tensors[name] = tensor
             data_order.append(name)
+        if model_cfg.qk_norm:
+            for name, pattern in (
+                (f"W_q_norm_{i}", layer_inputs[i].q_norm_pattern),
+                (f"W_k_norm_{i}", layer_inputs[i].k_norm_pattern),
+            ):
+                if pattern is None:
+                    raise AssertionError("Q/K norm input registration is incomplete")
+                input_tensors[name] = TensorShape(tuple(pattern.shape))
+                data_order.append(name)
+        if external_packed_kv_cache:
+            cache_shape = (
+                batch_size * cache_rows_per_batch,
+                packed_kv_layout.mlen,
+            )
+            for role in ("K", "V"):
+                name = f"{role}_cache_{i}"
+                input_tensors[name] = TensorShape(cache_shape)
+                data_order.append(name)
     tensor_layouts = _tensor_layout_metadata(prog, input_tensors)
 
     # FPRAM layout (same as single-layer decoder):
@@ -3466,7 +4285,8 @@ def compile_native_hf_decoder(
     #   slot 3 = eps         (rms_norm, offset=3)
     #   slot 4 = 1/hidden    (rms_norm, offset=4)
     #   slot 5 = 1.0         (FFN SiLU)
-    #   slots 6-9 = 0.0      (padding)
+    #   slot 6 = 1/head_dim  (per-head Q/K RMSNorm, when enabled)
+    #   slots 7-9 = 0.0      (padding)
     # slot 2 must be a large NEGATIVE FINITE, not -inf: it is the padded-column score
     # mask (program_attention._build_valid_col_mask loads f7 from FP_SRAM[2]) and the
     # packed-attention col-mask buffer VRAM-aliases O_proj's tile-align padding rows.
@@ -3475,7 +4295,15 @@ def compile_native_hf_decoder(
     # (x)*0 = 0. NOTE: fp_preload is cast to float16 in create_sim_env (max ~65504),
     # so use a value WITHIN float16 range (not -1e30, which overflows to -inf).
     # -6e4 still masks (exp(score - 6e4) = 0) and its square stays finite.
-    fp_preload = [0.0, scale, -6.0e4, eps, 1.0 / hidden, 1.0] + [0.0] * 4
+    fp_preload = [
+        0.0,
+        scale,
+        -6.0e4,
+        eps,
+        1.0 / hidden,
+        1.0,
+        1.0 / head_dim if model_cfg.qk_norm else 0.0,
+    ] + [0.0] * 3
 
     # Result is at current's VRAM location
     o_vram_addr = prog.get_vram_addr(current.name)
@@ -3515,6 +4343,8 @@ def compile_native_hf_decoder(
         "inter_dim": inter,
         "padded_hidden_size": padded_hidden,
         "padded_inter_dim": padded_inter,
+        "local_inter_dim": local_inter,
+        "local_padded_inter_dim": local_padded_inter,
         "num_layers": n_layers,
         "batch_size": batch_size,
         "seq_len": seq_len,
@@ -3526,12 +4356,127 @@ def compile_native_hf_decoder(
         "padded_head_dim": padded_head_dim,
         "attention_head_packing": head_packing is not None,
         "attention_head_slot_dim": head_packing.head_slot_dim if head_packing is not None else padded_head_dim,
-        "attention_kv_storage_head_dim": padded_head_dim,
+        "attention_kv_storage_head_dim": (
+            packed_kv_layout.mlen if packed_kv_layout is not None else padded_head_dim
+        ),
+        "packed_kv_layout_id": (
+            packed_kv_layout.layout_id if packed_kv_layout is not None else None
+        ),
+        "packed_kv_selector_enabled": packed_kv_layout is not None,
+        "packed_kv_row_bytes": (
+            packed_kv_layout.packed_row_bytes if packed_kv_layout is not None else None
+        ),
+        "packed_kv_element_bits": (
+            packed_kv_layout.element_bits if packed_kv_layout is not None else None
+        ),
+        "packed_key_layout_id": (
+            packed_kv_layout.layout_id if packed_kv_layout is not None else None
+        ),
+        "packed_value_layout_id": (
+            packed_value_layout.layout_id if packed_value_layout is not None else None
+        ),
+        "packed_key_row_bytes": (
+            packed_kv_layout.packed_row_bytes if packed_kv_layout is not None else None
+        ),
+        "packed_value_row_bytes": (
+            packed_value_layout.packed_row_bytes if packed_value_layout is not None else None
+        ),
+        "packed_key_element_bits": (
+            packed_kv_layout.element_bits if packed_kv_layout is not None else None
+        ),
+        "packed_value_element_bits": (
+            packed_value_layout.element_bits if packed_value_layout is not None else None
+        ),
+        "packed_key_block_size": (
+            packed_kv_layout.block_size if packed_kv_layout is not None else None
+        ),
+        "packed_value_block_size": (
+            packed_value_layout.block_size if packed_value_layout is not None else None
+        ),
+        "packed_key_scale_bits": (
+            packed_kv_layout.scale_bits if packed_kv_layout is not None else None
+        ),
+        "packed_value_scale_bits": (
+            packed_value_layout.scale_bits if packed_value_layout is not None else None
+        ),
+        "decode_context_tokens": decode_context_tokens,
+        "local_decode_context_tokens": (
+            rank_partition.local_decode_context_tokens
+        ),
+        "local_cache_position": rank_partition.local_cache_position,
+        "owns_current_kv_token": rank_partition.owns_current_kv_token,
+        "kv_append_enabled": (
+            external_packed_kv_cache
+            and rank_partition.owns_current_kv_token
+        ),
+        "external_packed_kv_cache": external_packed_kv_cache,
+        "cache_rows_per_batch": cache_rows_per_batch,
+        "trace_only": trace_only,
+        "compiled_qk_norm": model_cfg.qk_norm,
+        "qk_norm_segment_width": head_dim if model_cfg.qk_norm else None,
+        "qk_norm_reciprocal_fp_offset": 6 if model_cfg.qk_norm else None,
+        "qk_norm_affine_storage_shape": (
+            [prog.hbm_v_prefetch_amount, mlen]
+            if model_cfg.qk_norm
+            else None
+        ),
+        "qk_norm_affine_pattern": (
+            "shared_head_weight_repeated_per_mlen_vector"
+            if model_cfg.qk_norm
+            else None
+        ),
+        "artifact_scope": (
+            FULL_MODEL_DECODE_SCOPE
+            if external_packed_kv_cache
+            else None
+        ),
+        "output_head_included": False,
+        "output_head_location": output_head_location,
+        "compiled_sram_policy": "streaming",
+        "compiled_kv_head_reuse": (
+            head_packing is not None and kv_head_reuse
+        ),
+        "tensor_parallel_degree": tensor_parallel_degree,
+        "kv_parallel_degree": kv_parallel_degree,
+        "tensor_parallel_rank": tensor_parallel_rank,
+        "kv_parallel_rank": kv_parallel_rank,
+        "kv_token_sharding": kv_token_sharding,
+        "local_num_heads": local_num_heads,
+        "local_num_kv_heads": local_num_kv_heads,
+        "tensor_parallel_query_head_range": [
+            rank_partition.query_head_start,
+            rank_partition.query_head_end,
+        ],
+        "tensor_parallel_kv_head_range": [
+            rank_partition.kv_head_start,
+            rank_partition.kv_head_end,
+        ],
+        "local_padded_query_width": padded_total_q_dim,
+        "local_packed_kv_active_elements": (
+            packed_kv_layout.active_elements
+            if packed_kv_layout is not None
+            else None
+        ),
+        "local_kv_head_selector_count": (
+            packed_kv_layout.kv_heads
+            if packed_kv_layout is not None
+            else None
+        ),
+        "communication_lowering": "external_collectives",
+        "external_collectives": list(rank_partition.external_collectives),
+        "weight_element_bits": weight_element_bits,
+        "weight_block_size": weight_block_size,
+        "weight_scale_bits": weight_scale_bits,
+        "weight_storage_format": weight_storage_format,
+        "kv_storage_format": kv_storage_format,
+        "key_storage_format": key_storage_format,
+        "value_storage_format": value_storage_format,
         "attention_broadcast_amount": head_packing.broadcast_amount if head_packing is not None else None,
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "mlen": mlen,
         "blen": blen,
+        "hlen": hlen,
         "mram_tile_capacity": mram_tile_capacity,
         "stage_checkpoints_enabled": stage_checkpoints,
         "stage_checkpoint_count": len(checkpoints.checkpoints or []),
@@ -3550,6 +4495,8 @@ def compile_native_hf_decoder(
             "inter_dim",
             "padded_hidden_size",
             "padded_inter_dim",
+            "local_inter_dim",
+            "local_padded_inter_dim",
             "num_layers",
             "batch_size",
             "seq_len",
@@ -3562,11 +4509,57 @@ def compile_native_hf_decoder(
             "attention_head_packing",
             "attention_head_slot_dim",
             "attention_kv_storage_head_dim",
+            "packed_kv_layout_id",
+            "packed_kv_selector_enabled",
+            "packed_kv_row_bytes",
+            "packed_kv_element_bits",
+            "packed_key_layout_id",
+            "packed_value_layout_id",
+            "packed_key_row_bytes",
+            "packed_value_row_bytes",
+            "packed_key_element_bits",
+            "packed_value_element_bits",
+            "packed_key_block_size",
+            "packed_value_block_size",
+            "packed_key_scale_bits",
+            "packed_value_scale_bits",
+            "local_decode_context_tokens",
+            "local_cache_position",
+            "owns_current_kv_token",
+            "kv_append_enabled",
+            "compiled_qk_norm",
+            "qk_norm_segment_width",
+            "qk_norm_reciprocal_fp_offset",
+            "qk_norm_affine_storage_shape",
+            "qk_norm_affine_pattern",
+            "weight_element_bits",
+            "weight_block_size",
+            "weight_scale_bits",
+            "weight_storage_format",
+            "kv_storage_format",
+            "key_storage_format",
+            "value_storage_format",
             "attention_broadcast_amount",
             "num_heads",
             "num_kv_heads",
+            "local_num_heads",
+            "local_num_kv_heads",
+            "tensor_parallel_degree",
+            "kv_parallel_degree",
+            "tensor_parallel_rank",
+            "kv_parallel_rank",
+            "kv_token_sharding",
+            "tensor_parallel_query_head_range",
+            "tensor_parallel_kv_head_range",
+            "local_padded_query_width",
+            "local_packed_kv_active_elements",
+            "local_kv_head_selector_count",
+            "compiled_kv_head_reuse",
+            "communication_lowering",
+            "external_collectives",
             "mlen",
             "blen",
+            "hlen",
             "mram_tile_capacity",
         )
     }
@@ -3582,6 +4575,7 @@ def compile_native_hf_decoder(
 
     return {
         "isa": isa_code,
+        "compilation_artifact": compilation_artifact,
         "golden_output": golden_out,
         "padded_golden_output": padded_golden_output,
         "hf_ground_truth": hf_ground_truth,

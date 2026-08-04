@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from compiler.asm_templates import ffn_asm, preload_addr_reg_asm, reset_reg_asm
+from compiler.aten.plena.packed_kv import (
+    PackedKVAppendAddress,
+    PackedKVLayout,
+    resolve_packed_kv_append,
+)
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -18,6 +23,11 @@ class ProgramTensorMixin:
         hbm_addr: int | None = None,
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
+        hbm_row_width: int | None = None,
+        hbm_element_width: int | None = None,
+        hbm_block_size: int | None = None,
+        hbm_scale_width: int | None = None,
+        precision_role: str = "activation",
     ) -> InputVar:
         """
         Declare an input tensor (in HBM).
@@ -37,7 +47,13 @@ class ProgramTensorMixin:
         """
         h, w = physical_shape or shape
         size = h * w
-        hbm_size = self.hbm_tensor_size(size)
+        hbm_size = self.hbm_tensor_size(
+            size,
+            hbm_row_width=hbm_row_width,
+            hbm_element_width=hbm_element_width,
+            hbm_block_size=hbm_block_size,
+            hbm_scale_width=hbm_scale_width,
+        )
 
         if hbm_addr is None:
             hbm_addr = self._allocate_hbm(hbm_size)
@@ -58,6 +74,11 @@ class ProgramTensorMixin:
             shape=shape,
             physical_shape=physical_shape,
             real_data_ratio=self.real_data_ratio,
+            hbm_row_width=hbm_row_width,
+            hbm_element_width=hbm_element_width,
+            hbm_block_size=hbm_block_size,
+            hbm_scale_width=hbm_scale_width,
+            precision_role=precision_role,
         )
         return var
 
@@ -131,7 +152,18 @@ class ProgramTensorMixin:
     # Store Operations
     # ========================================================================
 
-    def store(self, tensor_var, name: str | None = None, hbm_addr: int | None = None) -> InputVar:
+    def store(
+        self,
+        tensor_var,
+        name: str | None = None,
+        hbm_addr: int | None = None,
+        precision: int = 0,
+        hbm_row_width: int | None = None,
+        hbm_element_width: int | None = None,
+        hbm_block_size: int | None = None,
+        hbm_scale_width: int | None = None,
+        precision_role: str | None = None,
+    ) -> InputVar:
         """
         Write tensor from VRAM back to HBM.
 
@@ -143,22 +175,42 @@ class ProgramTensorMixin:
 
         display_name = name if name is not None else f"{tensor_var.display_name}_stored"
         internal_name = self._scoped_name(display_name)
+        if precision_role is None:
+            precision_role = "key" if precision == 1 else "activation"
 
         if hbm_addr is None:
             h, w = tensor_var.physical_shape
             size = h * w
-            hbm_size = self.hbm_tensor_size(size)
+            hbm_size = self.hbm_tensor_size(
+                size,
+                hbm_row_width=hbm_row_width,
+                hbm_element_width=hbm_element_width,
+                hbm_block_size=hbm_block_size,
+                hbm_scale_width=hbm_scale_width,
+            )
             hbm_addr = self._allocate_hbm(hbm_size)
         else:
             h, w = tensor_var.physical_shape
-            hbm_size = self.hbm_tensor_size(h * w)
+            hbm_size = self.hbm_tensor_size(
+                h * w,
+                hbm_row_width=hbm_row_width,
+                hbm_element_width=hbm_element_width,
+                hbm_block_size=hbm_block_size,
+                hbm_scale_width=hbm_scale_width,
+            )
 
         super().store_to_hbm(
             tensor_name=tensor_var.name,  # internal name for symbol table lookup
             hbm_addr=hbm_addr,
             hbm_object_name=internal_name,
             vlen=self.mlen,
+            precision=precision,
             store_amount=self.hbm_v_writeback_amount,
+            hbm_row_width=hbm_row_width,
+            hbm_element_width=hbm_element_width,
+            hbm_block_size=hbm_block_size,
+            hbm_scale_width=hbm_scale_width,
+            precision_role=precision_role,
         )
 
         var = InputVar(
@@ -172,6 +224,170 @@ class ProgramTensorMixin:
         )
         self._inputs[internal_name] = var
         return var
+
+    def append_packed_kv_row(
+        self,
+        tensor_var: VRAMMatrixVar,
+        cache_var: InputVar,
+        *,
+        token_index: int,
+        packed_layout: PackedKVLayout,
+        role: str,
+    ) -> PackedKVAppendAddress:
+        """Append one logical cache row while preserving global MX planes."""
+
+        if not isinstance(tensor_var, VRAMMatrixVar):
+            raise TypeError("PackedKV append source must be a VRAMMatrixVar")
+        if not isinstance(cache_var, InputVar):
+            raise TypeError("PackedKV append destination must be an InputVar")
+        if role not in {"key", "value"}:
+            raise ValueError("PackedKV append role must be key or value")
+
+        cache_layout = self.get_hbm_layout(cache_var.name)
+        if cache_layout.precision_role != role:
+            raise ValueError("PackedKV cache precision role differs")
+        if tensor_var.shape[0] != 1:
+            raise ValueError("PackedKV append source must have logical q_len=1")
+        if tensor_var.shape[1] != packed_layout.active_elements:
+            raise ValueError(
+                "PackedKV append source width must equal kv_heads * head_dim"
+            )
+        if tensor_var.physical_shape[1] != packed_layout.mlen:
+            raise ValueError("PackedKV append source must be MLEN-wide")
+        transfer_rows = self.hbm_v_writeback_amount
+        if tensor_var.physical_shape[0] < transfer_rows:
+            raise ValueError(
+                "PackedKV append source lacks H_STORE_V padding rows"
+            )
+
+        positions = getattr(self, "_packed_kv_append_positions", None)
+        if positions is None:
+            positions = {}
+            self._packed_kv_append_positions = positions
+        expected = positions.setdefault(cache_var.name, cache_var.shape[0])
+        if token_index != expected:
+            raise ValueError(
+                f"PackedKV append expected token {expected}, got {token_index}"
+            )
+        address = resolve_packed_kv_append(
+            cache_layout,
+            packed_layout,
+            token_index=token_index,
+            transfer_rows=transfer_rows,
+        )
+        super().store_to_hbm(
+            tensor_name=tensor_var.name,
+            hbm_addr=cache_layout.hbm_base_addr,
+            hbm_object_name=None,
+            vlen=self.mlen,
+            precision=1,
+            store_amount=transfer_rows,
+            hbm_row_width=cache_layout.hbm_row_width,
+            hbm_element_width=cache_layout.hbm_element_width,
+            hbm_block_size=cache_layout.hbm_block_size,
+            hbm_scale_width=cache_layout.hbm_scale_width,
+            precision_role=role,
+            hbm_offset_bytes=address.element_offset_bytes,
+            hbm_element_plane_bytes=address.element_plane_bytes,
+            transfer_shape=(1, packed_layout.mlen),
+            bind_tensor_hbm=False,
+        )
+        positions[cache_var.name] = token_index + 1
+        return address
+
+    def append_packed_kv_batch(
+        self,
+        tensor_var: VRAMMatrixVar,
+        cache_var: InputVar,
+        *,
+        cache_position: int,
+        batch_size: int,
+        source_rows_per_batch: int,
+        cache_rows_per_batch: int,
+        packed_layout: PackedKVLayout,
+        role: str,
+    ) -> tuple[PackedKVAppendAddress, ...]:
+        """Append one q_len=1 row to every independent cache slab."""
+
+        if not isinstance(tensor_var, VRAMMatrixVar):
+            raise TypeError("PackedKV append source must be a VRAMMatrixVar")
+        if not isinstance(cache_var, InputVar):
+            raise TypeError("PackedKV append destination must be an InputVar")
+        if role not in {"key", "value"}:
+            raise ValueError("PackedKV append role must be key or value")
+        integer_values = (
+            cache_position,
+            batch_size,
+            source_rows_per_batch,
+            cache_rows_per_batch,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in integer_values):
+            raise TypeError("PackedKV batch append coordinates must be integers")
+        if cache_position < 0 or min(
+            batch_size,
+            source_rows_per_batch,
+            cache_rows_per_batch,
+        ) <= 0:
+            raise ValueError("PackedKV batch append coordinates are invalid")
+        if source_rows_per_batch % self.mlen:
+            raise ValueError("PackedKV source rows per batch must be a multiple of MLEN")
+        if cache_rows_per_batch % self.mlen:
+            raise ValueError("PackedKV cache rows per batch must be a multiple of MLEN")
+        if tensor_var.physical_shape != (
+            batch_size * source_rows_per_batch,
+            packed_layout.mlen,
+        ):
+            raise ValueError("PackedKV append source does not match the independent batch slabs")
+
+        cache_layout = self.get_hbm_layout(cache_var.name)
+        if cache_layout.precision_role != role:
+            raise ValueError("PackedKV cache precision role differs")
+        if cache_layout.physical_shape != (
+            batch_size * cache_rows_per_batch,
+            packed_layout.mlen,
+        ):
+            raise ValueError("PackedKV cache does not match the independent batch slabs")
+        if cache_position + self.hbm_v_writeback_amount > cache_rows_per_batch:
+            raise ValueError("PackedKV append transfer crosses a cache slab boundary")
+
+        source_base = self.get_vram_addr(tensor_var.name)
+        addresses = []
+        for batch_index in range(batch_size):
+            source_view = self.alloc_at(
+                f"{tensor_var.display_name}_append_b{batch_index}",
+                1,
+                packed_layout.active_elements,
+                source_base
+                + batch_index * source_rows_per_batch * packed_layout.mlen,
+                physical_shape=(source_rows_per_batch, packed_layout.mlen),
+            )
+            token_index = batch_index * cache_rows_per_batch + cache_position
+            address = resolve_packed_kv_append(
+                cache_layout,
+                packed_layout,
+                token_index=token_index,
+                transfer_rows=self.hbm_v_writeback_amount,
+            )
+            super().store_to_hbm(
+                tensor_name=source_view.name,
+                hbm_addr=cache_layout.hbm_base_addr,
+                hbm_object_name=None,
+                vlen=self.mlen,
+                precision=1,
+                store_amount=self.hbm_v_writeback_amount,
+                hbm_row_width=cache_layout.hbm_row_width,
+                hbm_element_width=cache_layout.hbm_element_width,
+                hbm_block_size=cache_layout.hbm_block_size,
+                hbm_scale_width=cache_layout.hbm_scale_width,
+                precision_role=role,
+                hbm_offset_bytes=address.element_offset_bytes,
+                hbm_element_plane_bytes=address.element_plane_bytes,
+                transfer_shape=(1, packed_layout.mlen),
+                bind_tensor_hbm=False,
+            )
+            self.free_tensor(source_view)
+            addresses.append(address)
+        return tuple(addresses)
 
     # ========================================================================
     # VRAM Matrix Allocation
@@ -319,9 +535,10 @@ class ProgramTensorMixin:
         reci_hid_offset: int = 2,
         vlen: int | None = None,
         scratchpad_vram_addr: int | None = None,
+        destination_var: TensorVar | None = None,
     ) -> TensorVar:
         """
-        Normalize tensor in-place.
+        Normalize a tensor, in-place or into a separate destination.
 
         Args:
             tensor_var: tensor to normalize (must have VRAM backing, e.g., VRAMMatrixVar)
@@ -330,12 +547,16 @@ class ProgramTensorMixin:
             reci_hid_offset: FPRAM address of 1/hidden_dim
             vlen: vector length (default: program mlen)
             scratchpad_vram_addr: optional scratchpad VRAM address
+            destination_var: write the normalized rows here and leave the input
+                intact, so the caller can keep it as a residual
 
         Returns:
-            The same tensor_var (in-place operation)
+            The tensor holding the normalized rows
         """
         if not isinstance(tensor_var, VRAMMatrixVar):
             raise TypeError(f"norm requires VRAMMatrixVar, got {type(tensor_var)}")
+        if destination_var is not None and not isinstance(destination_var, VRAMMatrixVar):
+            raise TypeError("norm destination must be a VRAMMatrixVar")
 
         super().normalize(
             tensor_name=tensor_var.name,
@@ -344,8 +565,9 @@ class ProgramTensorMixin:
             reci_hid_offset=reci_hid_offset,
             vlen=vlen,
             scratchpad_vram_addr=scratchpad_vram_addr,
+            destination_name=None if destination_var is None else destination_var.name,
         )
-        return tensor_var
+        return tensor_var if destination_var is None else destination_var
 
     def rms_norm(
         self,
@@ -354,8 +576,9 @@ class ProgramTensorMixin:
         reci_hid_offset: int = 2,
         vlen: int | None = None,
         scratchpad_vram_addr: int | None = None,
+        destination_var: TensorVar | None = None,
     ) -> TensorVar:
-        """RMS normalization (in-place)."""
+        """RMS normalization, in-place unless *destination_var* is given."""
         return self.norm(
             tensor_var=tensor_var,
             mode="rms",
@@ -363,6 +586,7 @@ class ProgramTensorMixin:
             reci_hid_offset=reci_hid_offset,
             vlen=vlen,
             scratchpad_vram_addr=scratchpad_vram_addr,
+            destination_var=destination_var,
         )
 
     def layer_norm(
@@ -382,6 +606,109 @@ class ProgramTensorMixin:
             vlen=vlen,
             scratchpad_vram_addr=scratchpad_vram_addr,
         )
+
+    def affine_rms_norm(
+        self,
+        tensor_var: TensorVar,
+        weight_var: TensorVar,
+        *,
+        eps_offset: int = 3,
+        reci_hid_offset: int = 4,
+        vlen: int | None = None,
+    ) -> TensorVar:
+        """Apply RMSNorm and an expanded learned affine weight."""
+
+        if not isinstance(tensor_var, VRAMMatrixVar):
+            raise TypeError("affine_rms_norm requires a VRAM activation")
+        if not isinstance(weight_var, VRAMMatrixVar):
+            raise TypeError("affine_rms_norm requires a VRAM weight")
+        if tensor_var.shape != weight_var.shape:
+            raise ValueError("affine RMSNorm weight must match the logical shape")
+        if tensor_var.physical_shape != weight_var.physical_shape:
+            raise ValueError("affine RMSNorm weight must match physical storage")
+
+        self.rms_norm(
+            tensor_var,
+            eps_offset=eps_offset,
+            reci_hid_offset=reci_hid_offset,
+            vlen=vlen,
+        )
+        self.vram_mul(tensor_var, weight_var, num_rows=tensor_var.shape[0])
+        return tensor_var
+
+    def segmented_affine_rms_norm(
+        self,
+        tensor_var: TensorVar,
+        weight_var: TensorVar,
+        *,
+        segment_width: int,
+        reci_segment_offset: int,
+        eps_offset: int = 3,
+        vlen: int | None = None,
+    ) -> TensorVar:
+        """Apply per-segment RMSNorm and a learned affine weight.
+
+        A full weight tensor preserves the original elementwise path. A
+        transfer-padded MLEN-wide pattern is reused across rows and column
+        blocks, which represents shared per-head Q/K norm weights compactly.
+        """
+
+        if not isinstance(tensor_var, VRAMMatrixVar):
+            raise TypeError("segmented RMSNorm requires a VRAM activation")
+        if not isinstance(weight_var, VRAMMatrixVar):
+            raise TypeError("segmented RMSNorm requires a VRAM weight")
+        expanded_weight = (
+            tensor_var.shape == weight_var.shape
+            and tensor_var.physical_shape == weight_var.physical_shape
+        )
+        compact_pattern = (
+            weight_var.shape[0] >= 1
+            and weight_var.shape[1] == self.mlen
+            and weight_var.physical_shape[0] >= 1
+            and weight_var.physical_shape[1] == self.mlen
+        )
+        if not expanded_weight and not compact_pattern:
+            raise ValueError(
+                "segmented RMSNorm weight must match the activation or be "
+                "an MLEN-wide broadcast pattern"
+            )
+        if compact_pattern and vlen not in (None, self.mlen):
+            raise ValueError("compact segmented RMSNorm weights require VLEN=MLEN")
+
+        super().segmented_rms_normalize(
+            tensor_var.name,
+            segment_width=segment_width,
+            eps_offset=eps_offset,
+            reci_segment_offset=reci_segment_offset,
+            vlen=vlen,
+        )
+        if expanded_weight:
+            self.vram_mul(tensor_var, weight_var, num_rows=tensor_var.shape[0])
+        else:
+            self.vram_broadcast_row_mul(
+                tensor_var,
+                weight_var,
+                num_rows=tensor_var.shape[0],
+            )
+        return tensor_var
+
+    def silu(
+        self,
+        tensor_var: TensorVar,
+        *,
+        const_one_fp_address: int = 5,
+        vlen: int | None = None,
+    ) -> TensorVar:
+        """Apply SiLU in-place."""
+
+        if not isinstance(tensor_var, VRAMMatrixVar):
+            raise TypeError("silu requires a VRAM activation")
+        super().silu(
+            tensor_var.name,
+            const_one_fp_address=const_one_fp_address,
+            vlen=vlen,
+        )
+        return tensor_var
 
     # ========================================================================
     # Composite Decoder Operations
@@ -412,6 +739,21 @@ class ProgramTensorMixin:
             physical_shape=(workspace_rows, mlen),
         )
         workspace_base_address = self.get_vram_addr(workspace.name)
+        gate_layout = self.get_hbm_layout(w_gate.name)
+        up_layout = self.get_hbm_layout(w_up.name)
+        down_layout = self.get_hbm_layout(w_down.name)
+        weight_widths = {
+            layout.hbm_element_width
+            for layout in (gate_layout, up_layout, down_layout)
+        }
+        if len(weight_widths) != 1:
+            raise ValueError("fused FFN weights must use one element width")
+        if (
+            gate_layout.element_plane_bytes != up_layout.element_plane_bytes
+            or gate_layout.element_stride_bytes(inter_dim)
+            != up_layout.element_stride_bytes(inter_dim)
+        ):
+            raise ValueError("fused FFN gate and up layouts must match")
 
         isa_code = preload_addr_reg_asm(
             addr_reg_to_set=[1, 2, 3],
@@ -427,7 +769,7 @@ class ProgramTensorMixin:
             seq_len=1,
             hidden_size=hidden_size,
             intermediate_size=inter_dim,
-            alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            alive_registers=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             gate_weight_hbm_offset_reg=1,
             up_weight_hbm_offset_reg=2,
             down_weight_hbm_offset_reg=3,
@@ -436,6 +778,11 @@ class ProgramTensorMixin:
             use_loop_instructions=use_loop_instructions,
             matrix_sram_size=self.mram_capacity_elems,
             workspace_base_address=workspace_base_address,
+            weight_element_bits=up_layout.hbm_element_width,
+            up_weight_element_plane_bytes=up_layout.element_plane_bytes,
+            up_weight_stride_bytes=up_layout.element_stride_bytes(inter_dim),
+            down_weight_element_plane_bytes=down_layout.element_plane_bytes,
+            down_weight_stride_bytes=down_layout.element_stride_bytes(hidden_size),
         )
 
         self.emit(isa_code)

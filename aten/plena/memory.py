@@ -145,7 +145,7 @@ class SubMatrixInfo:
     valid_shape: tuple[int, int] | None = None  # Logical rows/cols carried by this physical tile
 
     # Pre-calculated addresses (computed during compiler phase, used directly at runtime)
-    hbm_offset: int = 0  # Offset in HBM (in elements)
+    hbm_offset: int = 0  # Element-plane byte offset from the tensor base.
     mram_addr: int | None = None  # Address in MRAM (if loaded)
 
 
@@ -169,6 +169,11 @@ class MatrixBlockLayout:
     # HBM Address Information
     hbm_base_addr: int = 0
     hbm_size: int = 0  # Size after applying real_data_ratio (MXFP8 = 1.125)
+    hbm_row_width: int = 256
+    hbm_element_width: int = 8
+    hbm_block_size: int = 8
+    hbm_scale_width: int = 8
+    precision_role: str = "activation"
 
     # Sub-block map: (row_idx, col_idx) -> SubMatrixInfo
     sub_blocks: dict[tuple[int, int], SubMatrixInfo] = field(default_factory=dict)
@@ -188,8 +193,11 @@ class MatrixBlockLayout:
         # Create information for all sub-blocks (pre-calculate addresses)
         for r in range(self.num_row_blocks):
             for c in range(self.num_col_blocks):
-                # HBM offset (row-major): sub-block (r,c) starts at r*block_size*cols + c*block_size
-                hbm_offset = r * self.block_size * physical_cols + c * self.block_size
+                logical_offset = (
+                    r * self.block_size * physical_cols
+                    + c * self.block_size
+                )
+                hbm_offset = self.element_offset_bytes(logical_offset)
                 valid_rows = max(0, min(self.block_size, rows - r * self.block_size))
                 valid_cols = max(0, min(self.block_size, cols - c * self.block_size))
 
@@ -203,6 +211,63 @@ class MatrixBlockLayout:
                     mram_addr=None,
                 )
                 self.sub_blocks[(r, c)] = sub_info
+
+    @property
+    def row_bytes(self) -> int:
+        if self.hbm_row_width % 8:
+            raise ValueError("HBM row width must be byte aligned")
+        return self.hbm_row_width // 8
+
+    @property
+    def element_plane_bytes(self) -> int:
+        rows, cols = self.physical_shape or self.full_shape
+        logical_bytes = self.element_span_bytes(rows * cols)
+        return self._align_plane(logical_bytes)
+
+    @property
+    def scale_plane_bytes(self) -> int:
+        rows, cols = self.physical_shape or self.full_shape
+        elements = rows * cols
+        if elements % self.hbm_block_size:
+            raise ValueError("HBM tensor size must contain whole MX blocks")
+        scale_count = elements // self.hbm_block_size
+        logical_bits = scale_count * self.hbm_scale_width
+        logical_bytes = (logical_bits + 7) // 8
+        return self._align_plane(logical_bytes)
+
+    def _align_plane(self, byte_count: int) -> int:
+        row_bytes = self.row_bytes
+        return ((byte_count + row_bytes - 1) // row_bytes) * row_bytes
+
+    def element_span_bytes(self, element_count: int) -> int:
+        if element_count < 0:
+            raise ValueError("element count must be non-negative")
+        bits = element_count * self.hbm_element_width
+        if bits % 8:
+            raise ValueError(
+                "HBM element spans must begin and end on byte boundaries"
+            )
+        return bits // 8
+
+    def element_offset_bytes(self, logical_element_offset: int) -> int:
+        return self.element_span_bytes(logical_element_offset)
+
+    def scale_offset_bytes(self, logical_element_offset: int) -> int:
+        if logical_element_offset < 0:
+            raise ValueError("element offset must be non-negative")
+        if logical_element_offset % self.hbm_block_size:
+            raise ValueError("HBM scale offsets must begin on an MX block")
+        scale_bits = (
+            logical_element_offset
+            // self.hbm_block_size
+            * self.hbm_scale_width
+        )
+        if scale_bits % 8:
+            raise ValueError("HBM scale offsets must be byte aligned")
+        return scale_bits // 8
+
+    def element_stride_bytes(self, logical_element_stride: int) -> int:
+        return self.element_span_bytes(logical_element_stride)
 
     def get_sub_block(self, row_idx: int, col_idx: int) -> SubMatrixInfo:
         """Get specified sub-block"""

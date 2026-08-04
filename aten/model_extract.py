@@ -21,6 +21,7 @@ class ModelConfig:
     rope_theta: float
     vocab_size: int | None
     model_type: str
+    qk_norm: bool = False
 
     @property
     def total_q_dim(self) -> int:
@@ -249,16 +250,23 @@ def extract_model_config(model: Any) -> ModelConfig:
     num_kv_heads = getattr(config, "num_key_value_heads", None)
     if num_kv_heads is None:
         num_kv_heads = getattr(config, "n_kv_heads", num_heads)
+    model_type = str(getattr(config, "model_type", "unknown"))
+    qk_norm = getattr(config, "qk_norm", None)
+    if qk_norm is None:
+        qk_norm = getattr(config, "use_qk_norm", None)
+    if qk_norm is None:
+        qk_norm = model_type == "qwen3"
     return ModelConfig(
         hidden_size=hidden,
         inter_dim=inter_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
-        head_dim=hidden // num_heads,
+        head_dim=int(getattr(config, "head_dim", hidden // num_heads)),
         eps=getattr(config, "rms_norm_eps", 1e-5),
         rope_theta=getattr(config, "rope_theta", 10000.0),
         vocab_size=getattr(config, "vocab_size", None),
-        model_type=getattr(config, "model_type", "unknown"),
+        model_type=model_type,
+        qk_norm=bool(qk_norm),
     )
 
 

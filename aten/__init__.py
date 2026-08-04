@@ -9,6 +9,13 @@ from pathlib import Path
 PLENA_PKG_DIR = Path(__file__).parent
 NATIVE_OPS_YAML = PLENA_PKG_DIR / "native_ops.yaml"
 
+from compiler.aten.execution_trace import (  # noqa: E402, F401
+    CompilationArtifact,
+    ExecutionTrace,
+    ExecutionTraceEntry,
+    TensorTraceMetadata,
+    build_execution_trace,
+)
 from compiler.aten.isa_builder import (  # noqa: E402, F401
     Comment,
     Instr,

@@ -1,12 +1,8 @@
-"""Ablation study proving HF-vs-golden accuracy gap is from MXFP8 weight quantization.
+"""Controlled attribution of decoder error to weight and activation precision.
 
-Runs compile_native_hf_decoder in four precision modes and compares golden output
-against the HF float32 ground truth. Expected result:
-
-    hardware       (MXFP8 + BF16)  ~52% allclose  ← full HW gap
-    no_weight_quant (fp32 + BF16)  ~99% allclose  ← removing MXFP8 closes it
-    no_bf16        (MXFP8 + fp32)  ~52% allclose  ← BF16 doesn't matter
-    fp32           (fp32 + fp32)   ~99% allclose  ← confirms quantization is sole cause
+Each precision factor is changed independently while keeping the scheduled
+execution path fixed. This separates MXFP8 weight error from BF16 rounding
+instead of attributing both effects through an end-to-end allclose percentage.
 
 Usage:
     pytest aten/tests/test_quantization_ablation.py -v -s
@@ -23,12 +19,47 @@ MODEL_ID = "AICrossSim/clm-60m"
 DEFAULT_LAYERS = 5
 
 
-def _run_ablation(num_layers: int) -> dict[str, dict]:
+def _comparison(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    """Return scale-aware error metrics for two shape-identical outputs."""
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"output shape mismatch: actual={tuple(actual.shape)}, "
+            f"expected={tuple(expected.shape)}"
+        )
+
+    actual_flat = actual.float().flatten()
+    expected_flat = expected.float().flatten()
+    error = actual_flat - expected_flat
+    mse = error.square().mean()
+    reference_rms = expected_flat.square().mean().sqrt().clamp_min(
+        torch.finfo(torch.float32).eps
+    )
+    cosine = torch.nn.functional.cosine_similarity(
+        actual_flat.unsqueeze(0),
+        expected_flat.unsqueeze(0),
+    )
+
+    return {
+        "allclose": (
+            torch.isclose(actual_flat, expected_flat, atol=1e-2)
+            .float()
+            .mean()
+            .item()
+            * 100
+        ),
+        "mse": mse.item(),
+        "nrmse": (mse.sqrt() / reference_rms).item(),
+        "cosine": cosine.item(),
+    }
+
+
+def _run_ablation(num_layers: int) -> dict[str, dict[str, dict[str, float]]]:
     from transformers import AutoModelForCausalLM
     from compiler.aten.plena_frontend import compile_native_hf_decoder
 
     model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-    results = {}
+    outputs: dict[str, torch.Tensor] = {}
+    baseline: dict[str, dict[str, float]] = {}
 
     for mode in MODES:
         result = compile_native_hf_decoder(
@@ -39,50 +70,89 @@ def _run_ablation(num_layers: int) -> dict[str, dict]:
         )
         golden = result["golden_output"]
         hf_gt = result["hf_ground_truth"]
+        outputs[mode] = golden
+        baseline[mode] = _comparison(golden, hf_gt)
 
-        n = min(hf_gt.numel(), golden.numel())
-        g_flat = golden.float().flatten()[:n]
-        h_flat = hf_gt.float().flatten()[:n]
+    pairs = {
+        # Change only intermediate precision at each fixed weight precision.
+        "bf16_quantized_weights": _comparison(
+            outputs["hardware"], outputs["no_bf16"]
+        ),
+        "bf16_unquantized_weights": _comparison(
+            outputs["no_weight_quant"], outputs["fp32"]
+        ),
+        # Change only weight precision at each fixed intermediate precision.
+        "mxfp8_bf16_intermediates": _comparison(
+            outputs["hardware"], outputs["no_weight_quant"]
+        ),
+        "mxfp8_fp32_intermediates": _comparison(
+            outputs["no_bf16"], outputs["fp32"]
+        ),
+    }
+    return {"baseline": baseline, "pairs": pairs}
 
-        allclose_pct = torch.isclose(h_flat, g_flat, atol=1e-2).float().mean().item() * 100
-        mse = ((h_flat - g_flat) ** 2).mean().item()
 
-        results[mode] = {"allclose": allclose_pct, "mse": mse}
-
-    return results
+def _print_results(
+    results: dict[str, dict[str, dict[str, float]]],
+    num_layers: int,
+) -> None:
+    print(f"\n{'=' * 78}")
+    print(f"  QUANTIZATION ABLATION ({num_layers} layers)")
+    print(f"{'=' * 78}")
+    print(
+        f"  {'Comparison':<31} {'allclose%':>10} {'NRMSE':>12} "
+        f"{'cosine':>12} {'MSE':>13}"
+    )
+    print(f"  {'-' * 31} {'-' * 10} {'-' * 12} {'-' * 12} {'-' * 13}")
+    for name, metrics in results["baseline"].items():
+        print(
+            f"  {name + ' vs fp32 reference':<31} "
+            f"{metrics['allclose']:>9.2f}% {metrics['nrmse']:>12.6f} "
+            f"{metrics['cosine']:>12.8f} {metrics['mse']:>13.6e}"
+        )
+    for name, metrics in results["pairs"].items():
+        print(
+            f"  {name:<31} {metrics['allclose']:>9.2f}% "
+            f"{metrics['nrmse']:>12.6f} {metrics['cosine']:>12.8f} "
+            f"{metrics['mse']:>13.6e}"
+        )
 
 
 @pytest.mark.slow
-def test_mxfp8_is_sole_gap_source():
-    """Prove MXFP8 weight quantization accounts for the full HF-vs-golden gap."""
+def test_mxfp8_weight_error_dominates_bf16_rounding():
+    """Attribute the dominant error with matched, single-factor contrasts."""
     results = _run_ablation(DEFAULT_LAYERS)
+    baseline = results["baseline"]
+    pairs = results["pairs"]
 
-    hw = results["hardware"]["allclose"]
-    no_q = results["no_weight_quant"]["allclose"]
-    no_bf = results["no_bf16"]["allclose"]
-    fp = results["fp32"]["allclose"]
+    # The scheduled implementation itself remains an accurate FP32 control.
+    fp32_allclose = baseline["fp32"]["allclose"]
+    assert fp32_allclose > 95.0, (
+        f"FP32 scheduled control should be >95%: got {fp32_allclose:.1f}%"
+    )
 
-    # BF16 intermediates contribute nothing: hardware ≈ no_bf16
-    assert abs(hw - no_bf) < 2.0, f"BF16 should not matter: hardware={hw:.1f}% vs no_bf16={no_bf:.1f}%"
+    bf16_pairs = (
+        pairs["bf16_quantized_weights"],
+        pairs["bf16_unquantized_weights"],
+    )
+    mxfp8_pairs = (
+        pairs["mxfp8_bf16_intermediates"],
+        pairs["mxfp8_fp32_intermediates"],
+    )
 
-    # Removing MXFP8 closes the gap: no_weight_quant ≈ fp32 ≈ ~99%
-    assert no_q > 95.0, f"no_weight_quant should be >95%: got {no_q:.1f}%"
-    assert fp > 95.0, f"fp32 should be >95%: got {fp:.1f}%"
-    assert abs(no_q - fp) < 3.0, f"no_weight_quant ≈ fp32: {no_q:.1f}% vs {fp:.1f}%"
+    # BF16 rounding is small and independently bounded under both weight modes.
+    assert max(pair["nrmse"] for pair in bf16_pairs) < 0.01
+    assert min(pair["cosine"] for pair in bf16_pairs) > 0.9999
 
-    # The gap is real: hardware should be meaningfully lower
-    assert hw < no_q - 10.0, f"MXFP8 should cause >10% gap: hardware={hw:.1f}% vs no_quant={no_q:.1f}%"
+    # MXFP8 remains dominant under either intermediate-precision control.
+    largest_bf16_mse = max(pair["mse"] for pair in bf16_pairs)
+    smallest_mxfp8_mse = min(pair["mse"] for pair in mxfp8_pairs)
+    assert smallest_mxfp8_mse > 10.0 * largest_bf16_mse, (
+        "MXFP8 weight error must exceed BF16 rounding by at least 10x MSE: "
+        f"MXFP8={smallest_mxfp8_mse:.6e}, BF16={largest_bf16_mse:.6e}"
+    )
 
-    print(f"\n{'=' * 60}")
-    print(f"  QUANTIZATION ABLATION PROOF ({DEFAULT_LAYERS} layers)")
-    print(f"{'=' * 60}")
-    print(f"  {'Mode':<20} {'allclose%':>12} {'MSE':>15}")
-    print(f"  {'-' * 20} {'-' * 12} {'-' * 15}")
-    for mode in MODES:
-        r = results[mode]
-        print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print("\n  MXFP8 weight quantization = 100% of the gap")
-    print("  BF16 intermediate precision = 0% of the gap")
+    _print_results(results, DEFAULT_LAYERS)
 
 
 if __name__ == "__main__":
@@ -90,15 +160,4 @@ if __name__ == "__main__":
     parser.add_argument("--layers", type=int, default=DEFAULT_LAYERS)
     args = parser.parse_args()
 
-    results = _run_ablation(args.layers)
-
-    print(f"\n{'=' * 60}")
-    print(f"  QUANTIZATION ABLATION ({args.layers} layers)")
-    print(f"{'=' * 60}")
-    print(f"  {'Mode':<20} {'allclose%':>12} {'MSE':>15}")
-    print(f"  {'-' * 20} {'-' * 12} {'-' * 15}")
-    for mode in MODES:
-        r = results[mode]
-        print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print("\n  Conclusion: MXFP8 weight quantization = 100% of the gap")
-    print("  BF16 intermediate precision = 0% of the gap")
+    _print_results(_run_ablation(args.layers), args.layers)

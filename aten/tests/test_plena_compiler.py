@@ -197,7 +197,7 @@ def test_mram_allocator_scales_with_runtime_mlen():
 
 
 def test_compiler_threads_runtime_memory_geometry():
-    """PlenaCompiler must pass runtime mlen/capacity into VRAM and MRAM allocators."""
+    """Compiler allocators must use the runtime MLEN-squared tile geometry."""
     from compiler.aten.plena import PlenaCompiler
 
     prog = PlenaCompiler(mlen=256, blen=64, mram_tile_capacity=3)
@@ -208,7 +208,12 @@ def test_compiler_threads_runtime_memory_geometry():
     assert prog.mram_capacity_elems == 3 * tile_elems
     assert prog.mram_allocator.alignment == tile_elems
     assert prog.mram_allocator.total_size == 3 * tile_elems
-    assert prog.vram_allocator.alignment == 256
+    assert prog.vram_allocator.alignment == tile_elems
+
+    first_addr = prog.vram_allocator.allocate(1, "alignment_probe_0")
+    second_addr = prog.vram_allocator.allocate(1, "alignment_probe_1")
+    assert first_addr == 0
+    assert second_addr == tile_elems
 
     print("  PASS test_compiler_threads_runtime_memory_geometry")
 

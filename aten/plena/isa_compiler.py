@@ -9,6 +9,8 @@ from compiler.asm_templates import (
     reset_reg_asm,
     rms_norm_asm,
     rope_asm,
+    segmented_rms_norm_asm,
+    silu_asm,
     store_act_asm,
 )
 from compiler.aten.plena.isa_attention import IsaAttentionMixin
@@ -16,6 +18,7 @@ from compiler.aten.plena.isa_emit import IsaEmitMixin
 from compiler.aten.plena.isa_fp_ops import IsaFPOpsMixin
 from compiler.aten.plena.isa_matrix import IsaMatrixMixin
 from compiler.aten.plena.isa_tile_rows import IsaTileRowMixin
+from compiler.aten.plena.memory import MatrixBlockLayout
 from compiler.aten.plena.memory_state import MemoryStateMixin
 from compiler.aten.plena.registers import RegisterAllocator
 
@@ -43,6 +46,10 @@ class IsaCompiler(
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
         mram_tile_capacity: int = 4,
+        hbm_row_width: int = 256,
+        hbm_element_width: int = 8,
+        hbm_block_size: int = 8,
+        hbm_scale_width: int = 8,
     ):
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
         super().__init__(
@@ -50,6 +57,10 @@ class IsaCompiler(
             blen=blen,
             unroll_loops=unroll_loops,
             mram_tile_capacity=mram_tile_capacity,
+            hbm_row_width=hbm_row_width,
+            hbm_element_width=hbm_element_width,
+            hbm_block_size=hbm_block_size,
+            hbm_scale_width=hbm_scale_width,
         )
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
@@ -62,6 +73,7 @@ class IsaCompiler(
         vram_object_name: str,
         vlen: int = 64,
         preload_len: int | None = None,
+        precision: int | None = None,
     ) -> str:
         """
         Load a Batch tensor from HBM to VRAM.
@@ -79,6 +91,8 @@ class IsaCompiler(
         logical_h, logical_w = hbm_layout.full_shape
         h, w = hbm_layout.physical_shape or hbm_layout.full_shape
         hbm_addr = hbm_layout.hbm_base_addr
+        if precision is None:
+            precision = int(hbm_layout.precision_role in {"key", "value"})
         size = h * w
         vram_base = self.vram_allocator.allocate(size, name=vram_object_name)
         self.add_vram_object(
@@ -115,6 +129,9 @@ class IsaCompiler(
             act_vram_offset=vram_base,
             activation_offset_reg=addr_reg,
             stride_size=w,
+            element_bits=hbm_layout.hbm_element_width,
+            element_plane_bytes=hbm_layout.element_plane_bytes,
+            precision=precision,
         )
 
         self.register_allocator.free_gp(gp_regs_for_addr)
@@ -132,6 +149,15 @@ class IsaCompiler(
         vlen: int = 64,
         precision: int = 0,  # 0 = Activation, 1 = KeyValue
         store_amount: int | None = None,  # HBM_V_Writeback_Amount
+        hbm_row_width: int | None = None,
+        hbm_element_width: int | None = None,
+        hbm_block_size: int | None = None,
+        hbm_scale_width: int | None = None,
+        precision_role: str = "activation",
+        hbm_offset_bytes: int = 0,
+        hbm_element_plane_bytes: int | None = None,
+        transfer_shape: tuple[int, int] | None = None,
+        bind_tensor_hbm: bool = True,
     ) -> str:
         """
         Write tensor from VRAM back to HBM.
@@ -163,8 +189,51 @@ class IsaCompiler(
             else:
                 raise ValueError(f"Tensor '{tensor_name}' has no HBM address. Please specify hbm_addr.")
 
-        batch_size = tensor_info.physical_shape[0] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[0]
-        hidden_size = tensor_info.physical_shape[1] if tensor_info.physical_shape != (0, 0) else tensor_info.shape[1]
+        physical_shape = (
+            tensor_info.physical_shape
+            if tensor_info.physical_shape != (0, 0)
+            else tensor_info.shape
+        )
+        if transfer_shape is None:
+            batch_size, hidden_size = physical_shape
+        else:
+            batch_size, hidden_size = transfer_shape
+            if (
+                batch_size <= 0
+                or hidden_size <= 0
+                or batch_size > physical_shape[0]
+                or hidden_size > physical_shape[1]
+            ):
+                raise ValueError(
+                    "transfer_shape must fit inside the VRAM tensor backing"
+                )
+        if hbm_offset_bytes < 0:
+            raise ValueError("hbm_offset_bytes must be non-negative")
+        if (
+            hbm_element_plane_bytes is not None
+            and (
+                isinstance(hbm_element_plane_bytes, bool)
+                or not isinstance(hbm_element_plane_bytes, int)
+                or hbm_element_plane_bytes <= 0
+            )
+        ):
+            raise ValueError("hbm_element_plane_bytes must be a positive integer")
+        element_width = hbm_element_width or self.hbm_element_width
+        block_size = hbm_block_size or self.hbm_block_size
+        scale_width = hbm_scale_width or self.hbm_scale_width
+        row_width = hbm_row_width or self.hbm_row_width
+        output_layout = MatrixBlockLayout(
+            name=hbm_object_name or f"{tensor_name}_store",
+            full_shape=tensor_info.shape,
+            physical_shape=(batch_size, hidden_size),
+            block_size=self.mlen,
+            hbm_base_addr=hbm_addr,
+            hbm_row_width=row_width,
+            hbm_element_width=element_width,
+            hbm_block_size=block_size,
+            hbm_scale_width=scale_width,
+            precision_role=precision_role,
+        )
 
         isa_code = f"; Store {tensor_name} from VRAM to HBM\n"
         isa_code += f"; VRAM[{tensor_info.vram_addr}] -> HBM[{hbm_addr}], shape=({batch_size}, {hidden_size})\n"
@@ -195,24 +264,49 @@ class IsaCompiler(
                 hbm_addr_reg=hbm_addr_reg,
                 stride_size=hidden_size,
                 store_amount=store_amount,
+                precision=precision,
+                element_bits=element_width,
+                element_plane_bytes=(
+                    output_layout.element_plane_bytes
+                    if hbm_element_plane_bytes is None
+                    else hbm_element_plane_bytes
+                ),
+                initial_hbm_offset_bytes=hbm_offset_bytes,
             )
 
-            if tensor_info.hbm_addr < 0 or tensor_info.hbm_addr != hbm_addr:
+            if bind_tensor_hbm and (
+                tensor_info.hbm_addr < 0 or tensor_info.hbm_addr != hbm_addr
+            ):
                 tensor_info.hbm_addr = hbm_addr
                 # HBM stores element + scale rows, each row-aligned (see hbm_tensor_size).
                 size = batch_size * hidden_size
-                tensor_info.hbm_size = self.hbm_tensor_size(size)
+                tensor_info.hbm_size = self.hbm_tensor_size(
+                    size,
+                    hbm_row_width=hbm_row_width,
+                    hbm_element_width=hbm_element_width,
+                    hbm_block_size=hbm_block_size,
+                    hbm_scale_width=hbm_scale_width,
+                )
         finally:
             self.register_allocator.free_gp(gp_regs)
             if need_free_addr:
                 self.register_allocator.free_addr(addr_regs)
 
         if hbm_object_name is not None:
+            if not bind_tensor_hbm:
+                raise ValueError(
+                    "an unbound HBM slice cannot register a new HBM object"
+                )
             self.add_hbm_object(
                 name=hbm_object_name,
                 hbm_addr=hbm_addr,
                 shape=tensor_info.shape,
                 physical_shape=(batch_size, hidden_size),
+                hbm_row_width=hbm_row_width,
+                hbm_element_width=hbm_element_width,
+                hbm_block_size=hbm_block_size,
+                hbm_scale_width=hbm_scale_width,
+                precision_role=precision_role,
             )
 
         return self._emit(isa_code)
@@ -225,9 +319,10 @@ class IsaCompiler(
         reci_hid_offset: int = 2,
         vlen: int | None = None,
         scratchpad_vram_addr: int | None = None,
+        destination_name: str | None = None,
     ) -> str:
         """
-        Normalize a VRAM tensor in-place.
+        Normalize a VRAM tensor, in-place or into a separate destination.
 
         Supports:
         - mode="rms":   RMSNorm
@@ -240,6 +335,8 @@ class IsaCompiler(
             reci_hid_offset: FPRAM address of 1/hidden_dim
             vlen: vector length (default: self.mlen)
             scratchpad_vram_addr: scratchpad VRAM address (default: auto-allocate temporary space)
+            destination_name: write the normalized rows here and leave the
+                input intact. RMSNorm only.
         """
         if tensor_name not in self:
             raise KeyError(f"Tensor '{tensor_name}' not found in symbol table")
@@ -247,6 +344,25 @@ class IsaCompiler(
         tensor_info = self[tensor_name]
         if tensor_info.vram_addr is None:
             raise ValueError(f"Tensor '{tensor_name}' has no VRAM address")
+
+        destination_addr = None
+        if destination_name is not None:
+            if destination_name not in self:
+                raise KeyError(
+                    f"Destination '{destination_name}' not found in symbol table"
+                )
+            destination_info = self[destination_name]
+            if destination_info.vram_addr is None:
+                raise ValueError(
+                    f"Destination '{destination_name}' has no VRAM address"
+                )
+            if destination_info.physical_shape != tensor_info.physical_shape:
+                raise ValueError(
+                    "out-of-place normalization needs matching physical shapes: "
+                    f"{tensor_name} {tensor_info.physical_shape} vs "
+                    f"{destination_name} {destination_info.physical_shape}"
+                )
+            destination_addr = destination_info.vram_addr
 
         logical_batch_size, logical_hidden_dim = tensor_info.shape
         physical_batch_size, physical_hidden_dim = tensor_info.physical_shape
@@ -261,7 +377,13 @@ class IsaCompiler(
         if mode not in ("rms", "layer"):
             raise ValueError(f"Unsupported normalization mode: {mode}. Expected 'rms' or 'layer'.")
 
-        gp_regs = self.register_allocator.allocate_gp(4)
+        if mode == "layer" and destination_addr is not None:
+            raise ValueError("out-of-place normalization is RMSNorm only")
+
+        # The fifth register carries the out-of-place write cursor.
+        gp_regs = self.register_allocator.allocate_gp(
+            5 if destination_addr is not None else 4
+        )
 
         temp_scratchpad_name = None
         if scratchpad_vram_addr is None:
@@ -285,6 +407,7 @@ class IsaCompiler(
                     batch_size=batch_size,
                     hidden_dim=hidden_dim,
                     unroll=self._unroll,
+                    destination_base_address=destination_addr,
                 )
             else:
                 isa_code += layer_norm_asm(
@@ -305,6 +428,106 @@ class IsaCompiler(
             self.register_allocator.free_gp(gp_regs)
             if temp_scratchpad_name is not None:
                 self.vram_allocator.free(temp_scratchpad_name, strict=False)
+
+    def segmented_rms_normalize(
+        self,
+        tensor_name: str,
+        *,
+        segment_width: int,
+        reci_segment_offset: int,
+        eps_offset: int = 3,
+        vlen: int | None = None,
+        scratchpad_vram_addr: int | None = None,
+    ) -> str:
+        """Apply independent RMS normalization to each logical segment."""
+
+        if tensor_name not in self:
+            raise KeyError(f"Tensor '{tensor_name}' not found in symbol table")
+        tensor_info = self[tensor_name]
+        if tensor_info.vram_addr is None:
+            raise ValueError(f"Tensor '{tensor_name}' has no VRAM address")
+        if vlen is None:
+            vlen = self.mlen
+
+        logical_rows, logical_hidden_dim = tensor_info.shape
+        physical_rows, physical_hidden_dim = tensor_info.physical_shape
+        gp_regs = self.register_allocator.allocate_gp(3)
+        scratch_name = None
+        if scratchpad_vram_addr is None:
+            scratch_name = (
+                f"__segmented_norm_scratch__{tensor_name}__"
+                f"{len(self.generated_code)}"
+            )
+            scratchpad_vram_addr = self.vram_allocator.allocate(
+                vlen,
+                name=scratch_name,
+            )
+
+        try:
+            isa_code = segmented_rms_norm_asm(
+                eps_offset=eps_offset,
+                reci_segment_offset=reci_segment_offset,
+                alive_registers=gp_regs,
+                activation_base_address=tensor_info.vram_addr,
+                scratchpad_base_address=scratchpad_vram_addr,
+                vlen=vlen,
+                physical_rows=physical_rows,
+                logical_rows=logical_rows,
+                logical_hidden_dim=logical_hidden_dim,
+                physical_hidden_dim=physical_hidden_dim,
+                segment_width=segment_width,
+            )
+            return self._emit(isa_code)
+        finally:
+            self.register_allocator.free_gp(gp_regs)
+            if scratch_name is not None:
+                self.vram_allocator.free(scratch_name, strict=False)
+
+    def silu(
+        self,
+        tensor_name: str,
+        *,
+        const_one_fp_address: int = 5,
+        vlen: int | None = None,
+        scratchpad_vram_addr: int | None = None,
+    ) -> str:
+        """Apply SiLU in-place to the physical tensor backing."""
+
+        if tensor_name not in self:
+            raise KeyError(f"Tensor '{tensor_name}' not found in symbol table")
+        tensor_info = self[tensor_name]
+        if tensor_info.vram_addr is None:
+            raise ValueError(f"Tensor '{tensor_name}' has no VRAM address")
+        if vlen is None:
+            vlen = self.mlen
+
+        physical_rows, physical_hidden_dim = tensor_info.physical_shape
+        if (physical_rows * physical_hidden_dim) % vlen != 0:
+            raise ValueError("SiLU physical storage must contain complete vectors")
+
+        gp_regs = self.register_allocator.allocate_gp(3)
+        scratch_name = None
+        if scratchpad_vram_addr is None:
+            scratch_name = f"__silu_scratch__{tensor_name}__{len(self.generated_code)}"
+            scratchpad_vram_addr = self.vram_allocator.allocate(
+                vlen,
+                name=scratch_name,
+            )
+        try:
+            isa_code = silu_asm(
+                const_one_fp_address=const_one_fp_address,
+                alive_registers=gp_regs,
+                activation_base_address=tensor_info.vram_addr,
+                scratchpad_base_address=scratchpad_vram_addr,
+                vlen=vlen,
+                batch_size=physical_rows,
+                hidden_dim=physical_hidden_dim,
+            )
+            return self._emit(isa_code)
+        finally:
+            self.register_allocator.free_gp(gp_regs)
+            if scratch_name is not None:
+                self.vram_allocator.free(scratch_name, strict=False)
 
     def rope(
         self,
@@ -369,6 +592,9 @@ class IsaCompiler(
         self.register_allocator = RegisterAllocator()
         # Call MemoryStateMixin.reset() explicitly since the merged class shadows it.
         MemoryStateMixin.reset(self)
+        trace_tensors = getattr(self, "_trace_hbm_tensors", None)
+        if trace_tensors is not None:
+            trace_tensors.clear()
 
     def get_tensor_info(self, name: str):
         """Get unified tensor/object info by name."""
@@ -381,6 +607,11 @@ class IsaCompiler(
         shape: tuple[int, int],
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
+        hbm_row_width: int | None = None,
+        hbm_element_width: int | None = None,
+        hbm_block_size: int | None = None,
+        hbm_scale_width: int | None = None,
+        precision_role: str = "activation",
     ):
         """Register an HBM object and build its HBM layout.
 
@@ -388,14 +619,23 @@ class IsaCompiler(
         parameter order ``(name, hbm_addr, shape, ...)`` that all IsaCompiler
         callers use.
         """
-        return MemoryStateMixin.add_hbm_object(
+        info = MemoryStateMixin.add_hbm_object(
             self,
             name=name,
             shape=shape,
             physical_shape=physical_shape,
             hbm_addr=hbm_addr,
             real_data_ratio=real_data_ratio,
+            hbm_row_width=hbm_row_width,
+            hbm_element_width=hbm_element_width,
+            hbm_block_size=hbm_block_size,
+            hbm_scale_width=hbm_scale_width,
+            precision_role=precision_role,
         )
+        remember = getattr(self, "_remember_trace_tensor", None)
+        if remember is not None:
+            remember(name)
+        return info
 
     def free_hbm_object(self, name: str, strict: bool = False):
         """Free an HBM object by name (defaults to non-strict)."""

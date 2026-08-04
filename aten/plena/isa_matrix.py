@@ -42,10 +42,20 @@ class IsaMatrixMixin:
         return [1, 2, 3] if gp_regs is None else gp_regs
 
     def _emit_hbm_prefetch_setup(self, asm: IsaBuilder, layout, gp_scale: int, gp_stride: int) -> None:
-        rows, cols = layout.physical_shape or layout.full_shape
-        asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), rows * cols)
+        _, cols = layout.physical_shape or layout.full_shape
+        asm.instr(
+            "S_ADDI_INT",
+            gp(gp_scale),
+            gp(0),
+            layout.element_plane_bytes,
+        )
         asm.instr("C_SET_SCALE_REG", gp(gp_scale))
-        asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), cols)
+        asm.instr(
+            "S_ADDI_INT",
+            gp(gp_stride),
+            gp(0),
+            layout.element_stride_bytes(cols),
+        )
         asm.instr("C_SET_STRIDE_REG", gp(gp_stride))
 
     def _emit_hbm_subblock_prefetch(
@@ -58,8 +68,10 @@ class IsaMatrixMixin:
         hbm_addr_reg: int,
         gp_scale: int,
         gp_mram: int,
+        matrix_precision: str = "weight",
         comment: str | None = None,
     ) -> None:
+        precision_funct1 = self._matrix_precision_funct1(matrix_precision)
         sub_block = layout.get_sub_block(row_idx, col_idx)
         hbm_offset = sub_block.hbm_offset
         sub_block.mram_addr = mram_addr
@@ -67,7 +79,24 @@ class IsaMatrixMixin:
         asm.comment(comment if comment is not None else f"SubBlock [{row_idx}][{col_idx}]: HBM offset = {hbm_offset}")
         asm.instr("S_ADDI_INT", gp(gp_mram), gp(0), mram_addr)
         asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), hbm_offset)
-        asm.instr("H_PREFETCH_M", gp(gp_mram), gp(gp_scale), areg(hbm_addr_reg), 1, 0)
+        asm.instr(
+            "H_PREFETCH_M",
+            gp(gp_mram),
+            gp(gp_scale),
+            areg(hbm_addr_reg),
+            1,
+            precision_funct1,
+        )
+
+    @staticmethod
+    def _matrix_precision_funct1(matrix_precision: str) -> int:
+        if matrix_precision == "weight":
+            return 0
+        if matrix_precision == "key_value":
+            return 1
+        raise ValueError(
+            "matrix_precision must be 'weight' or 'key_value'"
+        )
 
     def _emit_hbm_subblock_sequence(
         self,
@@ -78,6 +107,7 @@ class IsaMatrixMixin:
         hbm_addr_reg: int,
         gp_scale: int,
         gp_mram: int,
+        matrix_precision: str = "weight",
     ) -> None:
         mram_addr = mram_start_addr
         block_size = self.mlen * self.mlen
@@ -91,6 +121,7 @@ class IsaMatrixMixin:
                 hbm_addr_reg,
                 gp_scale,
                 gp_mram,
+                matrix_precision=matrix_precision,
             )
             mram_addr += block_size
 
@@ -102,6 +133,7 @@ class IsaMatrixMixin:
         mram_dest_addr: int,
         hbm_addr_reg: int = 1,
         gp_regs: list[int] | None = None,
+        matrix_precision: str = "weight",
     ) -> str:
         """Emit HBM->MRAM prefetch for one mlen x mlen sub-block."""
         gp_regs = self._default_hbm_gp_regs(gp_regs)
@@ -123,6 +155,7 @@ class IsaMatrixMixin:
             hbm_addr_reg,
             gp_scale,
             gp_mram,
+            matrix_precision=matrix_precision,
             comment=f"HBM offset: {hbm_offset} (precomputed)",
         )
 
@@ -739,6 +772,63 @@ class IsaMatrixMixin:
 
         isa_code = "\n".join(lines) + "\n"
         return self._emit(isa_code)
+
+    def vram_matrix_mul_broadcast_row(
+        self,
+        dst_matrix: str,
+        src_matrix: str,
+        *,
+        num_rows: int | None = None,
+    ) -> str:
+        """Multiply every destination vector by the first source vector.
+
+        The source is one MLEN-wide pattern. Reusing it across destination
+        rows and column blocks implements compact periodic affine weights
+        without expanding the learned vector in HBM.
+        """
+
+        dst_info = self[dst_matrix]
+        src_info = self[src_matrix]
+        self._ensure_vram_matrix_layout(dst_matrix)
+        self._ensure_vram_matrix_layout(src_matrix)
+
+        dst_rows, _ = dst_info.shape
+        dst_physical_rows, dst_physical_cols = dst_info.physical_shape
+        src_physical_rows, src_physical_cols = src_info.physical_shape
+        if num_rows is None:
+            num_rows = dst_rows
+        if num_rows <= 0 or num_rows > dst_rows:
+            raise ValueError(
+                f"num_rows must be in [1, {dst_rows}], got {num_rows}"
+            )
+        if src_info.shape[0] < 1 or src_physical_rows < 1:
+            raise ValueError("broadcast source must contain at least one row")
+        if src_info.shape[1] != self.mlen or src_physical_cols != self.mlen:
+            raise ValueError("broadcast source must contain one MLEN-wide pattern")
+        if dst_physical_cols % self.mlen:
+            raise ValueError("destination physical width must be MLEN-aligned")
+
+        dst_addr = dst_info.vram_addr
+        src_addr = src_info.vram_addr
+        gp_dst, gp_src = self.register_allocator.allocate_gp(2)
+        lines = [
+            f"; === VRAM Broadcast Row Mul: {dst_matrix} *= {src_matrix}[0] ===",
+            f"; destination rows={num_rows}, column blocks={dst_physical_cols // self.mlen}",
+        ]
+        for row in range(num_rows):
+            for col_block in range(dst_physical_cols // self.mlen):
+                vector_addr = (
+                    dst_addr
+                    + col_block * dst_physical_rows * self.mlen
+                    + row * self.mlen
+                )
+                lines.extend(load_large_int(gp_dst, vector_addr))
+                lines.extend(load_large_int(gp_src, src_addr))
+                lines.append(
+                    f"V_MUL_VV gp{gp_dst}, gp{gp_dst}, gp{gp_src}, 0"
+                )
+        self.register_allocator.free_gp([gp_dst, gp_src])
+        return self._emit("\n".join(lines) + "\n")
 
     def _target_tile_addr(self, target_matrix: str, target_row_idx: int, target_col_idx: int) -> tuple[int, int, int]:
         if target_matrix not in self:

@@ -21,6 +21,7 @@ class IsaAttentionMixin:
         rows: int | None = None,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        state_stride: int | None = None,
     ) -> str:
         """
         Online Softmax Computation.
@@ -37,14 +38,24 @@ class IsaAttentionMixin:
           [mlen, 2*mlen):   m_res = exp(m_old - m_curr)
           [2*mlen, 3*mlen): l_old / l_new
         """
+        state_stride = mlen if state_stride is None else state_stride
+        active_rows = mlen if rows is None else rows
+        if not 0 < active_rows <= mlen:
+            raise ValueError(f"rows={active_rows} must be in [1,{mlen}]")
+        if state_stride < active_rows:
+            raise ValueError(
+                f"state_stride={state_stride} cannot hold {active_rows} rows"
+            )
         if getattr(self, "unroll_attention", False):
             return self._online_softmax_asm_unrolled(
                 mlen=mlen,
                 s_address=s_address,
                 m_start_address=m_start_address,
                 scale=scale,
+                rows=rows,
                 valid_cols=valid_cols,
                 inline_normalize=inline_normalize,
+                state_stride=state_stride,
             )
 
         gp_regs = self.register_allocator.allocate_gp(5)
@@ -71,8 +82,12 @@ class IsaAttentionMixin:
         # Set address registers
         lines.extend(load_large_int(gp_s, s_address))
         lines.extend(load_large_int(gp_m_addr, m_start_address))
-        lines.append(f"S_ADDI_INT gp{gp_m_res_addr}, gp{gp_m_addr}, {mlen}")
-        lines.append(f"S_ADDI_INT gp{gp_l_addr}, gp{gp_m_res_addr}, {mlen}")
+        lines.append(
+            f"S_ADDI_INT gp{gp_m_res_addr}, gp{gp_m_addr}, {state_stride}"
+        )
+        lines.append(
+            f"S_ADDI_INT gp{gp_l_addr}, gp{gp_m_res_addr}, {state_stride}"
+        )
 
         mask_en = 0
         if valid_cols is not None and valid_cols < mlen:
@@ -87,8 +102,7 @@ class IsaAttentionMixin:
         if scale != 1.0:
             lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
 
-        loop_rows = mlen if rows is None else rows
-        lines.append(f"C_LOOP_START gp{gp_loop}, {loop_rows}")
+        lines.append(f"C_LOOP_START gp{gp_loop}, {active_rows}")
         lines.append(f"S_LD_FP f{fp_m_old}, gp{gp_m_addr}, 0")
         lines.append(f"S_ADD_FP f{fp_m_res}, f{fp_m_old}, f0")
 
@@ -146,10 +160,20 @@ class IsaAttentionMixin:
         s_address: int,
         m_start_address: int,
         scale: float = 1.0,
+        rows: int | None = None,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        state_stride: int | None = None,
     ) -> str:
         """Legacy Python-unrolled online softmax emission, kept for A/B comparisons."""
+        state_stride = mlen if state_stride is None else state_stride
+        active_rows = mlen if rows is None else rows
+        if not 0 < active_rows <= mlen:
+            raise ValueError(f"rows={active_rows} must be in [1,{mlen}]")
+        if state_stride < active_rows:
+            raise ValueError(
+                f"state_stride={state_stride} cannot hold {active_rows} rows"
+            )
         gp_regs = self.register_allocator.allocate_gp(5)
         gp_s = gp_regs[0]
         gp_m_addr = gp_regs[1]
@@ -168,8 +192,12 @@ class IsaAttentionMixin:
         lines.append("; === Online Softmax ===")
         lines.extend(load_large_int(gp_s, s_address))
         lines.extend(load_large_int(gp_m_addr, m_start_address))
-        lines.append(f"S_ADDI_INT gp{gp_m_res_addr}, gp{gp_m_addr}, {mlen}")
-        lines.append(f"S_ADDI_INT gp{gp_l_addr}, gp{gp_m_res_addr}, {mlen}")
+        lines.append(
+            f"S_ADDI_INT gp{gp_m_res_addr}, gp{gp_m_addr}, {state_stride}"
+        )
+        lines.append(
+            f"S_ADDI_INT gp{gp_l_addr}, gp{gp_m_res_addr}, {state_stride}"
+        )
 
         if scale != 1.0:
             lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
@@ -183,7 +211,7 @@ class IsaAttentionMixin:
             lines.append(f"C_SET_V_MASK_REG gp{gp_mask}")
             mask_en = 1
 
-        for row in range(mlen):
+        for row in range(active_rows):
             lines.append(f"; Row {row}")
             lines.append(f"S_LD_FP f{fp_m_old}, gp{gp_m_addr}, {row}")
             lines.append(f"S_ADD_FP f{fp_m_res}, f{fp_m_old}, f0")
@@ -244,6 +272,9 @@ class IsaAttentionMixin:
         pv_address: int,
         rows: int | None = None,
         pv_physical_rows: int | None = None,
+        v_element_bits: int = 8,
+        prefetch_v: bool = True,
+        v_mram_base: int = 0,
     ) -> str:
         """
         Compute PV = P @ V via M_MM.
@@ -265,7 +296,7 @@ class IsaAttentionMixin:
         if pv_physical_rows is None:
             pv_physical_rows = mlen
 
-        if getattr(self, "unroll_attention", False):
+        if getattr(self, "unroll_attention", False) or rows == 1:
             return self._pv_multiply_asm_unrolled(
                 mlen=mlen,
                 blen=blen,
@@ -275,6 +306,10 @@ class IsaAttentionMixin:
                 v_hbm_offset=v_hbm_offset,
                 pv_address=pv_address,
                 pv_physical_rows=pv_physical_rows,
+                rows=rows,
+                v_element_bits=v_element_bits,
+                prefetch_v=prefetch_v,
+                v_mram_base=v_mram_base,
             )
 
         gp_regs = self.register_allocator.allocate_gp(8)
@@ -312,14 +347,18 @@ class IsaAttentionMixin:
             # Prefetch V[:, v_col_block*mlen:(v_col_block+1)*mlen] (mlen × mlen) to MSRAM.
             # V is row-major in HBM: V[row, col] at offset row*head_dim + col, so the
             # column-block base offset = v_hbm_offset + v_col_block * mlen (elements).
-            v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
-            lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
-            lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            # funct1=0 => PREFETCH_M_H (High Precision, m_controller_precision_select=0),
-            # matching how V is staged in HBM (same High-Precision MXINT format as the K/W
-            # weights, which load via _H). funct1=1 (_L / Low Precision) mis-decodes the
-            # High-staged V into garbage (~constant mantissas) -> rank-1 P@V collapse.
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 0")
+            v_block_bits = v_col_block * mlen * v_element_bits
+            if v_block_bits % 8:
+                raise ValueError("V column-block offset must be byte aligned")
+            v_block_hbm_offset = v_hbm_offset + v_block_bits // 8
+            resident_block_base = v_mram_base + v_col_block * mlen * mlen
+            lines.extend(load_large_int(gp_v, resident_block_base))
+            if prefetch_v:
+                lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
+                lines.append(
+                    f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, "
+                    f"a{v_hbm_offset_reg}, 1, 1"
+                )
 
             pv_col_block_base = pv_address + v_col_block * pv_physical_rows * mlen
             lines.extend(load_large_int(gp_pv_col_base, pv_col_block_base))
@@ -337,7 +376,9 @@ class IsaAttentionMixin:
             lines.append(f"S_ADDI_INT gp{gp_p}, gp{gp_p}, {blen * mlen}")
             lines.append(f"S_ADDI_INT gp{gp_pv}, gp{gp_pv}, {blen * mlen}")
             lines.append(f"C_LOOP_END gp{gp_p_loop}")
-            lines.append(f"S_ADDI_INT gp{gp_v}, gp{gp_v}, {blen}")
+            # The matrix operand carries its column index scaled by MLEN; the
+            # PV column base is a VRAM offset and stays unscaled.
+            lines.append(f"S_ADDI_INT gp{gp_v}, gp{gp_v}, {blen * mlen}")
             lines.append(f"S_ADDI_INT gp{gp_pv_col_base}, gp{gp_pv_col_base}, {blen}")
             lines.append(f"C_LOOP_END gp{gp_v_loop}")
 
@@ -354,10 +395,19 @@ class IsaAttentionMixin:
         v_hbm_offset: int,
         pv_address: int,
         pv_physical_rows: int | None = None,
+        rows: int | None = None,
+        v_element_bits: int = 8,
+        prefetch_v: bool = True,
+        v_mram_base: int = 0,
     ) -> str:
-        """Legacy Python-unrolled P @ V emission, kept for A/B comparisons."""
+        """Emit explicit P @ V tiles without placing matrix writeout in a loop."""
         if pv_physical_rows is None:
             pv_physical_rows = mlen
+        p_row_groups = (
+            mlen // blen
+            if rows is None
+            else max(1, min(mlen // blen, math.ceil(rows / blen)))
+        )
         gp_regs = self.register_allocator.allocate_gp(5)
         gp_p = gp_regs[0]
         gp_v = gp_regs[1]
@@ -379,12 +429,18 @@ class IsaAttentionMixin:
             lines.append(
                 f"; --- V column block {v_col_block} (columns {v_col_block * mlen} to {(v_col_block + 1) * mlen - 1}) ---"
             )
-            v_block_hbm_offset = v_hbm_offset + v_col_block * mlen
-            lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
-            lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            # funct1=0 => PREFETCH_M_H (High Precision), matching V's HBM staging; _L
-            # (Low Precision) mis-decodes it to garbage. See _pv_multiply_asm above.
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 0")
+            v_block_bits = v_col_block * mlen * v_element_bits
+            if v_block_bits % 8:
+                raise ValueError("V column-block offset must be byte aligned")
+            v_block_hbm_offset = v_hbm_offset + v_block_bits // 8
+            resident_block_base = v_mram_base + v_col_block * mlen * mlen
+            lines.extend(load_large_int(gp_v, resident_block_base))
+            if prefetch_v:
+                lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
+                lines.append(
+                    f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, "
+                    f"a{v_hbm_offset_reg}, 1, 1"
+                )
 
             # Only emit output-column tiles that this block actually covers. When
             # head_dim < mlen (e.g. GQA head_slot_dim=4), mlen//blen would over-iterate
@@ -394,10 +450,11 @@ class IsaAttentionMixin:
             v_col_tiles = max(1, math.ceil(block_cols / blen))
             for v_col in range(v_col_tiles):
                 lines.append(f"; V column {v_col_block * mlen + v_col * blen}")
-                v_msram_offset = v_col * blen
-                lines.append(f"S_ADDI_INT gp{gp_v}, gp0, {v_msram_offset}")
+                # MRAM column index, scaled by MLEN as the matrix operand requires.
+                v_msram_offset = resident_block_base + v_col * blen * mlen
+                lines.extend(load_large_int(gp_v, v_msram_offset))
 
-                for p_row in range(mlen // blen):
+                for p_row in range(p_row_groups):
                     p_row_addr = p_address + p_row * blen * mlen
                     lines.extend(load_large_int(gp_p, p_row_addr))
                     lines.append(f"M_MM 0, gp{gp_v}, gp{gp_p}")
@@ -744,14 +801,30 @@ class IsaAttentionMixin:
         seq_len: int,
         head_dim: int,
         rows: int | None = None,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
     ) -> str:
         """
         Initialize Online Softmax state for Q block q_idx:
           m_old = -inf (FP SRAM), l = 0 (FP SRAM), O_row = 0 (VRAM).
         """
-        fp_sram_start = self._ONLINE_SOFTMAX_FPSRAM_BASE
+        active_rows = self.mlen if rows is None else rows
+        state_stride = self.mlen if state_stride is None else state_stride
+        if not 0 < active_rows <= self.mlen:
+            raise ValueError(
+                f"rows={active_rows} must be in [1,{self.mlen}]"
+            )
+        if state_stride < active_rows:
+            raise ValueError(
+                f"state_stride={state_stride} cannot hold {active_rows} rows"
+            )
+        fp_sram_start = (
+            self._ONLINE_SOFTMAX_FPSRAM_BASE
+            if state_base_address is None
+            else state_base_address
+        )
         m_old_addr = fp_sram_start
-        l_addr = fp_sram_start + 2 * self.mlen  # skip m_res region
+        l_addr = fp_sram_start + 2 * state_stride
 
         o_info = self[o_matrix]
         o_vram_addr = o_info.vram_addr
@@ -760,8 +833,8 @@ class IsaAttentionMixin:
 
         isa_code = f"; === Init Online Softmax for Q block {q_idx} ===\n"
 
-        isa_code += self._reset_fpsram_asm(m_old_addr, self.mlen, 2)  # slot 2 = -inf
-        isa_code += self._reset_fpsram_asm(l_addr, self.mlen, 0)  # slot 0 = 0.0
+        isa_code += self._reset_fpsram_asm(m_old_addr, active_rows, 2)
+        isa_code += self._reset_fpsram_asm(l_addr, active_rows, 0)
         isa_code += self._reset_vram_asm(
             start_address=o_vram_addr,
             rows=self.mlen if rows is None else rows,
@@ -780,6 +853,8 @@ class IsaAttentionMixin:
         rows: int | None = None,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
     ) -> str:
         """
         Run Online Softmax on one S block.
@@ -793,7 +868,11 @@ class IsaAttentionMixin:
         s_info = self[s_block_matrix]
         s_address = s_info.vram_addr
 
-        fp_sram_start = self._ONLINE_SOFTMAX_FPSRAM_BASE
+        fp_sram_start = (
+            self._ONLINE_SOFTMAX_FPSRAM_BASE
+            if state_base_address is None
+            else state_base_address
+        )
         m_start_address = fp_sram_start
 
         isa_code = f"; === Online Softmax Block {s_block_matrix} ===\n"
@@ -805,6 +884,7 @@ class IsaAttentionMixin:
             rows=rows,
             valid_cols=valid_cols,
             inline_normalize=inline_normalize,
+            state_stride=state_stride,
         )
 
         return self._emit(isa_code)
@@ -817,6 +897,9 @@ class IsaAttentionMixin:
         pv_matrix: str,
         head_dim: int,
         rows: int | None = None,
+        v_element_offset: int = 0,
+        prefetch_v: bool = True,
+        v_mram_base: int = 0,
     ) -> str:
         """
         Compute PV = P @ V[k_idx].
@@ -832,7 +915,15 @@ class IsaAttentionMixin:
 
         v_layout = self.get_hbm_layout(v_sub_matrix)
         physical_head_dim = (v_layout.physical_shape or v_layout.full_shape)[1]
-        v_hbm_offset = k_idx * self.mlen * physical_head_dim
+        if v_element_offset < 0 or v_element_offset + head_dim > physical_head_dim:
+            raise ValueError(
+                f"V element range [{v_element_offset},{v_element_offset + head_dim}) "
+                f"exceeds physical width {physical_head_dim}"
+            )
+        v_element_offset = (
+            k_idx * self.mlen * physical_head_dim + v_element_offset
+        )
+        v_hbm_offset = v_layout.element_offset_bytes(v_element_offset)
 
         isa_code = f"; === Compute PV = P @ V[k_idx={k_idx}] ===\n"
 
@@ -846,6 +937,19 @@ class IsaAttentionMixin:
             addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
         )
 
+        _, v_physical_cols = v_layout.physical_shape or v_layout.full_shape
+        isa_code += "\n".join(
+            load_large_int(gp_regs[0], v_layout.element_plane_bytes)
+        ) + "\n"
+        isa_code += f"C_SET_SCALE_REG gp{gp_regs[0]}\n"
+        isa_code += "\n".join(
+            load_large_int(
+                gp_regs[0],
+                v_layout.element_stride_bytes(v_physical_cols),
+            )
+        ) + "\n"
+        isa_code += f"C_SET_STRIDE_REG gp{gp_regs[0]}\n"
+
         isa_code += self._pv_multiply_asm(
             mlen=self.mlen,
             blen=self.blen,
@@ -856,6 +960,9 @@ class IsaAttentionMixin:
             pv_address=pv_address,
             rows=rows,
             pv_physical_rows=pv_info.physical_shape[0],
+            v_element_bits=v_layout.hbm_element_width,
+            prefetch_v=prefetch_v,
+            v_mram_base=v_mram_base,
         )
 
         self.register_allocator.free_gp(gp_regs)
@@ -863,7 +970,13 @@ class IsaAttentionMixin:
 
         return self._emit(isa_code)
 
-    def warm_v_prefetch(self, v_sub_matrix: str, k_idx: int) -> str:
+    def warm_v_prefetch(
+        self,
+        v_sub_matrix: str,
+        k_idx: int,
+        v_element_offset: int = 0,
+        mram_dest_addr: int = 0,
+    ) -> str:
         """Prefetch V[k_idx] into MSRAM ONCE (High precision) before the per-head P@V
         loop so it has fully landed by head 0's first tile. Paired with the RTL
         cold-start re-prime at the M_BTMM->M_MM boundary: the re-prime re-warms the
@@ -872,7 +985,16 @@ class IsaAttentionMixin:
         guarantees the spin reads V for row 0 too."""
         v_layout = self.get_hbm_layout(v_sub_matrix)
         physical_head_dim = (v_layout.physical_shape or v_layout.full_shape)[1]
-        v_hbm_offset = k_idx * self.mlen * physical_head_dim
+        if v_element_offset < 0 or v_element_offset >= physical_head_dim:
+            raise ValueError(
+                f"V element offset {v_element_offset} exceeds physical width {physical_head_dim}"
+            )
+        if mram_dest_addr < 0:
+            raise ValueError("V MRAM destination must be non-negative")
+        v_element_offset = (
+            k_idx * self.mlen * physical_head_dim + v_element_offset
+        )
+        v_hbm_offset = v_layout.element_offset_bytes(v_element_offset)
         addr_regs = self.register_allocator.allocate_addr(1)
         v_hbm_reg = addr_regs[0]
         gp_regs = self.register_allocator.allocate_gp(2)
@@ -883,9 +1005,26 @@ class IsaAttentionMixin:
         isa_code += preload_addr_reg_asm(
             addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
         )
-        isa_code += f"S_ADDI_INT gp{gp_regs[0]}, gp0, 0\n"
+        _, v_physical_cols = v_layout.physical_shape or v_layout.full_shape
+        isa_code += "\n".join(
+            load_large_int(gp_regs[0], v_layout.element_plane_bytes)
+        ) + "\n"
+        isa_code += f"C_SET_SCALE_REG gp{gp_regs[0]}\n"
+        isa_code += "\n".join(
+            load_large_int(
+                gp_regs[0],
+                v_layout.element_stride_bytes(v_physical_cols),
+            )
+        ) + "\n"
+        isa_code += f"C_SET_STRIDE_REG gp{gp_regs[0]}\n"
+        isa_code += "\n".join(
+            load_large_int(gp_regs[0], mram_dest_addr)
+        ) + "\n"
         isa_code += "\n".join(load_large_int(gp_regs[1], v_hbm_offset)) + "\n"
-        isa_code += f"H_PREFETCH_M gp{gp_regs[0]}, gp{gp_regs[1]}, a{v_hbm_reg}, 1, 0\n"
+        isa_code += (
+            f"H_PREFETCH_M gp{gp_regs[0]}, gp{gp_regs[1]}, "
+            f"a{v_hbm_reg}, 1, 1\n"
+        )
 
         self.register_allocator.free_gp(gp_regs)
         self.register_allocator.free_addr(addr_regs)
@@ -898,14 +1037,21 @@ class IsaAttentionMixin:
         seq_len: int,
         head_dim: int,
         rows: int | None = None,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
     ) -> str:
         """Scale the current row block of O by m_res: O[q_idx] *= m_res."""
         o_info = self[o_matrix]
         o_address = o_info.vram_addr
         physical_seq_len = o_info.physical_shape[0]
 
-        fp_sram_start = self._ONLINE_SOFTMAX_FPSRAM_BASE
-        m_res_addr = fp_sram_start + self.mlen
+        fp_sram_start = (
+            self._ONLINE_SOFTMAX_FPSRAM_BASE
+            if state_base_address is None
+            else state_base_address
+        )
+        state_stride = self.mlen if state_stride is None else state_stride
+        m_res_addr = fp_sram_start + state_stride
 
         row_offset = q_idx * self.mlen
 
@@ -929,14 +1075,21 @@ class IsaAttentionMixin:
         seq_len: int,
         head_dim: int,
         rows: int | None = None,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
     ) -> str:
         """Final scaling: O[q_idx] /= l."""
         o_info = self[o_matrix]
         o_address = o_info.vram_addr
         physical_seq_len = o_info.physical_shape[0]
 
-        fp_sram_start = self._ONLINE_SOFTMAX_FPSRAM_BASE
-        l_addr = fp_sram_start + 2 * self.mlen
+        fp_sram_start = (
+            self._ONLINE_SOFTMAX_FPSRAM_BASE
+            if state_base_address is None
+            else state_base_address
+        )
+        state_stride = self.mlen if state_stride is None else state_stride
+        l_addr = fp_sram_start + 2 * state_stride
 
         row_offset = q_idx * self.mlen
 

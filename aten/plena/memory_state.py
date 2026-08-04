@@ -129,6 +129,11 @@ class MemoryStateMixin:
         kind: str = "HBMObject",
         real_data_ratio: float = 1.125,
         strict: bool = False,
+        hbm_row_width: int | None = None,
+        hbm_element_width: int | None = None,
+        hbm_block_size: int | None = None,
+        hbm_scale_width: int | None = None,
+        precision_role: str = "activation",
     ) -> MemoryObjectInfo:
         del dtype, kind
         self.register_matrix(
@@ -138,6 +143,11 @@ class MemoryStateMixin:
             hbm_base_addr=hbm_addr,
             real_data_ratio=real_data_ratio,
             strict=strict,
+            hbm_row_width=hbm_row_width,
+            hbm_element_width=hbm_element_width,
+            hbm_block_size=hbm_block_size,
+            hbm_scale_width=hbm_scale_width,
+            precision_role=precision_role,
         )
         return self[name]
 
@@ -214,15 +224,25 @@ class MemoryStateMixin:
         self.fpram_matrices.pop(name, None)
         return info
 
-    def hbm_tensor_size(self, num_elements: int) -> int:
+    def hbm_tensor_size(
+        self,
+        num_elements: int,
+        *,
+        hbm_row_width: int | None = None,
+        hbm_element_width: int | None = None,
+        hbm_block_size: int | None = None,
+        hbm_scale_width: int | None = None,
+    ) -> int:
         """Row-aligned HBM byte footprint of one tensor: element rows + scale rows,
         each padded up to hbm_row_width, matching the stager (create_mem_for_sim /
         plena_utils.calculate_instr_storage_offset_from_shapes). Replaces the packed
         `int(size * real_data_ratio)` estimate, which ignored per-tensor row padding
         and mislaid every following tensor whenever a region was not naturally
         row-aligned (weights/K/V read zeros; common at small MLEN)."""
-        row_bits = self.hbm_row_width
-        ew, bs, sw = self.hbm_element_width, self.hbm_block_size, self.hbm_scale_width
+        row_bits = hbm_row_width or self.hbm_row_width
+        ew = hbm_element_width or self.hbm_element_width
+        bs = hbm_block_size or self.hbm_block_size
+        sw = hbm_scale_width or self.hbm_scale_width
         bytes_per_row = row_bits // 8
         elements_per_row = (row_bits // (ew * bs)) * bs
         element_rows = -(-num_elements // elements_per_row) if elements_per_row > 0 else 0
@@ -239,6 +259,11 @@ class MemoryStateMixin:
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
         strict: bool = True,
+        hbm_row_width: int | None = None,
+        hbm_element_width: int | None = None,
+        hbm_block_size: int | None = None,
+        hbm_scale_width: int | None = None,
+        precision_role: str = "activation",
     ) -> MatrixBlockLayout:
         """Register an HBM matrix and derive its mlen block layout."""
         del real_data_ratio  # HBM size is now row-aligned (see hbm_tensor_size)
@@ -252,7 +277,25 @@ class MemoryStateMixin:
                 raise ValueError(f"Matrix physical cols ({physical_cols}) must be multiple of mlen ({self.mlen})")
 
         size = physical_rows * physical_cols
-        hbm_size = self.hbm_tensor_size(size)
+        if precision_role not in {
+            "weight",
+            "activation",
+            "key",
+            "value",
+            "vector",
+        }:
+            raise ValueError(f"unsupported precision role {precision_role!r}")
+        row_width = hbm_row_width or self.hbm_row_width
+        element_width = hbm_element_width or self.hbm_element_width
+        block_size = hbm_block_size or self.hbm_block_size
+        scale_width = hbm_scale_width or self.hbm_scale_width
+        hbm_size = self.hbm_tensor_size(
+            size,
+            hbm_row_width=row_width,
+            hbm_element_width=element_width,
+            hbm_block_size=block_size,
+            hbm_scale_width=scale_width,
+        )
 
         layout = MatrixBlockLayout(
             name=name,
@@ -261,6 +304,11 @@ class MemoryStateMixin:
             block_size=self.mlen,
             hbm_base_addr=hbm_base_addr,
             hbm_size=hbm_size,
+            hbm_row_width=row_width,
+            hbm_element_width=element_width,
+            hbm_block_size=block_size,
+            hbm_scale_width=scale_width,
+            precision_role=precision_role,
         )
 
         self.hbm_matrices[name] = layout

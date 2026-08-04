@@ -10,8 +10,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Protocol, Union
 
-from asm_templates._imm import add_large_int as _add_large_int_lines
-from asm_templates._imm import load_large_int as _load_large_int_lines
+from compiler.asm_templates._imm import add_large_int as _add_large_int_lines
+from compiler.asm_templates._imm import load_large_int as _load_large_int_lines
 
 
 class Renderable(Protocol):

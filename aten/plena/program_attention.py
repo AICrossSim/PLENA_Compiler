@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from compiler.asm_templates import preload_addr_reg_asm
 from compiler.asm_templates._imm import add_large_int
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
@@ -57,6 +58,21 @@ class ProgramAttentionMixin:
         self.register_allocator.free_gp([gp_mask, gp_fp, gp_loop])
         self.emit("\n".join(lines) + "\n")
         return mask
+
+    def _scale_scores_before_mask(
+        self,
+        scores: VRAMMatrixVar,
+        scale: float,
+        rows: int,
+    ) -> float:
+        """Scale score rows before adding a finite representation of -infinity."""
+        if scale != 1.0:
+            self.tile_row_mul_fp_broadcast_asm(
+                self.get_vram_addr(scores.name),
+                1,
+                list(range(rows)),
+            )
+        return 1.0
 
     def flash_attention(
         self,
@@ -274,12 +290,24 @@ class ProgramAttentionMixin:
                         target_col_idx=0,
                     )
                     valid_col_mask = valid_col_masks.get(block_cols)
+                    block_scale = scale
+                    if valid_col_mask is not None or needs_triangular_mask:
+                        block_scale = self._scale_scores_before_mask(
+                            S_block,
+                            scale,
+                            block_rows,
+                        )
                     if valid_col_mask is not None:
                         self.vram_add(S_block, valid_col_mask, num_rows=block_rows)
                     if needs_triangular_mask:
                         self.vram_add(S_block, causal_mask)
                     softmax_valid_cols = None if valid_col_mask is not None else block_cols
-                    self.online_softmax_block(S_block, scale, rows=block_rows, valid_cols=softmax_valid_cols)
+                    self.online_softmax_block(
+                        S_block,
+                        block_scale,
+                        rows=block_rows,
+                        valid_cols=softmax_valid_cols,
+                    )
                     self.compute_pv(S_block, V, physical_k_idx, PV, head_dim, rows=block_rows)
                     self.scale_o_row(O_batch, q_idx, rows=block_rows)
                     self.vram_add(O_batch, PV, dst_row_offset=q_idx * mlen, num_rows=block_rows)
@@ -326,7 +354,7 @@ class ProgramAttentionMixin:
             )
         if hkv != 1:
             raise NotImplementedError(
-                "ATen fused GQA currently supports one packed KV group in this "
+                "ATen fused GQA supports one packed KV group in this "
                 "entry point. Multi-KV packed decoder lowering should use "
                 "flash_attention_packed_group per KV group."
             )
@@ -360,7 +388,7 @@ class ProgramAttentionMixin:
             scale = 1.0 / math.sqrt(h_qkv)
 
         if s_q > mlen or s_kv > mlen:
-            raise NotImplementedError("Packed GQA lowering currently supports one sequence tile.")
+            raise NotImplementedError("Packed GQA lowering supports one sequence tile.")
         if V.shape[0] < batch_size * s_kv:
             raise ValueError(f"V rows {V.shape[0]} cannot cover batch_size*kv_seq_len={batch_size * s_kv}")
 
@@ -460,9 +488,10 @@ class ProgramAttentionMixin:
         q_idx: int,
         k_idx: int,
         s_base_address: int,
-        k_head_offset: int = 0,
+        k_head_selector: int = 0,
         q_rows: int | None = None,
         kv_cols: int | None = None,
+        prefetch_k: bool = True,
     ) -> None:
         """Emit packed QK^T with M_BTMM/M_BMM_WO into head-major S tiles.
 
@@ -476,20 +505,27 @@ class ProgramAttentionMixin:
         """
         self._ensure_hbm_sub_matrix_registered(K)
         k_layout = self.get_hbm_layout(K.name)
-        self._emit_hbm_matrix_load(
-            k_layout,
-            3,
-            lambda addr_reg, gp_regs: self.load_sub_matrix_asm(
-                name=K.name,
-                row_idx=k_idx,
-                col_idx=0,
-                mram_dest_addr=0,
-                hbm_addr_reg=addr_reg,
-                gp_regs=gp_regs,
-            ),
-        )
+        if prefetch_k:
+            self._emit_hbm_matrix_load(
+                k_layout,
+                3,
+                lambda addr_reg, gp_regs: self.load_sub_matrix_asm(
+                    name=K.name,
+                    row_idx=k_idx,
+                    col_idx=0,
+                    mram_dest_addr=0,
+                    hbm_addr_reg=addr_reg,
+                    gp_regs=gp_regs,
+                    matrix_precision="key_value",
+                ),
+            )
 
         mlen, blen = self.mlen, self.blen
+        selector_count = mlen // self.hlen
+        if not 0 <= k_head_selector < selector_count:
+            raise ValueError(
+                f"K head selector {k_head_selector} outside [0,{selector_count})"
+            )
         q_base = self.get_vram_addr(Q_group.name) + q_idx * mlen * mlen
         n_q_tiles = max(1, (min(mlen, q_rows or mlen) + blen - 1) // blen)
         n_kv_tiles = max(1, (min(mlen, kv_cols or mlen) + blen - 1) // blen)
@@ -499,14 +535,14 @@ class ProgramAttentionMixin:
                  f"({n_q_tiles} query-tile x {n_kv_tiles} kv-tile) ==="]
         for qt in range(n_q_tiles):
             for kt in range(n_kv_tiles):
-                k_off = k_head_offset + kt * blen * mlen
+                k_off = kt * blen * mlen
                 # kt==0 reads K from MRAM base 0 (gp0); kt>0 offsets by kt*BLEN*MLEN
                 # (the kv-tile's block rows, read transposed).
                 k_reg = "gp0" if k_off == 0 else f"gp{gp_k}"
                 lines += ([] if k_off == 0 else load_large_int(gp_k, k_off))
                 lines += [
                     *load_large_int(gp_q, q_base + qt * blen * mlen),
-                    f"M_BTMM 0, {k_reg}, gp{gp_q}",
+                    f"M_BTMM {k_head_selector}, {k_reg}, gp{gp_q}",
                     *load_large_int(gp_s, s_base_address + qt * blen * mlen + kt * blen),
                     f"M_BMM_WO gp{gp_s}, 0",
                 ]
@@ -518,27 +554,61 @@ class ProgramAttentionMixin:
         *,
         q_base_gp: int,
         k_hbm_addr_reg: int,
+        k_hbm_offset_gp: int,
         s_base_address: int,
         k_layout,
-        k_head_offset: int = 0,
+        k_head_selector: int = 0,
     ) -> None:
-        """Emit packed QK^T using loop-carried Q and K base registers."""
+        """Emit packed QK^T using loop-carried Q and K byte offsets."""
+        selector_count = self.mlen // self.hlen
+        if not 0 <= k_head_selector < selector_count:
+            raise ValueError(
+                f"K head selector {k_head_selector} outside [0,{selector_count})"
+            )
         gp_mram, gp_hbm, gp_s = self.register_allocator.allocate_gp(3)
-        rows, cols = k_layout.physical_shape or k_layout.full_shape
+        _, cols = k_layout.physical_shape or k_layout.full_shape
         lines = [
             "; === Packed GQA QK^T using compiler M_BTMM (KV-looped) ===",
-            *load_large_int(gp_hbm, rows * cols),
+            *load_large_int(gp_hbm, k_layout.element_plane_bytes),
             f"C_SET_SCALE_REG gp{gp_hbm}",
-            *load_large_int(gp_hbm, cols),
+            *load_large_int(
+                gp_hbm,
+                k_layout.element_stride_bytes(cols),
+            ),
             f"C_SET_STRIDE_REG gp{gp_hbm}",
             f"S_ADDI_INT gp{gp_mram}, gp0, 0",
-            f"S_ADDI_INT gp{gp_hbm}, gp0, 0",
-            f"H_PREFETCH_M gp{gp_mram}, gp{gp_hbm}, a{k_hbm_addr_reg}, 1, 0",
-            f"M_BTMM {k_head_offset}, gp0, gp{q_base_gp}",
+            f"H_PREFETCH_M gp{gp_mram}, gp{k_hbm_offset_gp}, "
+            f"a{k_hbm_addr_reg}, 1, 1",
+            f"M_BTMM {k_head_selector}, gp0, gp{q_base_gp}",
             *load_large_int(gp_s, s_base_address),
             f"M_BMM_WO gp{gp_s}, 0",
         ]
         self.register_allocator.free_gp([gp_mram, gp_hbm, gp_s])
+        self.emit("\n".join(lines) + "\n")
+
+    def _emit_packed_matrix_prefetch_dynamic(
+        self,
+        *,
+        layout,
+        hbm_addr_reg: int,
+        hbm_offset_gp: int,
+        mram_dest_addr: int,
+    ) -> None:
+        """Prefetch one packed matrix tile at a loop-carried byte offset."""
+
+        gp_mram, gp_setup = self.register_allocator.allocate_gp(2)
+        _, cols = layout.physical_shape or layout.full_shape
+        lines = [
+            f"; Load SubMatrix {layout.name} at loop-carried row block",
+            *load_large_int(gp_setup, layout.element_plane_bytes),
+            f"C_SET_SCALE_REG gp{gp_setup}",
+            *load_large_int(gp_setup, layout.element_stride_bytes(cols)),
+            f"C_SET_STRIDE_REG gp{gp_setup}",
+            *load_large_int(gp_mram, mram_dest_addr),
+            f"H_PREFETCH_M gp{gp_mram}, gp{hbm_offset_gp}, "
+            f"a{hbm_addr_reg}, 1, 1",
+        ]
+        self.register_allocator.free_gp([gp_mram, gp_setup])
         self.emit("\n".join(lines) + "\n")
 
     def _reset_vram_from_gp(
@@ -653,6 +723,7 @@ class ProgramAttentionMixin:
         output_head_base: int = 0,
         k_idx: int = 0,
         valid_cols: int | None = None,
+        kv_head_selector: int = 0,
     ) -> None:
         """Compiler-owned packed-head flash attention for one KV group."""
         seq_len, q_width = Q_group.shape
@@ -664,7 +735,7 @@ class ProgramAttentionMixin:
                 f"got logical_width={q_width}, physical_width={q_physical_width}, MLEN={mlen}"
             )
         if seq_len > mlen:
-            raise NotImplementedError("Packed attention currently supports one sequence tile.")
+            raise NotImplementedError("Packed attention supports one sequence tile.")
         if group_heads > broadcast_amount:
             raise ValueError(f"group_heads={group_heads} exceeds broadcast_amount={broadcast_amount}")
         if broadcast_amount * head_slot_dim != mlen:
@@ -674,15 +745,26 @@ class ProgramAttentionMixin:
             )
         if getattr(self, "hlen", head_slot_dim) != head_slot_dim:
             raise ValueError(f"Packed attention requires HLEN={head_slot_dim}, got {self.hlen}")
+        if not 0 <= kv_head_selector < mlen // head_slot_dim:
+            raise ValueError(
+                f"KV head selector {kv_head_selector} outside "
+                f"[0,{mlen // head_slot_dim})"
+            )
 
         self._ensure_hbm_sub_matrix_registered(K)
         self._ensure_hbm_sub_matrix_registered(V)
         self._ensure_vram_matrix_layout(Q_group.name)
 
         rows = min(mlen, seq_len)
-        # RTL M_BTMM applies NO bmm_scale (unlike the emulator's fixed 0.25), so the
-        # QK^T scores reach the softmax unscaled -> apply the caller's scale directly.
-        # (scale/0.25 would make the softmax 4x too sharp -> peaked P -> inflated P@V.)
+        active_cols = valid_cols if valid_cols is not None else seq_len
+        if active_cols <= 0:
+            raise ValueError("packed attention requires at least one KV column")
+        kv_blocks = math.ceil(active_cols / mlen)
+        if kv_blocks > 1 and rows != 1:
+            raise NotImplementedError(
+                "multi-tile PackedKV lowering is restricted to q_len=1 decode"
+            )
+        # M_BTMM leaves QK scores unscaled; softmax applies the declared scale.
         softmax_scale = scale
 
         s_views = [
@@ -708,17 +790,228 @@ class ProgramAttentionMixin:
                 mlen=mlen,
             )
         )
+        if kv_blocks > 1:
+            full_block_count, tail_columns = divmod(active_cols, mlen)
+            o_heads = [
+                self.alloc(
+                    f"_packed_O_head{head}",
+                    rows,
+                    head_slot_dim,
+                    strict=False,
+                    physical_shape=(mlen, mlen),
+                )
+                for head in range(group_heads)
+            ]
+            state_stride = rows
+            state_bases = [
+                self._ONLINE_SOFTMAX_FPSRAM_BASE
+                + head * 3 * state_stride
+                for head in range(group_heads)
+            ]
+            for head, o_head in enumerate(o_heads):
+                self.emit(
+                    f"; PackedKV softmax state head {head}, "
+                    f"base {state_bases[head]}, stride {state_stride}\n"
+                )
+                self.init_online_softmax(
+                    0,
+                    o_head,
+                    rows=rows,
+                    state_base_address=state_bases[head],
+                    state_stride=state_stride,
+                )
+
+            tail_mask = (
+                self._build_valid_col_mask(
+                    f"_packed_valid_col_mask_{tail_columns}",
+                    tail_columns,
+                )
+                if tail_columns
+                else None
+            )
+            k_layout = self.get_hbm_layout(K.name)
+            v_layout = self.get_hbm_layout(V.name)
+            k_block_step = k_layout.element_offset_bytes(mlen * mlen)
+            v_block_step = v_layout.element_offset_bytes(mlen * mlen)
+            v_selector_offset = v_layout.element_offset_bytes(
+                kv_head_selector * head_slot_dim
+            )
+            gp_k_offset, gp_v_offset, gp_step, gp_loop = (
+                self.register_allocator.allocate_gp(4)
+            )
+            k_addr_reg, v_addr_reg = self.register_allocator.allocate_addr(2)
+            try:
+                setup = preload_addr_reg_asm(
+                    addr_reg_to_set=[k_addr_reg, v_addr_reg],
+                    available_registers=[gp_step, gp_loop],
+                    addr_reg_val=[k_layout.hbm_base_addr, v_layout.hbm_base_addr],
+                )
+                setup += "\n".join(
+                    [
+                        *load_large_int(gp_k_offset, k_idx * k_block_step),
+                        *load_large_int(
+                            gp_v_offset,
+                            k_idx * v_block_step + v_selector_offset,
+                        ),
+                    ]
+                ) + "\n"
+                self.emit(setup)
+
+                def emit_sequence_block(
+                    block_cols: int,
+                    valid_col_mask: VRAMMatrixVar | None,
+                ) -> None:
+                    self._emit_packed_matrix_prefetch_dynamic(
+                        layout=k_layout,
+                        hbm_addr_reg=k_addr_reg,
+                        hbm_offset_gp=gp_k_offset,
+                        mram_dest_addr=0,
+                    )
+                    self._emit_packed_qkt_to_s(
+                        Q_group=Q_group,
+                        K=K,
+                        q_idx=0,
+                        k_idx=0,
+                        s_base_address=scratch_base_address,
+                        k_head_selector=kv_head_selector,
+                        q_rows=rows,
+                        kv_cols=block_cols,
+                        prefetch_k=False,
+                    )
+                    self._emit_packed_matrix_prefetch_dynamic(
+                        layout=v_layout,
+                        hbm_addr_reg=v_addr_reg,
+                        hbm_offset_gp=gp_v_offset,
+                        mram_dest_addr=0,
+                    )
+                    for head, s_head in enumerate(s_views):
+                        if valid_col_mask is not None:
+                            block_scale = self._scale_scores_before_mask(
+                                s_head,
+                                softmax_scale,
+                                rows,
+                            )
+                            self.vram_add(
+                                s_head,
+                                valid_col_mask,
+                                num_rows=rows,
+                            )
+                        else:
+                            block_scale = softmax_scale
+                        self.online_softmax_block(
+                            s_head,
+                            block_scale,
+                            rows=rows,
+                            valid_cols=(
+                                None
+                                if valid_col_mask is not None
+                                else block_cols
+                            ),
+                            state_base_address=state_bases[head],
+                            state_stride=state_stride,
+                        )
+                        self.compute_pv(
+                            s_head,
+                            V,
+                            0,
+                            pv,
+                            head_slot_dim,
+                            rows=rows,
+                            prefetch_v=False,
+                        )
+                        self.scale_o_row(
+                            o_heads[head],
+                            0,
+                            rows=rows,
+                            state_base_address=state_bases[head],
+                            state_stride=state_stride,
+                        )
+                        self.vram_add(o_heads[head], pv, num_rows=rows)
+
+                if full_block_count:
+                    self.emit(
+                        "; PackedKV compact full-block loop\n"
+                        f"C_LOOP_START gp{gp_loop}, {full_block_count}\n"
+                    )
+                    emit_sequence_block(mlen, None)
+                    advances = [
+                        *add_large_int(
+                            gp_k_offset,
+                            gp_k_offset,
+                            k_block_step,
+                            temp_reg=gp_step,
+                        ),
+                        *add_large_int(
+                            gp_v_offset,
+                            gp_v_offset,
+                            v_block_step,
+                            temp_reg=gp_step,
+                        ),
+                        f"C_LOOP_END gp{gp_loop}",
+                    ]
+                    self.emit("\n".join(advances) + "\n")
+                if tail_columns:
+                    self.emit(
+                        "; PackedKV compact masked-tail block, "
+                        f"valid columns {tail_columns}\n"
+                    )
+                    emit_sequence_block(tail_columns, tail_mask)
+                self.emit("; PackedKV compact sequence complete\n")
+            finally:
+                self.register_allocator.free_addr([k_addr_reg, v_addr_reg])
+                self.register_allocator.free_gp(
+                    [gp_k_offset, gp_v_offset, gp_step, gp_loop]
+                )
+
+            for head, o_head in enumerate(o_heads):
+                self.final_scale_o(
+                    0,
+                    o_head,
+                    rows=rows,
+                    state_base_address=state_bases[head],
+                    state_stride=state_stride,
+                )
+                output_head = output_head_base + head
+                output_col_block = (
+                    output_head * head_slot_dim
+                ) // mlen
+                output_lane = (
+                    (output_head * head_slot_dim) % mlen
+                ) // head_slot_dim
+                output_block_base = (
+                    output_base_address
+                    + output_col_block * output_physical_rows * mlen
+                )
+                self._pack_o_head_to_output(
+                    o_head=o_head,
+                    output_base_address=output_block_base,
+                    output_physical_rows=output_physical_rows,
+                    head_slot=output_lane,
+                    head_slot_dim=head_slot_dim,
+                    rows=rows,
+                    scratch_address=pack_scratch_addr,
+                )
+                self.free_tensor(o_head)
+
+            if tail_mask is not None:
+                self.free_tensor(tail_mask)
+            for s_view in s_views:
+                self.free_tensor(s_view)
+            self.free_tensor(pv)
+            self.free_tensor(pack_scratch)
+            return
+
         self._emit_packed_qkt_to_s(
             Q_group=Q_group,
             K=K,
             q_idx=0,
             k_idx=k_idx,
             s_base_address=scratch_base_address,
+            k_head_selector=kv_head_selector,
             q_rows=rows,
             kv_cols=(valid_cols if valid_cols is not None else seq_len),
         )
 
-        active_cols = valid_cols or seq_len
         valid_col_mask = (
             self._build_valid_col_mask(f"_packed_valid_col_mask_{active_cols}", active_cols)
             if self._needs_explicit_valid_col_mask(active_cols)
@@ -726,7 +1019,8 @@ class ProgramAttentionMixin:
         )
         # Warm V into MSRAM once so head 0's cold-start-reprimed first tile reads V
         # (not the QK^T's stale K) on row 0 too — it lands during head 0's softmax.
-        self.warm_v_prefetch(V.name, k_idx)
+        v_element_offset = kv_head_selector * head_slot_dim
+        self.warm_v_prefetch(V.name, k_idx, v_element_offset=v_element_offset)
         for head, s_head in enumerate(s_views):
             o_head = self.alloc(
                 f"_packed_O_head{head}",
@@ -736,6 +1030,13 @@ class ProgramAttentionMixin:
                 physical_shape=(mlen, mlen),
             )
             self.init_online_softmax(0, o_head, rows=rows)
+            applied_scale = softmax_scale
+            if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar):
+                applied_scale = self._scale_scores_before_mask(
+                    s_head,
+                    softmax_scale,
+                    rows,
+                )
             if valid_col_mask is not None:
                 self.vram_add(s_head, valid_col_mask, num_rows=rows)
             if isinstance(causal_mask, VRAMMatrixVar):
@@ -752,9 +1053,18 @@ class ProgramAttentionMixin:
             # l/m_res round-trip used by scale_o_row/final_scale_o, whose per-row store
             # is racy on this RTL (drops -> O saturates to FP12 max; see online_softmax.py).
             # o_head was zeroed by init_online_softmax, so vram_add copies pv into O.
-            self.online_softmax_block(s_head, softmax_scale, rows=rows,
+            self.online_softmax_block(s_head, applied_scale, rows=rows,
                                       valid_cols=softmax_valid_cols, inline_normalize=True)
-            self.compute_pv(s_head, V, k_idx, pv, head_slot_dim, rows=rows)
+            self.compute_pv(
+                s_head,
+                V,
+                k_idx,
+                pv,
+                head_slot_dim,
+                rows=rows,
+                v_element_offset=v_element_offset,
+                prefetch_v=False,
+            )
             self.vram_add(o_head, pv, num_rows=rows)
             output_head = output_head_base + head
             output_col_block = (output_head * head_slot_dim) // mlen
@@ -773,6 +1083,8 @@ class ProgramAttentionMixin:
 
         if valid_col_mask is not None:
             self.free_tensor(valid_col_mask)
+        for s_view in s_views:
+            self.free_tensor(s_view)
         self.free_tensor(pv)
         self.free_tensor(pack_scratch)
 
@@ -803,7 +1115,7 @@ class ProgramAttentionMixin:
         num_kv_heads = len(kv_pairs)
         q_physical_rows, q_physical_cols = Q_full.physical_shape
         if seq_len > mlen:
-            raise NotImplementedError("KV-group looped packed attention currently supports one sequence tile.")
+            raise NotImplementedError("KV-group looped packed attention supports one sequence tile.")
         if q_physical_cols < num_kv_heads * mlen:
             raise ValueError(
                 f"Q_full physical cols {q_physical_cols} cannot hold {num_kv_heads} MLEN-wide groups"
@@ -843,7 +1155,7 @@ class ProgramAttentionMixin:
         q_group_stride = q_physical_rows * mlen
         o_group_stride = q_physical_rows * mlen
         rows = min(mlen, seq_len)
-        softmax_scale = scale / 0.25
+        softmax_scale = scale
         k_layout = self.get_hbm_layout(kv_pairs[0][0].name)
 
         s_views = [
@@ -884,6 +1196,7 @@ class ProgramAttentionMixin:
             self._emit_packed_qkt_to_s_dynamic(
                 q_base_gp=gp_q,
                 k_hbm_addr_reg=k_addr_reg,
+                k_hbm_offset_gp=0,
                 s_base_address=scratch_base_address,
                 k_layout=k_layout,
             )
@@ -897,6 +1210,13 @@ class ProgramAttentionMixin:
                     physical_shape=(mlen, mlen),
                 )
                 self.init_online_softmax(0, o_head, rows=rows)
+                applied_scale = softmax_scale
+                if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar):
+                    applied_scale = self._scale_scores_before_mask(
+                        s_head,
+                        softmax_scale,
+                        rows,
+                    )
                 if valid_col_mask is not None:
                     self.vram_add(s_head, valid_col_mask, num_rows=rows)
                 if isinstance(causal_mask, VRAMMatrixVar):
@@ -908,7 +1228,7 @@ class ProgramAttentionMixin:
                     if valid_col_mask is not None or isinstance(causal_mask, VRAMMatrixVar)
                     else seq_len
                 )
-                self.online_softmax_block(s_head, softmax_scale, rows=rows, valid_cols=softmax_valid_cols)
+                self.online_softmax_block(s_head, applied_scale, rows=rows, valid_cols=softmax_valid_cols)
                 self.emit(
                     self._pv_multiply_asm(
                         mlen=mlen,
@@ -917,6 +1237,7 @@ class ProgramAttentionMixin:
                         p_address=self.get_vram_addr(s_head.name),
                         v_hbm_offset_reg=v_addr_reg,
                         v_hbm_offset=0,
+                        v_element_bits=k_layout.hbm_element_width,
                         pv_address=self.get_vram_addr(pv.name),
                         rows=rows,
                     )
@@ -964,11 +1285,13 @@ class ProgramAttentionMixin:
         causal_mask: bool | VRAMMatrixVar | None = True,
         k_idx: int = 0,
         valid_cols: int | None = None,
+        kv_head_selector: int = 0,
     ) -> None:
         """Emit one KV group's packed-head flash-attention body.
 
         Q_group and the output use an MLEN-wide row where active Q heads occupy
-        HLEN-sized lanes. K/V are one KV head stored as MLEN-padded HBM rows.
+        HLEN-sized lanes. ``kv_head_selector`` chooses an HLEN lane when K/V
+        share one PackedKV row and remains zero for padded per-head inputs.
         """
         seq_len, q_width = Q_group.shape
         mlen = self.mlen
@@ -1000,9 +1323,606 @@ class ProgramAttentionMixin:
             causal_mask=causal_mask,
             k_idx=k_idx,
             valid_cols=valid_cols,
+            kv_head_selector=kv_head_selector,
         )
 
-    def init_online_softmax(self, q_idx: int, o_matrix: VRAMMatrixVar, rows: int | None = None):
+    def _flash_attention_packed_cache_reused(
+        self,
+        Q_full: VRAMMatrixVar,
+        K_packed: InputVar,
+        V_packed: InputVar,
+        *,
+        num_kv_heads: int,
+        group_heads: int,
+        head_slot_dim: int,
+        output_base_address: int,
+        scratch_base_address: int,
+        broadcast_amount: int,
+        scale: float | None,
+        causal_mask: bool | VRAMMatrixVar | None,
+        k_idx: int,
+        active_cols: int,
+        batch_size: int,
+        rows_per_batch: int,
+        cache_rows_per_batch: int,
+    ) -> None:
+        """Reuse each resident packed K/V tile across every local selector."""
+
+        if group_heads <= 0 or group_heads > broadcast_amount:
+            raise ValueError(
+                f"group_heads={group_heads} must be in "
+                f"[1,broadcast_amount={broadcast_amount}]"
+            )
+        if broadcast_amount * head_slot_dim != self.mlen:
+            raise ValueError(
+                "broadcast_amount*head_slot_dim must equal MLEN "
+                f"({broadcast_amount}*{head_slot_dim} != {self.mlen})"
+            )
+        if self.mram_tile_capacity < 2:
+            raise ValueError("KV-head reuse requires two resident MRAM tiles")
+        total_query_heads = num_kv_heads * group_heads
+        state_end = self._ONLINE_SOFTMAX_FPSRAM_BASE + 3 * total_query_heads
+        if state_end > self.fpram_allocator.total_size:
+            raise ValueError(
+                "KV-head reuse softmax state exceeds scalar FP SRAM capacity"
+            )
+
+        mlen = self.mlen
+        q_physical_rows = Q_full.physical_shape[0]
+        batch_stride = rows_per_batch * mlen
+        group_stride = q_physical_rows * mlen
+        cache_blocks_per_batch = cache_rows_per_batch // mlen
+        kv_blocks = math.ceil(active_cols / mlen)
+        resident_v_tile = mlen * mlen
+        softmax_scale = (
+            1.0 / math.sqrt(head_slot_dim) if scale is None else scale
+        )
+        workspace_rows = math.ceil(total_query_heads / mlen) * mlen
+
+        s_views = [
+            self.alloc_at(
+                f"_packed_reuse_S_h{head}",
+                mlen,
+                mlen,
+                scratch_base_address + head * mlen * mlen,
+                physical_shape=(mlen, mlen),
+            )
+            for head in range(group_heads)
+        ]
+        pv = self.alloc(
+            "_packed_reuse_PV",
+            1,
+            head_slot_dim,
+            strict=False,
+            physical_shape=(mlen, mlen),
+        )
+        pack_scratch = self.alloc(
+            "_packed_reuse_pack_scratch",
+            1,
+            mlen,
+            strict=False,
+            physical_shape=(1, mlen),
+        )
+        pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
+        q_base = self.get_vram_addr(Q_full.name)
+
+        try:
+            for batch_idx in range(batch_size):
+                o_workspace = self.alloc(
+                    f"_packed_reuse_O_b{batch_idx}",
+                    total_query_heads,
+                    head_slot_dim,
+                    strict=False,
+                    physical_shape=(workspace_rows, mlen),
+                )
+                o_workspace_base = self.get_vram_addr(o_workspace.name)
+                o_heads: list[VRAMMatrixVar] = []
+                q_groups: list[VRAMMatrixVar] = []
+                try:
+                    for selector in range(num_kv_heads):
+                        output_group_base = (
+                            output_base_address
+                            + selector * group_stride
+                            + batch_idx * batch_stride
+                        )
+                        self.emit(
+                            self._reset_vram_asm(
+                                start_address=output_group_base,
+                                rows=1,
+                                cols=mlen,
+                                total_rows=rows_per_batch,
+                                mlen=mlen,
+                            )
+                        )
+                        q_groups.append(
+                            self.alloc_at(
+                                f"_packed_reuse_Q_b{batch_idx}_g{selector}",
+                                1,
+                                mlen,
+                                (
+                                    q_base
+                                    + selector * group_stride
+                                    + batch_idx * batch_stride
+                                ),
+                                physical_shape=(rows_per_batch, mlen),
+                            )
+                        )
+                        for head in range(group_heads):
+                            global_head = selector * group_heads + head
+                            o_head = self.alloc_at(
+                                f"_packed_reuse_O_b{batch_idx}_h{global_head}",
+                                1,
+                                head_slot_dim,
+                                o_workspace_base + global_head * mlen,
+                                physical_shape=(workspace_rows, mlen),
+                            )
+                            state_base = (
+                                self._ONLINE_SOFTMAX_FPSRAM_BASE
+                                + 3 * global_head
+                            )
+                            self.init_online_softmax(
+                                0,
+                                o_head,
+                                rows=1,
+                                state_base_address=state_base,
+                                state_stride=1,
+                            )
+                            o_heads.append(o_head)
+
+                    batch_k_idx = k_idx + batch_idx * cache_blocks_per_batch
+                    full_block_count, tail_columns = divmod(active_cols, mlen)
+                    tail_mask = (
+                        self._build_valid_col_mask(
+                            f"_packed_reuse_valid_cols_{tail_columns}",
+                            tail_columns,
+                        )
+                        if tail_columns
+                        else None
+                    )
+                    k_layout = self.get_hbm_layout(K_packed.name)
+                    v_layout = self.get_hbm_layout(V_packed.name)
+                    k_block_step = k_layout.element_offset_bytes(mlen * mlen)
+                    v_block_step = v_layout.element_offset_bytes(mlen * mlen)
+                    gp_k_offset, gp_v_offset, gp_step, gp_loop = (
+                        self.register_allocator.allocate_gp(4)
+                    )
+                    k_addr_reg, v_addr_reg = (
+                        self.register_allocator.allocate_addr(2)
+                    )
+                    try:
+                        setup = preload_addr_reg_asm(
+                            addr_reg_to_set=[k_addr_reg, v_addr_reg],
+                            available_registers=[gp_step, gp_loop],
+                            addr_reg_val=[
+                                k_layout.hbm_base_addr,
+                                v_layout.hbm_base_addr,
+                            ],
+                        )
+                        setup += "\n".join(
+                            [
+                                *load_large_int(
+                                    gp_k_offset,
+                                    batch_k_idx * k_block_step,
+                                ),
+                                *load_large_int(
+                                    gp_v_offset,
+                                    batch_k_idx * v_block_step,
+                                ),
+                            ]
+                        ) + "\n"
+                        self.emit(setup)
+
+                        def emit_reused_block(
+                            block_cols: int,
+                            valid_col_mask: VRAMMatrixVar | None,
+                        ) -> None:
+                            self._emit_packed_matrix_prefetch_dynamic(
+                                layout=k_layout,
+                                hbm_addr_reg=k_addr_reg,
+                                hbm_offset_gp=gp_k_offset,
+                                mram_dest_addr=0,
+                            )
+                            self._emit_packed_matrix_prefetch_dynamic(
+                                layout=v_layout,
+                                hbm_addr_reg=v_addr_reg,
+                                hbm_offset_gp=gp_v_offset,
+                                mram_dest_addr=resident_v_tile,
+                            )
+                            for selector, q_group in enumerate(q_groups):
+                                self.emit(
+                                    f"; PackedKV reused batch {batch_idx}, "
+                                    f"selector {selector}\n"
+                                )
+                                self._emit_packed_qkt_to_s(
+                                    Q_group=q_group,
+                                    K=K_packed,
+                                    q_idx=0,
+                                    k_idx=0,
+                                    s_base_address=scratch_base_address,
+                                    k_head_selector=selector,
+                                    q_rows=1,
+                                    kv_cols=block_cols,
+                                    prefetch_k=False,
+                                )
+                                for head, s_head in enumerate(s_views):
+                                    global_head = selector * group_heads + head
+                                    o_head = o_heads[global_head]
+                                    state_base = (
+                                        self._ONLINE_SOFTMAX_FPSRAM_BASE
+                                        + 3 * global_head
+                                    )
+                                    applied_scale = softmax_scale
+                                    if valid_col_mask is not None or isinstance(
+                                        causal_mask,
+                                        VRAMMatrixVar,
+                                    ):
+                                        applied_scale = self._scale_scores_before_mask(
+                                            s_head,
+                                            softmax_scale,
+                                            1,
+                                        )
+                                    if valid_col_mask is not None:
+                                        self.vram_add(
+                                            s_head,
+                                            valid_col_mask,
+                                            num_rows=1,
+                                        )
+                                    if isinstance(causal_mask, VRAMMatrixVar):
+                                        self.vram_add(
+                                            s_head,
+                                            causal_mask,
+                                            num_rows=1,
+                                        )
+                                    elif causal_mask is True:
+                                        self.emit(
+                                            "; NOTE: reused cached attention received "
+                                            "causal_mask=True without a VRAM mask; "
+                                            "no mask applied.\n"
+                                        )
+
+                                    single_block = kv_blocks == 1
+                                    self.online_softmax_block(
+                                        s_head,
+                                        applied_scale,
+                                        rows=1,
+                                        valid_cols=(
+                                            None
+                                            if valid_col_mask is not None
+                                            or isinstance(
+                                                causal_mask,
+                                                VRAMMatrixVar,
+                                            )
+                                            else block_cols
+                                        ),
+                                        inline_normalize=single_block,
+                                        state_base_address=state_base,
+                                        state_stride=1,
+                                    )
+                                    if not single_block:
+                                        self.scale_o_row(
+                                            o_head,
+                                            0,
+                                            rows=1,
+                                            state_base_address=state_base,
+                                            state_stride=1,
+                                        )
+                                    self.compute_pv(
+                                        s_head,
+                                        V_packed,
+                                        0,
+                                        pv,
+                                        head_slot_dim,
+                                        rows=1,
+                                        prefetch_v=False,
+                                        v_mram_base=(
+                                            resident_v_tile
+                                            + selector * head_slot_dim * mlen
+                                        ),
+                                    )
+                                    self.vram_add(o_head, pv, num_rows=1)
+
+                        if full_block_count:
+                            self.emit(
+                                "; PackedKV reused compact full-block loop\n"
+                                f"C_LOOP_START gp{gp_loop}, "
+                                f"{full_block_count}\n"
+                            )
+                            emit_reused_block(mlen, None)
+                            advances = [
+                                *add_large_int(
+                                    gp_k_offset,
+                                    gp_k_offset,
+                                    k_block_step,
+                                    temp_reg=gp_step,
+                                ),
+                                *add_large_int(
+                                    gp_v_offset,
+                                    gp_v_offset,
+                                    v_block_step,
+                                    temp_reg=gp_step,
+                                ),
+                                f"C_LOOP_END gp{gp_loop}",
+                            ]
+                            self.emit("\n".join(advances) + "\n")
+                        if tail_columns:
+                            self.emit(
+                                "; PackedKV reused compact masked-tail block, "
+                                f"valid columns {tail_columns}\n"
+                            )
+                            emit_reused_block(tail_columns, tail_mask)
+                        self.emit(
+                            "; PackedKV reused compact sequence complete\n"
+                        )
+                    finally:
+                        self.register_allocator.free_addr(
+                            [k_addr_reg, v_addr_reg]
+                        )
+                        self.register_allocator.free_gp(
+                            [gp_k_offset, gp_v_offset, gp_step, gp_loop]
+                        )
+                        if tail_mask is not None:
+                            self.free_tensor(tail_mask)
+
+                    for selector in range(num_kv_heads):
+                        output_group_base = (
+                            output_base_address
+                            + selector * group_stride
+                            + batch_idx * batch_stride
+                        )
+                        for head in range(group_heads):
+                            global_head = selector * group_heads + head
+                            o_head = o_heads[global_head]
+                            if kv_blocks > 1:
+                                state_base = (
+                                    self._ONLINE_SOFTMAX_FPSRAM_BASE
+                                    + 3 * global_head
+                                )
+                                self.final_scale_o(
+                                    0,
+                                    o_head,
+                                    rows=1,
+                                    state_base_address=state_base,
+                                    state_stride=1,
+                                )
+                            self._pack_o_head_to_output(
+                                o_head=o_head,
+                                output_base_address=output_group_base,
+                                output_physical_rows=rows_per_batch,
+                                head_slot=head,
+                                head_slot_dim=head_slot_dim,
+                                rows=1,
+                                scratch_address=pack_scratch_addr,
+                            )
+                finally:
+                    for q_group in q_groups:
+                        self.free_tensor(q_group)
+                    for o_head in o_heads:
+                        self.free_tensor(o_head)
+                    self.free_tensor(o_workspace)
+        finally:
+            for s_view in s_views:
+                self.free_tensor(s_view)
+            self.free_tensor(pv)
+            self.free_tensor(pack_scratch)
+
+    def flash_attention_packed_cache(
+        self,
+        Q_full: VRAMMatrixVar,
+        K_packed: InputVar,
+        V_packed: InputVar,
+        *,
+        num_kv_heads: int,
+        group_heads: int,
+        head_slot_dim: int,
+        output_base_address: int,
+        scratch_base_address: int,
+        broadcast_amount: int,
+        scale=None,
+        causal_mask: bool | VRAMMatrixVar | None = True,
+        k_idx: int = 0,
+        valid_cols: int | None = None,
+        cache_position: int | None = None,
+        batch_size: int = 1,
+        rows_per_batch: int | None = None,
+        query_rows_per_batch: int | None = None,
+        cache_rows_per_batch: int | None = None,
+        kv_head_reuse: bool = False,
+    ) -> None:
+        """Unroll independent batch slabs and KV selectors over one packed cache."""
+        if not isinstance(kv_head_reuse, bool):
+            raise TypeError("kv_head_reuse must be boolean")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if num_kv_heads <= 0 or num_kv_heads > self.mlen // head_slot_dim:
+            raise ValueError(
+                f"num_kv_heads={num_kv_heads} exceeds "
+                f"{self.mlen // head_slot_dim} selector slots"
+            )
+        q_rows, _ = Q_full.shape
+        q_physical_rows, q_physical_cols = Q_full.physical_shape
+        if rows_per_batch is None:
+            if q_physical_rows % batch_size:
+                raise ValueError(
+                    f"Q physical rows {q_physical_rows} are not divisible by "
+                    f"batch_size={batch_size}"
+                )
+            rows_per_batch = q_physical_rows // batch_size
+        if rows_per_batch <= 0 or batch_size * rows_per_batch != q_physical_rows:
+            raise ValueError(
+                f"batch_size*rows_per_batch must equal Q physical rows "
+                f"({batch_size}*{rows_per_batch} != {q_physical_rows})"
+            )
+        if rows_per_batch % self.mlen:
+            raise ValueError(
+                f"rows_per_batch={rows_per_batch} must be a multiple of MLEN={self.mlen}"
+            )
+        if query_rows_per_batch is None:
+            if q_rows % batch_size:
+                raise ValueError(
+                    f"Q logical rows {q_rows} are not divisible by batch_size={batch_size}"
+                )
+            query_rows_per_batch = q_rows // batch_size
+        if not 0 < query_rows_per_batch <= min(rows_per_batch, self.mlen):
+            raise ValueError(
+                f"query_rows_per_batch={query_rows_per_batch} must be in "
+                f"[1,{min(rows_per_batch, self.mlen)}]"
+            )
+        if valid_cols is not None and valid_cols <= 0:
+            raise ValueError("valid_cols must be positive")
+        if query_rows_per_batch == 1:
+            if valid_cols is None:
+                raise ValueError(
+                    "cached q_len=1 attention requires an explicit valid_cols"
+                )
+            if cache_position is None:
+                raise ValueError(
+                    "cached q_len=1 attention requires an explicit cache_position"
+                )
+            if (
+                isinstance(cache_position, bool)
+                or not isinstance(cache_position, int)
+                or cache_position < 0
+            ):
+                raise ValueError("cache_position must be a non-negative integer")
+            if cache_position != valid_cols - 1:
+                raise ValueError(
+                    "cached q_len=1 attention requires cache_position == "
+                    "valid_cols - 1"
+                )
+        elif cache_position is not None:
+            raise ValueError(
+                "cache_position is only valid for cached q_len=1 attention"
+            )
+        if k_idx < 0:
+            raise ValueError("k_idx must be non-negative")
+        if q_physical_cols < num_kv_heads * self.mlen:
+            raise ValueError(
+                f"Q_full physical width {q_physical_cols} cannot hold "
+                f"{num_kv_heads} MLEN groups"
+            )
+        k_physical_rows = K_packed.physical_shape[0]
+        v_physical_rows = V_packed.physical_shape[0]
+        if k_physical_rows != v_physical_rows:
+            raise ValueError("PackedKV K and V physical row counts must match")
+        if cache_rows_per_batch is None:
+            if k_physical_rows % batch_size:
+                raise ValueError(
+                    f"PackedKV rows {k_physical_rows} are not divisible by "
+                    f"batch_size={batch_size}"
+                )
+            cache_rows_per_batch = k_physical_rows // batch_size
+        if (
+            cache_rows_per_batch <= 0
+            or cache_rows_per_batch % self.mlen
+        ):
+            raise ValueError(
+                "cache_rows_per_batch must be a positive multiple of MLEN"
+            )
+        if batch_size * cache_rows_per_batch > k_physical_rows:
+            raise ValueError("PackedKV physical rows cannot cover all batch slabs")
+        active_cols = (
+            query_rows_per_batch
+            if valid_cols is None
+            else valid_cols
+        )
+        if active_cols > cache_rows_per_batch:
+            raise ValueError(
+                f"valid_cols={active_cols} exceeds the "
+                f"{cache_rows_per_batch}-row cache slab"
+            )
+        cache_blocks_per_batch = cache_rows_per_batch // self.mlen
+        required_k_rows = (
+            k_idx + batch_size * cache_blocks_per_batch
+        ) * self.mlen
+        for tensor, role in ((K_packed, "K"), (V_packed, "V")):
+            physical = tensor.physical_shape
+            if physical[1] != self.mlen:
+                raise ValueError(
+                    f"PackedKV {role} rows must be MLEN-wide, got {physical[1]}"
+                )
+            if physical[0] < required_k_rows:
+                raise ValueError(
+                    f"PackedKV {role} has {physical[0]} rows, "
+                    f"requires at least {required_k_rows}"
+                )
+        q_base = self.get_vram_addr(Q_full.name)
+        batch_stride = rows_per_batch * self.mlen
+        group_stride = q_physical_rows * self.mlen
+        if kv_head_reuse and num_kv_heads > 1:
+            if query_rows_per_batch != 1:
+                raise NotImplementedError(
+                    "KV-head reuse requires cached q_len=1 attention"
+                )
+            self._flash_attention_packed_cache_reused(
+                Q_full,
+                K_packed,
+                V_packed,
+                num_kv_heads=num_kv_heads,
+                group_heads=group_heads,
+                head_slot_dim=head_slot_dim,
+                output_base_address=output_base_address,
+                scratch_base_address=scratch_base_address,
+                broadcast_amount=broadcast_amount,
+                scale=scale,
+                causal_mask=causal_mask,
+                k_idx=k_idx,
+                active_cols=active_cols,
+                batch_size=batch_size,
+                rows_per_batch=rows_per_batch,
+                cache_rows_per_batch=cache_rows_per_batch,
+            )
+            return
+        for batch_idx in range(batch_size):
+            batch_k_idx = (
+                k_idx + batch_idx * cache_blocks_per_batch
+            )
+            for kv_head in range(num_kv_heads):
+                self.emit(
+                    f"; PackedKV batch {batch_idx}, selector {kv_head}, "
+                    f"K block {batch_k_idx}\n"
+                )
+                q_group = self.alloc_at(
+                    f"_packed_cache_Q_b{batch_idx}_group{kv_head}",
+                    query_rows_per_batch,
+                    self.mlen,
+                    (
+                        q_base
+                        + kv_head * group_stride
+                        + batch_idx * batch_stride
+                    ),
+                    physical_shape=(rows_per_batch, self.mlen),
+                )
+                try:
+                    self.flash_attention_packed_group(
+                        q_group,
+                        K_packed,
+                        V_packed,
+                        group_heads=group_heads,
+                        head_slot_dim=head_slot_dim,
+                        output_base_address=(
+                            output_base_address
+                            + kv_head * group_stride
+                            + batch_idx * batch_stride
+                        ),
+                        scratch_base_address=scratch_base_address,
+                        broadcast_amount=broadcast_amount,
+                        scale=scale,
+                        causal_mask=causal_mask,
+                        k_idx=batch_k_idx,
+                        valid_cols=valid_cols,
+                        kv_head_selector=kv_head,
+                    )
+                finally:
+                    self.free_tensor(q_group)
+
+    def init_online_softmax(
+        self,
+        q_idx: int,
+        o_matrix: VRAMMatrixVar,
+        rows: int | None = None,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
+    ):
         """Initialize Online Softmax state: m=-inf, l=0, O_row=0"""
         o_info = super().get_tensor_info(o_matrix.name)
         seq_len, head_dim = o_info.shape
@@ -1013,6 +1933,8 @@ class ProgramAttentionMixin:
             seq_len=seq_len,
             head_dim=head_dim,
             rows=rows,
+            state_base_address=state_base_address,
+            state_stride=state_stride,
         )
 
     def online_softmax_block(
@@ -1022,6 +1944,8 @@ class ProgramAttentionMixin:
         rows: int | None = None,
         valid_cols: int | None = None,
         inline_normalize: bool = False,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
     ):
         """Perform Online Softmax on S block"""
         super().online_softmax_block(
@@ -1030,6 +1954,8 @@ class ProgramAttentionMixin:
             rows=rows,
             valid_cols=valid_cols,
             inline_normalize=inline_normalize,
+            state_base_address=state_base_address,
+            state_stride=state_stride,
         )
 
     def compute_pv(
@@ -1040,6 +1966,9 @@ class ProgramAttentionMixin:
         pv_matrix: VRAMMatrixVar,
         head_dim: int,
         rows: int | None = None,
+        v_element_offset: int = 0,
+        prefetch_v: bool = True,
+        v_mram_base: int = 0,
     ):
         """Compute PV = P @ V[k_idx] where P is stored in s_block."""
         if not isinstance(s_block, VRAMMatrixVar):
@@ -1057,9 +1986,19 @@ class ProgramAttentionMixin:
             pv_matrix=pv_matrix.name,
             head_dim=head_dim,
             rows=rows,
+            v_element_offset=v_element_offset,
+            prefetch_v=prefetch_v,
+            v_mram_base=v_mram_base,
         )
 
-    def scale_o_row(self, o_matrix: VRAMMatrixVar, q_idx: int, rows: int | None = None):
+    def scale_o_row(
+        self,
+        o_matrix: VRAMMatrixVar,
+        q_idx: int,
+        rows: int | None = None,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
+    ):
         """Scale current row block of O by m_res"""
         o_info = super().get_tensor_info(o_matrix.name)
         seq_len, head_dim = o_info.shape
@@ -1070,9 +2009,18 @@ class ProgramAttentionMixin:
             seq_len=seq_len,
             head_dim=head_dim,
             rows=rows,
+            state_base_address=state_base_address,
+            state_stride=state_stride,
         )
 
-    def final_scale_o(self, q_idx: int, o_matrix: VRAMMatrixVar, rows: int | None = None):
+    def final_scale_o(
+        self,
+        q_idx: int,
+        o_matrix: VRAMMatrixVar,
+        rows: int | None = None,
+        state_base_address: int | None = None,
+        state_stride: int | None = None,
+    ):
         """Final scaling: O[q_idx] = O[q_idx] / l"""
         o_info = super().get_tensor_info(o_matrix.name)
         seq_len, head_dim = o_info.shape
@@ -1083,6 +2031,8 @@ class ProgramAttentionMixin:
             seq_len=seq_len,
             head_dim=head_dim,
             rows=rows,
+            state_base_address=state_base_address,
+            state_stride=state_stride,
         )
 
 

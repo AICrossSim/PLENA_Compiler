@@ -18,6 +18,7 @@ Usage:
     python -m compiler.aten.sliced_emulator_runner AICrossSim/clm-60m --seq-len 32
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,20 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 _COMPILER_ROOT = Path(__file__).resolve().parents[1]  # PLENA_Compiler/
 _REPO_ROOT = _COMPILER_ROOT.parent
-for _p in [str(_REPO_ROOT), str(_REPO_ROOT / "tools"), str(_COMPILER_ROOT)]:
+# Simulator-side test helpers. PLENA_SIMULATOR_TEST_PATH overrides the location;
+# the fallback is the simulator's own testbench directory.
+_VALIDATION_ROOT = Path(
+    os.environ.get(
+        "PLENA_SIMULATOR_TEST_PATH",
+        _REPO_ROOT.parent / "PLENA_Simulator" / "transactional_emulator" / "testbench",
+    )
+)
+for _p in [
+    str(_REPO_ROOT),
+    str(_REPO_ROOT / "tools"),
+    str(_COMPILER_ROOT),
+    str(_VALIDATION_ROOT),
+]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
