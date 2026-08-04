@@ -19,6 +19,7 @@ for _p in [_SIM_ROOT, os.path.join(_SIM_ROOT, "tools"), os.path.join(_SIM_ROOT, 
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import pytest  # noqa: E402
 import torch  # noqa: E402
 
 
@@ -904,6 +905,7 @@ def test_mha_causal_skips_future_tiles_and_masks_only_diagonal():
     print("  PASS test_mha_causal_skips_future_tiles_and_masks_only_diagonal")
 
 
+@pytest.mark.online
 def test_compile_native_hf_decoder_golden_vs_hf():
     """Golden (MXFP8+BF16) should closely match HF float32 at native dims."""
     from compiler.aten.plena_frontend import compile_native_hf_decoder
@@ -929,6 +931,7 @@ def test_compile_native_hf_decoder_golden_vs_hf():
     print(f"  PASS test_compile_native_hf_decoder_golden_vs_hf ({pct:.1f}% allclose, cos={cos.item():.4f})")
 
 
+@pytest.mark.online
 def test_native_compile_assembles():
     """Native-dim ISA must assemble without overflow."""
     import os

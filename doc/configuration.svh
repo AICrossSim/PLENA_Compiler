@@ -8,7 +8,7 @@ import precision_pkg::*;
 package configuration_pkg;
     // Compute Unit Related 
     parameter   BLEN = 4;
-    parameter   HLEN = 8
+    parameter   HLEN = 8;
     parameter   MLEN = 64;
     parameter   VLEN = 64;
     parameter   INST_BUFF_DEPTH = 16;

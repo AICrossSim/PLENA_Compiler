@@ -27,3 +27,9 @@ packages = [
     "generator",
     "utils",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "online: requires network access and a remote model checkpoint",
+    "slow: long-running profiling or quantization experiment",
+]
