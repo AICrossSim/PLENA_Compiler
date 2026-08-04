@@ -644,7 +644,9 @@ def _generate_lm_head_code(
         batch=model_info.get("batch_size", 1),
         hidden_size=hidden_size,
         vocab_size=vocab_size,
-        alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4]),
+        # The projection lowering uses six scratch registers: weight cursor,
+        # temporary, activation cursor, writeback cursor, HBM offset, result base.
+        alive_registers=hardware_config.get("alive_registers", [1, 2, 3, 4, 5, 6]),
         lm_head_weight_hbm_offset_reg=scheduler["register_assignment"]
         .get("hbm_addr_reg", {})
         .get("lm_head_weight_offset", 0),

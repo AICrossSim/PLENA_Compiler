@@ -8,7 +8,7 @@ Runs the full pipeline:
     Compare VRAM → PyTorch reference forward
 
 Start scope: clm-60m at seq_len=128. First run is EXPECTED TO FAIL
-numerically because of known semantic bugs (see session plan Phase 2/4/5).
+numerically because several semantic paths are not yet validated end to end.
 Harness makes those failures visible so subsequent phases can measure
 progress.
 
@@ -491,7 +491,7 @@ def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128, num_layer
     #     return 2
 
     print("\n[PASS-PARTIAL] pipeline ran end-to-end. Numerical check deferred")
-    print("until HBM weight threading + semantic fixes land (Phase 4, 5, and weight-load wiring).")
+    print("until HBM weight threading and the remaining semantic fixes are validated.")
     return 0
 
 
