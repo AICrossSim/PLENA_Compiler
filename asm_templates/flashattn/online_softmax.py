@@ -63,8 +63,11 @@ def online_softmax_code(
         # Load the starting address of S, which is the QKT result of the current head, in shape of (MLEN, MLEN)
         generated_code += _load_large_int(s_address_register, s_address)
         generated_code += _load_large_int(m_last_address_register, m_start_address)
-        generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {mlen} \n"
-        generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {mlen} \n"
+        # The running max, its residual and the running sum occupy consecutive
+        # sub-blocks of one slot per query row swept, so they are `rows` apart.
+        state_rows = mlen if rows is None else rows
+        generated_code += f"S_ADDI_INT gp{m_res_address_register}, gp{m_last_address_register}, {state_rows} \n"
+        generated_code += f"S_ADDI_INT gp{l_old_address_register}, gp{m_res_address_register}, {state_rows} \n"
 
         # Load qk_scale from FP SRAM (preloaded at FP SRAM address 5)
         generated_code += f"S_LD_FP f{qk_scale_register}, gp0, {qk_scale_address} \n"

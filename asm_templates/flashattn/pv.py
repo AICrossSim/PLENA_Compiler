@@ -20,9 +20,11 @@ def computing_pv_code(
     v_head_index: int,
     output_base_address: int,
     head_offset: int,
+    v_tile_offset: int = 0,
     v_msram_base: int = 0,  # MSRAM base for V; use its own tile (e.g. mlen*mlen) so K at tile 0 cannot clobber it
     rows: int | None = None,
     prefetch_v: bool = True,  # emit the V HBM->MSRAM prefetch; False = V already resident
+    v_head_selector: int | None = None,
 ) -> str:
     """
     Compute PV = P @ V and write directly to packed output format.
@@ -44,6 +46,13 @@ def computing_pv_code(
         output_base_address: base address for packed output
         head_offset: offset within each row for this head (= q_head_index * head_dim)
         v_msram_base: MSRAM base address for V (can be 0 since K was already used)
+        v_head_selector: how this KV head is addressed. ``None`` fetches the
+            head's own tile, putting the head in the HBM prefetch offset. An
+            integer instead fetches the packed row base and walks the head's
+            HLEN column window; the matrix operand carries its column index
+            scaled by MLEN, so that window starts ``selector * head_dim * mlen``
+            into the resident tile. The caller decides whether to reuse or
+            refetch that tile across heads.
     """
     generated_code = "; PV Per KV Head Multiplication (packed output) \n"
     p_base_register = alive_registers[0]
@@ -59,7 +68,12 @@ def computing_pv_code(
     # the prefetch on the first head (prefetch_v=False afterwards) — the other
     # heads reuse the resident copy instead of re-reading HBM.
     if prefetch_v:
-        generated_code += _load_large_int(v_base_register, v_head_index * head_dim)
+        # With a head selector the resident tile is the packed KV row shared by
+        # every head, so the prefetch drops the per-head element offset.
+        v_hbm_offset = v_tile_offset + (
+            v_head_index * head_dim if v_head_selector is None else 0
+        )
+        generated_code += _load_large_int(v_base_register, v_hbm_offset)
         generated_code += _load_large_int(out_base_register, v_msram_base)
         # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
         generated_code += f"H_PREFETCH_M gp{out_base_register}, gp{v_base_register}, a{v_base_hbm_offset_reg}, 0, 1 \n"
@@ -68,8 +82,13 @@ def computing_pv_code(
     p_start_address = p_base_address + q_head_index * mlen * mlen
     generated_code += _load_large_int(p_base_register, p_start_address)
 
-    # V is prefetched to MSRAM at v_msram_base
-    generated_code += _load_large_int(v_base_register, v_msram_base)
+    # V is prefetched to MSRAM at v_msram_base. A head selector walks this
+    # head's HLEN column window of the resident packed tile; the matrix operand
+    # scales its column index by MLEN.
+    v_operand_base = v_msram_base + (
+        0 if v_head_selector is None else v_head_selector * head_dim * mlen
+    )
+    generated_code += _load_large_int(v_base_register, v_operand_base)
 
     # Output starts at output_base + head_offset (for this head's column position)
     generated_code += _load_large_int(out_base_register, output_base_address + head_offset * head_dim)
@@ -102,8 +121,9 @@ def computing_pv_code(
         # Move to next column position (blen elements to the right)
         generated_code += f"S_ADDI_INT gp{out_col_register}, gp{out_col_register}, {blen} \n"
         generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_col_register}, 0 \n"
-        # Move V to next column block
-        generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen} \n"
+        # Move V to next column block. The matrix operand carries its column
+        # index scaled by MLEN, so one BLEN-column group is BLEN * MLEN.
+        generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen * mlen} \n"
 
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
 
@@ -116,6 +136,8 @@ def computing_pv_code(
         # Write to packed output position
         generated_code += f"M_MV_WO gp{out_base_register}, gp0, 0 \n"
         generated_code += f"S_ADDI_INT gp{out_base_register}, gp{out_base_register}, {blen} \n"
-        generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen} \n"
+        # The matrix operand carries its column index scaled by MLEN; the
+        # output cursor above is a VRAM column offset and stays unscaled.
+        generated_code += f"S_ADDI_INT gp{v_base_register}, gp{v_base_register}, {blen * mlen} \n"
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
     return generated_code

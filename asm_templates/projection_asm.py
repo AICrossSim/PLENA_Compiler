@@ -69,9 +69,11 @@ def _emit_projection_chunk(
                 )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
-            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
+            column_group = (weight_row % (mlen // blen)) * blen
+            # Matrix operand: MLEN-scaled column index. Result: VRAM column offset.
+            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {column_group * mlen} ")
             lines.append(
-                f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
+                f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {column_group} "
             )
         for act_col in range(batch // blen):
             addr = activation_base_address + act_col * mlen * blen + chunk_act_base
@@ -337,15 +339,26 @@ def projection_T_asm(
                 lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen} ")
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
-            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % tiles_per_mlen) * blen} ")
+            # The matrix operand's column index is MLEN-scaled, so a BLEN-wide
+            # column group is BLEN * MLEN in the address; the VRAM result cursor
+            # is element-addressed and advances by BLEN.
+            column_group = weight_row % tiles_per_mlen
             lines.append(
-                f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % tiles_per_mlen) * blen} "
+                f"S_ADDI_INT gp{w_actual_register}, gp0, {column_group * blen * mlen} "
+            )
+            lines.append(
+                f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {column_group * blen} "
             )
         for act_col in range(batch // blen):
             lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
             for inner_loop_index in range(hidden_size // mlen):
-                lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
+                # The weight tile is stored (out_features, in_features), so the
+                # reduction runs down its columns: `M_TMM` selects BLEN of its
+                # rows, which are BLEN columns of the transpose, and reduces over
+                # in_features. `M_MM` would pair the activation's hidden
+                # dimension with out_features instead.
+                lines.append(f"M_TMM 0, gp{act_reg}, gp{w_temp_register} ")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                 lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
