@@ -12,7 +12,13 @@ the single source of truth.
 
 from __future__ import annotations
 
+import re
+
 IMM2_BOUND = 1 << 18  # S_ADDI_INT supports values 0..2^18-1
+
+_ADDI_PATTERN = re.compile(
+    r"^\s*S_ADDI_INT\s+gp(?P<dest>\d+)\s*,\s*gp(?P<source>\d+)\s*,\s*(?P<imm>\d+)\s*$"
+)
 
 
 def load_large_int(reg: int, value: int) -> list[str]:
@@ -86,3 +92,40 @@ def add_large_int_str(dest_reg: int, src_reg: int, value: int, temp_reg: int | N
 def addi_large_int_str(dest_reg: int, src_reg: int, value: int, temp_reg: int) -> str:
     """String variant of addi_large_int."""
     return add_large_int_str(dest_reg, src_reg, value, temp_reg=temp_reg)
+
+
+def legalize_immediates(assembly: str) -> str:
+    """Rewrite every `S_ADDI_INT` whose immediate exceeds the encoding field.
+
+    The templates build addresses and strides from raw text, and several of
+    those strides are `MLEN * MLEN`, which reaches exactly `2**18` at MLEN=512
+    and overflows the 18-bit immediate. Legalising the emitted text covers every
+    template at once, including ones that do not yet route their arithmetic
+    through the helpers above, so a geometry cannot fail on an encoding limit
+    that has a mechanical fix.
+
+    `gp0` sources become a wide load; every other source becomes the chunked
+    relative add, which needs no scratch register and so is safe to apply after
+    register allocation.
+    """
+    output: list[str] = []
+    for line in assembly.splitlines():
+        match = _ADDI_PATTERN.match(line)
+        if match is None:
+            output.append(line)
+            continue
+        dest, source, value = (
+            int(match.group("dest")),
+            int(match.group("source")),
+            int(match.group("imm")),
+        )
+        if value < IMM2_BOUND:
+            output.append(line)
+            continue
+        replacement = (
+            load_large_int(dest, value)
+            if source == 0
+            else add_large_int(dest, source, value)
+        )
+        output.extend(replacement)
+    return "\n".join(output) + ("\n" if assembly.endswith("\n") else "")
