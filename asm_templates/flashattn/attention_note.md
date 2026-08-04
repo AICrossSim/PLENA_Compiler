@@ -4,7 +4,7 @@
 
 ## Algorithm
 
-![Flash Attention Algorithm](FlashAttention.png)
+![Flash Attention Algorithm](flashattn.png)
 
 ---
 
