@@ -10,12 +10,118 @@ from compiler.aten.plena.attention_pipeline_plan import (
     RowPipelineOp,
     interleave_row_chains,
 )
+from compiler.aten.plena.native_layout import SoftmaxRowGroupPlan
 
 
 class IsaAttentionMixin:
     # =========================================================================
     # Flash Attention Implementation
     # =========================================================================
+
+    def _online_softmax_row_bank_asm(
+        self,
+        *,
+        mlen: int,
+        s_address: int,
+        state_address: int,
+        output_address: int | None,
+        scale: float,
+        rows: int,
+        valid_cols: int | None,
+        first_block: bool,
+    ) -> str:
+        """Lower one online-softmax block through the rtl-v6 row engine."""
+
+        plan = SoftmaxRowGroupPlan.build(
+            sequence=getattr(self, "_native_sequence_packing", None),
+            rows=rows,
+            mlen=mlen,
+            row_lanes=int(self.softmax_row_lanes),
+            valid_cols=valid_cols,
+        )
+        gp_s, gp_state, gp_o, gp_loop = self.register_allocator.allocate_gp(4)
+        fp_scale = 1
+        lines = [
+            "; === Multi-row online softmax / row-bank state ===",
+        ]
+        if scale != 1.0:
+            lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
+        for run in plan.affine_runs():
+            group = run.first
+            row_log2 = int(math.log2(group.row_lanes))
+            lines.extend(load_large_int(gp_s, s_address + group.base_row * mlen))
+            lines.extend(load_large_int(gp_state, state_address + group.base_row))
+            if output_address is not None:
+                lines.extend(
+                    load_large_int(gp_o, output_address + group.base_row * mlen)
+                )
+            if run.count > 1:
+                lines.append(f"C_LOOP_START gp{gp_loop}, {run.count}")
+            if scale != 1.0:
+                lines.append(
+                    f"V_MUL_ROWS_F gp{gp_s}, gp{gp_s}, f{fp_scale}, "
+                    f"{group.active_rows}, {row_log2}"
+                )
+            lines.extend(
+                (
+                    f"V_RED_MAX_ROWS gp{gp_state}, gp{gp_s}, "
+                    f"{group.active_rows}, {row_log2}",
+                    f"V_SFM_MAX_ROWS gp{gp_state}, gp{gp_state}, "
+                    f"{group.active_rows}, {row_log2}",
+                )
+            )
+            if not first_block:
+                if output_address is None:
+                    raise ValueError("recurrent row-bank softmax requires output address")
+                lines.append(
+                    f"V_MUL_ROWS_STATS gp{gp_o}, gp{gp_o}, gp{gp_state}, "
+                    f"{group.active_rows}, {row_log2}"
+                )
+            lines.extend(
+                (
+                    f"V_SUB_ROWS gp{gp_s}, gp{gp_s}, gp{gp_state}, "
+                    f"{group.active_rows}, {row_log2}",
+                    f"V_EXP_ROWS gp{gp_s}, gp{gp_s}, "
+                    f"{group.active_rows}, {row_log2}",
+                    f"V_RED_SUM_ROWS gp{gp_state}, gp{gp_s}, "
+                    f"{group.active_rows}, {row_log2}",
+                    f"V_SFM_SUM_ROWS gp{gp_state}, gp{gp_state}, "
+                    f"{group.active_rows}, {row_log2}",
+                )
+            )
+            if run.count > 1:
+                lines.extend(
+                    (
+                        f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {group.row_lanes * mlen}",
+                        f"S_ADDI_INT gp{gp_state}, gp{gp_state}, {group.row_lanes}",
+                    )
+                )
+                if output_address is not None:
+                    lines.append(
+                        f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {group.row_lanes * mlen}"
+                    )
+                lines.append(f"C_LOOP_END gp{gp_loop}")
+        # Bank-alignment fallbacks are deliberately explicit and rare.  The
+        # current packed layouts align every active slab for R<=8.
+        if plan.scalar_fallback_rows:
+            raise ValueError(
+                "row-bank softmax encountered unaligned active rows: "
+                f"{plan.scalar_fallback_rows}"
+            )
+        self.register_allocator.free_gp([gp_s, gp_state, gp_o, gp_loop])
+        if hasattr(self, "record_softmax_row_stats"):
+            metadata = plan.metadata()
+            active = plan.active_rows
+            metadata.update(
+                {
+                    "softmax_state_reads": (0 if first_block else 2 * active),
+                    "softmax_state_writes": 2 * active,
+                    "scalar_state_loads_elided": (0 if first_block else 2 * active),
+                    "scalar_state_stores_elided": (1 if first_block else 2) * active,
+                }
+            )
+            self.record_softmax_row_stats(metadata)
+        return "\n".join(lines) + "\n"
 
     def _online_softmax_asm(
         self,
@@ -94,6 +200,7 @@ class IsaAttentionMixin:
             "rtl-v3",
             "rtl-v4",
             "rtl-v5",
+            "rtl-v6",
         }
 
         lines = []
@@ -557,10 +664,11 @@ class IsaAttentionMixin:
             "rtl-v3",
             "rtl-v4",
             "rtl-v5",
+            "rtl-v6",
         }:
             raise ValueError(
                 "row-interleaved-v1 requires vector_scalar_schedule='rtl-v3' "
-                "'rtl-v4', or 'rtl-v5'"
+                "'rtl-v4', 'rtl-v5', or 'rtl-v6'"
             )
 
         timing: GQATimingProfile = getattr(self, "gqa_timing_profile", None)
@@ -872,6 +980,7 @@ class IsaAttentionMixin:
             "rtl-v3",
             "rtl-v4",
             "rtl-v5",
+            "rtl-v6",
         }:
             return None
         plan = getattr(self, "_native_sequence_packing", None)
@@ -1008,6 +1117,7 @@ class IsaAttentionMixin:
             "rtl-v3",
             "rtl-v4",
             "rtl-v5",
+            "rtl-v6",
         }
 
         lines = []
@@ -1127,6 +1237,7 @@ class IsaAttentionMixin:
             "rtl-v3",
             "rtl-v4",
             "rtl-v5",
+            "rtl-v6",
         }
 
         lines = [
@@ -1736,6 +1847,22 @@ class IsaAttentionMixin:
         s_info = self[s_block_matrix]
         isa_code = f"; === Online Softmax First Block {s_block_matrix} ===\n"
         if (
+            getattr(self, "softmax_state_schedule", "sram-v1")
+            == "row-bank-simd-v3"
+        ):
+            layout = self._softmax_state_layout
+            isa_code += self._online_softmax_row_bank_asm(
+                mlen=self.mlen,
+                s_address=s_info.vram_addr,
+                state_address=layout.m_base(state_head),
+                output_address=None,
+                scale=scale,
+                rows=self.mlen if rows is None else rows,
+                valid_cols=valid_cols,
+                first_block=True,
+            )
+            return self._emit(isa_code)
+        if (
             getattr(self, "softmax_state_schedule", "sram-v1") == "streamed-v2"
             and stream_state
         ):
@@ -1781,6 +1908,28 @@ class IsaAttentionMixin:
         """
         s_info = self[s_block_matrix]
         s_address = s_info.vram_addr
+        if (
+            getattr(self, "softmax_state_schedule", "sram-v1")
+            == "row-bank-simd-v3"
+        ):
+            if output_address is None:
+                raise ValueError("row-bank recurrent softmax requires output_address")
+            layout = self._softmax_state_layout
+            lane_address = output_address + int(output_head_slot or 0) * int(
+                getattr(self, "hlen", self.mlen)
+            )
+            isa_code = f"; === Online Softmax Block {s_block_matrix} ===\n"
+            isa_code += self._online_softmax_row_bank_asm(
+                mlen=self.mlen,
+                s_address=s_address,
+                state_address=layout.m_base(state_head),
+                output_address=lane_address,
+                scale=scale,
+                rows=self.mlen if rows is None else rows,
+                valid_cols=valid_cols,
+                first_block=False,
+            )
+            return self._emit(isa_code)
         if (
             getattr(self, "softmax_state_schedule", "sram-v1") == "streamed-v2"
             and output_address is not None

@@ -86,14 +86,21 @@ class KVResidencyPlan:
 
     def k_address(self, block: int) -> int:
         if self.is_resident(block):
-            return self.resident_k_addresses[block]
+            # Do not materialize the complete resident-address tuple for a
+            # single lookup. Long-context causal attention queries this path
+            # once per logical Q/K pair, so tuple construction here turns an
+            # otherwise linear address calculation into a major compiler
+            # allocation hotspot.
+            return block * self.tile_elements
         if self.stream_k_address is None:
             raise ValueError("streaming K address requested for a full-resident plan")
         return self.stream_k_address
 
     def v_address(self, block: int) -> int:
         if self.is_resident(block):
-            return self.resident_v_addresses[block]
+            return (
+                self.resident_prefix_blocks + block
+            ) * self.tile_elements
         if self.stream_v_address is None:
             raise ValueError("streaming V address requested for a full-resident plan")
         return self.stream_v_address

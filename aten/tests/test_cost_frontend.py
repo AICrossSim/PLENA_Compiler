@@ -121,6 +121,70 @@ def _arithmetic_opcodes(trace) -> dict[str, int]:
     }
 
 
+def test_rtl_v6_multirow_state_and_direct_pv_lowering() -> None:
+    trace = compile_native_decoder_cost_trace(
+        model_config=_tiny_packed_qwen3(),
+        hardware_config=_tiny_packed_hardware(),
+        seq_len=7,
+        batch_size=4,
+        num_layers=1,
+        vector_scalar_schedule="rtl-v6",
+        softmax_vector_schedule="multi-row-v1",
+        softmax_state_schedule="row-bank-simd-v3",
+        pv_accumulation_schedule="direct-packed-rmw-v1",
+        softmax_row_lanes=4,
+        cost_trace_granularity="detailed",
+        use_cache=False,
+    )
+
+    counts = trace.stages["layer/attention"].dynamic_opcodes
+    assert counts["V_RED_MAX_ROWS"] > 0
+    assert counts["V_SFM_MAX_ROWS"] > 0
+    assert counts["V_SFM_SUM_ROWS"] > 0
+    assert counts["V_SFM_FINAL_ROWS"] > 0
+    assert counts["M_MM_WO_PACKED_ACC"] > 0
+    packed = trace.metadata["packed_attention"]
+    assert packed["softmax_row_lanes"] == 4
+    assert packed["softmax_state_bank_entries"] > 0
+    assert packed["pv_shift_ops_elided"] > 0
+    assert packed["pv_vector_adds_elided"] > 0
+    assert packed["pv_direct_accumulate_rows"] == packed["pv_shift_ops_elided"]
+
+    summary_trace = compile_native_decoder_cost_trace(
+        model_config=_tiny_packed_qwen3(),
+        hardware_config=_tiny_packed_hardware(),
+        seq_len=7,
+        batch_size=4,
+        num_layers=1,
+        vector_scalar_schedule="rtl-v6",
+        softmax_vector_schedule="multi-row-v1",
+        softmax_state_schedule="row-bank-simd-v3",
+        pv_accumulation_schedule="direct-packed-rmw-v1",
+        softmax_row_lanes=4,
+        cost_trace_granularity="affine-block-summary-v1",
+        use_cache=False,
+    )
+    row_actions = [
+        action
+        for action in summary_trace.energy_actions
+        if action.activity_fidelity in {"exact_active_rows", "configured_row_tier"}
+    ]
+    assert row_actions
+    assert {action.total_lanes for action in row_actions} == {4}
+    assert all(
+        0 < action.active_lanes <= action.total_lanes
+        for action in row_actions
+    )
+    assert any(
+        action.component == "softmax_state_sram" and action.action == "read"
+        for action in summary_trace.energy_actions
+    )
+    assert any(
+        action.component == "softmax_state_sram" and action.action == "write"
+        for action in summary_trace.energy_actions
+    )
+
+
 def test_cost_frontend_uses_shared_auto_compact_stats_tier() -> None:
     trace = compile_native_decoder_cost_trace(
         model_config=_tiny_packed_qwen3(),
@@ -262,14 +326,16 @@ def test_gqa_row_interleaving_preserves_arithmetic_and_dma_work() -> None:
 
 
 @pytest.mark.parametrize(
-    ("seq_len", "mram_tile_capacity"),
+    ("seq_len", "batch_size", "mram_tile_capacity"),
     (
-        (39, 2),
-        (65, 6),
+        (39, 1, 2),
+        (65, 1, 6),
+        (39, 2, 2),
     ),
 )
 def test_affine_summary_matches_detailed_ideal_work(
     seq_len: int,
+    batch_size: int,
     mram_tile_capacity: int,
 ) -> None:
     hardware = CompilerCostHardware(
@@ -282,7 +348,7 @@ def test_affine_summary_matches_detailed_ideal_work(
         model_config=_tiny_packed_qwen3(),
         hardware_config=hardware,
         seq_len=seq_len,
-        batch_size=1,
+        batch_size=batch_size,
         num_layers=1,
         vector_scalar_schedule="rtl-v4",
         selector_schedule="hoisted-v1",
@@ -310,6 +376,14 @@ def test_affine_summary_matches_detailed_ideal_work(
     assert sum(event.multiplicity for event in summary.memory_events) == sum(
         event.multiplicity for event in detailed.memory_events
     )
+    if batch_size > 1:
+        assert len(summary.memory_events) < len(detailed.memory_events)
+        assert any(
+            any(axis.name == "packed_kv_batch" for axis in event.enclosing_axes)
+            for event in summary.memory_events
+            if (event.transfer.source or "").startswith("packed_kv_affine")
+        )
+
     def aggregate_actions(trace):
         result = Counter()
         for action in trace.energy_actions:

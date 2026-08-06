@@ -397,7 +397,7 @@ class IsaCompiler(
         optimized_rms = (
             mode == "rms"
             and getattr(self, "vector_scalar_schedule", "legacy")
-            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5"}
+            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5", "rtl-v6"}
         )
         gp_regs = self.register_allocator.allocate_gp(6 if optimized_rms else 4)
 
@@ -425,7 +425,7 @@ class IsaCompiler(
                     epsilon_slot=eps_offset,
                     reciprocal_hidden_slot=reci_hid_offset,
                     rtl_v2=getattr(self, "vector_scalar_schedule", "legacy")
-                    in {"rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5"},
+                    in {"rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5", "rtl-v6"},
                 )
                 self.record_vector_scalar_stats(lowering.metadata)
                 if getattr(self, "_cost_sink", None) is None:
@@ -598,10 +598,12 @@ class IsaCompiler(
 
     def get_vram_addr(self, name: str) -> int:
         """Get VRAM base address of an object."""
-        info = self.get_tensor_info(name)
-        if info.vram_addr is None:
+        layout = self.vram_matrices.get(name)
+        if layout is None:
+            if name not in self:
+                raise KeyError(f"Object '{name}' not found")
             raise ValueError(f"Object '{name}' has no VRAM address")
-        return info.vram_addr
+        return layout.vram_base_addr
 
     def get_vram_tile_addr(
         self,

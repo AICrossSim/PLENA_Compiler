@@ -44,6 +44,7 @@ MATRIX_COMPUTE_OPS = {
     "M_BTMV",
     "M_BMM_WO",
     "M_MM_WO",
+    "M_MM_WO_PACKED_ACC",
     "M_MV_WO",
     "M_BMV_WO",
 }
@@ -62,12 +63,21 @@ VECTOR_COMPUTE_OPS = {
     "V_RED_MAX_SEG",
     "V_RED_SUM_SEGS",
     "V_RED_MAX_SEGS",
+    "V_RED_SUM_ROWS",
+    "V_RED_MAX_ROWS",
     "V_ADD_VSEG",
     "V_SUB_VSEG",
     "V_MUL_VSEG",
     "V_STAT_MUL_F",
     "V_STAT_ADD_F",
     "V_STAT_RSQRT",
+    "V_SUB_ROWS",
+    "V_EXP_ROWS",
+    "V_MUL_ROWS_STATS",
+    "V_MUL_ROWS_F",
+    "V_SFM_MAX_ROWS",
+    "V_SFM_SUM_ROWS",
+    "V_SFM_FINAL_ROWS",
     "V_RED_SUM_OVR",
     "V_RED_MAX_OVR",
     "V_RED_SUM_SEG_OVR",
@@ -371,6 +381,16 @@ def _logic_energy_actions(
     """
 
     if opcode in MATRIX_COMPUTE_OPS:
+        if opcode == "M_MM_WO_PACKED_ACC":
+            packed_action = (
+                "accumulate"
+                if len(args) >= 4 and str(args[3]).strip() == "1"
+                else "overwrite"
+            )
+            return (
+                ("matrix", "output_conversion", opcode, -1),
+                ("packed_pv_accumulator", packed_action, opcode, -1),
+            )
         if opcode.endswith("_WO"):
             return (("matrix", "output_conversion", opcode, -1),)
         if opcode in {"M_MV", "M_TMV", "M_BMV", "M_BTMV"}:
@@ -388,10 +408,19 @@ def _logic_energy_actions(
         "V_RED_SUM_SEG",
         "V_RED_SUM_SEG_OVR",
         "V_RED_SUM_SEGS",
+        "V_RED_SUM_ROWS",
     }:
         segment_log2 = _segment_log2(opcode, args)
         base_opcode = opcode.removesuffix("_OVR")
-        suffix = "segments" if base_opcode.endswith("SEGS") else "segment" if base_opcode.endswith("SEG") else "full"
+        suffix = (
+            "rows"
+            if base_opcode.endswith("ROWS")
+            else "segments"
+            if base_opcode.endswith("SEGS")
+            else "segment"
+            if base_opcode.endswith("SEG")
+            else "full"
+        )
         return (("vector", f"reduction_sum_{suffix}", opcode, segment_log2),)
     if opcode in {
         "V_RED_MAX",
@@ -399,21 +428,34 @@ def _logic_energy_actions(
         "V_RED_MAX_SEG",
         "V_RED_MAX_SEG_OVR",
         "V_RED_MAX_SEGS",
+        "V_RED_MAX_ROWS",
     }:
         segment_log2 = _segment_log2(opcode, args)
         base_opcode = opcode.removesuffix("_OVR")
-        suffix = "segments" if base_opcode.endswith("SEGS") else "segment" if base_opcode.endswith("SEG") else "full"
+        suffix = (
+            "rows"
+            if base_opcode.endswith("ROWS")
+            else "segments"
+            if base_opcode.endswith("SEGS")
+            else "segment"
+            if base_opcode.endswith("SEG")
+            else "full"
+        )
         return (("vector", f"reduction_max_{suffix}", opcode, segment_log2),)
     if opcode in {"V_ADD_VV", "V_SUB_VV"}:
         return (("vector", "lane_add_sub_vv", opcode, -1),)
     if opcode in {"V_ADD_VF", "V_SUB_VF"}:
         return (("vector", "lane_add_sub_vf", opcode, -1),)
+    if opcode == "V_SUB_ROWS":
+        return (("vector", "softmax_row_subtract", opcode, _segment_log2(opcode, args)),)
     if opcode in {"V_ADD_VSEG", "V_SUB_VSEG"}:
         return (("vector", "lane_add_sub_vseg", opcode, _segment_log2(opcode, args)),)
     if opcode == "V_MUL_VV":
         return (("vector", "lane_multiply_vv", opcode, -1),)
     if opcode == "V_MUL_VF":
         return (("vector", "lane_multiply_vf", opcode, -1),)
+    if opcode in {"V_MUL_ROWS_STATS", "V_MUL_ROWS_F"}:
+        return (("vector", "softmax_row_multiply", opcode, _segment_log2(opcode, args)),)
     if opcode == "V_MUL_VSEG":
         return (("vector", "lane_multiply_vseg", opcode, _segment_log2(opcode, args)),)
     if opcode in {"V_STAT_MUL_F", "V_STAT_ADD_F", "V_STAT_RSQRT"}:
@@ -425,6 +467,15 @@ def _logic_energy_actions(
         return (("vector", family, opcode, -1),)
     if opcode == "V_EXP_V":
         return (("vector", "lane_sfu_exp", opcode, -1),)
+    if opcode == "V_EXP_ROWS":
+        return (("vector", "softmax_row_exp", opcode, _segment_log2(opcode, args)),)
+    if opcode in {"V_SFM_MAX_ROWS", "V_SFM_SUM_ROWS", "V_SFM_FINAL_ROWS"}:
+        phase = {
+            "V_SFM_MAX_ROWS": "max_update",
+            "V_SFM_SUM_ROWS": "sum_update",
+            "V_SFM_FINAL_ROWS": "final_reciprocal",
+        }[opcode]
+        return (("softmax_state", phase, opcode, _segment_log2(opcode, args)),)
     if opcode == "V_RECI_V":
         return (("vector", "lane_sfu_reciprocal", opcode, -1),)
     if opcode == "V_SHIFT_V":
@@ -472,9 +523,75 @@ def _segment_log2(opcode: str, args: tuple[str, ...]) -> int:
         return -1
 
 
-def _sram_actions(opcode: str) -> tuple[tuple[str, str, int], ...]:
+def _row_action_count(opcode: str, args: tuple[str, ...]) -> int:
+    if opcode in {
+        "V_RED_SUM_ROWS",
+        "V_RED_MAX_ROWS",
+        "V_SFM_MAX_ROWS",
+        "V_SFM_SUM_ROWS",
+        "V_SFM_FINAL_ROWS",
+    }:
+        try:
+            return int(args[2], 0)
+        except (IndexError, ValueError):
+            return 0
+    if opcode in {"V_SUB_ROWS", "V_EXP_ROWS", "V_MUL_ROWS_STATS", "V_MUL_ROWS_F"}:
+        try:
+            return int(args[-2], 0)
+        except (IndexError, ValueError):
+            return 0
+    return 0
+
+
+def _row_lane_tier(opcode: str, args: tuple[str, ...], fallback: int) -> int:
+    """Decode the configured row tier carried by rtl-v6 row instructions."""
+
+    if _row_action_count(opcode, args) <= 0:
+        return 0
+    try:
+        tier_log2 = int(args[-1], 0)
+    except (IndexError, ValueError):
+        return fallback
+    tier = 1 << tier_log2
+    return tier if tier in {1, 2, 4, 8} else fallback
+
+
+def _sram_actions(opcode: str, args: tuple[str, ...] = ()) -> tuple[tuple[str, str, int], ...]:
     """Return logical macro accesses implied by one dynamic instruction."""
 
+    rows = _row_action_count(opcode, args)
+    if opcode in {"V_RED_SUM_ROWS", "V_RED_MAX_ROWS"}:
+        return (
+            ("vector_sram", "read", rows),
+            ("softmax_state_sram", "write", rows),
+        )
+    if opcode in {"V_SFM_MAX_ROWS", "V_SFM_SUM_ROWS", "V_SFM_FINAL_ROWS"}:
+        return (
+            ("softmax_state_sram", "read", rows),
+            ("softmax_state_sram", "write", rows),
+        )
+    if opcode == "V_SUB_ROWS":
+        return (
+            ("vector_sram", "read", rows),
+            ("vector_sram", "write", rows),
+            ("softmax_state_sram", "read", rows),
+        )
+    if opcode in {"V_EXP_ROWS", "V_MUL_ROWS_F"}:
+        return (("vector_sram", "read", rows), ("vector_sram", "write", rows))
+    if opcode == "V_MUL_ROWS_STATS":
+        return (
+            ("vector_sram", "read", rows),
+            ("vector_sram", "write", rows),
+            ("softmax_state_sram", "read", rows),
+        )
+    if opcode == "M_MM_WO_PACKED_ACC":
+        accumulate = len(args) >= 4 and str(args[3]).strip() == "1"
+        vector_read = (("vector_sram", "read", 1),) if accumulate else ()
+        return (
+            ("matrix_sram", "read", 1),
+            *vector_read,
+            ("vector_sram", "write", 1),
+        )
     if opcode in MATRIX_COMPUTE_OPS:
         return (("matrix_sram", "read", 2), ("matrix_sram", "write", 1))
     if opcode in VECTOR_COMPUTE_OPS:
@@ -583,6 +700,15 @@ def _build_energy_actions(trace: CostTrace) -> list[EnergyAction]:
             for args, variant_count, activity_fidelity, active_segments in opcode_variants:
                 variant_text = ",".join(args) if args else "aggregate"
                 for component, action, source_opcode, segment_log2 in _logic_energy_actions(opcode, args):
+                    row_operation = _row_action_count(opcode, args) > 0
+                    configured_row_tier = int(
+                        trace.metadata.get("packed_attention", {}).get(
+                            "softmax_row_lanes", 1
+                        )
+                    )
+                    row_tier = _row_lane_tier(
+                        opcode, args, configured_row_tier
+                    )
                     actions.append(
                         EnergyAction(
                             stage=stage_name,
@@ -593,21 +719,23 @@ def _build_energy_actions(trace: CostTrace) -> list[EnergyAction]:
                             variant=variant_text,
                             segment_log2=segment_log2,
                             segment_count=active_segments,
+                            active_lanes=(active_segments if row_operation else 0),
+                            total_lanes=(row_tier if row_operation else 0),
                             activity_fidelity=activity_fidelity,
                             parallel_kernel=lineage,
                         )
                     )
-            for component, action, accesses in _sram_actions(opcode):
-                actions.append(
-                    EnergyAction(
-                        stage=stage_name,
-                        component=component,
-                        action=action,
-                        count=count * accesses,
-                        precision=opcode,
-                        parallel_kernel=lineage,
+                for component, action, accesses in _sram_actions(opcode, args):
+                    actions.append(
+                        EnergyAction(
+                            stage=stage_name,
+                            component=component,
+                            action=action,
+                            count=variant_count * accesses,
+                            precision=opcode,
+                            parallel_kernel=lineage,
+                        )
                     )
-                )
     for event in trace.memory_events:
         transfer = event.transfer
         lineage = parallel_kernel_lineage_id(event.parallel_kernel)
@@ -759,6 +887,13 @@ def _build_summary_energy_actions(
                 )
             for args, variant_count, fidelity, active_segments in opcode_variants:
                 variant_text = ",".join(args) if args else "aggregate"
+                row_operation = _row_action_count(opcode, args) > 0
+                configured_row_tier = int(
+                    trace.metadata.get("packed_attention", {}).get(
+                        "softmax_row_lanes", 1
+                    )
+                )
+                row_tier = _row_lane_tier(opcode, args, configured_row_tier)
                 for component, action, source_opcode, segment_log2 in _logic_energy_actions(opcode, args):
                     actions.append(
                         EnergyAction(
@@ -770,21 +905,23 @@ def _build_summary_energy_actions(
                             variant=variant_text,
                             segment_log2=segment_log2,
                             segment_count=active_segments,
+                            active_lanes=(active_segments if row_operation else 0),
+                            total_lanes=(row_tier if row_operation else 0),
                             activity_fidelity=fidelity,
                             parallel_kernel=lineage,
                         )
                     )
-            for component, action, accesses in _sram_actions(opcode):
-                actions.append(
-                    EnergyAction(
-                        stage=stage_name,
-                        component=component,
-                        action=action,
-                        count=count * accesses,
-                        precision=opcode,
-                        parallel_kernel=lineage,
+                for component, action, accesses in _sram_actions(opcode, args):
+                    actions.append(
+                        EnergyAction(
+                            stage=stage_name,
+                            component=component,
+                            action=action,
+                            count=variant_count * accesses,
+                            precision=opcode,
+                            parallel_kernel=lineage,
+                        )
                     )
-                )
     return _merge_energy_actions(actions)
 
 
@@ -1514,6 +1651,16 @@ def _vector_activity(
         return "exact_single_segment", 1
     if opcode in {"V_RED_SUM_SEGS", "V_RED_MAX_SEGS", "V_SHIFT_V"}:
         return "full_width", 0
+    if opcode in {"V_RED_SUM_ROWS", "V_RED_MAX_ROWS", "V_SFM_MAX_ROWS", "V_SFM_SUM_ROWS", "V_SFM_FINAL_ROWS"}:
+        if len(args) < 3:
+            return "clock_work_unavailable", 0
+        try:
+            return "exact_active_rows", int(args[2], 0)
+        except ValueError:
+            return "clock_work_unavailable", 0
+    if opcode in {"V_SUB_ROWS", "V_EXP_ROWS", "V_MUL_ROWS_STATS", "V_MUL_ROWS_F"}:
+        rows = _row_action_count(opcode, args)
+        return ("configured_row_tier", rows) if rows else ("clock_work_unavailable", 0)
     if opcode in {"V_ADD_VSEG", "V_SUB_VSEG", "V_MUL_VSEG"}:
         if len(args) == 4:
             return "full_width", 0

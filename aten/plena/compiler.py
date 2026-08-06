@@ -24,8 +24,14 @@ from compiler.aten.plena.native_layout import (
     FP_CONSTANT_NUM_DEFAULT,
     PACKED_QK_SCHEDULES,
     PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
+    PV_ACCUMULATION_SCHEDULES,
+    PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1,
+    SOFTMAX_ROW_LANE_TIERS,
     SOFTMAX_STATE_SCHEDULES,
+    SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3,
     SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
+    SOFTMAX_VECTOR_SCHEDULES,
+    SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1,
     build_softmax_state_layout,
 )
 from compiler.aten.plena.kv_residency import MATRIX_SRAM_POLICIES
@@ -125,6 +131,9 @@ class PlenaCompiler(
         packed_qk_schedule: str = PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
         vector_scalar_schedule: str = "rtl-v5",
         compact_stats_lanes: int | None = None,
+        softmax_vector_schedule: str = SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1,
+        pv_accumulation_schedule: str = PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1,
+        softmax_row_lanes: int = 1,
         selector_schedule: str = "legacy",
         reduction_output_mode: str = "accumulate-v1",
         gqa_pipeline_schedule: str | None = None,
@@ -217,11 +226,44 @@ class PlenaCompiler(
             )
         self.softmax_state_schedule = softmax_state_schedule
         self.packed_qk_schedule = packed_qk_schedule
+        if softmax_vector_schedule not in SOFTMAX_VECTOR_SCHEDULES:
+            raise ValueError(
+                f"softmax_vector_schedule must be one of "
+                f"{sorted(SOFTMAX_VECTOR_SCHEDULES)}, got {softmax_vector_schedule!r}"
+            )
+        if pv_accumulation_schedule not in PV_ACCUMULATION_SCHEDULES:
+            raise ValueError(
+                f"pv_accumulation_schedule must be one of "
+                f"{sorted(PV_ACCUMULATION_SCHEDULES)}, got "
+                f"{pv_accumulation_schedule!r}"
+            )
+        if softmax_row_lanes not in SOFTMAX_ROW_LANE_TIERS:
+            raise ValueError(
+                f"softmax_row_lanes must be one of {SOFTMAX_ROW_LANE_TIERS}, "
+                f"got {softmax_row_lanes}"
+            )
+        if softmax_vector_schedule == "single-row-v1" and softmax_row_lanes != 1:
+            raise ValueError(
+                "single-row-v1 requires softmax_row_lanes=1"
+            )
+        if vector_scalar_schedule != "rtl-v6" and (
+            softmax_vector_schedule != SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1
+            or pv_accumulation_schedule != PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1
+            or softmax_state_schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3
+        ):
+            raise ValueError(
+                "multi-row softmax, row-bank state, and direct packed PV "
+                "require vector_scalar_schedule='rtl-v6'"
+            )
+        self.softmax_vector_schedule = softmax_vector_schedule
+        self.pv_accumulation_schedule = pv_accumulation_schedule
+        self.softmax_row_lanes = int(softmax_row_lanes)
         self.fp_constant_num = int(fp_constant_num)
         self.fp_sram_depth = (
             int(fp_sram_depth) if fp_sram_depth is not None else _behavior_config_value("FP_SRAM_DEPTH", 0)
         )
         if vector_scalar_schedule not in {
+            "rtl-v6",
             "rtl-v5",
             "rtl-v4",
             "rtl-v3",
@@ -230,7 +272,7 @@ class PlenaCompiler(
             "legacy",
         }:
             raise ValueError(
-                "vector_scalar_schedule must be 'rtl-v5', 'rtl-v4', 'rtl-v3', "
+                "vector_scalar_schedule must be 'rtl-v6', 'rtl-v5', 'rtl-v4', 'rtl-v3', "
                 "'rtl-v2', 'compiler-v1', or 'legacy', got "
                 f"{vector_scalar_schedule!r}"
             )
@@ -242,7 +284,7 @@ class PlenaCompiler(
                     for tier in COMPACT_STATS_LANE_TIERS
                     if tier >= min(64, max(1, mlen // max(1, self.hlen)))
                 )
-                if vector_scalar_schedule == "rtl-v5"
+                if vector_scalar_schedule in {"rtl-v5", "rtl-v6"}
                 else 16
             )
         if compact_stats_lanes not in COMPACT_STATS_LANE_TIERS:
@@ -250,14 +292,14 @@ class PlenaCompiler(
                 "compact_stats_lanes must be one of "
                 f"{COMPACT_STATS_LANE_TIERS}, got {compact_stats_lanes}"
             )
-        if vector_scalar_schedule != "rtl-v5" and compact_stats_lanes != 16:
+        if vector_scalar_schedule not in {"rtl-v5", "rtl-v6"} and compact_stats_lanes != 16:
             raise ValueError(
                 "non-rtl-v5 schedules require fixed compact_stats_lanes=16"
             )
         self.compact_stats_lanes = int(compact_stats_lanes)
         self.compact_stats_lane_policy = (
             COMPACT_STATS_LANE_POLICY_AUTO_V1
-            if vector_scalar_schedule == "rtl-v5"
+            if vector_scalar_schedule in {"rtl-v5", "rtl-v6"}
             else COMPACT_STATS_LANE_POLICY_FIXED_16_V1
         )
         if selector_schedule not in {"hoisted-v1", "legacy"}:
@@ -281,10 +323,11 @@ class PlenaCompiler(
             "rtl-v3",
             "rtl-v4",
             "rtl-v5",
+            "rtl-v6",
         }:
             raise ValueError(
                 "gqa_pipeline_schedule='row-interleaved-v1' requires "
-                "vector_scalar_schedule='rtl-v3', 'rtl-v4', or 'rtl-v5'"
+                "vector_scalar_schedule='rtl-v3', 'rtl-v4', 'rtl-v5', or 'rtl-v6'"
             )
         self.gqa_pipeline_schedule = gqa_pipeline_schedule
         if address_generation_mode not in {
@@ -400,6 +443,23 @@ class PlenaCompiler(
             "tail_bmm_occurrences": 0,
             "tail_full_width_work_cycles": 0,
         }
+        self._softmax_row_stats: dict[str, int | float | str] = {
+            "softmax_row_lanes": self.softmax_row_lanes,
+            "softmax_row_groups": 0,
+            "softmax_row_lane_utilization": 0.0,
+            "softmax_full_group_count": 0,
+            "softmax_tail_group_count": 0,
+            "softmax_affine_run_count": 0,
+            "softmax_state_reads": 0,
+            "softmax_state_writes": 0,
+            "scalar_state_loads_elided": 0,
+            "scalar_state_stores_elided": 0,
+            "pv_direct_accumulate_rows": 0,
+            "pv_shift_ops_elided": 0,
+            "pv_vector_adds_elided": 0,
+            "pv_padding_rows_zeroed": 0,
+            "bank_conflict_fallbacks": 0,
+        }
         self._gqa_pipeline_stats: dict[str, int | str | bool] = {
             "softmax_first_block_pipeline_width": 0,
             "softmax_recurrent_pipeline_width": 0,
@@ -430,6 +490,9 @@ class PlenaCompiler(
         stats: dict[str, int | float | str] = {
             "packed_attention_schedule": self.packed_attention_schedule,
             "softmax_state_schedule": self.softmax_state_schedule,
+            "softmax_vector_schedule": self.softmax_vector_schedule,
+            "pv_accumulation_schedule": self.pv_accumulation_schedule,
+            "softmax_row_lanes": self.softmax_row_lanes,
             "packed_qk_schedule": self.packed_qk_schedule,
             "gqa_pipeline_schedule": self.gqa_pipeline_schedule,
             "gqa_timing_artifact": (str(self.gqa_timing_profile.path) if self.gqa_timing_profile is not None else None),
@@ -466,6 +529,7 @@ class PlenaCompiler(
         state_layout = getattr(self, "_softmax_state_layout", None)
         if state_layout is not None:
             stats.update(state_layout.metadata())
+        stats.update(self._softmax_row_stats)
         stats["qk_broadcast_reuse_factor"] = stats["qk_recompute_factor"]
         stats["broadcast_rtl_validation_status"] = (
             "broadcast_rtl_unvalidated"
@@ -513,6 +577,46 @@ class PlenaCompiler(
                 self._gqa_pipeline_stats[key] = int(self._gqa_pipeline_stats.get(key, 0)) + value
             else:
                 self._gqa_pipeline_stats[key] = value
+
+    def record_softmax_row_stats(
+        self, values: dict[str, int | float | str]
+    ) -> None:
+        """Merge row-group lowering metadata from the shared planner."""
+
+        groups = int(values.get("softmax_row_groups", 0))
+        prior_groups = int(self._softmax_row_stats.get("softmax_row_groups", 0))
+        if "softmax_row_lane_utilization" in values and groups:
+            prior_utilization = float(
+                self._softmax_row_stats.get("softmax_row_lane_utilization", 0.0)
+            )
+            self._softmax_row_stats["softmax_row_lane_utilization"] = (
+                prior_utilization * prior_groups
+                + float(values["softmax_row_lane_utilization"]) * groups
+            ) / (prior_groups + groups)
+        additive = {
+            "softmax_row_groups",
+            "softmax_full_group_count",
+            "softmax_tail_group_count",
+            "softmax_affine_run_count",
+            "softmax_state_reads",
+            "softmax_state_writes",
+            "scalar_state_loads_elided",
+            "scalar_state_stores_elided",
+            "pv_direct_accumulate_rows",
+            "pv_shift_ops_elided",
+            "pv_vector_adds_elided",
+            "pv_padding_rows_zeroed",
+            "bank_conflict_fallbacks",
+        }
+        for key, value in values.items():
+            if key == "softmax_row_lane_utilization":
+                continue
+            if key in additive:
+                self._softmax_row_stats[key] = int(
+                    self._softmax_row_stats.get(key, 0)
+                ) + int(value)
+            else:
+                self._softmax_row_stats[key] = value
 
     def record_vector_scalar_stats(self, values: dict[str, object]) -> None:
         """Accumulate metadata emitted by shared normalization/mask plans."""

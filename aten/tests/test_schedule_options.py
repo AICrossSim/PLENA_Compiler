@@ -1,5 +1,6 @@
 from compiler.aten.plena.schedule_options import (
     CURRENT_DSE_PROFILE,
+    RTL_V6_CANDIDATE_PROFILE,
     RTL_VALIDATION_PROFILE,
     compiler_schedule_profile,
     compiler_schedule_profile_kwargs,
@@ -26,3 +27,13 @@ def test_rtl_validation_profile_uses_head_major_fallback() -> None:
     assert compiler_schedule_profile_kwargs(RTL_VALIDATION_PROFILE) == (
         profile.as_kwargs()
     )
+
+
+def test_rtl_v6_candidate_enables_all_three_attention_optimizations() -> None:
+    profile = compiler_schedule_profile(RTL_V6_CANDIDATE_PROFILE)
+
+    assert profile.vector_scalar_schedule == "rtl-v6"
+    assert profile.softmax_vector_schedule == "multi-row-v1"
+    assert profile.softmax_state_schedule == "row-bank-simd-v3"
+    assert profile.pv_accumulation_schedule == "direct-packed-rmw-v1"
+    assert profile.softmax_row_lanes == 4

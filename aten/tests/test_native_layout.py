@@ -4,8 +4,10 @@ import pytest
 
 from compiler.aten.plena.native_layout import (
     SequencePackingPlan,
+    SoftmaxRowGroupPlan,
     build_attention_head_packing,
     build_compact_stats_plan,
+    build_softmax_state_layout,
 )
 
 
@@ -171,3 +173,46 @@ def test_compact_head_group_locations_share_storage_block_without_overlap():
     assert packing.group_location(0) == (0, 0)
     assert packing.group_location(1) == (0, 8)
     assert packing.head_start_col(kv_head=1, local_head=1) == 12
+
+
+@pytest.mark.parametrize("row_lanes", [1, 2, 4, 8])
+def test_softmax_row_groups_preserve_packed_batch_segments(row_lanes):
+    sequence = SequencePackingPlan.build(batch_size=4, seq_len=7, mlen=16)
+    plan = SoftmaxRowGroupPlan.build(
+        sequence=sequence,
+        rows=sequence.attention_group_seq_len,
+        mlen=16,
+        row_lanes=row_lanes,
+    )
+    assert plan.active_rows == 14
+    assert {group.segment_index for group in plan.groups} == {0, 1}
+    assert all(
+        group.base_row // sequence.batch_slot_rows
+        == (group.base_row + group.active_rows - 1) // sequence.batch_slot_rows
+        for group in plan.groups
+    )
+
+
+def test_softmax_row_groups_encode_tail_and_bank_mapping():
+    plan = SoftmaxRowGroupPlan.build(
+        sequence=None,
+        rows=7,
+        mlen=16,
+        row_lanes=4,
+    )
+    assert [group.active_rows for group in plan.groups] == [4, 3]
+    assert plan.full_group_count == 1
+    assert plan.tail_group_count == 1
+    assert plan.groups[1].active_row_mask == 0b111
+    assert plan.groups[1].bank_address(6) == (2, 1)
+
+
+def test_row_bank_softmax_state_is_not_double_allocated_in_scalar_sram():
+    layout = build_softmax_state_layout(
+        mlen=2048,
+        active_broadcast_heads=8,
+        schedule="row-bank-simd-v3",
+    )
+    assert layout.required_depth == layout.fp_constant_num
+    assert layout.state_bank_entries == 8 * 2048
+    assert layout.storage_kind == "dedicated-softmax-state-bank"

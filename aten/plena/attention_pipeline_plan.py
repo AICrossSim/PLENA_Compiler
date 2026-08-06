@@ -67,7 +67,8 @@ class GQATimingProfile:
         schema_version = int(data.get("schema_version", 0))
         model = str(data.get("model", ""))
         if schema_version < 3 or not any(
-            marker in model for marker in ("rtl_v3", "rtl_v4", "rtl_v5")
+            marker in model
+            for marker in ("rtl_v3", "rtl_v4", "rtl_v5", "rtl_v6")
         ):
             raise ValueError(
                 "GQA pipeline scheduling requires a compatible RTL-v3-or-later "

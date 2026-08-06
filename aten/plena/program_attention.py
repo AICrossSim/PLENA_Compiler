@@ -6,10 +6,10 @@ import math
 import os
 from dataclasses import dataclass
 
-from compiler.asm_templates._imm import add_large_int
-from compiler.asm_templates._imm import load_large_int
+from compiler.asm_templates._imm import IMM2_BOUND, add_large_int, load_large_int
 from compiler.aten.isa_builder import RepeatAxis
 from compiler.aten.plena.kv_residency import KVResidencyPlan, plan_kv_residency
+from compiler.aten.plena.native_layout import SoftmaxRowGroupPlan
 from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
 
 
@@ -107,6 +107,29 @@ class ProgramAttentionMixin:
     # Flash Attention Operations
     # ========================================================================
 
+    def _large_int_opcode_shape(self, value: int) -> tuple[str, ...]:
+        """Return the legalization opcode shape for an integer constant.
+
+        Affine attention summaries classify millions of logical kernels by
+        this small shape. The same addresses recur across K blocks, heads and
+        summary classes, so invoking the full immediate legalizer each time
+        is unnecessary Python work.
+        """
+
+        cache = getattr(self, "_large_int_opcode_shape_cache", None)
+        if cache is None:
+            cache = {}
+            self._large_int_opcode_shape_cache = cache
+        key = int(value)
+        shape = cache.get(key)
+        if shape is None:
+            shape = tuple(
+                line.split(maxsplit=1)[0]
+                for line in load_large_int(1, key)
+            )
+            cache[key] = shape
+        return shape
+
     def _needs_explicit_valid_col_mask(self, valid_cols: int | None) -> bool:
         """Return true when softmax must ignore padded K columns.
 
@@ -153,7 +176,7 @@ class ProgramAttentionMixin:
         if (
             getattr(self, "_cost_sink", None) is not None
             and getattr(self, "vector_scalar_schedule", "legacy")
-            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5"}
+            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5", "rtl-v6"}
         ):
             self._active_cost_stage = "global/valid_col_mask"
         try:
@@ -196,7 +219,7 @@ class ProgramAttentionMixin:
             return None
         if (
             getattr(self, "vector_scalar_schedule", "legacy")
-            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5"}
+            in {"compiler-v1", "rtl-v2", "rtl-v3", "rtl-v4", "rtl-v5", "rtl-v6"}
             and isinstance(causal_mask, VRAMMatrixVar)
             and apply_causal_mask
             and causal_mask_covers_padding
@@ -882,6 +905,10 @@ class ProgramAttentionMixin:
         self,
         input_var: InputVar,
         tiles: tuple[tuple[int, int], ...],
+        *,
+        outer_axes: tuple[RepeatAxis, ...] = (),
+        record_dma: bool = True,
+        emit_instructions: bool = True,
     ) -> bool:
         """Compress one Q-block's contiguous streaming K/V DMA occurrences."""
 
@@ -897,72 +924,158 @@ class ProgramAttentionMixin:
         if row_indices != tuple(range(row_indices[0], row_indices[0] + len(tiles))):
             return False
 
+        destination_stride = (
+            int(tiles[1][1]) - int(tiles[0][1])
+            if len(tiles) > 1
+            else 0
+        )
+        if any(
+            int(destination)
+            != int(tiles[0][1]) + index * destination_stride
+            for index, (_row, destination) in enumerate(tiles)
+        ):
+            return False
+        return self._emit_packed_kv_prefetch_affine_range(
+            input_var,
+            first_row=row_indices[0],
+            count=len(tiles),
+            first_destination=int(tiles[0][1]),
+            destination_stride=destination_stride,
+            outer_axes=outer_axes,
+            record_dma=record_dma,
+            emit_instructions=emit_instructions,
+        )
+
+    def _emit_packed_kv_prefetch_affine_range(
+        self,
+        input_var: InputVar,
+        *,
+        first_row: int,
+        count: int,
+        first_destination: int,
+        destination_stride: int,
+        outer_axes: tuple[RepeatAxis, ...] = (),
+        record_dma: bool = True,
+        emit_instructions: bool = True,
+    ) -> bool:
+        """Emit an exact affine K/V prefetch census without tile objects."""
+
+        sink = getattr(self, "_cost_sink", None)
+        if (
+            sink is None
+            or getattr(sink, "granularity", "detailed")
+            != "affine-block-summary-v1"
+            or count <= 0
+            or first_row < 0
+        ):
+            return False
+
         self._ensure_hbm_sub_matrix_registered(input_var)
         layout = self.get_hbm_layout(input_var.name)
         rows, cols = layout.physical_shape or layout.full_shape
         total_elements = rows * cols
 
-        def immediate_shape(value: int) -> tuple[str, ...]:
-            return tuple(
-                line.split(maxsplit=1)[0]
-                for line in load_large_int(1, value)
+        immediate_shape = self._large_int_opcode_shape
+
+        if emit_instructions:
+            first_hbm_offset = layout.get_sub_block(
+                first_row, 0
+            ).hbm_offset
+            hbm_stride = (
+                layout.get_sub_block(first_row + 1, 0).hbm_offset
+                - first_hbm_offset
+                if count > 1
+                else 0
             )
 
-        instruction_census: dict[
-            tuple[tuple[str, ...], tuple[str, ...]],
-            list[object],
-        ] = {}
-        for row_idx, destination in tiles:
-            hbm_offset = layout.get_sub_block(row_idx, 0).hbm_offset
-            shape_key = (
-                immediate_shape(destination),
-                immediate_shape(hbm_offset),
+            # PLENA tile strides are 4-KiB aligned, so load_large_int's
+            # opcode shape can change only once at the 18-bit boundary. Keep
+            # an exact fallback for future layouts with unaligned strides.
+            aligned = (
+                destination_stride >= 0
+                and hbm_stride >= 0
+                and destination_stride % 0x1000 == 0
+                and hbm_stride % 0x1000 == 0
             )
-            entry = instruction_census.get(shape_key)
-            if entry is None:
-                instruction_census[shape_key] = [
-                    row_idx,
-                    destination,
-                    1,
-                ]
+            instruction_census: dict[
+                tuple[tuple[str, ...], tuple[str, ...]],
+                list[object],
+            ] = {}
+            boundaries = {0, count}
+            if aligned:
+                for first, stride in (
+                    (first_destination, destination_stride),
+                    (first_hbm_offset, hbm_stride),
+                ):
+                    if stride > 0 and first < IMM2_BOUND:
+                        boundaries.add(
+                            min(
+                                count,
+                                (IMM2_BOUND - first + stride - 1) // stride,
+                            )
+                        )
+                ranges = tuple(
+                    (start, stop)
+                    for start, stop in zip(
+                        sorted(boundaries), sorted(boundaries)[1:]
+                    )
+                    if stop > start
+                )
             else:
-                entry[2] = int(entry[2]) + 1
+                ranges = tuple((index, index + 1) for index in range(count))
 
-        for shape_key, (
-            representative_row,
-            representative_destination,
-            repetitions,
-        ) in instruction_census.items():
-            row_idx = int(representative_row)
-            destination = int(representative_destination)
-            key = (
-                "packed_kv_prefetch_instruction_v2",
-                self.mlen,
-                self.hbm_m_prefetch_amount,
-                rows * cols,
-                cols,
-                *shape_key,
-            )
-            repetitions = int(repetitions)
-            if not self.replay_cost_summary_template(
-                key,
-                count=repetitions,
-            ):
-                with self.cost_summary_template(key):
-                    self._emit_packed_kv_prefetch(
-                        input_var,
-                        ((row_idx, destination),),
-                        record_dma=False,
-                    )
-                if repetitions > 1:
-                    assert self.replay_cost_summary_template(
-                        key,
-                        count=repetitions - 1,
-                    )
+            for start, stop in ranges:
+                row_idx = first_row + start
+                destination = first_destination + start * destination_stride
+                hbm_offset = first_hbm_offset + start * hbm_stride
+                shape_key = (
+                    immediate_shape(destination),
+                    immediate_shape(hbm_offset),
+                )
+                entry = instruction_census.get(shape_key)
+                repetitions = stop - start
+                if entry is None:
+                    instruction_census[shape_key] = [
+                        row_idx,
+                        destination,
+                        repetitions,
+                    ]
+                else:
+                    entry[2] = int(entry[2]) + repetitions
 
-        first_row = row_indices[0]
+            for shape_key, (
+                representative_row,
+                representative_destination,
+                repetitions,
+            ) in instruction_census.items():
+                row_idx = int(representative_row)
+                destination = int(representative_destination)
+                key = (
+                    "packed_kv_prefetch_instruction_v2",
+                    self.mlen,
+                    self.hbm_m_prefetch_amount,
+                    rows * cols,
+                    cols,
+                    *shape_key,
+                )
+                repetitions = int(repetitions)
+                if not self.replay_cost_summary_template(
+                    key,
+                    count=repetitions,
+                ):
+                    with self.cost_summary_template(key):
+                        self._emit_packed_kv_prefetch(
+                            input_var,
+                            ((row_idx, destination),),
+                            record_dma=False,
+                        )
+                    if repetitions > 1:
+                        assert self.replay_cost_summary_template(
+                            key,
+                            count=repetitions - 1,
+                        )
+
         first_offset = layout.get_sub_block(first_row, 0).hbm_offset
-        count = len(tiles)
         axes = (
             (
                 RepeatAxis(
@@ -977,25 +1090,30 @@ class ProgramAttentionMixin:
             if count > 1
             else ()
         )
-        self.record_dma_stream(
-            self.make_exact_mx_dma_transfer(
-                opcode="H_PREFETCH_M",
-                precision="matrix_kv",
-                hbm_base=layout.hbm_base_addr,
-                total_elements=total_elements,
-                element_offset=first_offset,
-                dim=self.mlen,
-                amount=self.hbm_m_prefetch_amount,
-                stride=cols,
-                rstride=1,
-                source=(
-                    f"packed_kv_affine:{input_var.name}:"
-                    f"tile{first_row}:count{count}"
+        if record_dma:
+            combined_axes = (*outer_axes, *axes)
+            outer_multiplicity = math.prod(
+                axis.count for axis in outer_axes
+            )
+            self.record_dma_stream(
+                self.make_exact_mx_dma_transfer(
+                    opcode="H_PREFETCH_M",
+                    precision="matrix_kv",
+                    hbm_base=layout.hbm_base_addr,
+                    total_elements=total_elements,
+                    element_offset=first_offset,
+                    dim=self.mlen,
+                    amount=self.hbm_m_prefetch_amount,
+                    stride=cols,
+                    rstride=1,
+                    source=(
+                        f"packed_kv_affine:{input_var.name}:"
+                        f"tile{first_row}:count{count}"
+                    ),
                 ),
-            ),
-            multiplicity=count,
-            axes=axes,
-        )
+                multiplicity=count * outer_multiplicity,
+                axes=combined_axes,
+            )
         return True
 
     def _emit_packed_qkt_from_mram(
@@ -1040,11 +1158,7 @@ class ProgramAttentionMixin:
     ) -> tuple[object, ...]:
         """Return the exact cost shape of one memory-free packed QK kernel."""
 
-        def immediate_shape(value: int) -> tuple[str, ...]:
-            return tuple(
-                line.split(maxsplit=1)[0]
-                for line in load_large_int(1, value)
-            )
+        immediate_shape = self._large_int_opcode_shape
 
         return (
             "packed_qkt_from_mram_v2",
@@ -1083,13 +1197,23 @@ class ProgramAttentionMixin:
         head_slot_dim: int,
         rows: int,
         preserve_full_tile_work: bool = False,
+        direct_output_base: int | None = None,
+        direct_head_slot: int | None = None,
+        direct_accumulate: bool = False,
     ) -> None:
         """Emit PV using a V tile that is already resident in MRAM."""
         gp_p, gp_v, gp_pv, gp_pv_col, gp_v_loop, gp_p_loop = (
             self.register_allocator.allocate_gp(6)
         )
         p_address = self.get_vram_addr(s_block.name)
-        pv_address = self.get_vram_addr(pv_matrix.name)
+        direct_packed = direct_output_base is not None
+        if direct_packed and direct_head_slot is None:
+            raise ValueError("direct packed PV requires direct_head_slot")
+        pv_address = (
+            int(direct_output_base)
+            if direct_packed
+            else self.get_vram_addr(pv_matrix.name)
+        )
         v_col_groups = (
             self.mlen // self.blen
             if preserve_full_tile_work
@@ -1105,7 +1229,13 @@ class ProgramAttentionMixin:
             f"S_ADDI_INT gp{gp_pv}, gp{gp_pv_col}, 0",
             f"C_LOOP_START gp{gp_p_loop}, {p_row_groups}",
             f"M_MM 0, gp{gp_v}, gp{gp_p}",
-            f"M_MM_WO gp{gp_pv}, gp0, 0",
+            (
+                f"M_MM_WO_PACKED_ACC gp{gp_pv}, gp0, "
+                f"{int(direct_head_slot) * head_slot_dim}, "
+                f"{1 if direct_accumulate else 0}"
+                if direct_packed
+                else f"M_MM_WO gp{gp_pv}, gp0, 0"
+            ),
             f"S_ADDI_INT gp{gp_p}, gp{gp_p}, {self.blen * self.mlen}",
             f"S_ADDI_INT gp{gp_pv}, gp{gp_pv}, {self.blen * self.mlen}",
             f"C_LOOP_END gp{gp_p_loop}",
@@ -1118,6 +1248,68 @@ class ProgramAttentionMixin:
         )
         self.emit("\n".join(lines) + "\n")
 
+    def _zero_inactive_p_rows_for_direct_pv(
+        self,
+        *,
+        p_base_address: int,
+        zero_source_base: int,
+        rows: int,
+        row_ranges: tuple[tuple[int, int], ...],
+    ) -> int:
+        """Copy exact zero rows into P before an unmasked Matrix writeback.
+
+        Packed-O is cleared once before attention and dummy query rows are
+        never valid destinations.  Its corresponding dummy row is therefore a
+        stable zero-vector source.  Direct Matrix writeback operates on a full
+        BLEN row tile, so inactive P rows must be made finite zero rather than
+        retaining masked ``-inf``/NaN scores that would otherwise overwrite
+        dummy output rows.
+        """
+
+        active = [False] * rows
+        for start, end in row_ranges:
+            if start < 0 or end < start or end > rows:
+                raise ValueError(
+                    f"invalid direct-PV active row range {(start, end)} for rows={rows}"
+                )
+            for row in range(start, end):
+                active[row] = True
+        inactive = [row for row, is_active in enumerate(active) if not is_active]
+        if not inactive:
+            return 0
+
+        gp_dst, gp_zero, gp_loop = self.register_allocator.allocate_gp(3)
+        lines = ["; Zero inactive P rows before direct packed-PV writeback"]
+        run_start = inactive[0]
+        run_end = run_start + 1
+        runs: list[tuple[int, int]] = []
+        for row in inactive[1:]:
+            if row == run_end:
+                run_end += 1
+            else:
+                runs.append((run_start, run_end))
+                run_start, run_end = row, row + 1
+        runs.append((run_start, run_end))
+
+        for start, end in runs:
+            count = end - start
+            lines.extend(load_large_int(gp_dst, p_base_address + start * self.mlen))
+            lines.extend(load_large_int(gp_zero, zero_source_base + start * self.mlen))
+            if count > 1:
+                lines.append(f"C_LOOP_START gp{gp_loop}, {count}")
+            lines.append(f"V_ADD_VV gp{gp_dst}, gp{gp_zero}, gp{gp_zero}, 0")
+            if count > 1:
+                lines.extend(
+                    (
+                        f"S_ADDI_INT gp{gp_dst}, gp{gp_dst}, {self.mlen}",
+                        f"S_ADDI_INT gp{gp_zero}, gp{gp_zero}, {self.mlen}",
+                        f"C_LOOP_END gp{gp_loop}",
+                    )
+                )
+        self.register_allocator.free_gp([gp_dst, gp_zero, gp_loop])
+        self.emit("\n".join(lines) + "\n")
+        return len(inactive)
+
     def _prefetch_packed_kv_prefix(
         self,
         K: InputVar,
@@ -1125,6 +1317,10 @@ class ProgramAttentionMixin:
         *,
         first_k_idx: int,
         residency: KVResidencyPlan,
+        summary_k_dma_outer_axes: tuple[RepeatAxis, ...] = (),
+        summary_v_dma_outer_axes: tuple[RepeatAxis, ...] = (),
+        summary_record_k_dma: bool = True,
+        summary_record_v_dma: bool = True,
     ) -> None:
         """Load the deterministic resident K/V prefix once."""
         self._ensure_hbm_sub_matrix_registered(K)
@@ -1137,20 +1333,50 @@ class ProgramAttentionMixin:
             f"; === Packed GQA resident K/V prefix: first_k_idx={first_k_idx}, "
             f"prefix_blocks={count}, tiles={2 * count} ===\n"
         )
-        self._emit_packed_kv_prefetch(
-            K,
-            tuple(
-                (first_k_idx + block, residency.k_address(block))
-                for block in range(count)
-            ),
+        k_tiles = tuple(
+            (first_k_idx + block, residency.k_address(block))
+            for block in range(count)
         )
-        self._emit_packed_kv_prefetch(
-            V,
-            tuple(
-                (first_k_idx + block, residency.v_address(block))
-                for block in range(count)
-            ),
+        v_tiles = tuple(
+            (first_k_idx + block, residency.v_address(block))
+            for block in range(count)
         )
+        if self.cost_affine_summary_enabled():
+            self._emit_packed_kv_prefetch(
+                K,
+                k_tiles,
+                record_dma=False,
+            )
+            self._emit_packed_kv_prefetch(
+                V,
+                v_tiles,
+                record_dma=False,
+            )
+            if not self._emit_packed_kv_prefetch_affine_summary(
+                K,
+                k_tiles,
+                outer_axes=summary_k_dma_outer_axes,
+                record_dma=summary_record_k_dma,
+                emit_instructions=False,
+            ):
+                raise ValueError(
+                    "resident K prefix could not be represented as an "
+                    "affine CostEmitter stream"
+                )
+            if not self._emit_packed_kv_prefetch_affine_summary(
+                V,
+                v_tiles,
+                outer_axes=summary_v_dma_outer_axes,
+                record_dma=summary_record_v_dma,
+                emit_instructions=False,
+            ):
+                raise ValueError(
+                    "resident V prefix could not be represented as an "
+                    "affine CostEmitter stream"
+                )
+            return
+        self._emit_packed_kv_prefetch(K, k_tiles)
+        self._emit_packed_kv_prefetch(V, v_tiles)
 
     def _emit_packed_qkt_to_s_dynamic(
         self,
@@ -1783,9 +2009,7 @@ class ProgramAttentionMixin:
             if state_layout is not None
             else self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * self.mlen
         )
-        immediate_shape = lambda value: tuple(
-            line.split(maxsplit=1)[0] for line in load_large_int(1, value)
-        )
+        immediate_shape = self._large_int_opcode_shape
         template_key = (
             "packed_final_scale_v1",
             self.mlen,
@@ -1794,6 +2018,8 @@ class ProgramAttentionMixin:
             head_slot,
             state_head,
             getattr(self, "gqa_pipeline_schedule", "row-serial"),
+            getattr(self, "softmax_state_schedule", "streamed-v2"),
+            int(getattr(self, "softmax_row_lanes", 1)),
             immediate_shape(l_address),
             immediate_shape(output_base_address),
         )
@@ -1802,11 +2028,14 @@ class ProgramAttentionMixin:
             stats_cache = {}
             self._packed_final_scale_summary_stats = stats_cache
         if self.replay_cost_summary_template(template_key):
-            for name, delta in stats_cache[template_key].items():
+            cached = stats_cache[template_key]
+            for name, delta in cached["packed"].items():
                 self._packed_attention_stats[name] += delta
+            self.record_softmax_row_stats(cached["row"])
             return
 
         before_stats = dict(self._packed_attention_stats)
+        before_row_stats = dict(self._softmax_row_stats)
         with self.cost_summary_template(template_key):
             self._final_scale_packed_o_lane_body(
                 output_base_address=output_base_address,
@@ -1816,10 +2045,18 @@ class ProgramAttentionMixin:
                 l_address=l_address,
             )
         stats_cache[template_key] = {
-            name: int(value) - int(before_stats.get(name, 0))
-            for name, value in self._packed_attention_stats.items()
-            if isinstance(value, (int, bool))
-            and int(value) != int(before_stats.get(name, 0))
+            "packed": {
+                name: int(value) - int(before_stats.get(name, 0))
+                for name, value in self._packed_attention_stats.items()
+                if isinstance(value, (int, bool))
+                and int(value) != int(before_stats.get(name, 0))
+            },
+            "row": {
+                name: int(value) - int(before_row_stats.get(name, 0))
+                for name, value in self._softmax_row_stats.items()
+                if isinstance(value, (int, bool))
+                and int(value) != int(before_row_stats.get(name, 0))
+            },
         }
 
     def _final_scale_packed_o_lane_body(
@@ -1831,6 +2068,60 @@ class ProgramAttentionMixin:
         row_ranges: tuple[tuple[int, int], ...] | None,
         l_address: int,
     ) -> None:
+        if getattr(self, "softmax_state_schedule", "sram-v1") == "row-bank-simd-v3":
+            plan = SoftmaxRowGroupPlan.build(
+                sequence=getattr(self, "_native_sequence_packing", None),
+                rows=rows,
+                mlen=self.mlen,
+                row_lanes=int(self.softmax_row_lanes),
+            )
+            gp_state, gp_o, gp_loop = self.register_allocator.allocate_gp(3)
+            lines = ["; === Row-bank final packed-O normalization ==="]
+            lane_base = output_base_address + head_slot * int(self.hlen)
+            for run in plan.affine_runs():
+                group = run.first
+                row_log2 = int(math.log2(group.row_lanes))
+                lines.extend(load_large_int(gp_state, l_address + group.base_row))
+                lines.extend(
+                    load_large_int(
+                        gp_o, lane_base + group.base_row * self.mlen
+                    )
+                )
+                if run.count > 1:
+                    lines.append(f"C_LOOP_START gp{gp_loop}, {run.count}")
+                lines.extend(
+                    (
+                        f"V_SFM_FINAL_ROWS gp{gp_state}, gp{gp_state}, "
+                        f"{group.active_rows}, {row_log2}",
+                        f"V_MUL_ROWS_STATS gp{gp_o}, gp{gp_o}, "
+                        f"gp{gp_state}, {group.active_rows}, {row_log2}",
+                    )
+                )
+                if run.count > 1:
+                    lines.extend(
+                        (
+                            f"S_ADDI_INT gp{gp_state}, gp{gp_state}, {group.row_lanes}",
+                            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {group.row_lanes * self.mlen}",
+                            f"C_LOOP_END gp{gp_loop}",
+                        )
+                    )
+            if plan.scalar_fallback_rows:
+                raise ValueError(
+                    "row-bank final scale encountered unaligned active rows: "
+                    f"{plan.scalar_fallback_rows}"
+                )
+            self.register_allocator.free_gp([gp_state, gp_o, gp_loop])
+            self.emit("\n".join(lines) + "\n")
+            self.record_softmax_row_stats(
+                {
+                    "softmax_row_groups": 0,
+                    "softmax_state_reads": plan.active_rows,
+                    "softmax_state_writes": plan.active_rows,
+                    "scalar_state_loads_elided": plan.active_rows,
+                    "scalar_state_stores_elided": 0,
+                }
+            )
+            return
         if getattr(self, "gqa_pipeline_schedule", "row-serial") == "row-interleaved-v1":
             self._emit_pipelined_packed_o_scale(
                 value_address=l_address,
@@ -1890,6 +2181,10 @@ class ProgramAttentionMixin:
         resident_k_mram: tuple[int, ...] | None,
         resident_v_mram: tuple[int, ...] | None,
         kv_residency_plan: KVResidencyPlan | None,
+        summary_k_dma_outer_axes: tuple[RepeatAxis, ...] = (),
+        summary_v_dma_outer_axes: tuple[RepeatAxis, ...] = (),
+        summary_record_k_dma: bool = True,
+        summary_record_v_dma: bool = True,
     ) -> None:
         """Emit one packed GQA group in Q-block/K-block/head order.
 
@@ -1944,6 +2239,55 @@ class ProgramAttentionMixin:
         summary_qk_census: dict[
             tuple[object, ...], list[object]
         ] = {}
+
+        def affine_immediate_shape_groups(
+            start: int,
+            stop: int,
+            address,
+        ) -> tuple[tuple[int, int], ...]:
+            """Classify an affine address range by exact load opcode shape.
+
+            Matrix-SRAM tile strides in the supported domain are 4-KiB
+            aligned, so crossing the ADDI/LUI boundary creates at most two
+            classes. Retain an exact enumerated fallback for non-affine or
+            future unaligned layouts.
+            """
+
+            if stop <= start:
+                return ()
+            if stop - start == 1:
+                return ((start, 1),)
+            first = int(address(start))
+            stride = int(address(start + 1)) - first
+            if stride <= 0 or stride % 0x1000:
+                grouped: dict[tuple[str, ...], list[int]] = {}
+                for block in range(start, stop):
+                    shape = tuple(
+                        line.split(maxsplit=1)[0]
+                        for line in load_large_int(1, int(address(block)))
+                    )
+                    entry = grouped.get(shape)
+                    if entry is None:
+                        grouped[shape] = [block, 1]
+                    else:
+                        entry[1] += 1
+                return tuple(
+                    (representative, count)
+                    for representative, count in grouped.values()
+                )
+
+            below = 0
+            if first < IMM2_BOUND:
+                below = min(
+                    stop - start,
+                    (IMM2_BOUND - first + stride - 1) // stride,
+                )
+            groups: list[tuple[int, int]] = []
+            if below:
+                groups.append((start, below))
+            if below < stop - start:
+                groups.append((start + below, stop - start - below))
+            return tuple(groups)
 
         try:
             for q_block in range(num_q_blocks):
@@ -2025,31 +2369,28 @@ class ProgramAttentionMixin:
                     streaming_start = resident_count
                     streaming_count = processed_count - resident_count
                     if streaming_count:
-                        streaming_blocks = tuple(
-                            range(streaming_start, processed_count)
-                        )
-                        k_tiles = tuple(
-                            (
-                                k_idx + block,
-                                kv_residency_plan.k_address(block),
-                            )
-                            for block in streaming_blocks
-                        )
-                        v_tiles = tuple(
-                            (
-                                k_idx + block,
-                                kv_residency_plan.v_address(block),
-                            )
-                            for block in streaming_blocks
-                        )
                         affine_kv_summary = (
-                            self._emit_packed_kv_prefetch_affine_summary(
+                            self._emit_packed_kv_prefetch_affine_range(
                                 K,
-                                k_tiles,
+                                first_row=k_idx + streaming_start,
+                                count=streaming_count,
+                                first_destination=kv_residency_plan.k_address(
+                                    streaming_start
+                                ),
+                                destination_stride=0,
+                                outer_axes=summary_k_dma_outer_axes,
+                                record_dma=summary_record_k_dma,
                             )
-                            and self._emit_packed_kv_prefetch_affine_summary(
+                            and self._emit_packed_kv_prefetch_affine_range(
                                 V,
-                                v_tiles,
+                                first_row=k_idx + streaming_start,
+                                count=streaming_count,
+                                first_destination=kv_residency_plan.v_address(
+                                    streaming_start
+                                ),
+                                destination_stride=0,
+                                outer_axes=summary_v_dma_outer_axes,
+                                record_dma=summary_record_v_dma,
                             )
                         )
                         if not affine_kv_summary:
@@ -2112,8 +2453,14 @@ class ProgramAttentionMixin:
                     # boundaries, so retain one lightweight classification
                     # per resident block. All streamed blocks share one MRAM
                     # slot and therefore one exact QK instruction shape.
-                    for block in range(resident_count):
-                        add_qk_class(block, 1)
+                    for representative, repetitions in (
+                        affine_immediate_shape_groups(
+                            0,
+                            resident_count,
+                            kv_residency_plan.k_address,
+                        )
+                    ):
+                        add_qk_class(representative, repetitions)
                     if streaming_count:
                         add_qk_class(streaming_start, streaming_count)
 
@@ -2218,8 +2565,27 @@ class ProgramAttentionMixin:
                                 int(class_entry[1]) + repetitions
                             )
 
-                    for block in range(resident_count):
-                        add_head_class(block, 1)
+                    if resident_count:
+                        add_head_class(0, 1)
+                        resident_middle_start = 1
+                        resident_middle_stop = resident_count
+                        if (
+                            resident_count == processed_count
+                            and resident_count > 1
+                        ):
+                            resident_middle_stop -= 1
+                            add_head_class(resident_count - 1, 1)
+                        for representative, repetitions in (
+                            affine_immediate_shape_groups(
+                                resident_middle_start,
+                                resident_middle_stop,
+                                kv_residency_plan.v_address,
+                            )
+                        ):
+                            add_head_class(
+                                representative,
+                                repetitions,
+                            )
 
                     if streaming_count:
                         special_streaming = {
@@ -2312,23 +2678,30 @@ class ProgramAttentionMixin:
                 )
                 affine_kv_summary = False
                 if summary_streaming_blocks:
-                    k_tiles = tuple(
-                        (
-                            k_idx + block,
-                            kv_residency_plan.k_address(block),
-                        )
-                        for block in summary_streaming_blocks
-                    )
-                    v_tiles = tuple(
-                        (
-                            k_idx + block,
-                            kv_residency_plan.v_address(block),
-                        )
-                        for block in summary_streaming_blocks
-                    )
+                    streaming_start = summary_streaming_blocks[0]
                     affine_kv_summary = (
-                        self._emit_packed_kv_prefetch_affine_summary(K, k_tiles)
-                        and self._emit_packed_kv_prefetch_affine_summary(V, v_tiles)
+                        self._emit_packed_kv_prefetch_affine_range(
+                            K,
+                            first_row=k_idx + streaming_start,
+                            count=len(summary_streaming_blocks),
+                            first_destination=kv_residency_plan.k_address(
+                                streaming_start
+                            ),
+                            destination_stride=0,
+                            outer_axes=summary_k_dma_outer_axes,
+                            record_dma=summary_record_k_dma,
+                        )
+                        and self._emit_packed_kv_prefetch_affine_range(
+                            V,
+                            first_row=k_idx + streaming_start,
+                            count=len(summary_streaming_blocks),
+                            first_destination=kv_residency_plan.v_address(
+                                streaming_start
+                            ),
+                            destination_stride=0,
+                            outer_axes=summary_v_dma_outer_axes,
+                            record_dma=summary_record_v_dma,
+                        )
                     )
                     if affine_kv_summary:
                         self._packed_attention_stats["kv_tile_load_count"] += (
@@ -2640,11 +3013,7 @@ class ProgramAttentionMixin:
     ) -> tuple[object, ...]:
         del softmax_scale, physical_k_idx, active_rows
 
-        def immediate_shape(value: int) -> tuple[str, ...]:
-            return tuple(
-                line.split(maxsplit=1)[0]
-                for line in load_large_int(1, value)
-            )
+        immediate_shape = self._large_int_opcode_shape
 
         return (
             "packed_kmajor_head_v1",
@@ -2662,6 +3031,10 @@ class ProgramAttentionMixin:
             causal_mask is True and apply_causal_mask,
             output_lane,
             scratch_rows,
+            getattr(self, "softmax_vector_schedule", "single-row-v1"),
+            getattr(self, "softmax_state_schedule", "streamed-v2"),
+            getattr(self, "pv_accumulation_schedule", "shift-add-v1"),
+            int(getattr(self, "softmax_row_lanes", 1)),
             immediate_shape(self.get_vram_addr(s_block.name)),
             immediate_shape(self.get_vram_addr(pv_matrix.name)),
             immediate_shape(v_mram_address),
@@ -2725,13 +3098,25 @@ class ProgramAttentionMixin:
         if self.replay_cost_summary_template(
             template_key, count=summary_repetitions
         ):
-            for name, delta in stats_cache[template_key].items():
+            cached = stats_cache[template_key]
+            for name, delta in cached["packed"].items():
                 self._packed_attention_stats[name] += (
                     delta * summary_repetitions
                 )
+            self.record_softmax_row_stats(
+                {
+                    name: (
+                        value
+                        if name == "softmax_row_lane_utilization"
+                        else int(value) * summary_repetitions
+                    )
+                    for name, value in cached["row"].items()
+                }
+            )
             return
 
         before_stats = dict(self._packed_attention_stats)
+        before_row_stats = dict(self._softmax_row_stats)
         with self.cost_summary_template(template_key):
             if valid_col_mask is not None:
                 self.vram_add(s_block, valid_col_mask, num_rows=rows)
@@ -2778,40 +3163,93 @@ class ProgramAttentionMixin:
                     stats["softmax_m_stores_elided"] += rows
 
             self.emit(f"; Compute PV = P @ V[k_idx={physical_k_idx}]\n")
+            direct_pv = (
+                getattr(self, "pv_accumulation_schedule", "shift-add-v1")
+                == "direct-packed-rmw-v1"
+            )
+            direct_pv_padding_rows = 0
+            if direct_pv:
+                direct_pv_padding_rows = self._zero_inactive_p_rows_for_direct_pv(
+                    p_base_address=self.get_vram_addr(s_block.name),
+                    zero_source_base=output_block_base,
+                    rows=rows,
+                    row_ranges=row_ranges,
+                )
             self._compute_pv_from_mram(
                 s_block=s_block,
                 pv_matrix=pv_matrix,
                 v_mram_address=v_mram_address,
                 head_slot_dim=head_slot_dim,
                 rows=rows,
+                direct_output_base=(output_block_base if direct_pv else None),
+                direct_head_slot=(output_lane if direct_pv else None),
+                direct_accumulate=not first_block,
             )
             self._packed_attention_stats["pv_compute_count"] += 1
-            self._add_pv_to_packed_o_lane(
-                output_base_address=output_block_base,
-                pv=pv_matrix,
-                head_slot=output_lane,
-                head_slot_dim=head_slot_dim,
-                rows=rows,
-                scratch_address=scratch_address,
-                scratch_rows=scratch_rows,
-                row_ranges=row_ranges,
-            )
+            if direct_pv:
+                self.record_softmax_row_stats(
+                    {
+                        "pv_direct_accumulate_rows": active_rows,
+                        "pv_shift_ops_elided": active_rows,
+                        "pv_vector_adds_elided": active_rows,
+                        "pv_padding_rows_zeroed": direct_pv_padding_rows,
+                    }
+                )
+            else:
+                self._add_pv_to_packed_o_lane(
+                    output_base_address=output_block_base,
+                    pv=pv_matrix,
+                    head_slot=output_lane,
+                    head_slot_dim=head_slot_dim,
+                    rows=rows,
+                    scratch_address=scratch_address,
+                    scratch_rows=scratch_rows,
+                    row_ranges=row_ranges,
+                )
             self._packed_attention_stats["direct_o_lane_updates"] += active_rows
 
         stats_cache[template_key] = {
-            name: int(value) - int(before_stats.get(name, 0))
-            for name, value in self._packed_attention_stats.items()
-            if isinstance(value, (int, bool))
-            and int(value) != int(before_stats.get(name, 0))
+            "packed": {
+                name: int(value) - int(before_stats.get(name, 0))
+                for name, value in self._packed_attention_stats.items()
+                if isinstance(value, (int, bool))
+                and int(value) != int(before_stats.get(name, 0))
+            },
+            "row": {
+                name: (
+                    float(value)
+                    if name == "softmax_row_lane_utilization"
+                    else int(value) - int(before_row_stats.get(name, 0))
+                )
+                for name, value in self._softmax_row_stats.items()
+                if (
+                    name == "softmax_row_lane_utilization"
+                    or (
+                        isinstance(value, (int, bool))
+                        and int(value) != int(before_row_stats.get(name, 0))
+                    )
+                )
+            },
         }
         if summary_repetitions > 1:
             self.replay_cost_summary_template(
                 template_key, count=summary_repetitions - 1
             )
-            for name, delta in stats_cache[template_key].items():
+            cached = stats_cache[template_key]
+            for name, delta in cached["packed"].items():
                 self._packed_attention_stats[name] += (
                     delta * (summary_repetitions - 1)
                 )
+            self.record_softmax_row_stats(
+                {
+                    name: (
+                        value
+                        if name == "softmax_row_lane_utilization"
+                        else int(value) * (summary_repetitions - 1)
+                    )
+                    for name, value in cached["row"].items()
+                }
+            )
 
     def _emit_packed_attention_group_internal(
         self,
@@ -2836,6 +3274,10 @@ class ProgramAttentionMixin:
         output_precleared: bool = False,
         direct_output: bool = False,
         q_lane_base: int = 0,
+        summary_k_dma_outer_axes: tuple[RepeatAxis, ...] = (),
+        summary_v_dma_outer_axes: tuple[RepeatAxis, ...] = (),
+        summary_record_k_dma: bool = True,
+        summary_record_v_dma: bool = True,
     ) -> None:
         """Compiler-owned packed-head flash attention for one KV group."""
         seq_len, q_width = Q_group.shape
@@ -2909,11 +3351,11 @@ class ProgramAttentionMixin:
         ):
             if (
                 getattr(self, "softmax_state_schedule", "sram-v1")
-                != "streamed-v2"
+                not in {"streamed-v2", "row-bank-simd-v3"}
             ):
                 raise ValueError(
                     "broadcast-k-major-v1 requires "
-                    "softmax_state_schedule='streamed-v2'"
+                    "an independent per-head softmax state schedule"
                 )
             state_layout = getattr(self, "_softmax_state_layout", None)
             if (
@@ -2956,6 +3398,10 @@ class ProgramAttentionMixin:
                 resident_k_mram=resident_k_mram,
                 resident_v_mram=resident_v_mram,
                 kv_residency_plan=kv_residency_plan,
+                summary_k_dma_outer_axes=summary_k_dma_outer_axes,
+                summary_v_dma_outer_axes=summary_v_dma_outer_axes,
+                summary_record_k_dma=summary_record_k_dma,
+                summary_record_v_dma=summary_record_v_dma,
             )
             return
 
@@ -3460,6 +3906,53 @@ class ProgramAttentionMixin:
         if scale is None:
             scale = 1.0 / math.sqrt(head_slot_dim)
 
+        summary_enabled = self.cost_affine_summary_enabled()
+
+        # Each KV head is a distinct logical HBM object. Combining heads into
+        # one affine object preserves bytes but changes the physical object's
+        # reconstructed placement and therefore V4 channel/row mapping. Keep
+        # one compressed stream family per head; batch and Q-group repeats
+        # remain safe axes because they stay within that same object.
+        k_head_axis = None
+        v_head_axis = None
+
+        def summary_outer_axes(
+            variable: InputVar,
+            *,
+            head_axis: RepeatAxis | None,
+            include_q_group_reuse: bool = True,
+        ) -> tuple[RepeatAxis, ...]:
+            if not summary_enabled:
+                return ()
+            layout = self.get_hbm_layout(variable.name)
+            _rows, cols = layout.physical_shape or layout.full_shape
+            axes: list[RepeatAxis] = []
+            if batch_size > 1:
+                batch_element_delta = rows_per_batch * cols
+                axes.append(
+                    RepeatAxis(
+                        "packed_kv_batch",
+                        batch_size,
+                        element_base_delta=batch_element_delta,
+                        scale_base_delta=batch_element_delta // 8,
+                        logical_element_delta=batch_element_delta,
+                        logical_scale_delta=batch_element_delta // 8,
+                    )
+                )
+            if head_axis is not None:
+                axes.append(head_axis)
+            if include_q_group_reuse and schedule.chunks_per_kv > 1:
+                # Every packed Q chunk for one KV head consumes the same K/V
+                # stream. Preserve the repeated physical traffic without
+                # materializing one MemoryEvent per chunk.
+                axes.append(
+                    RepeatAxis(
+                        "packed_q_group_reuse",
+                        schedule.chunks_per_kv,
+                    )
+                )
+            return tuple(axes)
+
         q_base = self.get_vram_addr(Q_full.name)
         o_base = self.get_vram_addr(O_full.name)
         total_physical_rows = Q_full.physical_shape[0]
@@ -3503,11 +3996,37 @@ class ProgramAttentionMixin:
                     )
                 )
                 if use_prefix_plan and residency.resident_prefix_blocks:
+                    summary_record_prefix_k = (
+                        not summary_enabled
+                        or (
+                            batch_idx == 0
+                            and (k_head_axis is None or kv_head == 0)
+                        )
+                    )
+                    summary_record_prefix_v = (
+                        not summary_enabled
+                        or (
+                            batch_idx == 0
+                            and (v_head_axis is None or kv_head == 0)
+                        )
+                    )
                     self._prefetch_packed_kv_prefix(
                         K,
                         V,
                         first_k_idx=first_k_idx,
                         residency=residency,
+                        summary_k_dma_outer_axes=summary_outer_axes(
+                            K,
+                            head_axis=k_head_axis,
+                            include_q_group_reuse=False,
+                        ),
+                        summary_v_dma_outer_axes=summary_outer_axes(
+                            V,
+                            head_axis=v_head_axis,
+                            include_q_group_reuse=False,
+                        ),
+                        summary_record_k_dma=summary_record_prefix_k,
+                        summary_record_v_dma=summary_record_prefix_v,
                     )
                     resident_tile_loads = 2 * residency.resident_prefix_blocks
                     self._packed_attention_stats["kv_tile_load_count"] += (
@@ -3576,6 +4095,22 @@ class ProgramAttentionMixin:
                         + batch_offset,
                         physical_shape=(rows_per_batch, self.mlen),
                     )
+                    summary_record_k_dma = (
+                        not summary_enabled
+                        or (
+                            batch_idx == 0
+                            and chunk == 0
+                            and (k_head_axis is None or kv_head == 0)
+                        )
+                    )
+                    summary_record_v_dma = (
+                        not summary_enabled
+                        or (
+                            batch_idx == 0
+                            and chunk == 0
+                            and (v_head_axis is None or kv_head == 0)
+                        )
+                    )
                     self._emit_packed_attention_group_internal(
                         Q_group=q_group,
                         K=K,
@@ -3622,6 +4157,16 @@ class ProgramAttentionMixin:
                         direct_output=hardware_broadcast == 1,
                         output_head_base=q_lane_base,
                         q_lane_base=q_lane_base,
+                        summary_k_dma_outer_axes=summary_outer_axes(
+                            K,
+                            head_axis=k_head_axis,
+                        ),
+                        summary_v_dma_outer_axes=summary_outer_axes(
+                            V,
+                            head_axis=v_head_axis,
+                        ),
+                        summary_record_k_dma=summary_record_k_dma,
+                        summary_record_v_dma=summary_record_v_dma,
                     )
                     self.free_tensor(q_group)
 

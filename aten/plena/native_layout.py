@@ -11,15 +11,31 @@ import math
 from dataclasses import dataclass
 
 
-NATIVE_LAYOUT_SCHEMA_VERSION = 5
+NATIVE_LAYOUT_SCHEMA_VERSION = 6
 NATIVE_LAYOUT_MODES = frozenset({"compact", "legacy"})
 FP_CONSTANT_NUM_DEFAULT = 10
 SOFTMAX_STATE_SCHEDULE_STREAMED_V2 = "streamed-v2"
 SOFTMAX_STATE_SCHEDULE_SRAM_V1 = "sram-v1"
+SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3 = "row-bank-simd-v3"
 SOFTMAX_STATE_SCHEDULES = frozenset(
     {
         SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
         SOFTMAX_STATE_SCHEDULE_SRAM_V1,
+        SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3,
+    }
+)
+SOFTMAX_ROW_LANE_TIERS = (1, 2, 4, 8)
+SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1 = "single-row-v1"
+SOFTMAX_VECTOR_SCHEDULE_MULTI_ROW_V1 = "multi-row-v1"
+SOFTMAX_VECTOR_SCHEDULES = frozenset(
+    {SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1, SOFTMAX_VECTOR_SCHEDULE_MULTI_ROW_V1}
+)
+PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1 = "shift-add-v1"
+PV_ACCUMULATION_SCHEDULE_DIRECT_PACKED_RMW_V1 = "direct-packed-rmw-v1"
+PV_ACCUMULATION_SCHEDULES = frozenset(
+    {
+        PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1,
+        PV_ACCUMULATION_SCHEDULE_DIRECT_PACKED_RMW_V1,
     }
 )
 PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1 = "broadcast-k-major-v1"
@@ -198,6 +214,189 @@ class SequencePackingPlan:
 
 
 @dataclass(frozen=True)
+class SoftmaxRowGroup:
+    """One bank-aligned group of independent query rows.
+
+    ``active_rows`` is the number of live lanes in the group.  A tail group
+    keeps the same hardware tier and leaves the remaining state entries
+    invalid, so the ISA never reads dummy rows as online-softmax state.
+    """
+
+    base_row: int
+    active_rows: int
+    row_lanes: int
+    segment_index: int | None
+    segment_log2: int
+    mask_geometry: str
+
+    def __post_init__(self) -> None:
+        if self.row_lanes not in SOFTMAX_ROW_LANE_TIERS:
+            raise ValueError(f"unsupported softmax row tier {self.row_lanes}")
+        if not 1 <= self.active_rows <= self.row_lanes:
+            raise ValueError(
+                f"active_rows={self.active_rows} outside [1, {self.row_lanes}]"
+            )
+        if self.base_row < 0:
+            raise ValueError(f"base_row must be nonnegative, got {self.base_row}")
+
+    @property
+    def full(self) -> bool:
+        return self.active_rows == self.row_lanes
+
+    @property
+    def active_row_mask(self) -> int:
+        return (1 << self.active_rows) - 1
+
+    def bank_address(self, physical_row: int) -> tuple[int, int]:
+        if not self.base_row <= physical_row < self.base_row + self.active_rows:
+            raise IndexError(f"row {physical_row} is not active in {self}")
+        return physical_row % self.row_lanes, physical_row // self.row_lanes
+
+
+@dataclass(frozen=True)
+class SoftmaxRowGroupRun:
+    """A hardware-loopable run of row groups with identical geometry."""
+
+    groups: tuple[SoftmaxRowGroup, ...]
+
+    @property
+    def first(self) -> SoftmaxRowGroup:
+        return self.groups[0]
+
+    @property
+    def count(self) -> int:
+        return len(self.groups)
+
+
+@dataclass(frozen=True)
+class SoftmaxRowGroupPlan:
+    """Canonical row grouping for multi-row online softmax lowering."""
+
+    row_lanes: int
+    groups: tuple[SoftmaxRowGroup, ...]
+    scalar_fallback_rows: tuple[int, ...] = ()
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        sequence: SequencePackingPlan | None,
+        rows: int,
+        mlen: int,
+        row_lanes: int,
+        valid_cols: int | None = None,
+    ) -> "SoftmaxRowGroupPlan":
+        if row_lanes not in SOFTMAX_ROW_LANE_TIERS:
+            raise ValueError(
+                f"softmax_row_lanes must be one of {SOFTMAX_ROW_LANE_TIERS}, "
+                f"got {row_lanes}"
+            )
+        if rows <= 0 or rows > mlen:
+            raise ValueError(f"rows must be in [1, {mlen}], got {rows}")
+
+        if (
+            sequence is not None
+            and sequence.mode == "compact"
+            and sequence.seq_len <= mlen
+            and rows == sequence.attention_group_seq_len
+        ):
+            slot_rows = int(sequence.batch_slot_rows)
+            ranges = tuple(
+                (slot * slot_rows, int(sequence.seq_len), slot, slot_rows)
+                for slot in range(int(sequence.batch_pack_factor))
+            )
+        else:
+            ranges = ((0, rows, None, mlen),)
+
+        groups: list[SoftmaxRowGroup] = []
+        fallback: list[int] = []
+        for start, count, segment, segment_width in ranges:
+            cursor = start
+            end = start + count
+            while cursor < end and cursor % row_lanes:
+                fallback.append(cursor)
+                cursor += 1
+            while cursor < end:
+                active = min(row_lanes, end - cursor)
+                groups.append(
+                    SoftmaxRowGroup(
+                        base_row=cursor,
+                        active_rows=active,
+                        row_lanes=row_lanes,
+                        segment_index=segment,
+                        segment_log2=int(math.log2(segment_width)),
+                        mask_geometry=(
+                            f"segment:{segment}:{segment_width}"
+                            if segment is not None
+                            else (
+                                f"valid-cols:{valid_cols}"
+                                if valid_cols is not None and valid_cols < mlen
+                                else "full-row"
+                            )
+                        ),
+                    )
+                )
+                cursor += active
+        return cls(
+            row_lanes=row_lanes,
+            groups=tuple(groups),
+            scalar_fallback_rows=tuple(fallback),
+        )
+
+    @property
+    def active_rows(self) -> int:
+        return sum(group.active_rows for group in self.groups) + len(
+            self.scalar_fallback_rows
+        )
+
+    @property
+    def full_group_count(self) -> int:
+        return sum(group.full for group in self.groups)
+
+    @property
+    def tail_group_count(self) -> int:
+        return len(self.groups) - self.full_group_count
+
+    @property
+    def lane_utilization(self) -> float:
+        slots = len(self.groups) * self.row_lanes + len(self.scalar_fallback_rows)
+        return self.active_rows / slots if slots else 0.0
+
+    def affine_runs(self) -> tuple[SoftmaxRowGroupRun, ...]:
+        """Return maximal runs that share one row-group microkernel."""
+
+        runs: list[SoftmaxRowGroupRun] = []
+        current: list[SoftmaxRowGroup] = []
+        for group in self.groups:
+            if current:
+                previous = current[-1]
+                compatible = (
+                    group.active_rows == previous.active_rows
+                    and group.row_lanes == previous.row_lanes
+                    and group.mask_geometry == previous.mask_geometry
+                    and group.base_row == previous.base_row + previous.row_lanes
+                )
+                if not compatible:
+                    runs.append(SoftmaxRowGroupRun(tuple(current)))
+                    current = []
+            current.append(group)
+        if current:
+            runs.append(SoftmaxRowGroupRun(tuple(current)))
+        return tuple(runs)
+
+    def metadata(self) -> dict[str, int | float]:
+        return {
+            "softmax_row_lanes": self.row_lanes,
+            "softmax_row_groups": len(self.groups),
+            "softmax_row_lane_utilization": self.lane_utilization,
+            "softmax_full_group_count": self.full_group_count,
+            "softmax_tail_group_count": self.tail_group_count,
+            "softmax_affine_run_count": len(self.affine_runs()),
+            "bank_conflict_fallbacks": len(self.scalar_fallback_rows),
+        }
+
+
+@dataclass(frozen=True)
 class AttentionHeadPacking:
     """Physical packed-GQA storage and execution mapping.
 
@@ -329,7 +528,7 @@ def build_compact_stats_plan(
         raise ValueError(f"HLEN={hlen} must divide VLEN={vlen}")
     required = min(num_attention_heads, vlen // hlen)
     fallback_reason = None
-    if vector_scalar_schedule == "rtl-v5":
+    if vector_scalar_schedule in {"rtl-v5", "rtl-v6"}:
         configured = next(
             (
                 tier
@@ -372,6 +571,18 @@ class SoftmaxStateLayout:
     required_depth: int
 
     @property
+    def storage_kind(self) -> str:
+        if self.schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3:
+            return "dedicated-softmax-state-bank"
+        return "scalar-fp-sram"
+
+    @property
+    def state_bank_entries(self) -> int:
+        if self.schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3:
+            return self.active_broadcast_heads * self.mlen
+        return 0
+
+    @property
     def state_base(self) -> int:
         return self.fp_constant_num
 
@@ -385,12 +596,16 @@ class SoftmaxStateLayout:
         self._validate_head(head)
         if self.schedule == SOFTMAX_STATE_SCHEDULE_SRAM_V1:
             return self.state_base
+        if self.schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3:
+            return head * self.mlen
         return self.state_base + head * self.mlen
 
     def l_base(self, head: int) -> int:
         self._validate_head(head)
         if self.schedule == SOFTMAX_STATE_SCHEDULE_SRAM_V1:
             return self.state_base + 2 * self.mlen
+        if self.schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3:
+            return head * self.mlen
         return (
             self.state_base
             + self.active_broadcast_heads * self.mlen
@@ -404,14 +619,26 @@ class SoftmaxStateLayout:
             )
 
     def metadata(self) -> dict[str, int | float | str]:
-        state_entries = self.required_depth - self.fp_constant_num
+        state_entries = (
+            self.state_bank_entries
+            if self.schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3
+            else self.required_depth - self.fp_constant_num
+        )
         return {
             "softmax_state_schedule": self.schedule,
             "softmax_state_heads": self.active_broadcast_heads,
             "softmax_state_entries_required": state_entries,
+            "softmax_state_storage": self.storage_kind,
+            "softmax_state_bank_entries": self.state_bank_entries,
             "scalar_fp_sram_depth": self.required_depth,
             "scalar_fp_sram_state_utilization": (
-                state_entries / self.required_depth if self.required_depth else 0.0
+                (
+                    0.0
+                    if self.schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3
+                    else state_entries / self.required_depth
+                )
+                if self.required_depth
+                else 0.0
             ),
         }
 
@@ -438,7 +665,11 @@ def build_softmax_state_layout(
     state_rows = (
         3
         if schedule == SOFTMAX_STATE_SCHEDULE_SRAM_V1
-        else 2 * active_broadcast_heads
+        else (
+            0
+            if schedule == SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3
+            else 2 * active_broadcast_heads
+        )
     )
     return SoftmaxStateLayout(
         schedule=schedule,

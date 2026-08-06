@@ -1075,6 +1075,7 @@ _ATTENTION_PAIR_OPS = frozenset(
     {
         "M_BTMM",
         "M_BMM_WO",
+        "M_MM_WO_PACKED_ACC",
         "V_EXP_V",
         "V_RED_MAX_SEG",
         "V_RED_SUM_SEG",
@@ -1082,6 +1083,15 @@ _ATTENTION_PAIR_OPS = frozenset(
         "V_RED_SUM_SEG_OVR",
         "V_SHIFT_V",
         "V_SUB_VF",
+        "V_RED_MAX_ROWS",
+        "V_RED_SUM_ROWS",
+        "V_SUB_ROWS",
+        "V_EXP_ROWS",
+        "V_MUL_ROWS_STATS",
+        "V_MUL_ROWS_F",
+        "V_SFM_MAX_ROWS",
+        "V_SFM_SUM_ROWS",
+        "V_SFM_FINAL_ROWS",
     }
 )
 _SEGMENTED_NORM_OPS = frozenset(
@@ -1439,10 +1449,23 @@ def _finalize_energy_action_lineage(trace: CostTrace) -> dict[str, Any]:
         for component, action, opcode, _segment_log2 in (
             _logic_energy_actions(entry.opcode)
         ):
+            # ParallelKernelCensus deliberately compresses away operands, so
+            # it cannot distinguish packed-PV overwrite from accumulate mode.
+            # Preserve the two EnergyAction variants, but validate their exact
+            # aggregate against the final opcode census.
+            if entry.opcode == "M_MM_WO_PACKED_ACC" and component == "packed_pv_accumulator":
+                action = "__mode_total__"
             expected[
                 (entry.stage, lineage, opcode, component, action)
             ] += entry.count
         for component, action, accesses in _sram_actions(entry.opcode):
+            # The compressed parallel census intentionally drops operand
+            # variants. Variable-width row instructions therefore return a
+            # zero sentinel without their active_rows argument; their exact
+            # SRAM multiplicity remains covered by the EnergyAction emitted
+            # from the final structured schedule below.
+            if accesses <= 0:
+                continue
             expected[
                 (entry.stage, lineage, entry.opcode, component, action)
             ] += entry.count * accesses
@@ -1488,6 +1511,19 @@ def _finalize_energy_action_lineage(trace: CostTrace) -> dict[str, Any]:
                 action.action,
             )
         ] += action.count
+        if (
+            action.precision == "M_MM_WO_PACKED_ACC"
+            and action.component == "packed_pv_accumulator"
+        ):
+            action_families[
+                (
+                    action.stage,
+                    action.parallel_kernel,
+                    action.precision,
+                    action.component,
+                    "__mode_total__",
+                )
+            ] += action.count
     mismatches = {
         f"{stage}/{lineage}/{opcode}/{component}/{action}": {
             "expected": count,
@@ -1587,6 +1623,9 @@ def _trace_cache_key(
     softmax_state_schedule: str,
     packed_qk_schedule: str,
     vector_scalar_schedule: str,
+    softmax_vector_schedule: str,
+    pv_accumulation_schedule: str,
+    softmax_row_lanes: int,
     selector_schedule: str,
     reduction_output_mode: str,
     gqa_pipeline_schedule: str,
@@ -1612,6 +1651,9 @@ def _trace_cache_key(
         softmax_state_schedule,
         packed_qk_schedule,
         vector_scalar_schedule,
+        softmax_vector_schedule,
+        pv_accumulation_schedule,
+        softmax_row_lanes,
         selector_schedule,
         reduction_output_mode,
         gqa_pipeline_schedule,
@@ -1654,6 +1696,9 @@ def _config_hash(
     softmax_state_schedule: str,
     packed_qk_schedule: str,
     vector_scalar_schedule: str,
+    softmax_vector_schedule: str,
+    pv_accumulation_schedule: str,
+    softmax_row_lanes: int,
     selector_schedule: str,
     reduction_output_mode: str,
     gqa_pipeline_schedule: str,
@@ -1679,6 +1724,9 @@ def _config_hash(
         "softmax_state_schedule": softmax_state_schedule,
         "packed_qk_schedule": packed_qk_schedule,
         "vector_scalar_schedule": vector_scalar_schedule,
+        "softmax_vector_schedule": softmax_vector_schedule,
+        "pv_accumulation_schedule": pv_accumulation_schedule,
+        "softmax_row_lanes": softmax_row_lanes,
         "selector_schedule": selector_schedule,
         "reduction_output_mode": reduction_output_mode,
         "gqa_pipeline_schedule": gqa_pipeline_schedule,
@@ -1710,6 +1758,9 @@ def compile_native_decoder_cost_trace(
     softmax_state_schedule: str = SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
     packed_qk_schedule: str = PACKED_QK_SCHEDULE_BROADCAST_K_MAJOR_V1,
     vector_scalar_schedule: str = "rtl-v5",
+    softmax_vector_schedule: str = "single-row-v1",
+    pv_accumulation_schedule: str = "shift-add-v1",
+    softmax_row_lanes: int = 1,
     selector_schedule: str = "legacy",
     reduction_output_mode: str = "accumulate-v1",
     gqa_pipeline_schedule: str | None = None,
@@ -1753,6 +1804,7 @@ def compile_native_decoder_cost_trace(
     if packed_qk_schedule not in PACKED_QK_SCHEDULES:
         raise ValueError(f"packed_qk_schedule must be one of {sorted(PACKED_QK_SCHEDULES)}, got {packed_qk_schedule!r}")
     if vector_scalar_schedule not in {
+        "rtl-v6",
         "rtl-v5",
         "rtl-v4",
         "rtl-v3",
@@ -1761,7 +1813,7 @@ def compile_native_decoder_cost_trace(
         "legacy",
     }:
         raise ValueError(
-            "vector_scalar_schedule must be 'rtl-v5', 'rtl-v4', 'rtl-v3', 'rtl-v2', "
+            "vector_scalar_schedule must be 'rtl-v6', 'rtl-v5', 'rtl-v4', 'rtl-v3', 'rtl-v2', "
             "'compiler-v1', or 'legacy', got "
             f"{vector_scalar_schedule!r}"
         )
@@ -1792,7 +1844,7 @@ def compile_native_decoder_cost_trace(
     if gqa_pipeline_schedule is None:
         gqa_pipeline_schedule = (
             "row-interleaved-v1"
-            if vector_scalar_schedule in {"rtl-v3", "rtl-v4", "rtl-v5"}
+            if vector_scalar_schedule in {"rtl-v3", "rtl-v4", "rtl-v5", "rtl-v6"}
             else "row-serial"
         )
     if gqa_pipeline_schedule not in {"row-interleaved-v1", "row-serial"}:
@@ -1803,10 +1855,11 @@ def compile_native_decoder_cost_trace(
         "rtl-v3",
         "rtl-v4",
         "rtl-v5",
+        "rtl-v6",
     }:
         raise ValueError(
             "row-interleaved-v1 requires vector_scalar_schedule='rtl-v3', "
-            "'rtl-v4', or 'rtl-v5'"
+            "'rtl-v4', 'rtl-v5', or 'rtl-v6'"
         )
     if moe_routing_mode not in {"static-indices", "fixed-balanced"}:
         raise ValueError(f"moe_routing_mode must be 'static-indices' or 'fixed-balanced', got {moe_routing_mode!r}")
@@ -1903,6 +1956,9 @@ def compile_native_decoder_cost_trace(
         softmax_state_schedule=softmax_state_schedule,
         packed_qk_schedule=packed_qk_schedule,
         vector_scalar_schedule=vector_scalar_schedule,
+        softmax_vector_schedule=softmax_vector_schedule,
+        pv_accumulation_schedule=pv_accumulation_schedule,
+        softmax_row_lanes=softmax_row_lanes,
         selector_schedule=selector_schedule,
         reduction_output_mode=reduction_output_mode,
         gqa_pipeline_schedule=gqa_pipeline_schedule,
@@ -1978,6 +2034,9 @@ def compile_native_decoder_cost_trace(
         softmax_state_schedule=softmax_state_schedule,
         packed_qk_schedule=packed_qk_schedule,
         vector_scalar_schedule=vector_scalar_schedule,
+        softmax_vector_schedule=softmax_vector_schedule,
+        pv_accumulation_schedule=pv_accumulation_schedule,
+        softmax_row_lanes=softmax_row_lanes,
         compact_stats_lanes=compact_stats_plan.configured_lanes,
         selector_schedule=selector_schedule,
         reduction_output_mode=reduction_output_mode,
@@ -2262,6 +2321,9 @@ def compile_native_decoder_cost_trace(
             # select the rtl-v3 scoreboard without reverse-engineering an
             # optional diagnostics dictionary.
             "vector_scalar_schedule": vector_scalar_schedule,
+            "softmax_vector_schedule": softmax_vector_schedule,
+            "pv_accumulation_schedule": pv_accumulation_schedule,
+            "softmax_row_lanes": softmax_row_lanes,
             "selector_schedule": selector_schedule,
             "reduction_output_mode": reduction_output_mode,
             "packed_attention_schedule": packed_attention_schedule,
@@ -2318,6 +2380,9 @@ def compile_native_decoder_cost_trace(
                 softmax_state_schedule=softmax_state_schedule,
                 packed_qk_schedule=packed_qk_schedule,
                 vector_scalar_schedule=vector_scalar_schedule,
+                softmax_vector_schedule=softmax_vector_schedule,
+                pv_accumulation_schedule=pv_accumulation_schedule,
+                softmax_row_lanes=softmax_row_lanes,
                 selector_schedule=selector_schedule,
                 reduction_output_mode=reduction_output_mode,
                 gqa_pipeline_schedule=gqa_pipeline_schedule,
