@@ -100,6 +100,42 @@ class TestVectorRmaskHandling(unittest.TestCase):
                 self.assertEqual((encoded >> 22) & 0x1, 1)
                 self.assertEqual((encoded >> 18) & 0xF, 0)
 
+    def test_multi_row_aliases_use_reserved_function_encodings(self):
+        asm_path = "/tmp/plena_test_multi_row_aliases.asm"
+        with open(asm_path, "w") as f:
+            f.write("V_RED_MAX_ROWS gp1, gp2, 3, 2\n")
+            f.write("V_SUB_ROWS gp3, gp3, gp4, 3, 2\n")
+            f.write("V_EXP_ROWS gp3, gp3, 3, 2\n")
+            f.write("V_SFM_SUM_ROWS gp5, gp1, 3, 2\n")
+
+        reduction, subtract, exp, state = parse_asm_file(asm_path)
+        red_word = self.asm._convert_to_binary(reduction)
+        self.assertEqual(red_word & 0x3F, 0x3A)
+        self.assertEqual((red_word >> 14) & 0xF, 2)
+        self.assertEqual((red_word >> 18) & 0xF, 2)
+        self.assertEqual((red_word >> 22) & 0xF, 0x8)
+        subtract_word = self.asm._convert_to_binary(subtract)
+        exp_word = self.asm._convert_to_binary(exp)
+        self.assertEqual((subtract_word >> 22) & 0xF, 0xA)
+        self.assertEqual((subtract_word >> 18) & 0xF, 2)
+        self.assertEqual((exp_word >> 22) & 0xF, 0xA)
+        self.assertEqual((exp_word >> 18) & 0xF, 2)
+        self.assertEqual((self.asm._convert_to_binary(state) >> 22) & 0xF, 0xB)
+        self.assertEqual((self.asm._convert_to_binary(state) >> 18) & 0xF, 0x6)
+
+    def test_packed_pv_writeout_encodes_lane_and_mode_in_imm2(self):
+        asm_path = "/tmp/plena_test_packed_pv_writeout.asm"
+        with open(asm_path, "w") as f:
+            f.write("M_MM_WO_PACKED_ACC gp1, gp2, 384, 1\n")
+
+        instruction = parse_asm_file(asm_path)[0]
+        encoded = self.asm._convert_to_binary(instruction)
+        self.assertEqual(encoded & 0x3F, 0x06)
+        immediate = (encoded >> 14) & 0x3FFFF
+        self.assertEqual(immediate & 0xFFFF, 384)
+        self.assertEqual((immediate >> 16) & 0x1, 1)
+        self.assertEqual((immediate >> 17) & 0x1, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,7 @@ _RS1_RD_OPS = _RS1_RD_OPS | frozenset({"S_RSQRT_FP"})
 _SEGMENT_REDUCTION_OPS = frozenset({"V_RED_SUM_SEG", "V_RED_MAX_SEG"})
 _MULTI_SEGMENT_REDUCTION_OPS = frozenset({"V_RED_SUM_SEGS", "V_RED_MAX_SEGS"})
 _FULL_REDUCTION_OPS = frozenset({"V_RED_SUM", "V_RED_MAX"})
+_ROW_MODE_VECTOR_OPS = frozenset({"V_SUB_VF", "V_MUL_VF", "V_EXP_V"})
 _RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"})
 _FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})
 _RS2_RS1_RD_OPS = frozenset(
@@ -106,7 +107,16 @@ class AssemblyToBinary:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
 
-        if instruction.opcode in _FULL_REDUCTION_OPS:
+        if instruction.opcode in _ROW_MODE_VECTOR_OPS and funct1 is not None and funct1 & 0x8:
+            binary_instruction = (
+                (funct1 << (opw + 4 * ow))
+                + (rstride << (opw + 3 * ow))
+                + ((0 if rs2 is None else rs2) << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+        elif instruction.opcode in _FULL_REDUCTION_OPS:
             # Full reductions use rs3 as rmask and funct1[0] as overwrite.
             # Handle them before the legacy unary/immediate groups, otherwise
             # those shorter encodings silently discard the overwrite bit.
@@ -152,7 +162,9 @@ class AssemblyToBinary:
             )
         elif instruction.opcode in _MULTI_SEGMENT_REDUCTION_OPS:
             binary_instruction = (
-                (rstride << (opw + 3 * ow))
+                ((0 if funct1 is None else funct1) << (opw + 4 * ow))
+                + ((0 if rs2 is None else rs2) << (opw + 2 * ow))
+                + (rstride << (opw + 3 * ow))
                 + (rs1 << (opw + ow))
                 + (rd << opw)
                 + opcode

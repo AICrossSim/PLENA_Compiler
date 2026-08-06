@@ -132,6 +132,21 @@ _REDUCTION_OVERWRITE_ALIASES = {
     "V_RED_MAX_SEG_OVR": "V_RED_MAX_SEG",
 }
 _MULTI_SEGMENT_REDUCTIONS = frozenset({"V_RED_SUM_SEGS", "V_RED_MAX_SEGS"})
+_ROW_REDUCTION_ALIASES = {
+    "V_RED_SUM_ROWS": "V_RED_SUM_SEGS",
+    "V_RED_MAX_ROWS": "V_RED_MAX_SEGS",
+}
+_ROW_BINARY_ALIASES = {
+    "V_SUB_ROWS": ("V_SUB_VF", 0),
+    "V_MUL_ROWS_STATS": ("V_MUL_VF", 0),
+    "V_MUL_ROWS_F": ("V_MUL_VF", 1),
+}
+_ROW_UNARY_ALIASES = {"V_EXP_ROWS": ("V_EXP_V", 0)}
+_ROW_STATE_ALIASES = {
+    "V_SFM_MAX_ROWS": 0,
+    "V_SFM_SUM_ROWS": 1,
+    "V_SFM_FINAL_ROWS": 2,
+}
 
 
 def _parse_operand(operand):
@@ -226,6 +241,132 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
                 imm = _parse_operand(operands[1])
                 instructions.append(
                     Instruction(opcode, rd, None, None, None, None, None, imm)
+                )
+                continue
+            if opcode == "M_MM_WO_PACKED_ACC":
+                if len(operands) != 4:
+                    raise ValueError(
+                        "M_MM_WO_PACKED_ACC expects destination, stride, "
+                        f"lane_offset, mode: {line}"
+                    )
+                rd = _parse_operand(operands[0])
+                rs1 = _parse_operand(operands[1])
+                lane_offset = _parse_operand(operands[2])
+                mode = _parse_operand(operands[3])
+                if lane_offset is None or not 0 <= lane_offset < (1 << 16):
+                    raise ValueError(f"packed PV lane offset is not encodable: {line}")
+                if mode not in (0, 1):
+                    raise ValueError(f"packed PV mode must be 0 or 1: {line}")
+                imm = (1 << 17) | (mode << 16) | lane_offset
+                instructions.append(
+                    Instruction("M_MM_WO", rd, rs1, None, None, None, None, imm)
+                )
+                continue
+            if opcode in _ROW_REDUCTION_ALIASES:
+                if len(operands) != 4:
+                    raise ValueError(
+                        f"{opcode} expects gpDst, gpSrc, active_rows, row_log2: {line}"
+                    )
+                rd = _parse_operand(operands[0])
+                rs1 = _parse_operand(operands[1])
+                active_rows = _parse_operand(operands[2])
+                row_log2 = _parse_operand(operands[3])
+                if row_log2 not in (0, 1, 2, 3):
+                    raise ValueError(f"row_log2 must be in [0, 3]: {line}")
+                row_lanes = 1 << row_log2
+                if active_rows is None or not 1 <= active_rows <= row_lanes:
+                    raise ValueError(f"active_rows outside row tier: {line}")
+                instructions.append(
+                    Instruction(
+                        _ROW_REDUCTION_ALIASES[opcode],
+                        rd,
+                        rs1,
+                        active_rows - 1,
+                        row_log2,
+                        0x8,
+                        None,
+                        None,
+                    )
+                )
+                continue
+            if opcode in _ROW_BINARY_ALIASES:
+                if len(operands) != 5:
+                    raise ValueError(
+                        f"{opcode} expects gpDst, gpSrc, gpState, active_rows, "
+                        f"row_log2: {line}"
+                    )
+                active_rows = _parse_operand(operands[3])
+                row_log2 = _parse_operand(operands[4])
+                if row_log2 not in (0, 1, 2, 3):
+                    raise ValueError(f"row_log2 must be in [0, 3]: {line}")
+                if active_rows is None or not 1 <= active_rows <= 1 << row_log2:
+                    raise ValueError(f"active_rows outside row tier: {line}")
+                base_opcode, scalar_mode = _ROW_BINARY_ALIASES[opcode]
+                # funct1[3] selects row mode, funct1[2] distinguishes a scalar
+                # FP operand from packed state, and funct1[1:0] records the
+                # configured row tier. rstride carries the tail lane count.
+                row_funct = 0x8 | (scalar_mode << 2) | row_log2
+                instructions.append(
+                    Instruction(
+                        base_opcode,
+                        _parse_operand(operands[0]),
+                        _parse_operand(operands[1]),
+                        _parse_operand(operands[2]),
+                        active_rows - 1,
+                        row_funct,
+                        None,
+                        None,
+                    )
+                )
+                continue
+            if opcode in _ROW_UNARY_ALIASES:
+                if len(operands) != 4:
+                    raise ValueError(
+                        f"{opcode} expects gpDst, gpSrc, active_rows, row_log2: {line}"
+                    )
+                active_rows = _parse_operand(operands[2])
+                row_log2 = _parse_operand(operands[3])
+                if row_log2 not in (0, 1, 2, 3):
+                    raise ValueError(f"row_log2 must be in [0, 3]: {line}")
+                if active_rows is None or not 1 <= active_rows <= 1 << row_log2:
+                    raise ValueError(f"active_rows outside row tier: {line}")
+                base_opcode, _ = _ROW_UNARY_ALIASES[opcode]
+                instructions.append(
+                    Instruction(
+                        base_opcode,
+                        _parse_operand(operands[0]),
+                        _parse_operand(operands[1]),
+                        0,
+                        active_rows - 1,
+                        0x8 | row_log2,
+                        None,
+                        None,
+                    )
+                )
+                continue
+            if opcode in _ROW_STATE_ALIASES:
+                if len(operands) != 4:
+                    raise ValueError(
+                        f"{opcode} expects gpState, gpStats, active_rows, row_log2: {line}"
+                    )
+                active_rows = _parse_operand(operands[2])
+                row_log2 = _parse_operand(operands[3])
+                if row_log2 not in (0, 1, 2, 3):
+                    raise ValueError(f"row_log2 must be in [0, 3]: {line}")
+                if active_rows is None or not 1 <= active_rows <= 1 << row_log2:
+                    raise ValueError(f"active_rows outside row tier: {line}")
+                phase = _ROW_STATE_ALIASES[opcode]
+                instructions.append(
+                    Instruction(
+                        "V_ALU_VSEG",
+                        _parse_operand(operands[0]),
+                        _parse_operand(operands[1]),
+                        active_rows - 1,
+                        (phase << 2) | row_log2,
+                        0xB,
+                        None,
+                        None,
+                    )
                 )
                 continue
 
