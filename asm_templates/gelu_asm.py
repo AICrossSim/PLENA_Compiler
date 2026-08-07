@@ -1,4 +1,4 @@
-from ._imm import load_large_int_str as _load_large_int
+from ._sigmoid_activation import emit_sigmoid_activation
 
 
 def gelu_asm(
@@ -32,39 +32,14 @@ def gelu_asm(
     Returns:
         Generated assembly code string
     """
-    act_addr = alive_registers[0]
-    scratchpad_addr = alive_registers[1]
-    loop_reg = alive_registers[2]
-
-    num_vectors = (batch_size * hidden_dim) // vlen
-
-    generated_code = "; GELU Activation Generation\n"
-    generated_code += _load_large_int(act_addr, activation_base_address)
-    generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
-
-    # Load constants into FP registers
-    generated_code += f"S_LD_FP f1, gp0, {const_one_fp_address}\n"
-    generated_code += f"S_LD_FP f2, gp0, {const_1702_fp_address}\n"
-
-    generated_code += f"C_LOOP_START gp{loop_reg}, {num_vectors}\n"
-
-    # GELU computation: x * sigmoid(1.702 * x) = x * (1 / (1 + exp(-1.702 * x)))
-    # Step 1: 1.702 * x
-    generated_code += f"V_MUL_VF gp{scratchpad_addr}, gp{act_addr}, f2, 0\n"
-    # Step 2: -1.702 * x (negate using f0=0, with reverse order flag)
-    generated_code += f"V_SUB_VF gp{scratchpad_addr}, gp{scratchpad_addr}, f0, 0, 1\n"
-    # Step 3: exp(-1.702 * x)
-    generated_code += f"V_EXP_V gp{scratchpad_addr}, gp{scratchpad_addr}, 0\n"
-    # Step 4: 1 + exp(-1.702 * x)
-    generated_code += f"V_ADD_VF gp{scratchpad_addr}, gp{scratchpad_addr}, f1, 0\n"
-    # Step 5: 1 / (1 + exp(-1.702 * x)) = sigmoid(1.702 * x)
-    generated_code += f"V_RECI_V gp{scratchpad_addr}, gp{scratchpad_addr}, 0\n"
-    # Step 6: x * sigmoid(1.702 * x) = gelu(x), store in-place
-    generated_code += f"V_MUL_VV gp{act_addr}, gp{scratchpad_addr}, gp{act_addr}, 0\n"
-
-    # Move to next vector
-    generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen}\n"
-
-    generated_code += f"C_LOOP_END gp{loop_reg}\n"
-
-    return generated_code
+    return emit_sigmoid_activation(
+        banner="; GELU Activation Generation\n",
+        const_one_fp_address=const_one_fp_address,
+        pre_scale_fp_address=const_1702_fp_address,
+        alive_registers=alive_registers,
+        activation_base_address=activation_base_address,
+        scratchpad_base_address=scratchpad_base_address,
+        vlen=vlen,
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+    )

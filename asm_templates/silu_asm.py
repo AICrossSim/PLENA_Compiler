@@ -1,4 +1,4 @@
-from ._imm import load_large_int_str as _load_large_int
+from ._sigmoid_activation import emit_sigmoid_activation
 
 
 def silu_asm(
@@ -27,36 +27,14 @@ def silu_asm(
     Returns:
         Generated assembly code string
     """
-    act_addr = alive_registers[0]
-    scratchpad_addr = alive_registers[1]
-    loop_reg = alive_registers[2]
-
-    num_vectors = (batch_size * hidden_dim) // vlen
-
-    generated_code = "; SiLU Activation Generation\n"
-    generated_code += _load_large_int(act_addr, activation_base_address)
-    generated_code += _load_large_int(scratchpad_addr, scratchpad_base_address)
-
-    # Load constant 1.0 into f1
-    generated_code += f"S_LD_FP f1, gp0, {const_one_fp_address}\n"
-
-    generated_code += f"C_LOOP_START gp{loop_reg}, {num_vectors}\n"
-
-    # SiLU computation: x * sigmoid(x) = x * (1 / (1 + exp(-x)))
-    # Step 1: -x (negate using f0=0, with reverse order flag)
-    generated_code += f"V_SUB_VF gp{scratchpad_addr}, gp{act_addr}, f0, 0, 1\n"
-    # Step 2: exp(-x)
-    generated_code += f"V_EXP_V gp{scratchpad_addr}, gp{scratchpad_addr}, 0\n"
-    # Step 3: 1 + exp(-x)
-    generated_code += f"V_ADD_VF gp{scratchpad_addr}, gp{scratchpad_addr}, f1, 0\n"
-    # Step 4: 1 / (1 + exp(-x)) = sigmoid(x)
-    generated_code += f"V_RECI_V gp{scratchpad_addr}, gp{scratchpad_addr}, 0\n"
-    # Step 5: x * sigmoid(x) = silu(x), store in-place
-    generated_code += f"V_MUL_VV gp{act_addr}, gp{scratchpad_addr}, gp{act_addr}, 0\n"
-
-    # Move to next vector
-    generated_code += f"S_ADDI_INT gp{act_addr}, gp{act_addr}, {vlen}\n"
-
-    generated_code += f"C_LOOP_END gp{loop_reg}\n"
-
-    return generated_code
+    return emit_sigmoid_activation(
+        banner="; SiLU Activation Generation\n",
+        const_one_fp_address=const_one_fp_address,
+        pre_scale_fp_address=None,
+        alive_registers=alive_registers,
+        activation_base_address=activation_base_address,
+        scratchpad_base_address=scratchpad_base_address,
+        vlen=vlen,
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+    )
