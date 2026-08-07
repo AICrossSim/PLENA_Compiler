@@ -163,7 +163,6 @@ call into these.
 | `batched_matmul_asm.py` | Batched matrix multiply |
 | `silu_asm.py`, `gelu_asm.py` | Activation functions |
 | `lm_head.py` | LM head projection |
-| `gemv_asm.py` | General matrix-vector multiply |
 | `preload_act.py`, `preload_addr_reg.py` | VRAM/register preloading |
 | `store_act_asm.py` | Activation store-back to HBM |
 | `reset_reg_asm.py` | Register reset helpers |
