@@ -13,6 +13,7 @@ from compiler.aten.plena.program_routed_moe import ProgramRoutedMoeMixin
 from compiler.aten.plena.program_matrix_ops import ProgramMatrixOpsMixin
 from compiler.aten.plena.program_tensors import ProgramTensorMixin
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar
+from compiler.asm_templates._imm import legalize_immediates
 from compiler.utils.load_config import load_toml_config
 
 
@@ -140,7 +141,7 @@ class PlenaCompiler(
 
     def compile(self) -> str:
         """Get generated ISA code string."""
-        return super().get_code()
+        return legalize_immediates(super().get_code())
 
     @property
     def _compiler(self) -> PlenaCompiler:
