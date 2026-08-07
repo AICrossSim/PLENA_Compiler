@@ -17,7 +17,6 @@ PLENA_Compiler/
 |   |-- silu_asm.py          #   SiLU activation
 |   |-- gelu_asm.py          #   GELU activation
 |   |-- lm_head.py           #   LM head projection
-|   |-- gemv_asm.py          #   General matrix-vector multiply
 |   |-- _imm.py              #   Large immediate helpers
 |   |-- _k_split.py          #   K-split utilities
 |   |-- preload_act.py       #   VRAM preloading
