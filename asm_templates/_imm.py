@@ -38,6 +38,9 @@ def load_large_int(reg: int, value: int) -> list[str]:
     return lines
 
 
+CHUNK_LIMIT = 256  # chunked fallback ceiling; larger expansions fail loudly
+
+
 def add_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int | None = None) -> list[str]:
     """Return ASM lines for `gp{dest_reg} = gp{src_reg} + value`.
 
@@ -48,9 +51,12 @@ def add_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int | None 
     must not alias src_reg, because loading the immediate would clobber the
     source value before the add.
 
-    When `temp_reg` is omitted, larger values are emitted as a sequence of
-    bounded S_ADDI_INT chunks. This fallback is less compact but is safe in a
-    compiler-wide legalization pass because it requires no scratch register.
+    Without a temp register, a non-aliasing destination serves as its own
+    temporary: the immediate is materialised into dest_reg and added to
+    src_reg, since dest_reg is overwritten either way. Only the aliasing case
+    (dest_reg == src_reg) falls back to bounded S_ADDI_INT chunks; that
+    expansion is capped at CHUNK_LIMIT instructions so a pathological
+    immediate fails loudly instead of flooding the program.
     """
     if value < 0:
         raise ValueError(f"large immediate helpers only support non-negative values, got {value}")
@@ -62,10 +68,22 @@ def add_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int | None 
         lines.append(f"S_ADD_INT gp{dest_reg}, gp{src_reg}, gp{temp_reg}")
         return lines
 
-    lines: list[str] = []
+    if dest_reg != src_reg:
+        lines = load_large_int(dest_reg, value)
+        lines.append(f"S_ADD_INT gp{dest_reg}, gp{src_reg}, gp{dest_reg}")
+        return lines
+
+    chunk = IMM2_BOUND - 1
+    chunk_count = -(-value // chunk)
+    if chunk_count > CHUNK_LIMIT:
+        raise ValueError(
+            f"chunked immediate add of {value} to gp{src_reg} needs "
+            f"{chunk_count} instructions (limit {CHUNK_LIMIT}); provide a "
+            "temp register or a non-aliasing destination"
+        )
+    lines = []
     remaining = value
     source = src_reg
-    chunk = IMM2_BOUND - 1
     while remaining:
         step = min(remaining, chunk)
         lines.append(f"S_ADDI_INT gp{dest_reg}, gp{source}, {step}")
@@ -104,9 +122,10 @@ def legalize_immediates(assembly: str) -> str:
     through the helpers above, so a geometry cannot fail on an encoding limit
     that has a mechanical fix.
 
-    `gp0` sources become a wide load; every other source becomes the chunked
-    relative add, which needs no scratch register and so is safe to apply after
-    register allocation.
+    `gp0` sources become a wide load; a non-aliasing destination becomes a
+    wide load into the destination plus one add; only an aliasing
+    destination falls back to the chunked relative add. All three forms need
+    no scratch register and so are safe to apply after register allocation.
     """
     output: list[str] = []
     for line in assembly.splitlines():

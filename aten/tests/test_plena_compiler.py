@@ -53,11 +53,18 @@ def test_isa_builder_legalizes_relative_large_immediates():
     """Typed ISA builder should split relative S_ADDI_INT instructions safely."""
     from compiler.aten.isa_builder import IsaBuilder, gp
 
+    # Non-aliasing destination: the destination doubles as the temporary.
     rendered = IsaBuilder().instr("S_ADDI_INT", gp(5), gp(3), 300000).render()
-    assert "S_ADDI_INT gp5, gp3, 262143" in rendered
-    assert "S_ADDI_INT gp5, gp5, 37857" in rendered
+    assert "S_LUI_INT gp5, 73" in rendered
+    assert "S_ADDI_INT gp5, gp5, 992" in rendered
+    assert "S_ADD_INT gp5, gp3, gp5" in rendered
     assert "S_ADDI_INT gp5, gp3, 300000" not in rendered
-    assert "S_LUI_INT" not in rendered
+
+    # Aliasing destination: bounded ADDI chunks, still no scratch register.
+    aliased = IsaBuilder().instr("S_ADDI_INT", gp(5), gp(5), 300000).render()
+    assert "S_ADDI_INT gp5, gp5, 262143" in aliased
+    assert "S_ADDI_INT gp5, gp5, 37857" in aliased
+    assert "S_LUI_INT" not in aliased
     print("  PASS test_isa_builder_legalizes_relative_large_immediates")
 
 
@@ -355,14 +362,19 @@ def test_fix_large_immediates_legalizes_relative_adds():
     """_fix_large_immediates must legalize relative S_ADDI_INT without a scratch register."""
     from compiler.aten.plena_frontend import _fix_large_immediates
 
-    # Relative add: gp5 = gp3 + 300000. With no liveness information available
-    # in the post-pass, this lowers to bounded ADDI chunks instead of using a
-    # scratch register that could clobber live state.
+    # Relative add: gp5 = gp3 + 300000. The overwritten destination serves as
+    # its own temporary, so no live register can be clobbered.
     asm = "S_ADDI_INT gp5, gp3, 300000\n"
     fixed = _fix_large_immediates(asm)
-    assert "S_ADDI_INT gp5, gp3, 262143" in fixed
-    assert "S_ADDI_INT gp5, gp5, 37857" in fixed
+    assert "S_LUI_INT gp5, 73" in fixed
+    assert "S_ADDI_INT gp5, gp5, 992" in fixed
+    assert "S_ADD_INT gp5, gp3, gp5" in fixed
     assert "S_ADDI_INT gp5, gp3, 300000" not in fixed
+
+    # Aliasing add: gp5 = gp5 + 300000 stays on bounded ADDI chunks.
+    aliased = _fix_large_immediates("S_ADDI_INT gp5, gp5, 300000\n")
+    assert "S_ADDI_INT gp5, gp5, 262143" in aliased
+    assert "S_ADDI_INT gp5, gp5, 37857" in aliased
 
     # Absolute load: gp5 = gp0 + 300000 — SHOULD be converted
     asm2 = "S_ADDI_INT gp5, gp0, 300000\n"
