@@ -69,7 +69,7 @@ def _emit_projection_chunk(
                 )
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
-            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen} ")
+            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % (mlen // blen)) * blen * mlen} ")
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % (mlen // blen)) * blen} "
             )
@@ -337,7 +337,7 @@ def projection_T_asm(
                 lines.append(f"S_ADDI_INT gp{w_hbm_offset_register}, gp{w_hbm_offset_register}, {mlen} ")
             lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, 0 ")
         else:
-            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % tiles_per_mlen) * blen} ")
+            lines.append(f"S_ADDI_INT gp{w_actual_register}, gp0, {(weight_row % tiles_per_mlen) * blen * mlen} ")
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {(weight_row % tiles_per_mlen) * blen} "
             )
@@ -345,7 +345,7 @@ def projection_T_asm(
             lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
             for inner_loop_index in range(hidden_size // mlen):
-                lines.append(f"M_MM 0, gp{w_temp_register}, gp{act_reg} ")
+                lines.append(f"M_TMM 0, gp{act_reg}, gp{w_temp_register} ")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
                 lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
