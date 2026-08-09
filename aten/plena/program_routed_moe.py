@@ -22,6 +22,12 @@ MOE_STAGE_MARKER_PREFIX = "@stage="
 
 #: Every stage name the emulator's ``StageKind`` understands.
 #:
+#: Stage name that closes the MoE region. The emulator resolves it to a distinct
+#: ``StageKind`` of its own -- not the unclassified fallback -- so an epilogue is
+#: told apart from a region the classifier had no opinion about. Declared as a
+#: constant because both repositories key on the exact string.
+MOE_END_STAGE = "non_moe"
+
 #: Marker emission is validated against this set, so a typo fails at ASM-gen time
 #: instead of quietly collapsing a region into ``other``.
 MOE_STAGES: frozenset[str] = frozenset(
@@ -45,6 +51,18 @@ MOE_STAGES: frozenset[str] = frozenset(
         "shared_expert_projection",
         "shared_expert_activation",
         "shared_expert_gate",
+        # Terminator. Markers are sticky and there was no way to say "the MoE
+        # region is over", so every instruction after the last MoE marker --
+        # the lm_head, the next sublayer, anything at all -- kept that marker
+        # to the end of the program, and that cost lands in the shared-vs-routed
+        # ratio. A marker like any other, so it is emitted where the region ends
+        # rather than inferred.
+        #
+        # Spelled literally, not as `MOE_END_STAGE`: both repositories recover
+        # this set with a parser that refuses anything it cannot evaluate, so a
+        # name reference here fails to parse rather than resolving. The constant
+        # and this entry are held equal by a test instead.
+        "non_moe",
     }
 )
 
@@ -134,10 +152,31 @@ def moe_stage_marker(stage: str, detail: str = "") -> str:
     ``expert_weight_prefetch``. That is why the routed path marks its own dynamic
     prefetch explicitly; the shared path deliberately does not, folding weight
     traffic into ``shared_expert_projection`` where it belongs.
+
+    Because markers are sticky and a program does not end where its MoE region
+    does, the last MoE marker otherwise runs to the end of the file. Emit
+    :func:`moe_end_marker` at the point the region closes; see
+    :data:`MOE_END_STAGE`.
     """
     if stage not in MOE_STAGES:
         raise ValueError(f"unknown MoE stage {stage!r}; expected one of {sorted(MOE_STAGES)}")
     return f"{MOE_STAGE_MARKER_PREFIX}{stage}" + (f" {detail}" if detail else "")
+
+
+def moe_end_marker(detail: str = "") -> str:
+    """Close the MoE region, so what follows is billed to no MoE stage.
+
+    A separate entry point rather than ``moe_stage_marker(MOE_END_STAGE)``
+    because closing a region and setting one are different acts, and the caller
+    that has to remember this is the one assembling a decoder program, not the
+    one writing an emitter. Emit it once, after the last MoE work in the
+    program -- the combine, or the shared/routed add.
+
+    Omitting it is not silent: the profile reports how many instructions carry
+    the final marker, so an epilogue billed to a MoE stage is visible in the
+    JSON without reading the source that produced it.
+    """
+    return moe_stage_marker(MOE_END_STAGE, detail)
 
 
 class ProgramRoutedMoeMixin:
@@ -1738,8 +1777,10 @@ del _old, _new
 
 
 __all__ = [
+    "MOE_END_STAGE",
     "MOE_STAGES",
     "MOE_STAGE_MARKER_PREFIX",
     "ProgramRoutedMoeMixin",
+    "moe_end_marker",
     "moe_stage_marker",
 ]

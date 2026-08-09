@@ -55,6 +55,8 @@ jobs:
 
       - name: Run the top-k policy encoding guard
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_topk_policy_encoding.py -v
+      - name: Run the stage-terminator guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_terminator.py -v
 
   unit-tests:
     name: Generator unit tests

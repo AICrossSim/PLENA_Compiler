@@ -127,6 +127,25 @@ class ProgramMoeSharedMixin:
         broadcast across the hidden axis, ready to multiply the shared expert
         output. That is the same shape and mechanism the routed branch uses for
         route weights, so the two are combined identically downstream.
+
+        Two limits worth knowing before you reach them:
+
+        - ``name`` must be unique within a program. The scratch buffers are
+          derived from it, so calling this twice with the default is a collision,
+          not a second gate.
+        - ``rows`` is bounded by FPRAM. One gate scalar per token, plus the
+          ``one`` and ``neg_one`` constants which must themselves be at least
+          ``rows`` long, out of 1024 f16 slots shared with everything else -- so
+          the ceiling is near ``rows * 3``, not ``rows``. Measured at 297 with a
+          caller that sizes every other constant to 1; a realistically-shaped
+          caller runs out sooner.
+
+        Static instruction count grows with ``rows`` -- the token loop is unrolled
+        at emit time -- and the per-token cost grows with ``hidden`` as well, but
+        that second part is the broadcast helper's, not this loop's: measured 27
+        instructions per token at ``hidden=64`` against 182 at ``hidden=2048``,
+        while the dot-product loop itself is one ``C_LOOP`` regardless. A codegen
+        follow-up, not a correctness limit.
         """
         if hidden % self.mlen != 0:
             raise ValueError(f"{name}: hidden={hidden} must be divisible by MLEN={self.mlen}")
