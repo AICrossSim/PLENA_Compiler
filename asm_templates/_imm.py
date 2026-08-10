@@ -12,7 +12,13 @@ the single source of truth.
 
 from __future__ import annotations
 
+import re
+
 IMM2_BOUND = 1 << 18  # S_ADDI_INT supports values 0..2^18-1
+
+_ADDI_PATTERN = re.compile(
+    r"^\s*S_ADDI_INT\s+gp(?P<dest>\d+)\s*,\s*gp(?P<source>\d+)\s*,\s*(?P<imm>\d+)\s*$"
+)
 
 
 def load_large_int(reg: int, value: int) -> list[str]:
@@ -32,6 +38,9 @@ def load_large_int(reg: int, value: int) -> list[str]:
     return lines
 
 
+CHUNK_LIMIT = 256  # chunked fallback ceiling; larger expansions fail loudly
+
+
 def add_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int | None = None) -> list[str]:
     """Return ASM lines for `gp{dest_reg} = gp{src_reg} + value`.
 
@@ -42,9 +51,12 @@ def add_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int | None 
     must not alias src_reg, because loading the immediate would clobber the
     source value before the add.
 
-    When `temp_reg` is omitted, larger values are emitted as a sequence of
-    bounded S_ADDI_INT chunks. This fallback is less compact but is safe in a
-    compiler-wide legalization pass because it requires no scratch register.
+    Without a temp register, a non-aliasing destination serves as its own
+    temporary: the immediate is materialised into dest_reg and added to
+    src_reg, since dest_reg is overwritten either way. Only the aliasing case
+    (dest_reg == src_reg) falls back to bounded S_ADDI_INT chunks; that
+    expansion is capped at CHUNK_LIMIT instructions so a pathological
+    immediate fails loudly instead of flooding the program.
     """
     if value < 0:
         raise ValueError(f"large immediate helpers only support non-negative values, got {value}")
@@ -56,10 +68,22 @@ def add_large_int(dest_reg: int, src_reg: int, value: int, temp_reg: int | None 
         lines.append(f"S_ADD_INT gp{dest_reg}, gp{src_reg}, gp{temp_reg}")
         return lines
 
-    lines: list[str] = []
+    if dest_reg != src_reg:
+        lines = load_large_int(dest_reg, value)
+        lines.append(f"S_ADD_INT gp{dest_reg}, gp{src_reg}, gp{dest_reg}")
+        return lines
+
+    chunk = IMM2_BOUND - 1
+    chunk_count = -(-value // chunk)
+    if chunk_count > CHUNK_LIMIT:
+        raise ValueError(
+            f"chunked immediate add of {value} to gp{src_reg} needs "
+            f"{chunk_count} instructions (limit {CHUNK_LIMIT}); provide a "
+            "temp register or a non-aliasing destination"
+        )
+    lines = []
     remaining = value
     source = src_reg
-    chunk = IMM2_BOUND - 1
     while remaining:
         step = min(remaining, chunk)
         lines.append(f"S_ADDI_INT gp{dest_reg}, gp{source}, {step}")
@@ -86,3 +110,41 @@ def add_large_int_str(dest_reg: int, src_reg: int, value: int, temp_reg: int | N
 def addi_large_int_str(dest_reg: int, src_reg: int, value: int, temp_reg: int) -> str:
     """String variant of addi_large_int."""
     return add_large_int_str(dest_reg, src_reg, value, temp_reg=temp_reg)
+
+
+def legalize_immediates(assembly: str) -> str:
+    """Rewrite every `S_ADDI_INT` whose immediate exceeds the encoding field.
+
+    The templates build addresses and strides from raw text, and several of
+    those strides are `MLEN * MLEN`, which reaches exactly `2**18` at MLEN=512
+    and overflows the 18-bit immediate. Legalising the emitted text covers every
+    template at once, including ones that do not yet route their arithmetic
+    through the helpers above, so a geometry cannot fail on an encoding limit
+    that has a mechanical fix.
+
+    `gp0` sources become a wide load; a non-aliasing destination becomes a
+    wide load into the destination plus one add; only an aliasing
+    destination falls back to the chunked relative add. All three forms need
+    no scratch register and so are safe to apply after register allocation.
+    """
+    output: list[str] = []
+    for line in assembly.splitlines():
+        match = _ADDI_PATTERN.match(line)
+        if match is None:
+            output.append(line)
+            continue
+        dest, source, value = (
+            int(match.group("dest")),
+            int(match.group("source")),
+            int(match.group("imm")),
+        )
+        if value < IMM2_BOUND:
+            output.append(line)
+            continue
+        replacement = (
+            load_large_int(dest, value)
+            if source == 0
+            else add_large_int(dest, source, value)
+        )
+        output.extend(replacement)
+    return "\n".join(output) + ("\n" if assembly.endswith("\n") else "")

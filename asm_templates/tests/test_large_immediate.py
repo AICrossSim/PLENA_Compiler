@@ -89,14 +89,36 @@ class TestLoadLargeInt(unittest.TestCase):
         self.assertIn("S_ADDI_INT gp7, gp7, 992", asm)
         self.assertIn("S_ADD_INT gp5, gp3, gp7", asm)
 
-    def test_large_add_without_temp_chunks(self):
-        """Compiler-wide fallback must not need a scratch register."""
+    def test_large_add_without_temp_uses_destination(self):
+        """A non-aliasing destination serves as its own temp register."""
         result = _add_large_int(5, 3, 300000, temp_reg=None)
         asm = "\n".join(result)
-        self.assertIn("S_ADDI_INT gp5, gp3, 262143", asm)
-        self.assertIn("S_ADDI_INT gp5, gp5, 37857", asm)
+        self.assertIn("S_LUI_INT gp5, 73", asm)
+        self.assertIn("S_ADDI_INT gp5, gp5, 992", asm)
+        self.assertIn("S_ADD_INT gp5, gp3, gp5", asm)
         self.assertNotIn("S_ADDI_INT gp5, gp3, 300000", asm)
         _check_all_addi_immediates(self, asm, "add_large_int(no temp)")
+
+    def test_large_add_aliasing_destination_chunks(self):
+        """dest == src without a temp must still not need a scratch register."""
+        result = _add_large_int(5, 5, 300000, temp_reg=None)
+        asm = "\n".join(result)
+        self.assertIn("S_ADDI_INT gp5, gp5, 262143", asm)
+        self.assertIn("S_ADDI_INT gp5, gp5, 37857", asm)
+        self.assertNotIn("S_LUI_INT", asm)
+        _check_all_addi_immediates(self, asm, "add_large_int(aliasing)")
+
+    def test_large_add_aliasing_chunk_limit(self):
+        """A pathological aliasing immediate fails loudly instead of flooding."""
+        from asm_templates._imm import CHUNK_LIMIT, IMM2_BOUND
+
+        over_limit = (IMM2_BOUND - 1) * CHUNK_LIMIT + 1
+        with self.assertRaises(ValueError):
+            _add_large_int(5, 5, over_limit, temp_reg=None)
+        # exactly at the limit still succeeds
+        at_limit = (IMM2_BOUND - 1) * CHUNK_LIMIT
+        result = _add_large_int(5, 5, at_limit, temp_reg=None)
+        self.assertEqual(len(result), CHUNK_LIMIT)
 
 
 class TestProjectionAsmLargeMatrix(unittest.TestCase):
@@ -270,7 +292,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         """use_loop_instructions=True (production path) must handle large matrices."""
         ffn_asm = self._import_ffn_asm()
         args = dict(self.BASE_ARGS)
-        args["alive_registers"] = list(range(10))  # loop version needs 10
+        args["alive_registers"] = list(range(1, 12))  # loop version needs 11
         try:
             asm = ffn_asm(hidden_size=2048, intermediate_size=8192, use_loop_instructions=True, **args)
         except AssertionError as e:
@@ -282,7 +304,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         """Production path with smollm2 scale (hidden=128, inter=256) all immediates bounded."""
         ffn_asm = self._import_ffn_asm()
         args = dict(self.BASE_ARGS)
-        args["alive_registers"] = list(range(10))
+        args["alive_registers"] = list(range(1, 12))
         asm = ffn_asm(hidden_size=128, intermediate_size=256, use_loop_instructions=True, **args)
         _check_all_addi_immediates(self, asm, "ffn_asm(loop,128,256)")
 
@@ -290,7 +312,7 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
         """Production loop path must place FFN temps at the explicit workspace base."""
         ffn_asm = self._import_ffn_asm()
         args = dict(self.BASE_ARGS)
-        args["alive_registers"] = list(range(10))
+        args["alive_registers"] = list(range(1, 12))
         workspace_base = 1_000_000
         rows = args["batch"] * args["seq_len"]
         gate_base = workspace_base + rows * 256
@@ -303,10 +325,13 @@ class TestFfnAsmLargeMatrix(unittest.TestCase):
             **args,
         )
 
-        self.assertIn(f"S_LUI_INT gp3, {workspace_base >> 12}", asm)
-        self.assertIn(f"S_ADDI_INT gp3, gp3, {workspace_base & 0xFFF}", asm)
-        self.assertIn(f"S_LUI_INT gp5, {gate_base >> 12}", asm)
-        self.assertIn(f"S_ADDI_INT gp5, gp5, {gate_base & 0xFFF}", asm)
+        # The template holds the up/gate result bases in alive_registers[3] and [5].
+        up_reg = args["alive_registers"][3]
+        gate_reg = args["alive_registers"][5]
+        self.assertIn(f"S_LUI_INT gp{up_reg}, {workspace_base >> 12}", asm)
+        self.assertIn(f"S_ADDI_INT gp{up_reg}, gp{up_reg}, {workspace_base & 0xFFF}", asm)
+        self.assertIn(f"S_LUI_INT gp{gate_reg}, {gate_base >> 12}", asm)
+        self.assertIn(f"S_ADDI_INT gp{gate_reg}, gp{gate_reg}, {gate_base & 0xFFF}", asm)
         _check_all_addi_immediates(self, asm, "ffn_asm(loop,workspace)")
 
 
