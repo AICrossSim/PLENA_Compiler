@@ -28,9 +28,10 @@ from pathlib import Path
 
 # Add parent repo's tools + testbench to sys.path (mirror existing testbench bootstrap).
 _COMPILER_ROOT = Path(__file__).resolve().parents[2]  # compiler/
-_REPO_ROOT = _COMPILER_ROOT.parent
+_REPO_ROOT = Path(os.environ.get("PLENA_REPO_ROOT", str(_COMPILER_ROOT.parent))).resolve()
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "tools"))
+sys.path.insert(0, str(_REPO_ROOT / "PLENA_Tools"))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -70,8 +71,7 @@ def _load_model_for_weights(model_id: str, torch_dtype=None):
 from assembler import AssemblyToBinary  # noqa: E402
 
 # Tools imports for HBM weight population (same stack create_mem_for_sim uses).
-sys.path.insert(0, str(_REPO_ROOT / "tools"))
-from memory_mapping.memory_map import map_mx_data_to_hbm_for_behave_sim  # noqa: E402
+from memory_mapping.behave_sim import map_mx_data_to_hbm_for_behave_sim  # noqa: E402
 from memory_mapping.rand_gen import RandomMxfpTensorGenerator  # noqa: E402
 from utils.load_config import load_toml_config  # noqa: E402
 
