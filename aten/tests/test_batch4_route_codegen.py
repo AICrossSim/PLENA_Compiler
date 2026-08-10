@@ -1,10 +1,15 @@
 """Focused code-generation checks for four-token expert-major routing."""
 
+from pathlib import Path
+
 import pytest
 
 from assembler import AssemblyToBinary
 from compiler.aten.plena import PlenaCompiler
 from compiler.aten.plena.program_routed_moe import _route_dispatch_policy
+
+
+COMPILER_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _constants(prog: PlenaCompiler):
@@ -71,9 +76,10 @@ def test_batch4_expert_major_codegen_emits_one_dynamic_expert_body(tmp_path):
     asm_path = tmp_path / "batch4.asm"
     mem_path = tmp_path / "batch4.mem"
     asm_path.write_text(code)
-    words = AssemblyToBinary("doc/operation.svh", "doc/configuration.svh").generate_binary(
-        str(asm_path), str(mem_path)
-    )
+    words = AssemblyToBinary(
+        COMPILER_ROOT / "doc" / "operation.svh",
+        COMPILER_ROOT / "doc" / "configuration.svh",
+    ).generate_binary(str(asm_path), str(mem_path))
     assert len(words) == len(instructions)
     assert all(0 <= word <= 0xFFFF_FFFF for word in words)
 
