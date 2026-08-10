@@ -81,6 +81,7 @@ class PlenaCompiler(
         mram_tile_capacity: int = 4,
         hbm_v_prefetch_amount: int | None = None,
         hbm_v_writeback_amount: int | None = None,
+        vram_total_size: int = 0,
     ):
         """
         Args:
@@ -94,6 +95,8 @@ class PlenaCompiler(
             hbm_v_writeback_amount: H_STORE_V transfer count. Defaults to
                           BEHAVIOR.CONFIG.HBM_V_Writeback_Amount in
                           PLENA_SETTINGS_TOML / plena_settings.toml.
+            vram_total_size: Maximum VRAM elements available to this program.
+                          Zero preserves the historical unbounded allocator.
             unroll_loops: If True, unroll sub-projection and attention helper loops
                           at ASM-gen time to eliminate C_LOOP_START/END overhead.
                           Overridden by the ATEN_OPS_UNROLL env var ("1"=True, "0"=False).
@@ -109,6 +112,7 @@ class PlenaCompiler(
             real_data_ratio=real_data_ratio,
             unroll_loops=unroll_loops,
             mram_tile_capacity=mram_tile_capacity,
+            vram_total_size=vram_total_size,
         )
         if hbm_v_prefetch_amount is None:
             hbm_v_prefetch_amount = _behavior_config_value("HBM_V_Prefetch_Amount", 4)

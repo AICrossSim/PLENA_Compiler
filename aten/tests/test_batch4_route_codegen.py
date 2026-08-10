@@ -157,3 +157,31 @@ def test_route_dispatch_policy_limits_are_explicit():
     for experts, top_k in ((257, 8), (256, 9)):
         with pytest.raises(NotImplementedError):
             _route_dispatch_policy(experts, top_k)
+
+
+def test_full_hidden_shared_expert_fails_closed_at_rtl_vram_capacity():
+    capacity = 1024 * 8
+    prog = PlenaCompiler(mlen=8, blen=4, vram_total_size=capacity)
+    x = prog.alloc(
+        "X",
+        rows=4,
+        cols=2048,
+        strict=False,
+        physical_shape=(4, 2048),
+    )
+    weights = (
+        prog.input("W_shared_gate", shape=(2048, 5632)),
+        prog.input("W_shared_up", shape=(2048, 5632)),
+        prog.input("W_shared_down", shape=(5632, 2048)),
+    )
+
+    with pytest.raises(MemoryError, match="VRAM overflow"):
+        prog.moe_shared_expert_v0(
+            x,
+            weights,
+            rows=4,
+            intermediate=5632,
+            constants=_constants(prog),
+            policy_name="qwen2_moe",
+            name="full_hidden_shared",
+        )
