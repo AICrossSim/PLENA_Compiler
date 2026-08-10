@@ -86,6 +86,7 @@ class Instruction:
         self.funct1 = funct1
         self.funct2 = funct2
         self.imm = imm
+        self.rflag = rflag
         self.rmask = rstride
 
     def __repr__(self):
@@ -318,12 +319,11 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
 
 
 if __name__ == "__main__":
-    # Example usage
-    # file_path = '/home/george/Coprocessor_for_Llama/src/definitions/operation.svh'
-    # enum_dict = load_isa_definitions(file_path)
-    # print(enum_dict)
+    import argparse
 
-    asm_file_path = "/home/george/Coprocessor_for_Llama/src/system/test/benchmarks/fixed.asm"
-    loaded_instr = parse_asm_file(asm_file_path)
+    argument_parser = argparse.ArgumentParser(description="Parse a PLENA assembly file")
+    argument_parser.add_argument("asm_file", help="path to the assembly input")
+    args = argument_parser.parse_args()
+    loaded_instr = parse_asm_file(args.asm_file)
     for instr in loaded_instr:
         print(instr)
