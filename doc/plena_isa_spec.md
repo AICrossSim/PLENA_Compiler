@@ -336,6 +336,40 @@ are reserved and trap.
 This is a correctness-first v0 linear scan. Bitonic/performance top-k remains a
 future optimization.
 
+### C_ROUTE_BEGIN
+
+**Format:** `C_ROUTE_BEGIN expert_rd, indices_rs1, weights_rs2, policy`
+
+Start one fixed four-token route collection. The instruction snapshots the
+INT-SRAM base in `gp_reg<indices_rs1>`, the FP-SRAM base in
+`gp_reg<weights_rs2>`, the GP register selected by `expert_rd`, and the same
+policy values used by `V_TOPK` (`0` = 32/top-4, `1` = 128/top-8,
+`15` = `C_SET_TOPK_REG`).
+
+Exactly four `V_TOPK` instructions then write compact token-major results at
+`base + token * top_k`. The dispatcher validates bounds, matching INT/FP
+addresses, expert ranges, and duplicate experts within one token.
+
+### C_ROUTE_LOOP_START / C_ROUTE_LOOP_END
+
+**Format:** `C_ROUTE_LOOP_START` / `C_ROUTE_LOOP_END`
+
+These delimit a dynamic expert-major loop. At loop start, the hardware writes
+the smallest pending expert ID to the GP register selected by
+`C_ROUTE_BEGIN`. At loop end it advances to the next unique expert and jumps
+to the loop body, or exits after the final expert. Normal fixed-count
+`C_LOOP_START` loops may be nested inside this body.
+
+### V_ROUTE_MUL
+
+**Format:** `V_ROUTE_MUL rd, rs1, gp0, token`
+
+Multiply one vector row by the current expert's selected route weight for
+token slot `0..3`. If that token did not select the current expert, the source
+is replaced with exact FP zero before multiplication; this also prevents NaNs
+in an inactive row from leaking into the combined output. The third register
+field is reserved and must be `gp0`.
+
 ### V_EXP_V
 
 **Format:** `V_EXP_V rd, rs1, rmask`

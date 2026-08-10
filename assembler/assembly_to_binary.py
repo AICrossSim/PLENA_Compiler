@@ -21,7 +21,12 @@ _RMASK_VECTOR_OPS = frozenset(
         "V_MAX_VF",
         "V_MIN_VF",
         "V_TOPK",
+        "C_ROUTE_BEGIN",
+        "V_ROUTE_MUL",
     }
+)
+_NO_OPERAND_OPS = frozenset(
+    {"C_BREAK", "C_ROUTE_LOOP_START", "C_ROUTE_LOOP_END"}
 )
 _IMM_RS1_RD_OPS = frozenset(
     {
@@ -105,13 +110,24 @@ class AssemblyToBinary:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
 
+        if instruction.opcode == "C_ROUTE_BEGIN" and rmask not in (0, 1, 15):
+            raise ValueError(
+                "C_ROUTE_BEGIN policy must be 0 (32 experts/top-4), "
+                "1 (128 experts/top-8), or 15 (C_SET_TOPK_REG)"
+            )
+        if instruction.opcode == "V_ROUTE_MUL":
+            if rs2 != 0:
+                raise ValueError("V_ROUTE_MUL reserves rs2 and requires gp0")
+            if rmask not in range(4):
+                raise ValueError("V_ROUTE_MUL token must be in the batch4 range [0, 4)")
+
         if instruction.opcode in _IMM_RS1_RD_OPS:
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _RS1_RD_OPS:
             binary_instruction = (rs1 << (opw + ow)) + (rd << opw) + opcode
-        elif instruction.opcode == "C_BREAK":
+        elif instruction.opcode in _NO_OPERAND_OPS:
             binary_instruction = opcode
         elif instruction.opcode in _RD_ONLY_OPS:
             binary_instruction = (rd << opw) + opcode
