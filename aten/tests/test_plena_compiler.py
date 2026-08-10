@@ -350,6 +350,73 @@ def test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts():
     print("  PASS test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts")
 
 
+def test_router_mx_linear_rowpacked_compiles_for_rtl_topk():
+    """MXINT router weights use the RTL HBM format and feed rowpacked V_TOPK."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(
+        mlen=8,
+        blen=4,
+        mram_tile_capacity=128,
+        hbm_v_prefetch_amount=4,
+        unroll_loops=True,
+    )
+    x_input = prog.input("X", shape=(1, 8), physical_shape=(4, 8))
+    x = prog.load_batch(x_input, name="X")
+    router_weight = prog.input("W_router", shape=(8, 32), physical_shape=(8, 32))
+
+    logits = prog.moe_router_logits_matrix_mx_rowpacked_v0(
+        x,
+        router_weight,
+        rows=1,
+        hidden=8,
+        num_experts=32,
+        policy_name="test",
+    )
+    prog.moe_router_select_v0(
+        logits,
+        token_idx=0,
+        weights_fp_base=0,
+        indices_int_base=0,
+        num_experts=32,
+        top_k=4,
+    )
+    code = prog.compile()
+    matrix_prefetches = [line for line in code.splitlines() if line.startswith("H_PREFETCH_M ")]
+
+    assert logits.shape == (4, 8)
+    assert x_input.hbm_addr == 0
+    assert router_weight.hbm_addr == 64
+    assert len(matrix_prefetches) == 4
+    assert all(line.endswith(", 1, 0") for line in matrix_prefetches)
+    assert code.count("M_MM ") == 8
+    assert code.count("M_MM_WO") == 8
+    assert code.count("V_ADD_VF") == 4
+    assert "@stage=router_topk [test] MXINT matrix logits" in code
+    assert "C_SET_SCALE_REG" in code
+    assert "V_TOPK" in code
+
+
+def test_router_mx_legacy_name_remains_compatible():
+    """The archived pre-generalization router API remains callable."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=8, blen=4, mram_tile_capacity=128)
+    x = prog.alloc("X", rows=1, cols=8, strict=False, physical_shape=(4, 8))
+    router_weight = prog.input("W_router", shape=(8, 8), physical_shape=(8, 8))
+
+    logits = prog.router_logits_matrix_mx_rowpacked_v0(
+        x,
+        router_weight,
+        rows=1,
+        hidden=8,
+        num_experts=8,
+    )
+
+    assert logits.shape == (1, 8)
+    assert "H_PREFETCH_M" in prog.compile()
+
+
 def _build_dynamic_expert_projection(hidden, out_features=64, mlen=64, blen=4):
     """Compile one runtime-expert-id linear projection and return (code, output)."""
     from compiler.aten.plena import PlenaCompiler

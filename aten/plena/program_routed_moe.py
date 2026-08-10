@@ -396,6 +396,74 @@ class ProgramRoutedMoeMixin:
         self.free_tensor(matrix_logits)
         return packed_logits
 
+    def moe_router_logits_matrix_mx_rowpacked_v0(
+        self,
+        x: VRAMMatrixVar,
+        router_weight_matrix: InputVar,
+        *,
+        rows: int,
+        hidden: int,
+        num_experts: int,
+        policy_name: str = "moe",
+        name: str = "router_logits_matrix_mx",
+    ) -> VRAMMatrixVar:
+        """Emit router logits through the RTL MXINT matrix path.
+
+        The HBM weight tensor uses the one-byte MX element layout consumed by
+        ``H_PREFETCH_M`` precision 0. Matrix results are vector FP values. When
+        experts span multiple MLEN blocks, the result is packed into contiguous
+        token-major rows before it is consumed by ``V_TOPK``.
+        """
+        if hidden <= 0 or hidden % self.mlen != 0:
+            raise ValueError(f"router hidden={hidden} must be divisible by MLEN={self.mlen}")
+        if rows <= 0 or rows > x.shape[0]:
+            raise ValueError(f"router rows={rows} outside x rows={x.shape[0]}")
+        if num_experts <= 0:
+            raise ValueError(f"router num_experts={num_experts} must be positive")
+        if hidden > x.shape[1]:
+            raise ValueError(f"router hidden={hidden} exceeds x width={x.shape[1]}")
+        if router_weight_matrix.shape[0] < hidden or router_weight_matrix.shape[1] < num_experts:
+            raise ValueError(
+                "router_weight_matrix must have shape at least "
+                f"({hidden}, {num_experts}), got {router_weight_matrix.shape}"
+            )
+
+        expert_blocks = math.ceil(num_experts / self.mlen)
+        physical_rows = max(self.blen, math.ceil(x.shape[0] / self.blen) * self.blen)
+        physical_experts = expert_blocks * self.mlen
+        logical_logit_rows = rows if expert_blocks == 1 else rows * expert_blocks
+        physical_logit_rows = max(self.blen, math.ceil(logical_logit_rows / self.blen) * self.blen)
+
+        self._emit(
+            IsaBuilder().comment(
+                moe_stage_marker(
+                    "router_topk",
+                    f"[{policy_name}] MXINT matrix logits: rows={rows}, "
+                    f"hidden={hidden}, experts={num_experts}",
+                )
+            )
+        )
+        matrix_logits = self.linear_projection(
+            x,
+            router_weight_matrix,
+            name=f"{name}_matrix",
+            physical_shape=(physical_rows, physical_experts),
+            matrix_precision="weights",
+            set_scale=True,
+            hbm_element_bytes=1,
+        )
+        return self._pack_router_logits_token_major(
+            matrix_logits,
+            rows=rows,
+            num_experts=num_experts,
+            expert_blocks=expert_blocks,
+            logical_logit_rows=logical_logit_rows,
+            physical_logit_rows=physical_logit_rows,
+            policy_name=policy_name,
+            name=name,
+            label="MXINT matrix",
+        )
+
     def qwen3_router_logits_matrix_bf16_rowpacked_v0(
         self,
         x: VRAMMatrixVar,
@@ -2005,6 +2073,7 @@ class ProgramRoutedMoeMixin:
 #: bring-up tests that predate the rename) keep working. The ``moe_*`` defaults
 #: preserve GPT-OSS behaviour.
 _DEPRECATED_METHOD_ALIASES = {
+    "router_logits_matrix_mx_rowpacked_v0": "moe_router_logits_matrix_mx_rowpacked_v0",
     "gpt_oss_router_logits_bf16_v0": "moe_router_logits_bf16_v0",
     "gpt_oss_router_topk_softmax_v0": "moe_router_select_v0",
     "gpt_oss_expert_v0": "moe_expert_v0",
