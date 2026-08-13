@@ -57,6 +57,10 @@ jobs:
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_topk_policy_encoding.py -v
       - name: Run the stage-terminator guard
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_terminator.py -v
+      - name: Run the Mamba ISA contract guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_mamba_contract.py -v
+      - name: Run the Mamba scheduler guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_mamba_scheduler.py -v
 
   unit-tests:
     name: Generator unit tests

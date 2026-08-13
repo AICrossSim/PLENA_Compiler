@@ -6,6 +6,7 @@
 *.dir
 
 __pycache__
+build/
 
 # Generated assembly / machine-code artifacts from codegen tests and runs
 generated_*.asm
