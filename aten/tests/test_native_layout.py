@@ -205,6 +205,30 @@ def test_softmax_row_groups_encode_tail_and_bank_mapping():
     assert plan.tail_group_count == 1
     assert plan.groups[1].active_row_mask == 0b111
     assert plan.groups[1].bank_address(6) == (2, 1)
+    metadata = plan.metadata()
+    assert metadata["softmax_score_tile_rows"] == 16
+    assert metadata["softmax_score_tile_columns"] == 16
+    assert metadata["softmax_rows_per_issue"] == 4
+    assert metadata["softmax_score_bank_count"] == 4
+    assert metadata["softmax_read_elements_per_issue"] == 64
+    assert metadata["softmax_full_tile_unrolled"] is False
+
+
+def test_model_only_r16_counts_unaligned_packed_rows_as_single_row_fallbacks():
+    sequence = SequencePackingPlan.build(batch_size=4, seq_len=7, mlen=32)
+    plan = SoftmaxRowGroupPlan.build(
+        sequence=sequence,
+        rows=sequence.attention_group_seq_len,
+        mlen=32,
+        row_lanes=16,
+    )
+    runs = plan.execution_runs()
+    assert plan.active_rows == sequence.batch_pack_factor * sequence.seq_len
+    assert sum(
+        group.active_rows for run in runs for group in run.groups
+    ) == plan.active_rows
+    assert plan.metadata()["bank_conflict_fallbacks"] > 0
+    assert any(run.first.row_lanes == 1 for run in runs)
 
 
 def test_row_bank_softmax_state_is_not_double_allocated_in_scalar_sram():

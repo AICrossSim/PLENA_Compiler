@@ -553,7 +553,7 @@ def _row_lane_tier(opcode: str, args: tuple[str, ...], fallback: int) -> int:
     except (IndexError, ValueError):
         return fallback
     tier = 1 << tier_log2
-    return tier if tier in {1, 2, 4, 8} else fallback
+    return tier if tier in {1, 2, 4, 8, 16} else fallback
 
 
 def _sram_actions(opcode: str, args: tuple[str, ...] = ()) -> tuple[tuple[str, str, int], ...]:

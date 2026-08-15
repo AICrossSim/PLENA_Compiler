@@ -25,6 +25,7 @@ class CompilerScheduleOptions:
     softmax_vector_schedule: str
     pv_accumulation_schedule: str
     softmax_row_lanes: int
+    softmax_row_issue_schedule: str
     selector_schedule: str
     reduction_output_mode: str
     gqa_pipeline_schedule: str
@@ -46,6 +47,7 @@ _PROFILES = {
         softmax_vector_schedule="single-row-v1",
         pv_accumulation_schedule="shift-add-v1",
         softmax_row_lanes=1,
+        softmax_row_issue_schedule="group-serial-v1",
         selector_schedule="hoisted-v1",
         reduction_output_mode="overwrite-v1",
         gqa_pipeline_schedule="row-interleaved-v1",
@@ -62,6 +64,7 @@ _PROFILES = {
         softmax_vector_schedule="single-row-v1",
         pv_accumulation_schedule="shift-add-v1",
         softmax_row_lanes=1,
+        softmax_row_issue_schedule="group-serial-v1",
         selector_schedule="hoisted-v1",
         reduction_output_mode="overwrite-v1",
         gqa_pipeline_schedule="row-interleaved-v1",
@@ -78,6 +81,7 @@ _PROFILES = {
         softmax_vector_schedule="multi-row-v1",
         pv_accumulation_schedule="direct-packed-rmw-v1",
         softmax_row_lanes=4,
+        softmax_row_issue_schedule="wavefront-v1",
         selector_schedule="hoisted-v1",
         reduction_output_mode="overwrite-v1",
         gqa_pipeline_schedule="row-interleaved-v1",

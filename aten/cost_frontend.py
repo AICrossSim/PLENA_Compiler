@@ -71,6 +71,8 @@ from compiler.aten.plena.native_layout import (
     SequencePackingPlan,
     SOFTMAX_STATE_SCHEDULES,
     SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
+    SOFTMAX_ROW_ISA_TIERS,
+    SOFTMAX_ROW_MODEL_TIERS,
     build_attention_head_packing,
     build_compact_stats_plan,
     build_softmax_state_layout,
@@ -1626,6 +1628,7 @@ def _trace_cache_key(
     softmax_vector_schedule: str,
     pv_accumulation_schedule: str,
     softmax_row_lanes: int,
+    softmax_row_issue_schedule: str,
     selector_schedule: str,
     reduction_output_mode: str,
     gqa_pipeline_schedule: str,
@@ -1654,6 +1657,7 @@ def _trace_cache_key(
         softmax_vector_schedule,
         pv_accumulation_schedule,
         softmax_row_lanes,
+        softmax_row_issue_schedule,
         selector_schedule,
         reduction_output_mode,
         gqa_pipeline_schedule,
@@ -1699,6 +1703,7 @@ def _config_hash(
     softmax_vector_schedule: str,
     pv_accumulation_schedule: str,
     softmax_row_lanes: int,
+    softmax_row_issue_schedule: str,
     selector_schedule: str,
     reduction_output_mode: str,
     gqa_pipeline_schedule: str,
@@ -1727,6 +1732,7 @@ def _config_hash(
         "softmax_vector_schedule": softmax_vector_schedule,
         "pv_accumulation_schedule": pv_accumulation_schedule,
         "softmax_row_lanes": softmax_row_lanes,
+        "softmax_row_issue_schedule": softmax_row_issue_schedule,
         "selector_schedule": selector_schedule,
         "reduction_output_mode": reduction_output_mode,
         "gqa_pipeline_schedule": gqa_pipeline_schedule,
@@ -1761,6 +1767,7 @@ def compile_native_decoder_cost_trace(
     softmax_vector_schedule: str = "single-row-v1",
     pv_accumulation_schedule: str = "shift-add-v1",
     softmax_row_lanes: int = 1,
+    softmax_row_issue_schedule: str = "wavefront-v1",
     selector_schedule: str = "legacy",
     reduction_output_mode: str = "accumulate-v1",
     gqa_pipeline_schedule: str | None = None,
@@ -1840,6 +1847,20 @@ def compile_native_decoder_cost_trace(
     if cost_trace_granularity not in COST_TRACE_GRANULARITIES:
         raise ValueError(
             f"cost_trace_granularity must be one of {sorted(COST_TRACE_GRANULARITIES)}, got {cost_trace_granularity!r}"
+        )
+    if softmax_row_lanes not in SOFTMAX_ROW_MODEL_TIERS:
+        raise ValueError(
+            "softmax_row_lanes must be one of "
+            f"{SOFTMAX_ROW_MODEL_TIERS}, got {softmax_row_lanes}"
+        )
+    if (
+        softmax_row_lanes not in SOFTMAX_ROW_ISA_TIERS
+        and cost_trace_granularity
+        != COST_TRACE_GRANULARITY_AFFINE_BLOCK_SUMMARY_V1
+    ):
+        raise ValueError(
+            "model-only softmax row tiers require "
+            "cost_trace_granularity='affine-block-summary-v1'"
         )
     if gqa_pipeline_schedule is None:
         gqa_pipeline_schedule = (
@@ -1959,6 +1980,7 @@ def compile_native_decoder_cost_trace(
         softmax_vector_schedule=softmax_vector_schedule,
         pv_accumulation_schedule=pv_accumulation_schedule,
         softmax_row_lanes=softmax_row_lanes,
+        softmax_row_issue_schedule=softmax_row_issue_schedule,
         selector_schedule=selector_schedule,
         reduction_output_mode=reduction_output_mode,
         gqa_pipeline_schedule=gqa_pipeline_schedule,
@@ -2037,6 +2059,7 @@ def compile_native_decoder_cost_trace(
         softmax_vector_schedule=softmax_vector_schedule,
         pv_accumulation_schedule=pv_accumulation_schedule,
         softmax_row_lanes=softmax_row_lanes,
+        softmax_row_issue_schedule=softmax_row_issue_schedule,
         compact_stats_lanes=compact_stats_plan.configured_lanes,
         selector_schedule=selector_schedule,
         reduction_output_mode=reduction_output_mode,
@@ -2344,6 +2367,7 @@ def compile_native_decoder_cost_trace(
             "address_generation_mode": address_generation_mode,
             "ffn_address_schedule": ffn_address_schedule,
             "ffn_projection_schedule": prog.ffn_projection_schedule,
+            "softmax_row_issue_schedule": softmax_row_issue_schedule,
             "ffn_address_optimization": ffn_address_optimization,
             "cost_trace_granularity": cost_trace_granularity,
             "compute_trace_fidelity": (
@@ -2383,6 +2407,7 @@ def compile_native_decoder_cost_trace(
                 softmax_vector_schedule=softmax_vector_schedule,
                 pv_accumulation_schedule=pv_accumulation_schedule,
                 softmax_row_lanes=softmax_row_lanes,
+                softmax_row_issue_schedule=softmax_row_issue_schedule,
                 selector_schedule=selector_schedule,
                 reduction_output_mode=reduction_output_mode,
                 gqa_pipeline_schedule=gqa_pipeline_schedule,

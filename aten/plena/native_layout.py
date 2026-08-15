@@ -24,7 +24,18 @@ SOFTMAX_STATE_SCHEDULES = frozenset(
         SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3,
     }
 )
-SOFTMAX_ROW_LANE_TIERS = (1, 2, 4, 8)
+SOFTMAX_ROW_ISA_TIERS = (1, 2, 4, 8)
+SOFTMAX_ROW_MODEL_TIERS = (1, 2, 4, 8, 16)
+# Compatibility name for callers that mean executable hardware tiers.
+SOFTMAX_ROW_LANE_TIERS = SOFTMAX_ROW_ISA_TIERS
+SOFTMAX_ROW_ISSUE_SCHEDULE_GROUP_SERIAL_V1 = "group-serial-v1"
+SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1 = "wavefront-v1"
+SOFTMAX_ROW_ISSUE_SCHEDULES = frozenset(
+    {
+        SOFTMAX_ROW_ISSUE_SCHEDULE_GROUP_SERIAL_V1,
+        SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1,
+    }
+)
 SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1 = "single-row-v1"
 SOFTMAX_VECTOR_SCHEDULE_MULTI_ROW_V1 = "multi-row-v1"
 SOFTMAX_VECTOR_SCHEDULES = frozenset(
@@ -230,7 +241,7 @@ class SoftmaxRowGroup:
     mask_geometry: str
 
     def __post_init__(self) -> None:
-        if self.row_lanes not in SOFTMAX_ROW_LANE_TIERS:
+        if self.row_lanes not in SOFTMAX_ROW_MODEL_TIERS:
             raise ValueError(f"unsupported softmax row tier {self.row_lanes}")
         if not 1 <= self.active_rows <= self.row_lanes:
             raise ValueError(
@@ -274,6 +285,8 @@ class SoftmaxRowGroupPlan:
 
     row_lanes: int
     groups: tuple[SoftmaxRowGroup, ...]
+    score_tile_rows: int
+    score_tile_columns: int
     scalar_fallback_rows: tuple[int, ...] = ()
 
     @classmethod
@@ -285,10 +298,12 @@ class SoftmaxRowGroupPlan:
         mlen: int,
         row_lanes: int,
         valid_cols: int | None = None,
+        vlen: int | None = None,
     ) -> "SoftmaxRowGroupPlan":
-        if row_lanes not in SOFTMAX_ROW_LANE_TIERS:
+        if row_lanes not in SOFTMAX_ROW_MODEL_TIERS:
             raise ValueError(
-                f"softmax_row_lanes must be one of {SOFTMAX_ROW_LANE_TIERS}, "
+                "softmax_row_lanes must be one of "
+                f"{SOFTMAX_ROW_MODEL_TIERS}, "
                 f"got {row_lanes}"
             )
         if rows <= 0 or rows > mlen:
@@ -340,6 +355,8 @@ class SoftmaxRowGroupPlan:
         return cls(
             row_lanes=row_lanes,
             groups=tuple(groups),
+            score_tile_rows=mlen,
+            score_tile_columns=int(vlen if vlen is not None else mlen),
             scalar_fallback_rows=tuple(fallback),
         )
 
@@ -384,10 +401,40 @@ class SoftmaxRowGroupPlan:
             runs.append(SoftmaxRowGroupRun(tuple(current)))
         return tuple(runs)
 
-    def metadata(self) -> dict[str, int | float]:
+    def execution_runs(self) -> tuple[SoftmaxRowGroupRun, ...]:
+        """Return row-engine runs plus exact single-row alignment fallbacks."""
+
+        runs = list(self.affine_runs())
+        runs.extend(
+            SoftmaxRowGroupRun(
+                (
+                    SoftmaxRowGroup(
+                        base_row=row,
+                        active_rows=1,
+                        row_lanes=1,
+                        segment_index=None,
+                        segment_log2=0,
+                        mask_geometry="bank-alignment-single-row-fallback",
+                    ),
+                )
+            )
+            for row in self.scalar_fallback_rows
+        )
+        return tuple(sorted(runs, key=lambda run: run.first.base_row))
+
+    def metadata(self) -> dict[str, int | float | bool]:
         return {
             "softmax_row_lanes": self.row_lanes,
-            "softmax_row_groups": len(self.groups),
+            "softmax_score_tile_rows": self.score_tile_rows,
+            "softmax_score_tile_columns": self.score_tile_columns,
+            "softmax_rows_per_issue": self.row_lanes,
+            "softmax_score_bank_count": self.row_lanes,
+            "softmax_read_elements_per_issue": (
+                self.row_lanes * self.score_tile_columns
+            ),
+            "softmax_full_tile_unrolled": False,
+            "softmax_row_groups": len(self.groups)
+            + len(self.scalar_fallback_rows),
             "softmax_row_lane_utilization": self.lane_utilization,
             "softmax_full_group_count": self.full_group_count,
             "softmax_tail_group_count": self.tail_group_count,

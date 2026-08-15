@@ -133,6 +133,7 @@ def test_rtl_v6_multirow_state_and_direct_pv_lowering() -> None:
         softmax_state_schedule="row-bank-simd-v3",
         pv_accumulation_schedule="direct-packed-rmw-v1",
         softmax_row_lanes=4,
+        packed_qk_schedule="head-major-v1",
         cost_trace_granularity="detailed",
         use_cache=False,
     )
@@ -145,6 +146,20 @@ def test_rtl_v6_multirow_state_and_direct_pv_lowering() -> None:
     assert counts["M_MM_WO_PACKED_ACC"] > 0
     packed = trace.metadata["packed_attention"]
     assert packed["softmax_row_lanes"] == 4
+    assert packed["softmax_rows_per_issue"] == 4
+    assert packed["softmax_score_bank_count"] == 4
+    assert packed["softmax_read_elements_per_issue"] == 4 * 16
+    assert packed["softmax_read_width_bits_per_issue"] > 0
+    assert packed["softmax_row_group_ii"] == 1
+    assert packed["softmax_full_tile_unrolled"] is False
+    assert packed["rtl_vector_machine_integration"] == (
+        "production-vector-machine-banked-sram-module-v1"
+    )
+    assert packed["rtl_vector_machine_validation_status"] == (
+        "module-cocotb-r1-r2-r4-r8-passed"
+    )
+    assert packed["rtl_top_level_validation_status"] == "not-run-deferred"
+    assert packed["rtl_full_machine_integration"] is False
     assert packed["softmax_state_bank_entries"] > 0
     assert packed["pv_shift_ops_elided"] > 0
     assert packed["pv_vector_adds_elided"] > 0
@@ -161,6 +176,7 @@ def test_rtl_v6_multirow_state_and_direct_pv_lowering() -> None:
         softmax_state_schedule="row-bank-simd-v3",
         pv_accumulation_schedule="direct-packed-rmw-v1",
         softmax_row_lanes=4,
+        packed_qk_schedule="head-major-v1",
         cost_trace_granularity="affine-block-summary-v1",
         use_cache=False,
     )
@@ -217,6 +233,59 @@ def test_cost_frontend_uses_shared_auto_compact_stats_tier() -> None:
     assert {
         action.activity_fidelity for action in compact_actions
     } == {"exact_compact_lanes"}
+
+
+def test_r16_is_exact_summary_only_and_carries_model_fidelity() -> None:
+    common = {
+        "model_config": _tiny_packed_qwen3(),
+        "hardware_config": _tiny_packed_hardware(),
+        "seq_len": 7,
+        "batch_size": 4,
+        "num_layers": 1,
+        "vector_scalar_schedule": "rtl-v6",
+        "softmax_vector_schedule": "multi-row-v1",
+        "softmax_state_schedule": "row-bank-simd-v3",
+        "pv_accumulation_schedule": "direct-packed-rmw-v1",
+        "softmax_row_lanes": 16,
+        "packed_qk_schedule": "head-major-v1",
+        "use_cache": False,
+    }
+    trace = compile_native_decoder_cost_trace(
+        **common,
+        cost_trace_granularity="affine-block-summary-v1",
+    )
+    packed = trace.metadata["packed_attention"]
+    assert packed["softmax_row_lanes"] == 16
+    assert packed["softmax_row_lane_fidelity"] == (
+        "structural_extrapolation_not_isa_encodable"
+    )
+    assert packed["rtl_validation_available"] is False
+    assert packed["softmax_row_groups"] > 0
+    r8_trace = compile_native_decoder_cost_trace(
+        **{**common, "softmax_row_lanes": 8},
+        cost_trace_granularity="affine-block-summary-v1",
+    )
+    r16_matrix = {
+        (stage_name, opcode): count
+        for stage_name, stage in trace.stages.items()
+        for opcode, count in stage.dynamic_opcodes.items()
+        if opcode.startswith("M_")
+    }
+    r8_matrix = {
+        (stage_name, opcode): count
+        for stage_name, stage in r8_trace.stages.items()
+        for opcode, count in stage.dynamic_opcodes.items()
+        if opcode.startswith("M_")
+    }
+    assert r16_matrix == r8_matrix
+    assert [event.to_dict() for event in trace.memory_events] == [
+        event.to_dict() for event in r8_trace.memory_events
+    ]
+    with pytest.raises(ValueError, match="model-only softmax row tiers"):
+        compile_native_decoder_cost_trace(
+            **common,
+            cost_trace_granularity="detailed",
+        )
 
 
 def test_cost_frontend_rejects_mismatched_compact_stats_tier() -> None:

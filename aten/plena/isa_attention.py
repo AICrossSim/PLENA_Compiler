@@ -11,6 +11,10 @@ from compiler.aten.plena.attention_pipeline_plan import (
     interleave_row_chains,
 )
 from compiler.aten.plena.native_layout import SoftmaxRowGroupPlan
+from compiler.aten.plena.native_layout import (
+    SOFTMAX_ROW_ISSUE_SCHEDULE_GROUP_SERIAL_V1,
+    SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1,
+)
 
 
 class IsaAttentionMixin:
@@ -46,71 +50,194 @@ class IsaAttentionMixin:
         ]
         if scale != 1.0:
             lines.append(f"S_LD_FP f{fp_scale}, gp0, 1")
-        for run in plan.affine_runs():
+        runs = plan.execution_runs()
+
+        def emit_phase(
+            run,
+            command: str,
+            *,
+            use_score: bool = False,
+            use_state: bool = False,
+            use_output: bool = False,
+        ) -> None:
             group = run.first
-            row_log2 = int(math.log2(group.row_lanes))
-            lines.extend(load_large_int(gp_s, s_address + group.base_row * mlen))
-            lines.extend(load_large_int(gp_state, state_address + group.base_row))
-            if output_address is not None:
+            if use_score:
+                lines.extend(
+                    load_large_int(gp_s, s_address + group.base_row * mlen)
+                )
+            if use_state:
+                lines.extend(
+                    load_large_int(gp_state, state_address + group.base_row)
+                )
+            if use_output:
+                if output_address is None:
+                    raise ValueError(
+                        "row-bank softmax phase requires an output address"
+                    )
                 lines.extend(
                     load_large_int(gp_o, output_address + group.base_row * mlen)
                 )
             if run.count > 1:
                 lines.append(f"C_LOOP_START gp{gp_loop}, {run.count}")
-            if scale != 1.0:
-                lines.append(
-                    f"V_MUL_ROWS_F gp{gp_s}, gp{gp_s}, f{fp_scale}, "
-                    f"{group.active_rows}, {row_log2}"
-                )
-            lines.extend(
-                (
-                    f"V_RED_MAX_ROWS gp{gp_state}, gp{gp_s}, "
-                    f"{group.active_rows}, {row_log2}",
-                    f"V_SFM_MAX_ROWS gp{gp_state}, gp{gp_state}, "
-                    f"{group.active_rows}, {row_log2}",
-                )
-            )
-            if not first_block:
-                if output_address is None:
-                    raise ValueError("recurrent row-bank softmax requires output address")
-                lines.append(
-                    f"V_MUL_ROWS_STATS gp{gp_o}, gp{gp_o}, gp{gp_state}, "
-                    f"{group.active_rows}, {row_log2}"
-                )
-            lines.extend(
-                (
-                    f"V_SUB_ROWS gp{gp_s}, gp{gp_s}, gp{gp_state}, "
-                    f"{group.active_rows}, {row_log2}",
-                    f"V_EXP_ROWS gp{gp_s}, gp{gp_s}, "
-                    f"{group.active_rows}, {row_log2}",
-                    f"V_RED_SUM_ROWS gp{gp_state}, gp{gp_s}, "
-                    f"{group.active_rows}, {row_log2}",
-                    f"V_SFM_SUM_ROWS gp{gp_state}, gp{gp_state}, "
-                    f"{group.active_rows}, {row_log2}",
+            lines.append(
+                command.format(
+                    active_rows=group.active_rows,
+                    row_log2=int(math.log2(group.row_lanes)),
                 )
             )
             if run.count > 1:
-                lines.extend(
-                    (
-                        f"S_ADDI_INT gp{gp_s}, gp{gp_s}, {group.row_lanes * mlen}",
-                        f"S_ADDI_INT gp{gp_state}, gp{gp_state}, {group.row_lanes}",
-                    )
-                )
-                if output_address is not None:
+                if use_score:
                     lines.append(
-                        f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {group.row_lanes * mlen}"
+                        f"S_ADDI_INT gp{gp_s}, gp{gp_s}, "
+                        f"{group.row_lanes * mlen}"
+                    )
+                if use_state:
+                    lines.append(
+                        f"S_ADDI_INT gp{gp_state}, gp{gp_state}, "
+                        f"{group.row_lanes}"
+                    )
+                if use_output:
+                    lines.append(
+                        f"S_ADDI_INT gp{gp_o}, gp{gp_o}, "
+                        f"{group.row_lanes * mlen}"
                     )
                 lines.append(f"C_LOOP_END gp{gp_loop}")
-        # Bank-alignment fallbacks are deliberately explicit and rare.  The
-        # current packed layouts align every active slab for R<=8.
-        if plan.scalar_fallback_rows:
+
+        phase_specs: list[tuple[str, bool, bool, bool]] = []
+        if scale != 1.0:
+            phase_specs.append(
+                (
+                    f"V_MUL_ROWS_F gp{gp_s}, gp{gp_s}, f{fp_scale}, "
+                    "{active_rows}, {row_log2}",
+                    True,
+                    False,
+                    False,
+                )
+            )
+        phase_specs.extend(
+            (
+                (
+                    f"V_RED_MAX_ROWS gp{gp_state}, gp{gp_s}, "
+                    "{active_rows}, {row_log2}",
+                    True,
+                    True,
+                    False,
+                ),
+                (
+                    f"V_SFM_MAX_ROWS gp{gp_state}, gp{gp_state}, "
+                    "{active_rows}, {row_log2}",
+                    False,
+                    True,
+                    False,
+                ),
+            )
+        )
+        if not first_block:
+            if output_address is None:
+                raise ValueError("recurrent row-bank softmax requires output address")
+            phase_specs.append(
+                (
+                    f"V_MUL_ROWS_STATS gp{gp_o}, gp{gp_o}, gp{gp_state}, "
+                    "{active_rows}, {row_log2}",
+                    False,
+                    True,
+                    True,
+                )
+            )
+        phase_specs.extend(
+            (
+                (
+                    f"V_SUB_ROWS gp{gp_s}, gp{gp_s}, gp{gp_state}, "
+                    "{active_rows}, {row_log2}",
+                    True,
+                    True,
+                    False,
+                ),
+                (
+                    f"V_EXP_ROWS gp{gp_s}, gp{gp_s}, "
+                    "{active_rows}, {row_log2}",
+                    True,
+                    False,
+                    False,
+                ),
+                (
+                    f"V_RED_SUM_ROWS gp{gp_state}, gp{gp_s}, "
+                    "{active_rows}, {row_log2}",
+                    True,
+                    True,
+                    False,
+                ),
+                (
+                    f"V_SFM_SUM_ROWS gp{gp_state}, gp{gp_state}, "
+                    "{active_rows}, {row_log2}",
+                    False,
+                    True,
+                    False,
+                ),
+            )
+        )
+
+        if self.softmax_row_issue_schedule == SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1:
+            lines.append("; wavefront-v1: stream independent groups one phase at a time")
+            for command, use_score, use_state, use_output in phase_specs:
+                for run in runs:
+                    emit_phase(
+                        run,
+                        command,
+                        use_score=use_score,
+                        use_state=use_state,
+                        use_output=use_output,
+                    )
+        elif self.softmax_row_issue_schedule == SOFTMAX_ROW_ISSUE_SCHEDULE_GROUP_SERIAL_V1:
+            lines.append("; group-serial-v1 compatibility schedule")
+            for run in runs:
+                # A multi-group affine run must be split here; otherwise the
+                # hardware loop would still execute phase-major.
+                for group in run.groups:
+                    singleton = type(run)((group,))
+                    for command, use_score, use_state, use_output in phase_specs:
+                        emit_phase(
+                            singleton,
+                            command,
+                            use_score=use_score,
+                            use_state=use_state,
+                            use_output=use_output,
+                        )
+        else:  # Constructor validation should make this unreachable.
             raise ValueError(
-                "row-bank softmax encountered unaligned active rows: "
-                f"{plan.scalar_fallback_rows}"
+                f"unsupported softmax row issue schedule "
+                f"{self.softmax_row_issue_schedule!r}"
             )
         self.register_allocator.free_gp([gp_s, gp_state, gp_o, gp_loop])
         if hasattr(self, "record_softmax_row_stats"):
             metadata = plan.metadata()
+            vector_fp_width = int(getattr(self, "vector_fp_width", 0))
+            metadata.update(
+                {
+                    "softmax_read_width_bits_per_issue": (
+                        int(metadata["softmax_read_elements_per_issue"])
+                        * vector_fp_width
+                    ),
+                    "softmax_row_group_ii": 1,
+                    "softmax_independent_ii": 1,
+                    "softmax_dependent_ii": "rtl-shadow-pending",
+                    "softmax_row_issue_schedule": self.softmax_row_issue_schedule,
+                    "softmax_row_group_ii_fidelity": (
+                        "architectural_ideal_ii1_unvalidated"
+                    ),
+                    "rtl_vector_machine_integration": (
+                        "production-vector-machine-banked-sram-module-v1"
+                    ),
+                    "rtl_vector_machine_validation_status": (
+                        "module-cocotb-r1-r2-r4-r8-passed"
+                    ),
+                    "rtl_top_level_validation_status": "not-run-deferred",
+                    "rtl_full_machine_integration": False,
+                    "rtl_timing_validation_status": (
+                        "module-functional-passed-physical-timing-pending"
+                    ),
+                }
+            )
             active = plan.active_rows
             metadata.update(
                 {

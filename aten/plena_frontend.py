@@ -81,6 +81,8 @@ from compiler.aten.plena.native_layout import (
     PV_ACCUMULATION_SCHEDULES,
     PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1,
     SOFTMAX_ROW_LANE_TIERS,
+    SOFTMAX_ROW_ISSUE_SCHEDULES,
+    SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1,
     SOFTMAX_STATE_SCHEDULES,
     SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
     SOFTMAX_VECTOR_SCHEDULES,
@@ -4478,6 +4480,7 @@ def compile_native_hf_decoder(
     softmax_vector_schedule: str = SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1,
     pv_accumulation_schedule: str = PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1,
     softmax_row_lanes: int = 1,
+    softmax_row_issue_schedule: str = SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1,
     selector_schedule: str = "legacy",
     reduction_output_mode: str = "accumulate-v1",
     gqa_pipeline_schedule: str | None = None,
@@ -4546,6 +4549,12 @@ def compile_native_hf_decoder(
     if softmax_row_lanes not in SOFTMAX_ROW_LANE_TIERS:
         raise ValueError(
             f"softmax_row_lanes must be one of {SOFTMAX_ROW_LANE_TIERS}, got {softmax_row_lanes}"
+        )
+    if softmax_row_issue_schedule not in SOFTMAX_ROW_ISSUE_SCHEDULES:
+        raise ValueError(
+            "softmax_row_issue_schedule must be one of "
+            f"{sorted(SOFTMAX_ROW_ISSUE_SCHEDULES)}, got "
+            f"{softmax_row_issue_schedule!r}"
         )
     if softmax_vector_schedule == SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1 and softmax_row_lanes != 1:
         raise ValueError("single-row-v1 requires softmax_row_lanes=1")
@@ -5091,6 +5100,7 @@ def compile_native_hf_decoder(
         softmax_vector_schedule=softmax_vector_schedule,
         pv_accumulation_schedule=pv_accumulation_schedule,
         softmax_row_lanes=softmax_row_lanes,
+        softmax_row_issue_schedule=softmax_row_issue_schedule,
         selector_schedule=selector_schedule,
         reduction_output_mode=reduction_output_mode,
         gqa_pipeline_schedule=gqa_pipeline_schedule,

@@ -27,6 +27,9 @@ from compiler.aten.plena.native_layout import (
     PV_ACCUMULATION_SCHEDULES,
     PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1,
     SOFTMAX_ROW_LANE_TIERS,
+    SOFTMAX_ROW_MODEL_TIERS,
+    SOFTMAX_ROW_ISSUE_SCHEDULES,
+    SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1,
     SOFTMAX_STATE_SCHEDULES,
     SOFTMAX_STATE_SCHEDULE_ROW_BANK_SIMD_V3,
     SOFTMAX_STATE_SCHEDULE_STREAMED_V2,
@@ -134,6 +137,7 @@ class PlenaCompiler(
         softmax_vector_schedule: str = SOFTMAX_VECTOR_SCHEDULE_SINGLE_ROW_V1,
         pv_accumulation_schedule: str = PV_ACCUMULATION_SCHEDULE_SHIFT_ADD_V1,
         softmax_row_lanes: int = 1,
+        softmax_row_issue_schedule: str = SOFTMAX_ROW_ISSUE_SCHEDULE_WAVEFRONT_V1,
         selector_schedule: str = "legacy",
         reduction_output_mode: str = "accumulate-v1",
         gqa_pipeline_schedule: str | None = None,
@@ -197,6 +201,11 @@ class PlenaCompiler(
         self.hbm_v_prefetch_amount = hbm_v_prefetch_amount
         self.hbm_v_writeback_amount = hbm_v_writeback_amount
         self.hlen = _behavior_config_value("HLEN", mlen)
+        self.vector_fp_width = (
+            1
+            + _behavior_config_value("V_FP_EXP_WIDTH", 5)
+            + _behavior_config_value("V_FP_MANT_WIDTH", 6)
+        )
         self.broadcast_amount = _behavior_config_value("BROADCAST_AMOUNT", max(1, mlen // max(1, self.hlen)))
         if kv_residency_policy not in {"raw-tiles", *MATRIX_SRAM_POLICIES}:
             raise ValueError(
@@ -237,10 +246,25 @@ class PlenaCompiler(
                 f"{sorted(PV_ACCUMULATION_SCHEDULES)}, got "
                 f"{pv_accumulation_schedule!r}"
             )
-        if softmax_row_lanes not in SOFTMAX_ROW_LANE_TIERS:
+        model_only_row_tier = (
+            emission_mode == "cost"
+            and cost_trace_granularity == "affine-block-summary-v1"
+        )
+        supported_row_tiers = (
+            SOFTMAX_ROW_MODEL_TIERS
+            if model_only_row_tier
+            else SOFTMAX_ROW_LANE_TIERS
+        )
+        if softmax_row_lanes not in supported_row_tiers:
             raise ValueError(
-                f"softmax_row_lanes must be one of {SOFTMAX_ROW_LANE_TIERS}, "
+                f"softmax_row_lanes must be one of {supported_row_tiers}, "
                 f"got {softmax_row_lanes}"
+            )
+        if softmax_row_issue_schedule not in SOFTMAX_ROW_ISSUE_SCHEDULES:
+            raise ValueError(
+                "softmax_row_issue_schedule must be one of "
+                f"{sorted(SOFTMAX_ROW_ISSUE_SCHEDULES)}, got "
+                f"{softmax_row_issue_schedule!r}"
             )
         if softmax_vector_schedule == "single-row-v1" and softmax_row_lanes != 1:
             raise ValueError(
@@ -258,6 +282,12 @@ class PlenaCompiler(
         self.softmax_vector_schedule = softmax_vector_schedule
         self.pv_accumulation_schedule = pv_accumulation_schedule
         self.softmax_row_lanes = int(softmax_row_lanes)
+        self.softmax_row_lane_fidelity = (
+            "structural_extrapolation_not_isa_encodable"
+            if self.softmax_row_lanes not in SOFTMAX_ROW_LANE_TIERS
+            else "isa_encodable"
+        )
+        self.softmax_row_issue_schedule = softmax_row_issue_schedule
         self.fp_constant_num = int(fp_constant_num)
         self.fp_sram_depth = (
             int(fp_sram_depth) if fp_sram_depth is not None else _behavior_config_value("FP_SRAM_DEPTH", 0)
@@ -445,6 +475,41 @@ class PlenaCompiler(
         }
         self._softmax_row_stats: dict[str, int | float | str] = {
             "softmax_row_lanes": self.softmax_row_lanes,
+            "softmax_row_issue_schedule": self.softmax_row_issue_schedule,
+            "softmax_score_tile_rows": self.mlen,
+            "softmax_score_tile_columns": self.mlen,
+            "softmax_rows_per_issue": self.softmax_row_lanes,
+            "softmax_score_bank_count": self.softmax_row_lanes,
+            "softmax_read_elements_per_issue": self.softmax_row_lanes * self.mlen,
+            "softmax_read_width_bits_per_issue": (
+                self.softmax_row_lanes * self.mlen * self.vector_fp_width
+            ),
+            "softmax_row_group_ii": 1,
+            "softmax_independent_ii": 1,
+            "softmax_dependent_ii": "rtl-shadow-pending",
+            "softmax_row_group_ii_fidelity": "architectural_ideal_ii1_unvalidated",
+            "softmax_row_lane_fidelity": self.softmax_row_lane_fidelity,
+            "rtl_validation_available": (
+                self.softmax_row_lanes in SOFTMAX_ROW_LANE_TIERS
+            ),
+            "rtl_vector_machine_integration": (
+                "production-vector-machine-banked-sram-module-v1"
+                if self.softmax_row_lanes in SOFTMAX_ROW_LANE_TIERS
+                else "not_available_model_only_tier"
+            ),
+            "rtl_vector_machine_validation_status": (
+                "module-cocotb-r1-r2-r4-r8-passed"
+                if self.softmax_row_lanes in SOFTMAX_ROW_LANE_TIERS
+                else "structural_extrapolation_not_isa_encodable"
+            ),
+            "rtl_top_level_validation_status": "not-run-deferred",
+            "rtl_full_machine_integration": False,
+            "rtl_timing_validation_status": (
+                "module-functional-passed-physical-timing-pending"
+                if self.softmax_row_lanes in SOFTMAX_ROW_LANE_TIERS
+                else "not_available_model_only_tier"
+            ),
+            "softmax_full_tile_unrolled": False,
             "softmax_row_groups": 0,
             "softmax_row_lane_utilization": 0.0,
             "softmax_full_group_count": 0,
@@ -493,6 +558,7 @@ class PlenaCompiler(
             "softmax_vector_schedule": self.softmax_vector_schedule,
             "pv_accumulation_schedule": self.pv_accumulation_schedule,
             "softmax_row_lanes": self.softmax_row_lanes,
+            "softmax_row_issue_schedule": self.softmax_row_issue_schedule,
             "packed_qk_schedule": self.packed_qk_schedule,
             "gqa_pipeline_schedule": self.gqa_pipeline_schedule,
             "gqa_timing_artifact": (str(self.gqa_timing_profile.path) if self.gqa_timing_profile is not None else None),
@@ -579,7 +645,7 @@ class PlenaCompiler(
                 self._gqa_pipeline_stats[key] = value
 
     def record_softmax_row_stats(
-        self, values: dict[str, int | float | str]
+        self, values: dict[str, int | float | str | bool]
     ) -> None:
         """Merge row-group lowering metadata from the shared planner."""
 
@@ -608,6 +674,14 @@ class PlenaCompiler(
             "pv_padding_rows_zeroed",
             "bank_conflict_fallbacks",
         }
+        max_fields = {
+            "softmax_score_tile_rows",
+            "softmax_score_tile_columns",
+            "softmax_rows_per_issue",
+            "softmax_score_bank_count",
+            "softmax_read_elements_per_issue",
+            "softmax_read_width_bits_per_issue",
+        }
         for key, value in values.items():
             if key == "softmax_row_lane_utilization":
                 continue
@@ -615,6 +689,10 @@ class PlenaCompiler(
                 self._softmax_row_stats[key] = int(
                     self._softmax_row_stats.get(key, 0)
                 ) + int(value)
+            elif key in max_fields:
+                self._softmax_row_stats[key] = max(
+                    int(self._softmax_row_stats.get(key, 0)), int(value)
+                )
             else:
                 self._softmax_row_stats[key] = value
 

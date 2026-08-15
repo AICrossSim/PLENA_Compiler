@@ -1248,6 +1248,42 @@ class ProgramAttentionMixin:
         )
         self.emit("\n".join(lines) + "\n")
 
+    def _prefetch_pv_tile_to_mram(
+        self,
+        *,
+        v_input: InputVar,
+        k_idx: int,
+        mram_destination: int = 0,
+    ) -> None:
+        """Prefetch one V tile while preserving the legacy PV DMA lineage."""
+
+        self._emit_packed_kv_prefetch(
+            v_input,
+            ((k_idx, mram_destination),),
+            record_dma=False,
+        )
+        if getattr(self, "_cost_sink", None) is None:
+            return
+        layout = self.get_hbm_layout(v_input.name)
+        physical_rows, physical_head_dim = (
+            layout.physical_shape or layout.full_shape
+        )
+        element_offset = k_idx * self.mlen * physical_head_dim
+        self.record_dma_stream(
+            self.make_exact_mx_dma_transfer(
+                opcode="H_PREFETCH_M",
+                precision="matrix_kv",
+                hbm_base=layout.hbm_base_addr,
+                total_elements=physical_rows * physical_head_dim,
+                element_offset=element_offset,
+                dim=self.mlen,
+                amount=self.hbm_m_prefetch_amount,
+                stride=physical_head_dim,
+                rstride=1,
+                source=f"packed_pv:{v_input.name}:tile{k_idx}",
+            )
+        )
+
     def _zero_inactive_p_rows_for_direct_pv(
         self,
         *,
@@ -2020,6 +2056,7 @@ class ProgramAttentionMixin:
             getattr(self, "gqa_pipeline_schedule", "row-serial"),
             getattr(self, "softmax_state_schedule", "streamed-v2"),
             int(getattr(self, "softmax_row_lanes", 1)),
+            getattr(self, "softmax_row_issue_schedule", "group-serial-v1"),
             immediate_shape(l_address),
             immediate_shape(output_base_address),
         )
@@ -2078,37 +2115,58 @@ class ProgramAttentionMixin:
             gp_state, gp_o, gp_loop = self.register_allocator.allocate_gp(3)
             lines = ["; === Row-bank final packed-O normalization ==="]
             lane_base = output_base_address + head_slot * int(self.hlen)
-            for run in plan.affine_runs():
+
+            def emit_final_phase(run, *, final: bool) -> None:
                 group = run.first
                 row_log2 = int(math.log2(group.row_lanes))
                 lines.extend(load_large_int(gp_state, l_address + group.base_row))
-                lines.extend(
-                    load_large_int(
-                        gp_o, lane_base + group.base_row * self.mlen
-                    )
-                )
-                if run.count > 1:
-                    lines.append(f"C_LOOP_START gp{gp_loop}, {run.count}")
-                lines.extend(
-                    (
-                        f"V_SFM_FINAL_ROWS gp{gp_state}, gp{gp_state}, "
-                        f"{group.active_rows}, {row_log2}",
-                        f"V_MUL_ROWS_STATS gp{gp_o}, gp{gp_o}, "
-                        f"gp{gp_state}, {group.active_rows}, {row_log2}",
-                    )
-                )
-                if run.count > 1:
+                if not final:
                     lines.extend(
-                        (
-                            f"S_ADDI_INT gp{gp_state}, gp{gp_state}, {group.row_lanes}",
-                            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {group.row_lanes * self.mlen}",
-                            f"C_LOOP_END gp{gp_loop}",
+                        load_large_int(
+                            gp_o, lane_base + group.base_row * self.mlen
                         )
                     )
-            if plan.scalar_fallback_rows:
+                if run.count > 1:
+                    lines.append(f"C_LOOP_START gp{gp_loop}, {run.count}")
+                if final:
+                    lines.append(
+                        f"V_SFM_FINAL_ROWS gp{gp_state}, gp{gp_state}, "
+                        f"{group.active_rows}, {row_log2}"
+                    )
+                else:
+                    lines.append(
+                        f"V_MUL_ROWS_STATS gp{gp_o}, gp{gp_o}, "
+                        f"gp{gp_state}, {group.active_rows}, {row_log2}"
+                    )
+                if run.count > 1:
+                    lines.append(
+                        f"S_ADDI_INT gp{gp_state}, gp{gp_state}, "
+                        f"{group.row_lanes}"
+                    )
+                    if not final:
+                        lines.append(
+                            f"S_ADDI_INT gp{gp_o}, gp{gp_o}, {group.row_lanes * self.mlen}",
+                        )
+                    lines.append(f"C_LOOP_END gp{gp_loop}")
+
+            runs = plan.execution_runs()
+            if self.softmax_row_issue_schedule == "wavefront-v1":
+                lines.append("; wavefront-v1: produce all reciprocal factors first")
+                for run in runs:
+                    emit_final_phase(run, final=True)
+                for run in runs:
+                    emit_final_phase(run, final=False)
+            elif self.softmax_row_issue_schedule == "group-serial-v1":
+                lines.append("; group-serial-v1 compatibility schedule")
+                for run in runs:
+                    for group in run.groups:
+                        singleton = type(run)((group,))
+                        emit_final_phase(singleton, final=True)
+                        emit_final_phase(singleton, final=False)
+            else:
                 raise ValueError(
-                    "row-bank final scale encountered unaligned active rows: "
-                    f"{plan.scalar_fallback_rows}"
+                    "unsupported softmax row issue schedule "
+                    f"{self.softmax_row_issue_schedule!r}"
                 )
             self.register_allocator.free_gp([gp_state, gp_o, gp_loop])
             self.emit("\n".join(lines) + "\n")
@@ -3537,9 +3595,9 @@ class ProgramAttentionMixin:
                     if causal_mask is None or block <= q_block
                 )
                 streamed_state = (
-                    optimized_direct_output
+                    use_direct_output
                     and getattr(self, "softmax_state_schedule", "sram-v1")
-                    == "streamed-v2"
+                    in {"streamed-v2", "row-bank-simd-v3"}
                 )
                 double_buffered_kv = (
                     getattr(self, "gqa_pipeline_schedule", "row-serial")
@@ -3685,6 +3743,23 @@ class ProgramAttentionMixin:
                             stats["m_res_streamed_rows"] += rows
                             if last_processed_k_block:
                                 stats["softmax_m_stores_elided"] += rows
+                    direct_pv = (
+                        use_direct_output
+                        and getattr(
+                            self, "pv_accumulation_schedule", "shift-add-v1"
+                        )
+                        == "direct-packed-rmw-v1"
+                    )
+                    direct_pv_padding_rows = 0
+                    if direct_pv:
+                        direct_pv_padding_rows = (
+                            self._zero_inactive_p_rows_for_direct_pv(
+                                p_base_address=self.get_vram_addr(s_head.name),
+                                zero_source_base=output_block_base,
+                                rows=rows,
+                                row_ranges=active_output_ranges,
+                            )
+                        )
                     if double_buffered_kv:
                         self._compute_pv_from_mram(
                             s_block=s_head,
@@ -3692,10 +3767,38 @@ class ProgramAttentionMixin:
                             v_mram_address=kv_slot_elems,
                             head_slot_dim=head_slot_dim,
                             rows=rows,
-                            preserve_full_tile_work=True,
+                            preserve_full_tile_work=not direct_pv,
+                            direct_output_base=(
+                                output_block_base if direct_pv else None
+                            ),
+                            direct_head_slot=(output_lane if direct_pv else None),
+                            direct_accumulate=not first_processed_k_block,
                         )
                     elif resident_v_mram is None:
-                        self.compute_pv(s_head, V, physical_k_idx, pv, head_slot_dim, rows=rows)
+                        if direct_pv:
+                            self._prefetch_pv_tile_to_mram(
+                                v_input=V,
+                                k_idx=physical_k_idx,
+                            )
+                            self._compute_pv_from_mram(
+                                s_block=s_head,
+                                pv_matrix=pv,
+                                v_mram_address=0,
+                                head_slot_dim=head_slot_dim,
+                                rows=rows,
+                                direct_output_base=output_block_base,
+                                direct_head_slot=output_lane,
+                                direct_accumulate=not first_processed_k_block,
+                            )
+                        else:
+                            self.compute_pv(
+                                s_head,
+                                V,
+                                physical_k_idx,
+                                pv,
+                                head_slot_dim,
+                                rows=rows,
+                            )
                     else:
                         self._compute_pv_from_mram(
                             s_block=s_head,
@@ -3703,8 +3806,22 @@ class ProgramAttentionMixin:
                             v_mram_address=resident_v_mram[k_block],
                             head_slot_dim=head_slot_dim,
                             rows=rows,
+                            direct_output_base=(
+                                output_block_base if direct_pv else None
+                            ),
+                            direct_head_slot=(output_lane if direct_pv else None),
+                            direct_accumulate=not first_processed_k_block,
                         )
                     stats["pv_compute_count"] += 1
+                    if direct_pv:
+                        self.record_softmax_row_stats(
+                            {
+                                "pv_direct_accumulate_rows": active_output_rows,
+                                "pv_shift_ops_elided": active_output_rows,
+                                "pv_vector_adds_elided": active_output_rows,
+                                "pv_padding_rows_zeroed": direct_pv_padding_rows,
+                            }
+                        )
                     if double_buffered_kv:
                         processed_position = processed_k_blocks.index(k_block)
                         if processed_position + 1 < len(processed_k_blocks):
@@ -3723,16 +3840,17 @@ class ProgramAttentionMixin:
                                 rows=rows,
                                 row_ranges=active_output_ranges,
                             )
-                        self._add_pv_to_packed_o_lane(
-                            output_base_address=output_block_base,
-                            pv=pv,
-                            head_slot=output_lane,
-                            head_slot_dim=head_slot_dim,
-                            rows=rows,
-                            scratch_address=pack_scratch_addr,
-                            scratch_rows=pack_scratch_rows,
-                            row_ranges=active_output_ranges,
-                        )
+                        if not direct_pv:
+                            self._add_pv_to_packed_o_lane(
+                                output_base_address=output_block_base,
+                                pv=pv,
+                                head_slot=output_lane,
+                                head_slot_dim=head_slot_dim,
+                                rows=rows,
+                                scratch_address=pack_scratch_addr,
+                                scratch_rows=pack_scratch_rows,
+                                row_ranges=active_output_ranges,
+                            )
                         stats["direct_o_lane_updates"] += active_output_rows
                     else:
                         if not optimized_schedule or not first_processed_k_block:
