@@ -5,13 +5,14 @@ description = "PLENA assembly compiler and code generation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "pyyaml>=6.0.0",
     "torch>=2.0.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=7.0.0",
-    "ruff>=0.1.0",
+    "ruff==0.15.14",
 ]
 
 [build-system]
