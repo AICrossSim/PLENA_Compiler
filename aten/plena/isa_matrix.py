@@ -74,7 +74,7 @@ class IsaMatrixMixin:
     ) -> None:
         sub_block = layout.get_sub_block(row_idx, col_idx)
         hbm_offset = sub_block.hbm_offset * hbm_element_bytes
-        sub_block.mram_addr = mram_addr
+        self.bind_mram_subblock(sub_block, mram_addr)
 
         asm.comment(comment if comment is not None else f"SubBlock [{row_idx}][{col_idx}]: HBM offset = {hbm_offset}")
         asm.instr("S_ADDI_INT", gp(gp_mram), gp(0), mram_addr)

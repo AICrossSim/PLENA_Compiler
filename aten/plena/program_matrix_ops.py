@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -399,6 +400,124 @@ class ProgramMatrixOpsMixin:
         self.free_tensor(temp)
         return output
 
+    def linear_projection_slice(
+        self,
+        input_var: VRAMMatrixVar,
+        weight_var: InputVar,
+        *,
+        output_col_offset: int,
+        output_features: int,
+        name: str,
+        physical_shape: tuple[int, int] | None = None,
+        matrix_precision: str | int = "weights",
+        set_scale: bool = True,
+        hbm_element_bytes: int = 1,
+    ) -> VRAMMatrixVar:
+        """Project one MLEN-aligned output-column slice of a wide weight.
+
+        Kimi MLA consumes Q/K/V one head at a time. Materializing all 96 heads
+        simultaneously exceeds Vector SRAM, so this helper streams only the
+        requested columns from the existing row-major HBM weight and writes a
+        compact output whose first column is the slice's first column.
+        """
+        if output_col_offset < 0 or output_col_offset % self.mlen:
+            raise ValueError(
+                f"output_col_offset={output_col_offset} must be a non-negative MLEN multiple"
+            )
+        if output_features <= 0 or output_features % self.mlen:
+            raise ValueError(
+                f"output_features={output_features} must be a positive MLEN multiple"
+            )
+        if output_col_offset + output_features > weight_var.shape[1]:
+            raise ValueError(
+                f"slice [{output_col_offset}, {output_col_offset + output_features}) "
+                f"exceeds weight width={weight_var.shape[1]}"
+            )
+
+        rows, _ = input_var.shape
+        if physical_shape is None:
+            physical_rows = max(
+                input_var.physical_shape[0],
+                math.ceil(rows / self.blen) * self.blen,
+            )
+            physical_out_features = output_features
+        else:
+            physical_rows, physical_out_features = physical_shape
+        if physical_rows < rows or physical_out_features < output_features:
+            raise ValueError(
+                f"physical_shape {(physical_rows, physical_out_features)} cannot cover "
+                f"logical output {(rows, output_features)}"
+            )
+
+        output = self.alloc(
+            name,
+            rows,
+            output_features,
+            strict=False,
+            physical_shape=(physical_rows, physical_out_features),
+        )
+        physical_k = max(input_var.physical_shape[1], weight_var.physical_shape[0])
+        num_k_tiles = math.ceil(physical_k / self.mlen)
+        num_row_blocks = math.ceil(physical_rows / self.mlen)
+        num_output_blocks = output_features // self.mlen
+        weight_col_base = output_col_offset // self.mlen
+        chunks = tuple(_iter_k_chunks(num_k_tiles, self.mram_tile_capacity))
+        temp = None
+        if len(chunks) > 1:
+            temp = self.alloc(f"{name}_temp", self.mlen, self.mlen)
+
+        for chunk_index, (k_block_start, k_block_count) in enumerate(chunks):
+            k_split = {
+                "k_block_start": k_block_start,
+                "k_block_count": k_block_count,
+            }
+            for local_col in range(num_output_blocks):
+                weight_col = weight_col_base + local_col
+                for row_idx in range(num_row_blocks):
+                    if chunk_index == 0:
+                        self.vram_sub_projection_to(
+                            input_var,
+                            row_idx,
+                            weight_var,
+                            weight_col,
+                            output,
+                            row_idx,
+                            local_col,
+                            matrix_precision=matrix_precision,
+                            set_scale=set_scale,
+                            hbm_element_bytes=hbm_element_bytes,
+                            **k_split,
+                        )
+                    else:
+                        assert temp is not None
+                        self.vram_sub_projection_to(
+                            input_var,
+                            row_idx,
+                            weight_var,
+                            weight_col,
+                            temp,
+                            0,
+                            0,
+                            matrix_precision=matrix_precision,
+                            set_scale=set_scale,
+                            hbm_element_bytes=hbm_element_bytes,
+                            **k_split,
+                        )
+                        self.vram_block_add_to(
+                            output,
+                            row_idx,
+                            local_col,
+                            temp,
+                            0,
+                            0,
+                            output,
+                            row_idx,
+                            local_col,
+                        )
+        if temp is not None:
+            self.free_tensor(temp)
+        return output
+
     def linear_projection_bf16_stream_k_accum(
         self,
         input_var: VRAMMatrixVar,
@@ -632,6 +751,111 @@ class ProgramMatrixOpsMixin:
             dst_row_offset=dst_row_offset,
             src_row_offset=src_row_offset,
             num_rows=num_rows,
+        )
+
+    def vram_copy_region(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        *,
+        num_rows: int | None = None,
+        num_cols: int | None = None,
+        dst_row_offset: int = 0,
+        src_row_offset: int = 0,
+        dst_col_offset: int = 0,
+        src_col_offset: int = 0,
+    ) -> VRAMMatrixVar:
+        """Copy one tile-aligned VRAM region without reading or clearing HBM.
+
+        ``V_ADD_VF(..., f0)`` is a real move because architectural ``f0`` is
+        zero.  This avoids the unsafe ``dst *= 0; dst += src`` pattern, which
+        does not clear NaNs and used to make residual/intermediate wiring rely
+        on the simulator's initial VRAM contents.
+        """
+        dst = self._require_var(dst, VRAMMatrixVar, "dst")
+        src = self._require_var(src, VRAMMatrixVar, "src")
+        if num_rows is None:
+            num_rows = src.shape[0] - src_row_offset
+        if num_cols is None:
+            num_cols = src.shape[1] - src_col_offset
+        if num_rows <= 0 or num_cols <= 0:
+            raise ValueError(
+                f"copy dimensions must be positive, got rows={num_rows}, cols={num_cols}"
+            )
+        if any(offset < 0 for offset in (dst_row_offset, src_row_offset, dst_col_offset, src_col_offset)):
+            raise ValueError("VRAM copy offsets must be non-negative")
+        if dst_row_offset + num_rows > dst.shape[0]:
+            raise ValueError("VRAM copy exceeds destination rows")
+        if src_row_offset + num_rows > src.shape[0]:
+            raise ValueError("VRAM copy exceeds source rows")
+        if dst_col_offset + num_cols > dst.shape[1]:
+            raise ValueError("VRAM copy exceeds destination columns")
+        if src_col_offset + num_cols > src.shape[1]:
+            raise ValueError("VRAM copy exceeds source columns")
+        if num_cols % self.mlen or dst_col_offset % self.mlen or src_col_offset % self.mlen:
+            raise ValueError(
+                "VRAM copy columns and column offsets must be MLEN-aligned: "
+                f"cols={num_cols}, dst_offset={dst_col_offset}, src_offset={src_col_offset}, "
+                f"MLEN={self.mlen}"
+            )
+
+        dst_base = self.get_vram_addr(dst.name)
+        src_base = self.get_vram_addr(src.name)
+        dst_physical_rows = dst.physical_shape[0]
+        src_physical_rows = src.physical_shape[0]
+        dst_col_block = dst_col_offset // self.mlen
+        src_col_block = src_col_offset // self.mlen
+        col_blocks = num_cols // self.mlen
+        gp_dst, gp_src = self.register_allocator.allocate_gp(2)
+        try:
+            lines = [
+                "; === VRAM copy region ===",
+                f"; {src.name}[{src_row_offset}:{src_row_offset + num_rows}, "
+                f"{src_col_offset}:{src_col_offset + num_cols}] -> "
+                f"{dst.name}[{dst_row_offset}:{dst_row_offset + num_rows}, "
+                f"{dst_col_offset}:{dst_col_offset + num_cols}]",
+            ]
+            for col_idx in range(col_blocks):
+                for row_idx in range(num_rows):
+                    dst_addr = (
+                        dst_base
+                        + (dst_col_block + col_idx) * dst_physical_rows * self.mlen
+                        + (dst_row_offset + row_idx) * self.mlen
+                    )
+                    src_addr = (
+                        src_base
+                        + (src_col_block + col_idx) * src_physical_rows * self.mlen
+                        + (src_row_offset + row_idx) * self.mlen
+                    )
+                    lines.extend(load_large_int(gp_dst, dst_addr))
+                    lines.extend(load_large_int(gp_src, src_addr))
+                    lines.append(f"V_ADD_VF gp{gp_dst}, gp{gp_src}, f0, 0")
+            self.emit("\n".join(lines) + "\n")
+        finally:
+            self.register_allocator.free_gp([gp_dst, gp_src])
+        return dst
+
+    def vram_copy(
+        self,
+        src: VRAMMatrixVar,
+        *,
+        name: str,
+        num_rows: int | None = None,
+    ) -> VRAMMatrixVar:
+        """Allocate a same-shaped tensor and copy valid rows from ``src``."""
+        rows = src.shape[0] if num_rows is None else num_rows
+        out = self.alloc(
+            name,
+            rows=src.shape[0],
+            cols=src.shape[1],
+            strict=False,
+            physical_shape=src.physical_shape,
+        )
+        return self.vram_copy_region(
+            out,
+            src,
+            num_rows=rows,
+            num_cols=src.shape[1],
         )
 
     def embedding_add(self, input_var: VRAMMatrixVar, pos_weight_var: VRAMMatrixVar):

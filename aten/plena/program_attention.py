@@ -186,8 +186,16 @@ class ProgramAttentionMixin:
         kv_seq_len: int | None = None,
     ):
         """Single-head online-softmax flash attention using compiler primitives."""
-        total_q_rows, head_dim = Q.shape
+        total_q_rows, qk_dim = Q.shape
         mlen = self.mlen
+
+        if K.shape[1] != qk_dim:
+            raise ValueError(
+                f"Q/K head dimensions must match, got Q={qk_dim}, K={K.shape[1]}"
+            )
+        value_dim = V.shape[1]
+        if value_dim <= 0:
+            raise ValueError(f"V head dimension must be positive, got {value_dim}")
 
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -232,7 +240,7 @@ class ProgramAttentionMixin:
             raise ValueError(f"V physical rows per batch {v_rows_per_batch} must be multiple of MLEN={mlen}")
 
         if scale is None:
-            scale = 1.0 / math.sqrt(head_dim)
+            scale = 1.0 / math.sqrt(qk_dim)
         if causal_mask is True:
             causal_mask = self._build_causal_score_mask("_mha_causal_mask")
 
@@ -249,17 +257,20 @@ class ProgramAttentionMixin:
 
         S_block = self.alloc("S", mlen, mlen)
         pv_rows = min(mlen, seq_len)
-        PV = self.alloc("PV", pv_rows, head_dim, strict=False)
-        O = self.alloc(
+        PV = self.alloc("PV", pv_rows, value_dim, strict=False)
+        output = self.alloc(
             "O",
             batch_size * seq_len,
-            head_dim,
+            value_dim,
             strict=False,
-            physical_shape=(max(mlen, batch_size * seq_len), max(mlen, Q.physical_shape[1])),
+            physical_shape=(
+                max(mlen, batch_size * seq_len),
+                max(mlen, V.physical_shape[1]),
+            ),
         )
 
         q_base = self.get_vram_addr(Q.name)
-        o_base = self.get_vram_addr(O.name)
+        o_base = self.get_vram_addr(output.name)
         # Tensors are column-block-major: col-block cb of a tensor with physical height R
         # starts at cb*R*mlen, and row r within a col-block is at r*mlen. So advancing one
         # batch (q_rows_per_batch rows) within col-block 0 skips q_rows_per_batch*mlen flat
@@ -280,12 +291,12 @@ class ProgramAttentionMixin:
         for batch_idx in range(batch_size):
             if batch_size == 1 and total_q_rows == seq_len:
                 Q_batch = Q
-                O_batch = O
+                O_batch = output
             else:
                 Q_batch = self.alloc_at(
                     f"_mha_Q_b{batch_idx}",
                     seq_len,
-                    head_dim,
+                    qk_dim,
                     q_base + batch_idx * q_batch_stride,
                     # Preserve the full height so the col-block stride stays R*mlen; the
                     # per-batch base offset then lands batch b correctly inside every
@@ -296,11 +307,11 @@ class ProgramAttentionMixin:
                 O_batch = self.alloc_at(
                     f"_mha_O_b{batch_idx}",
                     seq_len,
-                    head_dim,
+                    value_dim,
                     o_base + batch_idx * o_batch_stride,
                     # Same reasoning as Q_batch: keep O's full height so writes to higher
                     # col-blocks (head_dim > mlen) land at R*mlen strides.
-                    physical_shape=O.physical_shape,
+                    physical_shape=output.physical_shape,
                 )
 
             batch_k_block_base = batch_idx * k_row_blocks_per_batch
@@ -353,7 +364,14 @@ class ProgramAttentionMixin:
                         self.vram_add(S_block, causal_mask)
                     softmax_valid_cols = None if valid_col_mask is not None else block_cols
                     self.online_softmax_block(S_block, scale, rows=block_rows, valid_cols=softmax_valid_cols)
-                    self.compute_pv(S_block, V, physical_k_idx, PV, head_dim, rows=block_rows)
+                    self.compute_pv(
+                        S_block,
+                        V,
+                        physical_k_idx,
+                        PV,
+                        value_dim,
+                        rows=block_rows,
+                    )
                     self.scale_o_row(O_batch, q_idx, rows=block_rows)
                     self.vram_add(O_batch, PV, dst_row_offset=q_idx * mlen, num_rows=block_rows)
 
@@ -361,8 +379,10 @@ class ProgramAttentionMixin:
 
         for mask in valid_col_masks.values():
             self.free_tensor(mask)
+        self.free_tensor(S_block)
+        self.free_tensor(PV)
 
-        return O
+        return output
 
     def _flash_attention_gqa_fused(
         self,
@@ -518,15 +538,15 @@ class ProgramAttentionMixin:
             )
 
         self.free_tensor(scratch)
-        O = VRAMMatrixVar(
+        output = VRAMMatrixVar(
             self,
             o_name,
             (logical_rows, hq * h_qkv),
             display_name="O",
             physical_shape=(physical_rows, physical_cols),
         )
-        self._tensors[o_name] = O
-        return O
+        self._tensors[o_name] = output
+        return output
 
     def _emit_packed_qkt_to_s(
         self,

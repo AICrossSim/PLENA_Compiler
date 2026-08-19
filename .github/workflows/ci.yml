@@ -73,6 +73,11 @@ jobs:
             aten/tests/test_state_lowering.py \
             aten/tests/test_state_memory_image.py \
             aten/tests/test_state_residency.py
+      - name: Run hybrid Matrix and routed-MoE substrate guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -v \
+            aten/tests/test_hybrid_substrate.py \
+            aten/tests/test_mram_binding_tracking.py
 
   unit-tests:
     name: Generator unit tests
