@@ -57,6 +57,22 @@ jobs:
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_topk_policy_encoding.py -v
       - name: Run the stage-terminator guard
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_terminator.py -v
+      - name: Run recurrent-state ISA compiler guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -v \
+            asm_templates/tests/test_large_immediate.py \
+            assembler/tests/test_c_set_topk_reg_encoding.py \
+            assembler/tests/test_l_scatter_m_encoding.py \
+            assembler/tests/test_x_state_encoding.py \
+            aten/tests/test_kda_scheduler.py \
+            aten/tests/test_layout_contract.py \
+            aten/tests/test_mamba_scheduler.py \
+            aten/tests/test_projection_scatter.py \
+            aten/tests/test_state_contract.py \
+            aten/tests/test_state_isa_lowering.py \
+            aten/tests/test_state_lowering.py \
+            aten/tests/test_state_memory_image.py \
+            aten/tests/test_state_residency.py
 
   unit-tests:
     name: Generator unit tests
