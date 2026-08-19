@@ -21,6 +21,12 @@ LAYOUT_DESCRIPTOR_ALIGNMENT = 64
 LAYOUT_FIELD_OFFSET = 80
 LAYOUT_FIELD_SIZE = 24
 LAYOUT_MAX_FIELDS = 7
+#: Byte offset of the consumer-lane trailer. The field records end at
+#: ``LAYOUT_FIELD_OFFSET + LAYOUT_MAX_FIELDS * LAYOUT_FIELD_SIZE`` (248), so the
+#: last eight bytes carry the packet geometry that the skew is tuned against.
+#: Without it the consumer lane widths are a third, uncontracted source of truth
+#: hardcoded independently in the emulator.
+LAYOUT_TRAILER_OFFSET = LAYOUT_FIELD_OFFSET + LAYOUT_MAX_FIELDS * LAYOUT_FIELD_SIZE
 LAYOUT_CONTRACT_NAME = "plena-l-scatter-m-v1"
 
 
@@ -203,6 +209,9 @@ class LayoutScatterDescriptor:
     spill_write_values_per_cycle: int
     producer_burst_values: int
     fifo_capacity_values: int
+    head_lanes: int
+    head_dim_lanes: int
+    state_dim_lanes: int
     fields: tuple[LayoutFieldDescriptor, ...] = ()
 
     def __post_init__(self) -> None:
@@ -231,6 +240,14 @@ class LayoutScatterDescriptor:
             "fifo_capacity_values",
         ):
             _u(name, getattr(self, name), 16)
+            if getattr(self, name) == 0:
+                raise ValueError(f"{name} must be positive")
+        for name in (
+            "head_lanes",
+            "head_dim_lanes",
+            "state_dim_lanes",
+        ):
+            _u(name, getattr(self, name), 8)
             if getattr(self, name) == 0:
                 raise ValueError(f"{name} must be positive")
         for name in (
@@ -383,6 +400,14 @@ class LayoutScatterDescriptor:
         for index, field in enumerate(self.fields):
             start = LAYOUT_FIELD_OFFSET + index * LAYOUT_FIELD_SIZE
             data[start : start + LAYOUT_FIELD_SIZE] = field.pack()
+        struct.pack_into(
+            "<BBB",
+            data,
+            LAYOUT_TRAILER_OFFSET,
+            self.head_lanes,
+            self.head_dim_lanes,
+            self.state_dim_lanes,
+        )
         return bytes(data)
 
     @classmethod
@@ -422,8 +447,13 @@ class LayoutScatterDescriptor:
             for index in range(field_count)
         )
         used = LAYOUT_FIELD_OFFSET + field_count * LAYOUT_FIELD_SIZE
-        if any(data[used:]):
+        if any(data[used:LAYOUT_TRAILER_OFFSET]):
             raise ValueError("layout descriptor unused field bytes must be zero")
+        head_lanes, head_dim_lanes, state_dim_lanes = struct.unpack_from(
+            "<BBB", data, LAYOUT_TRAILER_OFFSET
+        )
+        if any(data[LAYOUT_TRAILER_OFFSET + 3 :]):
+            raise ValueError("layout descriptor trailer padding must be zero")
         try:
             descriptor = cls(
                 *header[3:10],
@@ -438,6 +468,9 @@ class LayoutScatterDescriptor:
                 spill_width,
                 burst,
                 fifo,
+                head_lanes,
+                head_dim_lanes,
+                state_dim_lanes,
                 fields,
             )
         except ValueError as error:
@@ -514,6 +547,9 @@ class LayoutScatterDescriptor:
             spill_write_values_per_cycle=plan.spill_write_values_per_cycle,
             producer_burst_values=plan.producer_burst_values,
             fifo_capacity_values=plan.fifo_capacity_values,
+            head_lanes=plan.head_lanes,
+            head_dim_lanes=plan.head_dim_lanes,
+            state_dim_lanes=plan.state_dim_lanes,
             fields=fields,
         )
 
