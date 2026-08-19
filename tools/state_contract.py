@@ -130,6 +130,64 @@ def validate_compiler_opcodes(contract: dict[str, Any], operation_path: Path) ->
         raise ValueError("doc/operation.svh does not declare the contract X_STATE opcode")
 
 
+def validate_simulator_topk_targets(simulator_root: Path) -> None:
+    """Keep the 0x38 sub-target encoding aligned across the two repositories.
+
+    ``C_SET_TOPK_REG`` carries a four-bit target so the policy register and the
+    correction-bias address share one opcode, leaving 0x39-0x3C free for the
+    Shared-MoE route extension. The selector value and the packed policy shift
+    are written independently in ``aten/plena/program_routed_moe.py`` and in the
+    emulator, and neither the opcode table nor the descriptor contract covers
+    them, so a one-sided edit would quietly write the wrong control register
+    instead of failing.
+    """
+    # Read the emitter as text rather than importing it: this checker runs as a
+    # subprocess from the Simulator's testbench, where `aten` is not importable.
+    emitter = (ROOT / "aten" / "plena" / "program_routed_moe.py").read_text(
+        encoding="utf-8"
+    )
+
+    def _compiler_constant(name: str) -> int:
+        match = re.search(rf"^{name}\s*=\s*(\d+)\s*$", emitter, flags=re.MULTILINE)
+        if match is None:
+            raise ValueError(f"Compiler does not define {name}")
+        return int(match.group(1))
+
+    target_bias = _compiler_constant("_TOPK_REGISTER_TARGET_BIAS")
+    expert_shift = _compiler_constant("_TOPK_POLICY_EXPERT_SHIFT")
+
+    rust = (simulator_root / "transactional_emulator" / "src" / "op.rs").read_text(
+        encoding="utf-8"
+    )
+    for name, value in (
+        ("TOPK_REGISTER_TARGET_POLICY", 0),
+        ("TOPK_REGISTER_TARGET_BIAS", target_bias),
+    ):
+        match = re.search(rf"const\s+{name}\s*:\s*u8\s*=\s*(\d+)\s*;", rust)
+        if match is None:
+            raise ValueError(f"Simulator does not define {name}")
+        if int(match.group(1)) != value:
+            raise ValueError(
+                f"{name} is {match.group(1)} in the Simulator but {value} in the Compiler"
+            )
+
+    registers = (
+        simulator_root
+        / "transactional_emulator"
+        / "src"
+        / "accelerator"
+        / "registers.rs"
+    ).read_text(encoding="utf-8")
+    shift = re.search(r"topk_policy.*?>>\s*(\d+)", registers, flags=re.DOTALL)
+    if shift is None:
+        raise ValueError("Simulator does not unpack a top-k policy expert shift")
+    if int(shift.group(1)) != expert_shift:
+        raise ValueError(
+            f"top-k policy expert shift is {shift.group(1)} in the Simulator but "
+            f"{expert_shift} in the Compiler"
+        )
+
+
 def validate_simulator_opcodes(
     contract: dict[str, Any], operation_path: Path, simulator_root: Path
 ) -> None:
@@ -360,6 +418,7 @@ def main() -> None:
             ROOT / "doc" / "operation.svh",
             args.simulator_root.resolve(),
         )
+        validate_simulator_topk_targets(args.simulator_root.resolve())
     digest = hashlib.sha256(args.spec.read_bytes()).hexdigest()
     rendered_python = render_python(contract, digest)
     rendered_rust = render_rust(contract, digest)
