@@ -180,7 +180,12 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_MAX_VF               = 6'h35,
     V_MIN_VF               = 6'h36,
     V_TOPK                 = 6'h37,
-    C_SET_TOPK_REG         = 6'h38
+    C_SET_TOPK_REG         = 6'h38,
+
+    // 0x39-0x3C are reserved for the routed-MoE control extension.
+    X_STATE                = 6'h3D,
+    // 0x3E remains unallocated.
+    L_SCATTER_M            = 6'h3F
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {
@@ -190,7 +195,8 @@ typedef enum logic [2:0] {
     S_INT        = 3'h3,
     S_FP         = 3'h4,
     C            = 3'h5,
-    H            = 3'h6
+    H            = 3'h6,
+    L            = 3'h7
 } CUSTOM_ISA_TYPE;
 
 typedef struct {

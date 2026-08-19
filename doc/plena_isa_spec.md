@@ -323,10 +323,14 @@ index. `rmask` selects the routed-MoE policy:
   `FP_MEM[gp_reg<rd> + 0..3]` / `INT_MEM[gp_reg<rs2> + 0..3]`.
 - `rmask=1`: scan 128 logits, select top-8, and write weights/indices to
   `FP_MEM[gp_reg<rd> + 0..7]` / `INT_MEM[gp_reg<rs2> + 0..7]`.
-- `rmask=15`: take `(num_experts, top_k)` from the `TOPK_POLICY` control
+- `rmask=15`: take shape and route mode from the `TOPK_POLICY` control
   register instead of a fixed table. See `C_SET_TOPK_REG`.
 
-Weights are softmax-over-selected logits.
+The fixed policies write softmax-over-selected logits. The extended policy can
+instead write `sigmoid(selected_logits) / sum(sigmoid(selected_logits))`, as
+required by Kimi K3. With correction-bias enabled, ranking uses
+`raw_logit + correction_bias`, while the returned route weight still uses the
+raw logit; this matches no-aux-loss routing and avoids biasing the combine.
 
 Every other production MoE shape — Qwen2-MoE 60/top-4, DeepSeek-V2-Lite 64/top-6,
 DeepSeek-V3 256/top-8, Llama-4 Scout 16/top-1 — needs `rmask=15`: a table entry
@@ -724,18 +728,33 @@ Set the vector mask register for masked vector operations.
 
 ### C_SET_TOPK_REG
 
-**Format:** `C_SET_TOPK_REG rd`
+**Format:** `C_SET_TOPK_REG rd[, target]`
 
-**Operation:** `TOPK_POLICY = gp_reg<rd>`
+**Operation:**
+
+```text
+target = 0: TOPK_POLICY = gp_reg<rd>
+target = 1: TOPK_BIAS_VRAM_BASE = gp_reg<rd>
+```
 
 **Description:**
 
-Set the routed-MoE top-k policy consumed by `V_TOPK rmask=15`. The register holds
-both fields packed as `(num_experts << 8) | top_k`.
+Write one of the two sticky routed-MoE control registers. `target` occupies
+instruction bits `[13:10]`; values 2 through 15 are invalid and bits `[31:14]`
+must be zero. Omitting `target` means target 0, preserving the original
+`C_SET_TOPK_REG rd` machine word byte for byte.
 
-The 8-bit shift keeps the packed value inside a single `S_ADDI_INT` immediate
-(18 bits, see `S_ADDI_INT`) for up to 1023 experts; wider shapes still work via
-a legalized `S_LUI_INT` + `S_ADDI_INT` pair. The shift also caps `top_k` at 255.
+Target 0 sets the top-k policy consumed by `V_TOPK rmask=15`. The register is
+packed as:
+
+- bits `[7:0]`: `top_k`
+- bits `[21:8]`: `num_experts`
+- bit `22`: selected-sigmoid normalization instead of selected-softmax
+- bit `23`: add the rows named by `C_SET_TOPK_REG rd, 1` for ranking only
+
+The shape-only policies up to 1023 experts fit a single `S_ADDI_INT`; policies
+using the high mode bits are legalized into `S_LUI_INT` + `S_ADDI_INT`.
+`top_k` is capped at 255 and `num_experts` at 16383.
 
 Like the other `C_SET_*_REG` control registers this is sticky: it persists until
 overwritten, so a program with one routing policy sets it once. `V_TOPK` traps if
@@ -747,6 +766,16 @@ with `top_k=0`.
 S_ADDI_INT gp4, gp0, 16390         ; (64 << 8) | 6  -- DeepSeek-V2-Lite
 C_SET_TOPK_REG gp4                 ; TOPK_POLICY = 64 experts, top-6
 V_TOPK gp1, gp2, gp3, 15           ; route one token under that policy
+```
+
+Target 1 sets the first Vector-SRAM row of the correction-bias table used when
+bit 23 of `TOPK_POLICY` is set. The table contains
+`ceil(num_experts / VLEN)` contiguous BF16 rows. `V_TOPK` traps if
+correction-bias mode is enabled before target 1 initializes the register.
+
+```asm
+S_ADDI_INT gp5, gp0, 24576          ; first correction-bias Vector-SRAM row
+C_SET_TOPK_REG gp5, 1               ; TOPK_BIAS_VRAM_BASE = 24576
 ```
 
 ### C_BREAK
@@ -794,6 +823,33 @@ End of a hardware loop. If the loop counter (in register `rd`) is greater than 0
 ---
 
 ## Extensions
+
+### X_STATE
+
+**Format:** `X_STATE context_gp, descriptor_offset_gp, descriptor_hbm_reg, queue_id, subop`
+
+**Operation:** Issue one descriptor-driven Mamba-2 or KDA recurrent-state command.
+
+`X_STATE` uses opcode `0x3D` and the `R_FUNCT` encoding. Subops 0 through 6 are
+`PRELOAD`, `RESET`, `PREFILL`, `STEP`, `COMMIT`, `EVICT`, and `FENCE`.
+`FENCE` uses canonical zero descriptor operands and only consumes `queue_id`.
+The normative descriptor and lifecycle definition is in
+[`nemotron3_mamba_isa.md`](nemotron3_mamba_isa.md).
+
+### L_SCATTER_M
+
+**Format:** `L_SCATTER_M context_gp, descriptor_offset_gp, descriptor_hbm_reg, buffer_id, layout_mode`
+
+**Operation:** Materialize one Matrix-result record into a programmable banked
+producer-consumer layout before its matching `X_STATE` command.
+
+`L_SCATTER_M` uses opcode `0x3F` and the `R_FUNCT` encoding. Layout modes 0
+through 4 are `ROW_MAJOR`, `TRANSPOSE`, `MAMBA_SKEW`, `KDA_SKEW`, and
+`CUSTOM`. The 256-byte descriptor is little-endian and 64-byte aligned; it
+contains source Vector-SRAM geometry, physical banks/rows, FIFO/spill policy,
+field placement, and a CRC32 over every logical-to-physical mapping entry. The
+normative machine-readable definition is
+[`spec/l_scatter_m_v1.json`](../spec/l_scatter_m_v1.json).
 
 ### V_SHFT_V
 

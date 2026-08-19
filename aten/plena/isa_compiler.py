@@ -54,6 +54,7 @@ class IsaCompiler(
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()
         self.generated_code = ""
+        self._scratch_serial = 0
         self.unroll_attention = unroll_loops
 
     def load_batch(
@@ -62,6 +63,8 @@ class IsaCompiler(
         vram_object_name: str,
         vlen: int = 64,
         preload_len: int | None = None,
+        storage_precision: int = 1,
+        hbm_precision: int = 0,
     ) -> str:
         """
         Load a Batch tensor from HBM to VRAM.
@@ -93,7 +96,7 @@ class IsaCompiler(
         )
 
         addr_reg = self.register_allocator.allocate_addr(1)[0]
-        gp_regs_for_addr = self.register_allocator.allocate_gp(1)
+        gp_regs_for_addr = self.register_allocator.allocate_gp(2)
 
         isa_code = f"; Load_Batch {hbm_object_name} -> {vram_object_name}\n"
         isa_code += f"; HBM[{hbm_addr}] → VRAM[{vram_base}], shape=({h}, {w})\n"
@@ -115,6 +118,8 @@ class IsaCompiler(
             act_vram_offset=vram_base,
             activation_offset_reg=addr_reg,
             stride_size=w,
+            storage_precision=storage_precision,
+            hbm_precision=hbm_precision,
         )
 
         self.register_allocator.free_gp(gp_regs_for_addr)
@@ -205,7 +210,10 @@ class IsaCompiler(
                 tensor_info.hbm_addr = hbm_addr
                 # HBM stores element + scale rows, each row-aligned (see hbm_tensor_size).
                 size = batch_size * hidden_size
-                tensor_info.hbm_size = self.hbm_tensor_size(size)
+                tensor_info.hbm_size = self.hbm_tensor_size(
+                    size,
+                    hbm_real_data_ratio or self.real_data_ratio,
+                )
         finally:
             self.register_allocator.free_gp(gp_regs)
             if need_free_addr:
@@ -270,7 +278,10 @@ class IsaCompiler(
 
         temp_scratchpad_name = None
         if scratchpad_vram_addr is None:
-            temp_scratchpad_name = f"__norm_scratch__{tensor_name}__{len(self.generated_code)}"
+            temp_scratchpad_name = (
+                f"__norm_scratch__{tensor_name}__{self._scratch_serial}"
+            )
+            self._scratch_serial += 1
             scratchpad_vram_addr = self.vram_allocator.allocate(vlen, name=temp_scratchpad_name)
 
         try:
@@ -343,7 +354,8 @@ class IsaCompiler(
         # path keeps its original 5-register allocation so its output is byte-identical.
         gp_regs = self.register_allocator.allocate_gp(5 if self._unroll else 6)
 
-        scratch_name = f"__rope_scratch__{x_name}__{len(self.generated_code)}"
+        scratch_name = f"__rope_scratch__{x_name}__{self._scratch_serial}"
+        self._scratch_serial += 1
         scratch_addr = self.vram_allocator.allocate(vlen, name=scratch_name)
 
         try:
@@ -371,6 +383,7 @@ class IsaCompiler(
     def reset(self):
         """Reset compiler state (clear code, but retain symbol table)"""
         self.generated_code = ""
+        self._scratch_serial = 0
         self.register_allocator = RegisterAllocator()
         # Call MemoryStateMixin.reset() explicitly since the merged class shadows it.
         MemoryStateMixin.reset(self)
