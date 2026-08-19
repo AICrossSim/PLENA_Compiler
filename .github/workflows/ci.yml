@@ -84,6 +84,12 @@ jobs:
             aten/tests/test_nemotron3_blocks.py \
             aten/tests/test_nemotron3_full_program.py \
             aten/tests/test_nemotron3_hybrid.py
+      - name: Run Kimi K3 hybrid compiler guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -v -m "not slow" \
+            aten/tests/test_kimi_k3_full_program.py \
+            aten/tests/test_kimi_k3_hybrid.py \
+            aten/tests/test_mla_attention.py
 
   unit-tests:
     name: Generator unit tests

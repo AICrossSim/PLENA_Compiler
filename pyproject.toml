@@ -5,14 +5,22 @@ description = "PLENA assembly compiler and code generation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "numpy>=1.26.0",
     "pyyaml>=6.0.0",
     "torch>=2.0.0",
+    "transformers>=4.45.0,<5",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=7.0.0",
     "ruff==0.15.14",
+]
+tvm = [
+    # This release bundles the legacy TVM TIR API targeted by the compiler.
+    "tilelang==0.1.6.post2",
+    "nvidia-cuda-nvrtc-cu12>=12.9; sys_platform == 'linux'",
+    "nvidia-cuda-runtime-cu12>=12.9; sys_platform == 'linux'",
 ]
 
 [build-system]
@@ -30,4 +38,6 @@ packages = [
 ]
 
 [tool.pytest.ini_options]
+# `slow` covers legacy/manual full-model diagnostics. Deployable Kimi full-scale
+# lowering is guarded until Top-K and MLA-head bodies use hardware loops.
 markers = ["slow: manual compiler-scaling diagnostics"]

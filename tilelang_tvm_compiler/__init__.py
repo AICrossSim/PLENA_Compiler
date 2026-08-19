@@ -55,10 +55,10 @@ emulator output that does not match golden, with no immediate error.
 ==============================================================================
 """
 
-# Bootstrap: tilelang ships its own TVM 0.23 in `tilelang/3rdparty/tvm/`.
+# Bootstrap: tilelang ships its compatible TVM in `tilelang/3rdparty/tvm/`.
 # Importing tilelang first injects that bundled TVM onto sys.path so the
 # subsequent `from tvm import ...` statements throughout this package
-# pick up 0.23 (which is what we target). When this package is consumed
+# pick up that pinned API. When this package is consumed
 # from a venv that does not have tilelang installed, `import tilelang`
 # raises ImportError; we tolerate that case so unit tests of pure
 # codegen logic can still run as long as some TVM is on sys.path.
