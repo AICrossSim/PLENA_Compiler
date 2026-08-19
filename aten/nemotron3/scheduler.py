@@ -212,12 +212,18 @@ class Nemotron3HybridScheduler:
                     valid_tokens,
                 )
         for state_event in tail:
-            layer_type = (
-                HybridLayerType.MAMBA
-                if state_event.layer_id is not None
-                else HybridLayerType.MAMBA
-            )
-            self._append_state(events, passes - 1, layer_type, state_event)
+            # The tail only ever carries Mamba lifecycle events: attention and
+            # MoE layers emit no X_STATE. This used to be a conditional whose
+            # two branches were both MAMBA, which read as an unfinished
+            # dispatch; assert the invariant instead of pretending to choose.
+            if state_event.layer_id is not None and (
+                self.arch.pattern[state_event.layer_id] != "M"
+            ):
+                raise ValueError(
+                    f"layer {state_event.layer_id} emitted a state event but is "
+                    f"{self.arch.pattern[state_event.layer_id]!r}, not Mamba"
+                )
+            self._append_state(events, passes - 1, HybridLayerType.MAMBA, state_event)
         return Nemotron3HybridTrace(self.arch, self.config.phase, tuple(events), mamba_trace)
 
     @staticmethod
