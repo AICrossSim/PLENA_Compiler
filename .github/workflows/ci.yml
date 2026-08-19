@@ -78,6 +78,12 @@ jobs:
           PYTHONPATH=. python3 -m pytest -v \
             aten/tests/test_hybrid_substrate.py \
             aten/tests/test_mram_binding_tracking.py
+      - name: Run Nemotron 3 hybrid compiler guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -v -m "not slow" \
+            aten/tests/test_nemotron3_blocks.py \
+            aten/tests/test_nemotron3_full_program.py \
+            aten/tests/test_nemotron3_hybrid.py
 
   unit-tests:
     name: Generator unit tests

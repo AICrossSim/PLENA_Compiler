@@ -28,3 +28,6 @@ packages = [
     "generator",
     "utils",
 ]
+
+[tool.pytest.ini_options]
+markers = ["slow: manual compiler-scaling diagnostics"]
