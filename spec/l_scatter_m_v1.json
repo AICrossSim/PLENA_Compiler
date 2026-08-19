@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "contract_name": "plena-l-scatter-m-v1",
+  "instruction": {
+    "name": "L_SCATTER_M",
+    "opcode": 63,
+    "format": "R_FUNCT",
+    "fields": [
+      ["opcode", 0, 6],
+      ["context_gp", 6, 4],
+      ["descriptor_offset_gp", 10, 4],
+      ["descriptor_hbm_reg", 14, 4],
+      ["buffer_id", 18, 4],
+      ["layout_mode", 22, 4],
+      ["reserved", 26, 6]
+    ]
+  },
+  "layout_modes": {
+    "ROW_MAJOR": 0,
+    "TRANSPOSE": 1,
+    "MAMBA_SKEW": 2,
+    "KDA_SKEW": 3,
+    "CUSTOM": 4
+  },
+  "skew_kinds": {
+    "NONE": 0,
+    "LOCAL_ROW": 1,
+    "FIELD": 2,
+    "GROUP": 3
+  },
+  "flow_modes": {
+    "BUFFERED": 0,
+    "FIFO_WITH_SPILL": 1
+  },
+  "field_ids": {
+    "MAMBA_GATE": 0,
+    "MAMBA_X": 1,
+    "MAMBA_B": 2,
+    "MAMBA_C": 3,
+    "MAMBA_DT": 4,
+    "KDA_Q": 16,
+    "KDA_K": 17,
+    "KDA_V": 18,
+    "KDA_DECAY": 19,
+    "KDA_BETA": 20
+  },
+  "descriptor": {
+    "magic": 827151180,
+    "version": 1,
+    "size_bytes": 256,
+    "alignment_bytes": 64,
+    "field_offset": 80,
+    "field_size": 24,
+    "max_fields": 7,
+    "endianness": "little",
+    "header_extension": {
+      "banks": 64,
+      "ports_per_bank": 65,
+      "field_count": 66,
+      "layout_mode": 67,
+      "activation_precision": 68,
+      "buffer_id": 69,
+      "flow_mode": 70,
+      "spill_write_values_per_cycle": 71,
+      "producer_burst_values_u16": 72,
+      "fifo_capacity_values_u16": 74,
+      "mapping_crc32_u32": 76
+    }
+  },
+  "semantics": {
+    "source": "Feature-tile-major Matrix writeback resident in Vector SRAM",
+    "destination": "A 16-bank Matrix-SRAM projection region indexed by physical row and bank",
+    "scatter_on_write": "The architectural instruction materializes the producer-consumer layout before X_STATE may consume it",
+    "row_major": "source index i maps to row=floor(i/banks), bank=i mod banks",
+    "transpose": "logical [row,column] maps through column-major linearization before bank selection",
+    "skewed": "field-local coordinates map to a physical row and a cyclic bank rotation",
+    "activation_policy": "v1 accepts FP32, BF16, or FP16 Vector SRAM; MX8 activation is rejected until scale-aware Vector SRAM exists"
+  }
+}

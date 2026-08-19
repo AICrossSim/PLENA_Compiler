@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "contract_name": "plena-x-state-v2",
+  "opcode_reservations": {
+    "C_ROUTE_BEGIN": 57,
+    "C_ROUTE_LOOP_START": 58,
+    "C_ROUTE_LOOP_END": 59,
+    "V_ROUTE_MUL": 60,
+    "X_STATE": 61
+  },
+  "component_gaps": {
+    "simulator_missing": [
+      "V_PS_V",
+      "C_HADAMARD_TRANSFORM"
+    ]
+  },
+  "instruction": {
+    "name": "X_STATE",
+    "opcode": 61,
+    "opcode_allocation": "0x3D follows the routed-MoE allocation 0x39-0x3C; 0x3E remains free",
+    "format": "R_FUNCT",
+    "fields": [
+      ["opcode", 0, 6],
+      ["context_gp", 6, 4],
+      ["descriptor_offset_gp", 10, 4],
+      ["descriptor_hbm_reg", 14, 4],
+      ["queue_id", 18, 4],
+      ["subop", 22, 4],
+      ["reserved", 26, 6]
+    ]
+  },
+  "algorithms": {
+    "MAMBA2": 0,
+    "KDA": 1
+  },
+  "subops": {
+    "PRELOAD": 0,
+    "RESET": 1,
+    "PREFILL": 2,
+    "STEP": 3,
+    "COMMIT": 4,
+    "EVICT": 5,
+    "FENCE": 6
+  },
+  "precisions": {
+    "FP32": {"value": 0, "element_bytes": 4},
+    "BF16": {"value": 1, "element_bytes": 2},
+    "FP16": {"value": 2, "element_bytes": 2},
+    "MX8_B128": {"value": 3, "element_bytes": 1}
+  },
+  "flags": {
+    "LAST_CHUNK": 0,
+    "WRITE_COMPLETION": 1,
+    "PROFILE": 2
+  },
+  "descriptor": {
+    "magic": 844387160,
+    "version": 2,
+    "size_bytes": 256,
+    "alignment_bytes": 64,
+    "endianness": "little",
+    "streaming_sram_offset": 4294967295,
+    "common_fields": [
+      ["magic", 0, "u32"],
+      ["version", 4, "u16"],
+      ["size_bytes", 6, "u16"],
+      ["algorithm", 8, "u8"],
+      ["state_precision", 9, "u8"],
+      ["activation_precision", 10, "u8"],
+      ["accumulator_precision", 11, "u8"],
+      ["flags", 12, "u32"],
+      ["context_id", 16, "u32"],
+      ["request_id", 20, "u32"],
+      ["layer_id", 24, "u32"],
+      ["state_id", 28, "u32"],
+      ["batch_size", 32, "u16"],
+      ["num_heads", 34, "u16"],
+      ["sequence_length", 36, "u32"],
+      ["token_offset", 40, "u32"],
+      ["valid_tokens", 44, "u16"],
+      ["chunk_size", 46, "u16"],
+      ["state_sram_offset", 48, "u32"],
+      ["state_bytes", 52, "u32"],
+      ["conv_state_bytes", 56, "u32"],
+      ["parameter_precision", 60, "u8"],
+      ["conv_state_precision", 61, "u8"],
+      ["reserved0", 62, "bytes2"],
+      ["input_vram_addr", 64, "u32"],
+      ["output_vram_addr", 68, "u32"],
+      ["input_token_stride", 72, "u32"],
+      ["output_token_stride", 76, "u32"],
+      ["state_hbm_addr", 80, "u64"],
+      ["conv_state_hbm_addr", 88, "u64"],
+      ["state_scale_addr", 96, "u64"],
+      ["completion_addr", 104, "u64"],
+      ["dependency_event", 112, "u32"],
+      ["completion_event", 116, "u32"],
+      ["state_scale_bytes", 120, "u32"],
+      ["conv_state_scale_bytes", 124, "u32"]
+    ],
+    "payloads": {
+      "MAMBA2": [
+        ["head_dim", 128, "u16"],
+        ["state_dim", 130, "u16"],
+        ["groups", 132, "u16"],
+        ["conv_kernel", 134, "u16"],
+        ["xbc_offset", 136, "u32"],
+        ["dt_offset", 140, "u32"],
+        ["conv_weight_addr", 144, "u64"],
+        ["conv_bias_addr", 152, "u64"],
+        ["a_log_addr", 160, "u64"],
+        ["dt_bias_addr", 168, "u64"],
+        ["d_skip_addr", 176, "u64"],
+        ["parameter_scale_addr", 184, "u64"],
+        ["dt_min_f32_bits", 192, "u32"],
+        ["dt_max_f32_bits", 196, "u32"],
+        ["reserved_payload", 200, "bytes56"]
+      ],
+      "KDA": [
+        ["key_dim", 128, "u16"],
+        ["value_dim", 130, "u16"],
+        ["conv_kernel", 132, "u16"],
+        ["reserved_kda0", 134, "u16"],
+        ["q_offset", 136, "u32"],
+        ["k_offset", 140, "u32"],
+        ["v_offset", 144, "u32"],
+        ["decay_offset", 148, "u32"],
+        ["beta_offset", 152, "u32"],
+        ["reserved_kda1", 156, "u32"],
+        ["q_conv_weight_addr", 160, "u64"],
+        ["k_conv_weight_addr", 168, "u64"],
+        ["v_conv_weight_addr", 176, "u64"],
+        ["q_conv_bias_addr", 184, "u64"],
+        ["k_conv_bias_addr", 192, "u64"],
+        ["v_conv_bias_addr", 200, "u64"],
+        ["a_log_addr", 208, "u64"],
+        ["dt_bias_addr", 216, "u64"],
+        ["parameter_scale_addr", 224, "u64"],
+        ["output_scale_f32_bits", 232, "u32"],
+        ["gate_lower_bound_f32_bits", 236, "u32"],
+        ["reserved_payload", 240, "bytes16"]
+      ]
+    }
+  },
+  "completion_record": {
+    "size_bytes": 16,
+    "alignment_bytes": 64,
+    "fields": [
+      ["status", 0, "u32"],
+      ["completion_event", 4, "u32"],
+      ["elapsed_cycles", 8, "u64"]
+    ],
+    "status_values": {
+      "EMPTY": 0,
+      "SUCCESS": 1,
+      "INVALID_DESCRIPTOR": 2,
+      "UNSUPPORTED_ALGORITHM": 3,
+      "ADDRESS_ERROR": 4,
+      "STATE_HAZARD": 5,
+      "UNSUPPORTED_PRECISION": 6,
+      "INTERNAL_ERROR": 255
+    }
+  },
+  "events": {
+    "no_event": 4294967295
+  },
+  "architectural_boundary": {
+    "input_projection": "existing Matrix service",
+    "recurrent_core": "X_STATE",
+    "output_gate_and_norm": "existing Vector service",
+    "output_projection": "existing Matrix service",
+    "vram_address_unit": "element",
+    "hbm_address_unit": "byte",
+    "precision_policy": "activation_precision describes Vector SRAM values; parameter_precision describes X_STATE HBM parameters; state_precision describes the persistent recurrent matrix; conv_state_precision independently describes the short convolution history; accumulation remains FP32",
+    "mx8_scale_policy": "MX8_B128 uses one E8M0 exponent byte per 128 values along each tensor's innermost dimension; state scales begin with recurrent-state blocks followed by convolution-state blocks; parameter scales follow parameter fetch order",
+    "layout_policy": "state and projection bank layouts are hardware configuration, not descriptor fields"
+  }
+}

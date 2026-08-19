@@ -13,9 +13,12 @@ def preload_act_asm(
     activation_offset_reg: int,
     stride_size=None,
     vram_stride_mult: int = 1,
-    storage_precision: int = 1 # bytes per element
+    storage_precision: int = 1,  # bytes per element
+    hbm_precision: int = 0,
 ) -> str:
     """Preload activation from HBM to VRAM. Layout: (hidden//mlen, batch, mlen)."""
+    if hbm_precision not in (0, 1):
+        raise ValueError("hbm_precision must select activation (0) or key/value (1)")
     generated_code = "; Preload Activation Generation \n"
     a_actual_register = alive_registers[0]
     set_stride_register = alive_registers[1]
@@ -39,7 +42,8 @@ def preload_act_asm(
         vram_step = elements_per_prefetch * vram_stride_mult
         for i in range(math.ceil(hidden_size / elements_per_prefetch)):
             generated_code += (
-                f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, a{activation_offset_reg}, 0, 0, 0 \n"
+                f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, "
+                f"a{activation_offset_reg}, 0, {hbm_precision}, 0 \n"
             )
             generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vram_step} \n"
             generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {elements_per_prefetch} \n"
@@ -51,7 +55,10 @@ def preload_act_asm(
         generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_actual_register}, 0 \n"
         if batch > preload_len:
             generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / preload_len)} \n"
-        generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, a{activation_offset_reg}, 1, 0 \n"
+        generated_code += (
+            f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, "
+            f"a{activation_offset_reg}, 1, {hbm_precision} \n"
+        )
         generated_code += (
             f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len * vram_stride_mult} \n"
         )

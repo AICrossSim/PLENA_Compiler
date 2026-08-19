@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "status": "provisional_revised_after_nemotron_and_kda_rtx5090_profiles",
+  "rtl_base_commit": "2c5a5f46a5bd34bdc104b4a8e1f37b7bb9659345",
+  "branch": "feat/nemotron3-mamba-state-engine",
+  "isa": {
+    "opcode": 61,
+    "descriptor_version": 2,
+    "descriptor_bytes": 256,
+    "queue_ids": 16,
+    "minimum_command_fifo_depth": 4
+  },
+  "recurrent_datapath": {
+    "head_lanes": 2,
+    "row_lanes": 4,
+    "column_lanes": 8,
+    "fma_lanes_per_head": 32,
+    "banks_per_head": 32,
+    "ports_per_bank": 1,
+    "layout": "dual_axis_cyclic",
+    "head_tile_slots_per_lane": 2,
+    "recurrent_head_tile_sram_bytes": 262144,
+    "mamba_bf16_recurrent_head_tile_sram_bytes": 65536,
+    "accumulation": "fp32"
+  },
+  "conv_datapath": {
+    "max_channels": 36864,
+    "max_kernel": 4,
+    "max_transient_conv_state_bytes": 294912,
+    "sizing_workload": "Kimi K3 KDA BF16 conv state"
+  },
+  "memory": {
+    "minimum_transient_state_sram_bytes": 557056,
+    "persistent_state_cache_bytes_first_iteration": 0,
+    "persistent_state_policy": "HBM streaming with ping-pong head tiles",
+    "future_cache_options_bytes": [8388608, 16777216, 33554432, 67108864],
+    "modeled_hbm_bytes_per_cycle": 64
+  },
+  "precision_scope": {
+    "activation_first_iteration": ["bf16"],
+    "parameter_first_iteration": ["bf16"],
+    "state_first_iteration": ["fp32", "bf16"],
+    "kda_profiled_recurrent_state": "fp32",
+    "kda_profiled_conv_state": "bf16",
+    "accumulator": ["fp32"],
+    "simulator_only_until_quality_and_ppa": [
+      "mx8_b128_state",
+      "mx8_b128_parameters"
+    ],
+    "deferred_requires_scale_aware_vector_sram": ["mx8_b128_activation"]
+  },
+  "required_features": [
+    "transparent Matrix-result to X_STATE projection FIFO with Vector-SRAM spill fallback",
+    "Mamba group-shared B/C broadcast",
+    "fused state update and C reduction",
+    "KDA prediction-before-delta two-pass ordering",
+    "streaming state DMA with two head-tile slots",
+    "queue-specific FENCE and completion event scoreboard",
+    "logical HBM, cache, bank stall, and cycle counters"
+  ],
+  "not_claimed": [
+    "synthesized FPGA area or frequency",
+    "full Kimi K3 model support",
+    "full Nemotron or Kimi persistent state residency",
+    "MX8 end-to-end model quality",
+    "NVFP4 Matrix Engine support"
+  ],
+  "selection_rationale": {
+    "rtx5090_profile_scope": "official standalone NemotronHMamba2Mixer with random BF16 weights",
+    "rtx5090_decode_b1_mixer_median_us": 234.48,
+    "rtx5090_decode_b1_scan_us": 1.792,
+    "rtx5090_decode_b1_scan_fraction": 0.00764,
+    "rtx5090_stage_percentage_denominator": "active CUDA GPU kernel time inside nemotron.profile; CPU launch gaps excluded",
+    "rtx5090_prefill_b1_s2048_projection_fraction": 0.84909,
+    "rtx5090_decode_b1_projection_fraction": 0.88409,
+    "rtx5090_decode_b8_projection_fraction": 0.7425,
+    "nemotron_rtx5090_observed_state_precision": "bf16",
+    "kda_rtx5090_profile_scope": "official KimiDeltaAttention mixer with real dimensions and random BF16 weights",
+    "kda_rtx5090_decode_b1_mixer_median_us": 565.0,
+    "kda_rtx5090_recurrent_state_precision": "fp32",
+    "kda_rtx5090_conv_state_precision": "bf16",
+    "kda_persistent_state_mib_per_layer": 6.28125,
+    "mamba_fp32_streaming_us_per_layer_uncalibrated": 68.608,
+    "mamba_bf16_streaming_us_per_layer_uncalibrated": 34.304,
+    "kda_streaming_us_per_layer_uncalibrated": 205.824,
+    "mamba_resident_us_per_layer_uncalibrated": 16.4,
+    "kda_resident_us_per_layer_uncalibrated": 73.7,
+    "why_two_head_lanes": "One lane with ping-pong already reaches the modeled BF16 Mamba streaming HBM floor. Two lanes are retained for KDA and resident-state throughput, not for Mamba streaming.",
+    "why_not_four_head_lanes": "No modeled streaming gain; doubles FMA lanes, banks, and head-tile SRAM.",
+    "why_not_sixteen_banks": "Matches streaming HBM limit but slows resident KDA from 73.7 to 98.3 us/layer."
+  }
+}
