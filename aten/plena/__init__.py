@@ -2,6 +2,10 @@
 
 from compiler.aten.plena.compiler import PlenaCompiler
 from compiler.aten.plena.constants import BLEN, IMM2_BOUND, MLEN
+from compiler.aten.plena.decode_cache import (
+    DecodeCacheTensor,
+    allocate_decode_cache_tensor,
+)
 from compiler.aten.plena.expert_table import (
     ExpertWeightTable,
     reserve_expert_weight_table,
@@ -21,6 +25,7 @@ __all__ = [
     "IMM2_BOUND",
     "MLEN",
     "FPVar",
+    "DecodeCacheTensor",
     "ExpertWeightTable",
     "FullModelProgram",
     "SymbolicHbmBinding",
@@ -31,6 +36,7 @@ __all__ = [
     "TensorVar",
     "VRAMMatrixVar",
     "assert_registers_are_free",
+    "allocate_decode_cache_tensor",
     "reserve_expert_weight_table",
     "validate_symbolic_hbm_bindings",
 ]

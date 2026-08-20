@@ -75,9 +75,21 @@ hidden state
 | Compact Matrix 循环 | 完成 | MXFP8 GEMM 与 BF16 stream-K 均在 Rust 中逐元素一致 |
 | Nemotron 52 层机器码 | 完成 | 6,202,663 条、23.66 MiB；参数由 symbolic HBM manifest 描述 |
 | Kimi 93 层机器码 | 完成 | 96-head 共 11,502,370 条，原始机器码 43.88 MiB |
-| Prefill 和多 token MLA/GQA cache | 未完成 | 当前 connected 路径只验证单 token decode |
+| 4-token GQA / compressed-MLA cache | 完成 | Nemotron 32Q/2KV GQA 与 Kimi 96-head MLA 已在同一 HBM 实例中逐 token 追加并完成 Rust 数值对拍 |
+| Prefill 和整模多 token decode | 未完成 | 4-token 证明目前覆盖独立 Attention/MLA block；52/93 层 connected builder 仍生成单 token decode |
 | 真实权重整模执行 | 未完成 | 不能声称 Nemotron/Kimi 已在 PLENA 从第一层跑到最后一层 |
 | RTL、频率、面积和端到端加速比 | 未开始 | 属于下一阶段，不是本仓库当前结论 |
+
+4-token 测试保留真实 attention/cache 维度，只缩小外围 hidden rank：
+
+| 路径 | 真实维度 | Rust 结果 | HBM cache |
+|---|---|---|---|
+| Nemotron GQA | 32 query heads、2 KV heads、head dim 128 | 输出 100% allclose；4 个 K/V cache 全部 exact | 4,096 B logical K/V history |
+| Kimi compressed MLA | 96 heads、Q/K 192、V 128、compressed 576、4 个不同 RoPE 位置 | 输出、compressed history、重建 K/V 全部 exact | 4,608 B persistent latent + 一对固定 single-head scratch |
+
+Kimi 的测试会扫描 Compiler HBM 注册表；任何额外的 all-head expanded K/V cache 都会
+直接失败。4-token 展开方案需要 245,760 B，而实际 persistent history 是 4,608 B，
+缩小 53.33x。该数字只比较 cache payload，不包含权重和 SRAM guard rows。
 
 ## 快速开始
 
@@ -98,6 +110,14 @@ uv run pytest -q -m "not slow" \
   aten/tests/test_compact_matrix_loops.py \
   aten/tests/test_nemotron3_hybrid.py \
   aten/tests/test_kimi_k3_hybrid.py
+```
+
+多-token cache 的 Rust 数值测试位于配套 Simulator 分支；下面两条命令需在
+`PLENA_Simulator` checkout 中运行：
+
+```bash
+nix develop --no-write-lock-file --command just test-nemotron3-gqa-cache
+nix develop --no-write-lock-file --command just test-kimi3-mla-cache
 ```
 
 完整的分支测试列表见 [CI 配置](.github/workflows/ci.yml)。TileLang/TVM 不是

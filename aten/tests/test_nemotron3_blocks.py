@@ -1,6 +1,7 @@
 from aten.nemotron3.blocks import (
     NemotronAttentionShape,
     NemotronAttentionWeights,
+    allocate_nemotron_gqa_decode_cache,
     NemotronMoeConstants,
     NemotronMoeShape,
     NemotronMoeWeights,
@@ -58,6 +59,80 @@ def test_connected_nemotron_gqa_consumes_projected_qkv() -> None:
     assert "nemotron_attention_q" in assembly
     assert "nemotron_attention_k_scratch0" in assembly
     assert assembly.count("VRAM Sub Projection T To") == 2
+
+
+def test_four_token_nemotron_gqa_uses_persistent_bf16_cache() -> None:
+    prog, hidden = _program()
+    shape = NemotronAttentionShape(
+        hidden=64,
+        query_heads=2,
+        kv_heads=1,
+        head_dim=64,
+    )
+    weights = NemotronAttentionWeights(
+        q=_weight(prog, "cache_w_q", 64, 128),
+        k=_weight(prog, "cache_w_k", 64, 64),
+        v=_weight(prog, "cache_w_v", 64, 64),
+        out=_weight(prog, "cache_w_o", 128, 64),
+    )
+    cache = allocate_nemotron_gqa_decode_cache(
+        prog,
+        shape=shape,
+        max_tokens=4,
+    )
+
+    outputs = [
+        emit_nemotron_attention_block(
+            prog,
+            hidden,
+            shape=shape,
+            weights=weights,
+            rows=1,
+            name=f"gqa_token{token}",
+            cache=cache,
+            token_index=token,
+        )
+        for token in range(4)
+    ]
+    assembly = prog.compile()
+
+    assert all(output.shape == (1, 64) for output in outputs)
+    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_k_head0") == 4
+    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_v_head0") == 4
+    assert assembly.count("H_STORE_V") >= 8
+    pv_sections = assembly.split("; === Compute PV = P @ V")
+    assert len(pv_sections) > 1
+    for section in pv_sections[1:]:
+        prefetch = next(
+            line for line in section.splitlines() if line.startswith("H_PREFETCH_M")
+        )
+        assert prefetch.endswith(", 1, 1")
+    assert cache.persistent_bytes == 2 * 64 * 64 * 2
+    assert cache.keys[0].prefix(4).shape == (4, 64)
+
+
+def test_nemotron_gqa_cache_rejects_an_out_of_range_token() -> None:
+    prog, hidden = _program()
+    shape = NemotronAttentionShape(64, 2, 1, 64)
+    cache = allocate_nemotron_gqa_decode_cache(prog, shape=shape, max_tokens=4)
+    weights = NemotronAttentionWeights(
+        q=_weight(prog, "range_w_q", 64, 128),
+        k=_weight(prog, "range_w_k", 64, 64),
+        v=_weight(prog, "range_w_v", 64, 64),
+        out=_weight(prog, "range_w_o", 128, 64),
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError, match="exceeds cache capacity"):
+        emit_nemotron_attention_block(
+            prog,
+            hidden,
+            shape=shape,
+            weights=weights,
+            cache=cache,
+            token_index=4,
+        )
 
 
 def test_connected_nemotron_moe_executes_routed_and_shared_relu2() -> None:

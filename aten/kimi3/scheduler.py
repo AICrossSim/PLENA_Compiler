@@ -160,7 +160,10 @@ class KimiK3HybridTrace:
                     "the full 93-layer, 96-head single-token program now assembles; "
                     "MLA head bodies remain statically emitted and are a code-size optimization target"
                 ),
-                "persistent multi-token MLA cache append is not implemented",
+                (
+                    "four-token compressed MLA cache append/reconstruct is executable at block level; "
+                    "the full 93-layer connected builder remains context_length=1"
+                ),
                 "the trace is not an end-to-end GPU or RTL latency claim",
             ],
         }

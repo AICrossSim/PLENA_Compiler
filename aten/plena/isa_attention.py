@@ -244,7 +244,9 @@ class IsaAttentionMixin:
                     # Fold the attention sink into the row denominator (see rolled path).
                     lines.append(f"S_ADD_FP f{fp_sum_p}, f{fp_sum_p}, f{fp_sink_exp}")
                 lines.append(f"S_RECI_FP f{fp_sum_p}, f{fp_sum_p}, 0")
-                for _ in range(4):  # retire multi-cycle S_RECI_FP before V_MUL_VF reads it
+                for _ in range(
+                    4
+                ):  # retire multi-cycle S_RECI_FP before V_MUL_VF reads it
                     lines.append("S_ADDI_INT gp0, gp0, 0")
                 lines.append(f"V_MUL_VF gp{gp_s}, gp{gp_s}, f{fp_sum_p}, {mask_en}")
             else:
@@ -278,6 +280,7 @@ class IsaAttentionMixin:
         pv_physical_rows: int | None = None,
         v_hbm_row_stride: int | None = None,
         v_hbm_element_bytes: int = 1,
+        v_matrix_precision: int = 0,
     ) -> str:
         """
         Compute PV = P @ V via M_MM.
@@ -311,6 +314,7 @@ class IsaAttentionMixin:
                 pv_physical_rows=pv_physical_rows,
                 v_hbm_row_stride=v_hbm_row_stride,
                 v_hbm_element_bytes=v_hbm_element_bytes,
+                v_matrix_precision=v_matrix_precision,
             )
 
         gp_regs = self.register_allocator.allocate_gp(8)
@@ -325,12 +329,20 @@ class IsaAttentionMixin:
 
         num_v_col_blocks = max(1, math.ceil(head_dim / mlen))
         tiles_per_mlen = mlen // blen
-        p_row_groups = tiles_per_mlen if rows is None else max(1, min(tiles_per_mlen, (rows + blen - 1) // blen))
+        p_row_groups = (
+            tiles_per_mlen
+            if rows is None
+            else max(1, min(tiles_per_mlen, (rows + blen - 1) // blen))
+        )
 
         lines = []
         lines.append("; === PV Multiply (P @ V) using M_MM ===")
-        lines.append(f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})")
-        lines.append("; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot")
+        lines.append(
+            f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})"
+        )
+        lines.append(
+            "; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot"
+        )
         lines.append(f"; V split into {num_v_col_blocks} column blocks of width {mlen}")
         lines.append("; Storage layout: (batch, mlen, hidden/mlen), column-block major")
 
@@ -338,7 +350,9 @@ class IsaAttentionMixin:
         # BF16 KeyValue loads need 2 bytes/element.
         if v_hbm_row_stride is None:
             v_hbm_row_stride = mlen
-        lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, {v_hbm_row_stride * v_hbm_element_bytes}")
+        lines.append(
+            f"S_ADDI_INT gp{gp_stride}, gp0, {v_hbm_row_stride * v_hbm_element_bytes}"
+        )
         lines.append(f"C_SET_STRIDE_REG gp{gp_stride}")
 
         # M_MM_WO requires a nonzero stride reg (gp0=0 would be interpreted as stride=1).
@@ -354,14 +368,15 @@ class IsaAttentionMixin:
             # Prefetch V[:, v_col_block*mlen:(v_col_block+1)*mlen] (mlen × mlen) to MSRAM.
             # V is row-major in HBM: V[row, col] at offset row*head_dim + col, so the
             # column-block base offset = v_hbm_offset + v_col_block * mlen (elements).
-            v_block_hbm_offset = (v_hbm_offset + v_col_block * mlen) * v_hbm_element_bytes
+            v_block_hbm_offset = (
+                v_hbm_offset + v_col_block * mlen
+            ) * v_hbm_element_bytes
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            # funct1=0 => PREFETCH_M_H (High Precision, m_controller_precision_select=0),
-            # matching how V is staged in HBM (same High-Precision MXINT format as the K/W
-            # weights, which load via _H). funct1=1 (_L / Low Precision) mis-decodes the
-            # High-staged V into garbage (~constant mantissas) -> rank-1 P@V collapse.
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 0")
+            lines.append(
+                f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, "
+                f"a{v_hbm_offset_reg}, 1, {v_matrix_precision}"
+            )
 
             pv_col_block_base = pv_address + v_col_block * pv_physical_rows * mlen
             lines.extend(load_large_int(gp_pv_col_base, pv_col_block_base))
@@ -402,6 +417,7 @@ class IsaAttentionMixin:
         pv_physical_rows: int | None = None,
         v_hbm_row_stride: int | None = None,
         v_hbm_element_bytes: int = 1,
+        v_matrix_precision: int = 0,
     ) -> str:
         """Legacy Python-unrolled P @ V emission, kept for A/B comparisons."""
         if pv_physical_rows is None:
@@ -417,13 +433,19 @@ class IsaAttentionMixin:
 
         lines = []
         lines.append("; === PV Multiply (P @ V) using M_MM ===")
-        lines.append(f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})")
-        lines.append("; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot")
+        lines.append(
+            f"; P: ({mlen}, {mlen}) @ V: ({mlen}, {head_dim}) -> PV: ({mlen}, {head_dim})"
+        )
+        lines.append(
+            "; M_MM: (blen, mlen) @ (mlen, blen) -> (blen, blen), K=mlen in one shot"
+        )
         lines.append(f"; V split into {num_v_col_blocks} column blocks of width {mlen}")
         lines.append("; Storage layout: (batch, mlen, hidden/mlen), column-block major")
         if v_hbm_row_stride is None:
             v_hbm_row_stride = mlen
-        lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, {v_hbm_row_stride * v_hbm_element_bytes}")
+        lines.append(
+            f"S_ADDI_INT gp{gp_stride}, gp0, {v_hbm_row_stride * v_hbm_element_bytes}"
+        )
         lines.append(f"C_SET_STRIDE_REG gp{gp_stride}")
         lines.append(f"S_ADDI_INT gp{gp_stride}, gp0, 1")
 
@@ -431,12 +453,15 @@ class IsaAttentionMixin:
             lines.append(
                 f"; --- V column block {v_col_block} (columns {v_col_block * mlen} to {(v_col_block + 1) * mlen - 1}) ---"
             )
-            v_block_hbm_offset = (v_hbm_offset + v_col_block * mlen) * v_hbm_element_bytes
+            v_block_hbm_offset = (
+                v_hbm_offset + v_col_block * mlen
+            ) * v_hbm_element_bytes
             lines.append(f"S_ADDI_INT gp{gp_v}, gp0, 0")
             lines.extend(load_large_int(gp_hbm, v_block_hbm_offset))
-            # funct1=0 => PREFETCH_M_H (High Precision), matching V's HBM staging; _L
-            # (Low Precision) mis-decodes it to garbage. See _pv_multiply_asm above.
-            lines.append(f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, a{v_hbm_offset_reg}, 1, 0")
+            lines.append(
+                f"H_PREFETCH_M gp{gp_v}, gp{gp_hbm}, "
+                f"a{v_hbm_offset_reg}, 1, {v_matrix_precision}"
+            )
 
             # Only emit output-column tiles that this block actually covers. When
             # head_dim < mlen (e.g. GQA head_slot_dim=4), mlen//blen would over-iterate
@@ -454,7 +479,11 @@ class IsaAttentionMixin:
                     lines.extend(load_large_int(gp_p, p_row_addr))
                     lines.append(f"M_MM 0, gp{gp_v}, gp{gp_p}")
 
-                    pv_offset = v_col_block * pv_physical_rows * mlen + p_row * blen * mlen + v_col * blen
+                    pv_offset = (
+                        v_col_block * pv_physical_rows * mlen
+                        + p_row * blen * mlen
+                        + v_col * blen
+                    )
                     lines.extend(load_large_int(gp_pv, pv_address + pv_offset))
                     lines.append(f"M_MM_WO gp{gp_pv}, gp{gp_stride}, 0")
 
@@ -636,7 +665,9 @@ class IsaAttentionMixin:
         lines = []
         lines.append("; === Final Scaling O = O / l ===")
         lines.append(f"; head_dim = {head_dim}, {num_col_blocks} mlen-blocks per row")
-        lines.append("; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major")
+        lines.append(
+            "; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major"
+        )
         lines.append(f"; seq_len = {seq_len}, row_offset = {row_offset}")
 
         if num_col_blocks == 1:
@@ -691,7 +722,9 @@ class IsaAttentionMixin:
         lines = []
         lines.append("; === Final Scaling O = O / l ===")
         lines.append(f"; head_dim = {head_dim}, {num_col_blocks} mlen-blocks per row")
-        lines.append("; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major")
+        lines.append(
+            "; Storage layout: (seq_len, mlen, head_dim/mlen), column-block major"
+        )
         lines.append(f"; seq_len = {seq_len}, row_offset = {row_offset}")
         lines.extend(load_large_int(gp_l, l_address))
 
@@ -760,16 +793,24 @@ class IsaAttentionMixin:
         num_col_blocks = (cols + mlen - 1) // mlen
 
         lines = []
-        lines.append(f"; Reset VRAM rows [{row_offset}, {row_offset + rows}) of matrix at {start_address}")
+        lines.append(
+            f"; Reset VRAM rows [{row_offset}, {row_offset + rows}) of matrix at {start_address}"
+        )
         lines.append(f"; {rows} rows x {cols} cols, {num_col_blocks} blocks per row")
-        lines.append("; Storage layout: (total_rows, mlen, cols/mlen), column-block major")
+        lines.append(
+            "; Storage layout: (total_rows, mlen, cols/mlen), column-block major"
+        )
         lines.append(f"; total_rows = {total_rows}, row_offset = {row_offset}")
 
         if getattr(self, "unroll_attention", False):
             for row in range(rows):
                 actual_row = row_offset + row
                 for col_block in range(num_col_blocks):
-                    addr = start_address + col_block * total_rows * mlen + actual_row * mlen
+                    addr = (
+                        start_address
+                        + col_block * total_rows * mlen
+                        + actual_row * mlen
+                    )
                     lines.extend(load_large_int(gp_addr, addr))
                     lines.append(f"V_MUL_VF gp{gp_addr}, gp{gp_addr}, f0, 0")
         else:
@@ -872,6 +913,7 @@ class IsaAttentionMixin:
         head_dim: int,
         rows: int | None = None,
         v_hbm_element_bytes: int = 1,
+        v_matrix_precision: int = 0,
     ) -> str:
         """
         Compute PV = P @ V[k_idx].
@@ -898,7 +940,9 @@ class IsaAttentionMixin:
         from compiler.asm_templates import preload_addr_reg_asm
 
         isa_code += preload_addr_reg_asm(
-            addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
+            addr_reg_to_set=[v_hbm_reg],
+            available_registers=gp_regs,
+            addr_reg_val=[v_layout.hbm_base_addr],
         )
 
         # QK and PV may consume tensors with different physical widths (MLA is
@@ -922,6 +966,7 @@ class IsaAttentionMixin:
             pv_physical_rows=pv_info.physical_shape[0],
             v_hbm_row_stride=physical_head_dim,
             v_hbm_element_bytes=v_hbm_element_bytes,
+            v_matrix_precision=v_matrix_precision,
         )
 
         self.register_allocator.free_gp(gp_regs)
@@ -929,7 +974,13 @@ class IsaAttentionMixin:
 
         return self._emit(isa_code)
 
-    def warm_v_prefetch(self, v_sub_matrix: str, k_idx: int, v_hbm_element_bytes: int = 1) -> str:
+    def warm_v_prefetch(
+        self,
+        v_sub_matrix: str,
+        k_idx: int,
+        v_hbm_element_bytes: int = 1,
+        v_matrix_precision: int = 0,
+    ) -> str:
         """Prefetch V[k_idx] into MSRAM ONCE (High precision) before the per-head P@V
         loop so it has fully landed by head 0's first tile. Paired with the RTL
         cold-start re-prime at the M_BTMM->M_MM boundary: the re-prime re-warms the
@@ -952,7 +1003,9 @@ class IsaAttentionMixin:
 
         isa_code = "; === Warm V into MSRAM once (head-0 row-0 stale-K guard) ===\n"
         isa_code += preload_addr_reg_asm(
-            addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
+            addr_reg_to_set=[v_hbm_reg],
+            available_registers=gp_regs,
+            addr_reg_val=[v_layout.hbm_base_addr],
         )
         v_physical_rows = (v_layout.physical_shape or v_layout.full_shape)[0]
         v_scale_base = v_physical_rows * physical_head_dim * v_hbm_element_bytes
@@ -963,7 +1016,10 @@ class IsaAttentionMixin:
         isa_code += f"C_SET_STRIDE_REG gp{gp_regs[0]}\n"
         isa_code += f"S_ADDI_INT gp{gp_regs[0]}, gp0, 0\n"
         isa_code += "\n".join(load_large_int(gp_regs[1], v_hbm_offset)) + "\n"
-        isa_code += f"H_PREFETCH_M gp{gp_regs[0]}, gp{gp_regs[1]}, a{v_hbm_reg}, 1, 0\n"
+        isa_code += (
+            f"H_PREFETCH_M gp{gp_regs[0]}, gp{gp_regs[1]}, "
+            f"a{v_hbm_reg}, 1, {v_matrix_precision}\n"
+        )
 
         self.register_allocator.free_gp(gp_regs)
         self.register_allocator.free_addr(addr_regs)

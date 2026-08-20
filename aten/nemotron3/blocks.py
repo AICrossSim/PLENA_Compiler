@@ -15,11 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from compiler.aten.plena import (
+    DecodeCacheTensor,
     ExpertWeightTable,
     FPVar,
     InputVar,
     PlenaCompiler,
     VRAMMatrixVar,
+    allocate_decode_cache_tensor,
 )
 from compiler.aten.plena.program_routed_moe import moe_end_marker, moe_stage_marker
 
@@ -57,6 +59,57 @@ class NemotronAttentionWeights:
     k: InputVar
     v: InputVar
     out: InputVar
+
+
+@dataclass(frozen=True)
+class NemotronGqaDecodeCache:
+    """Persistent per-KV-head K/V tensors for incremental GQA decode."""
+
+    keys: tuple[DecodeCacheTensor, ...]
+    values: tuple[DecodeCacheTensor, ...]
+    max_tokens: int
+
+    @property
+    def persistent_bytes(self) -> int:
+        return sum(cache.byte_capacity for cache in (*self.keys, *self.values))
+
+    @property
+    def backings(self) -> tuple[InputVar, ...]:
+        return tuple(cache.backing for cache in (*self.keys, *self.values))
+
+
+def allocate_nemotron_gqa_decode_cache(
+    prog: PlenaCompiler,
+    *,
+    shape: NemotronAttentionShape,
+    max_tokens: int,
+    name: str = "nemotron_gqa_cache",
+) -> NemotronGqaDecodeCache:
+    """Allocate BF16 row-major cache tensors for all Nemotron K/V heads."""
+    shape.validate(prog.mlen)
+    keys = tuple(
+        allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_k_head{head}",
+            max_tokens=max_tokens,
+            width=shape.head_dim,
+        )
+        for head in range(shape.kv_heads)
+    )
+    values = tuple(
+        allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_v_head{head}",
+            max_tokens=max_tokens,
+            width=shape.head_dim,
+        )
+        for head in range(shape.kv_heads)
+    )
+    return NemotronGqaDecodeCache(
+        keys=keys,
+        values=values,
+        max_tokens=max_tokens,
+    )
 
 
 @dataclass(frozen=True)
@@ -133,12 +186,14 @@ def emit_nemotron_attention_block(
     weights: NemotronAttentionWeights,
     rows: int = 1,
     name: str = "nemotron_attention",
+    cache: NemotronGqaDecodeCache | None = None,
+    token_index: int | None = None,
 ) -> VRAMMatrixVar:
-    """Emit connected single-token GQA and return the mixer output.
+    """Emit connected GQA and return the mixer output.
 
-    The current proof path deliberately supports ``rows == kv_seq_len`` only.
-    Persistent K/V cache append/read is a later system feature and is not
-    represented as pre-staged fake K/V tensors here.
+    With ``cache=None`` this preserves the single-token scratch path.  With a
+    cache, one decode row is appended to each physical K/V head and the query
+    attends to the complete prefix ``[0, token_index]``.
     """
     shape.validate(prog.mlen)
     if rows < 1 or rows > hidden.shape[0]:
@@ -147,6 +202,17 @@ def emit_nemotron_attention_block(
         raise ValueError(
             f"{name}: hidden width={hidden.shape[1]} does not match {shape.hidden}"
         )
+    if (cache is None) != (token_index is None):
+        raise ValueError(f"{name}: cache and token_index must be provided together")
+    if cache is not None:
+        if rows != 1:
+            raise ValueError(f"{name}: incremental GQA decode requires rows=1")
+        if len(cache.keys) != shape.kv_heads or len(cache.values) != shape.kv_heads:
+            raise ValueError(f"{name}: cache head count does not match shape.kv_heads")
+        if cache.max_tokens <= token_index:
+            raise ValueError(
+                f"{name}: token_index={token_index} exceeds cache capacity={cache.max_tokens}"
+            )
 
     prog.emit(f"; {moe_end_marker(f'{name} non-MoE region')}\n")
     projection_rows = max(prog.mlen, hidden.physical_shape[0])
@@ -192,12 +258,32 @@ def emit_nemotron_attention_block(
             col_offset=kv_head * shape.head_dim,
             width=shape.head_dim,
         )
-        kv_inputs.append(
-            (
-                prog.store(k_head, name=f"{name}_k_scratch{kv_head}"),
-                prog.store(v_head, name=f"{name}_v_scratch{kv_head}"),
+        if cache is None:
+            kv_inputs.append(
+                (
+                    prog.store(k_head, name=f"{name}_k_scratch{kv_head}"),
+                    prog.store(v_head, name=f"{name}_v_scratch{kv_head}"),
+                )
             )
-        )
+        else:
+            cache.keys[kv_head].append_row(
+                prog,
+                k_head,
+                token_index=token_index,
+                name=f"{name}_k_append_head{kv_head}",
+            )
+            cache.values[kv_head].append_row(
+                prog,
+                v_head,
+                token_index=token_index,
+                name=f"{name}_v_append_head{kv_head}",
+            )
+            kv_inputs.append(
+                (
+                    cache.keys[kv_head].prefix(token_index + 1),
+                    cache.values[kv_head].prefix(token_index + 1),
+                )
+            )
         prog.free_tensor(k_head)
         prog.free_tensor(v_head)
 
@@ -218,7 +304,11 @@ def emit_nemotron_attention_block(
             scale=shape.head_dim**-0.5,
             batch_size=1,
             seq_len=rows,
-            kv_seq_len=rows,
+            kv_seq_len=rows if cache is None else token_index + 1,
+            k_matrix_precision="weights" if cache is None else "keyvalue",
+            v_matrix_precision="weights" if cache is None else "keyvalue",
+            k_hbm_element_bytes=1 if cache is None else 2,
+            v_hbm_element_bytes=1 if cache is None else 2,
         )
         prog.vram_copy_region(
             attention,

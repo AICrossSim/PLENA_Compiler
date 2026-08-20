@@ -12,11 +12,13 @@ from dataclasses import dataclass
 
 from compiler.aten.isa_builder import IsaBuilder, fp, gp
 from compiler.aten.plena import (
+    DecodeCacheTensor,
     ExpertWeightTable,
     FPVar,
     InputVar,
     PlenaCompiler,
     VRAMMatrixVar,
+    allocate_decode_cache_tensor,
     reserve_expert_weight_table,
 )
 from compiler.aten.plena.program_routed_moe import (
@@ -73,9 +75,13 @@ class MlaBlockShape:
             "kv_b_width": self.kv_b_width,
             "attention_width": self.attention_width,
         }
-        invalid = {name: width for name, width in fields.items() if width <= 0 or width % mlen}
+        invalid = {
+            name: width for name, width in fields.items() if width <= 0 or width % mlen
+        }
         if invalid:
-            raise ValueError(f"MLA widths must be positive MLEN multiples (MLEN={mlen}): {invalid}")
+            raise ValueError(
+                f"MLA widths must be positive MLEN multiples (MLEN={mlen}): {invalid}"
+            )
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,174 @@ class MlaNormConstants:
 
 
 @dataclass(frozen=True)
+class MlaDecodeCache:
+    """Compressed MLA history plus one reusable reconstructed-head scratch."""
+
+    compressed: DecodeCacheTensor
+    reconstructed_k: DecodeCacheTensor
+    reconstructed_v: DecodeCacheTensor
+    heads: int
+    max_tokens: int
+
+    @property
+    def persistent_backings(self) -> tuple[InputVar, ...]:
+        return (self.compressed.backing,)
+
+    @property
+    def scratch_backings(self) -> tuple[InputVar, ...]:
+        return (self.reconstructed_k.backing, self.reconstructed_v.backing)
+
+    @property
+    def all_backings(self) -> tuple[InputVar, ...]:
+        return (*self.persistent_backings, *self.scratch_backings)
+
+    @property
+    def logical_persistent_bytes(self) -> int:
+        return self.max_tokens * self.compressed.width * self.compressed.element_bytes
+
+    @property
+    def theoretical_expanded_cache_bytes(self) -> int:
+        return (
+            self.max_tokens
+            * self.heads
+            * (self.reconstructed_k.width + self.reconstructed_v.width)
+            * self.compressed.element_bytes
+        )
+
+    def assert_compressed_only(self) -> None:
+        """Reject accidental promotion of per-head scratch to persistent state."""
+        if not self.compressed.persistent:
+            raise AssertionError("MLA compressed cache must be persistent")
+        if self.reconstructed_k.persistent or self.reconstructed_v.persistent:
+            raise AssertionError("reconstructed MLA K/V scratch must not be persistent")
+        if self.theoretical_expanded_cache_bytes <= self.logical_persistent_bytes:
+            raise AssertionError(
+                "expanded MLA cache must be larger than compressed cache"
+            )
+
+    def assert_hbm_contract(self, prog: PlenaCompiler) -> None:
+        """Prove that this cache namespace contains no expanded per-head history.
+
+        Kimi MLA keeps only the low-rank latent and shared RoPE key across decode
+        steps.  K/V are reconstructed one head at a time into two fixed scratch
+        tensors.  Checking only the dataclass flags is insufficient: an accidental
+        ``prog.input`` allocation could still reserve an expanded cache in HBM.
+        This guard therefore audits the compiler's registered HBM objects too.
+        """
+        self.assert_compressed_only()
+
+        suffix = "_compressed"
+        if not self.compressed.backing.name.endswith(suffix):
+            raise AssertionError(
+                "MLA compressed-cache backing must use the '_compressed' suffix"
+            )
+        namespace = self.compressed.backing.name[: -len(suffix)]
+        expected = {backing.name: backing for backing in self.all_backings}
+        registered = {
+            name: backing
+            for name, backing in prog._inputs.items()
+            if name == namespace or name.startswith(f"{namespace}_")
+        }
+        if set(registered) != set(expected):
+            missing = sorted(set(expected) - set(registered))
+            unexpected = sorted(set(registered) - set(expected))
+            raise AssertionError(
+                f"MLA HBM namespace mismatch: missing={missing}, "
+                f"unexpected={unexpected}"
+            )
+        for name, backing in expected.items():
+            if registered[name] is not backing:
+                raise AssertionError(f"MLA HBM object {name!r} was replaced")
+
+        tensors = (self.compressed, self.reconstructed_k, self.reconstructed_v)
+        for tensor in tensors:
+            expected_shape = (self.max_tokens, tensor.width)
+            if tensor.backing.shape != expected_shape:
+                raise AssertionError(
+                    f"{tensor.backing.name}: logical shape {tensor.backing.shape} "
+                    f"does not match {expected_shape}"
+                )
+            expected_physical_shape = (tensor.storage_rows, tensor.width)
+            if tensor.backing.physical_shape != expected_physical_shape:
+                raise AssertionError(
+                    f"{tensor.backing.name}: physical shape "
+                    f"{tensor.backing.physical_shape} does not match "
+                    f"{expected_physical_shape}"
+                )
+            expected_bytes = tensor.storage_rows * tensor.width * tensor.element_bytes
+            if tensor.backing.hbm_size != expected_bytes:
+                raise AssertionError(
+                    f"{tensor.backing.name}: HBM size {tensor.backing.hbm_size} "
+                    f"does not match {expected_bytes} bytes"
+                )
+
+        # Scratch capacity must describe exactly one reconstructed head and must
+        # therefore be independent of ``heads``.
+        scratch_width = self.reconstructed_k.width + self.reconstructed_v.width
+        scratch_bytes = sum(backing.hbm_size for backing in self.scratch_backings)
+        expected_scratch_bytes = (
+            self.reconstructed_k.storage_rows
+            * scratch_width
+            * self.compressed.element_bytes
+        )
+        if scratch_bytes != expected_scratch_bytes:
+            raise AssertionError(
+                "MLA reconstructed scratch is not exactly one K/V head: "
+                f"actual={scratch_bytes}, expected={expected_scratch_bytes}"
+            )
+
+        ranges = sorted(
+            (backing.hbm_addr, backing.hbm_addr + backing.hbm_size, backing.name)
+            for backing in self.all_backings
+        )
+        for (_, previous_end, previous_name), (start, _, name) in zip(
+            ranges, ranges[1:]
+        ):
+            if start < previous_end:
+                raise AssertionError(
+                    f"MLA HBM objects overlap: {previous_name!r} and {name!r}"
+                )
+
+
+def allocate_mla_decode_cache(
+    prog: PlenaCompiler,
+    *,
+    shape: MlaBlockShape,
+    max_tokens: int,
+    name: str = "kimi_mla_cache",
+) -> MlaDecodeCache:
+    """Allocate one compressed cache and one reusable reconstructed head tile."""
+    shape.validate(prog.mlen)
+    cache = MlaDecodeCache(
+        compressed=allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_compressed",
+            max_tokens=max_tokens,
+            width=shape.kv_a_width,
+            persistent=True,
+        ),
+        reconstructed_k=allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_reconstructed_k_scratch",
+            max_tokens=max_tokens,
+            width=shape.qk_head,
+            persistent=False,
+        ),
+        reconstructed_v=allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_reconstructed_v_scratch",
+            max_tokens=max_tokens,
+            width=shape.v_head,
+            persistent=False,
+        ),
+        heads=shape.heads,
+        max_tokens=max_tokens,
+    )
+    cache.assert_compressed_only()
+    return cache
+
+
+@dataclass(frozen=True)
 class AttnResConstants:
     eps: int
     reciprocal_hidden: int
@@ -124,9 +298,13 @@ class KimiLatentMoeShape:
             "intermediate": self.intermediate,
             "shared_intermediate": self.shared_intermediate,
         }
-        invalid = {name: width for name, width in widths.items() if width <= 0 or width % mlen}
+        invalid = {
+            name: width for name, width in widths.items() if width <= 0 or width % mlen
+        }
         if invalid:
-            raise ValueError(f"Kimi latent-MoE widths must be MLEN multiples: {invalid}")
+            raise ValueError(
+                f"Kimi latent-MoE widths must be MLEN multiples: {invalid}"
+            )
         if not 0 < self.top_k <= self.num_experts:
             raise ValueError(
                 f"top_k={self.top_k} must be in [1, num_experts={self.num_experts}]"
@@ -222,7 +400,10 @@ def _view_columns(
         )
     rows = source.shape[0]
     physical_rows = source.physical_shape[0]
-    base = prog.get_vram_addr(source.name) + (col_offset // prog.mlen) * physical_rows * prog.mlen
+    base = (
+        prog.get_vram_addr(source.name)
+        + (col_offset // prog.mlen) * physical_rows * prog.mlen
+    )
     return prog.alloc_at(
         name,
         rows=rows,
@@ -297,11 +478,18 @@ def emit_kimi_attn_res(
         raise ValueError(f"{name}: AttnRes needs at least the current prefix")
     hidden = prefix_sum.shape[1]
     if hidden % prog.mlen:
-        raise ValueError(f"{name}: hidden={hidden} must be divisible by MLEN={prog.mlen}")
+        raise ValueError(
+            f"{name}: hidden={hidden} must be divisible by MLEN={prog.mlen}"
+        )
     if rows < 1 or rows > prefix_sum.shape[0]:
-        raise ValueError(f"{name}: rows={rows} outside prefix rows={prefix_sum.shape[0]}")
+        raise ValueError(
+            f"{name}: rows={rows} outside prefix rows={prefix_sum.shape[0]}"
+        )
     for candidate in candidates:
-        if candidate.shape != prefix_sum.shape or candidate.physical_shape != prefix_sum.physical_shape:
+        if (
+            candidate.shape != prefix_sum.shape
+            or candidate.physical_shape != prefix_sum.physical_shape
+        ):
             raise ValueError(
                 f"{name}: all candidates must match prefix shape/layout "
                 f"{prefix_sum.shape}/{prefix_sum.physical_shape}, got "
@@ -402,14 +590,15 @@ def emit_mla_residual_block(
     rows: int = 1,
     name: str = "kimi_mla",
     add_residual: bool = True,
+    cache: MlaDecodeCache | None = None,
+    token_index: int | None = None,
 ) -> VRAMMatrixVar:
     """Emit pre-norm MLA and optionally add the ordinary residual.
 
-    The decode correctness path currently covers the new token only
-    (``kv_seq_len == rows``).  K/V are reconstructed from the compressed
-    latent and then written to an HBM scratch consumed by the existing
-    attention engine.  Persistent multi-token compressed-cache append is a
-    separate system feature and is intentionally not claimed here.
+    With ``cache=None`` the block covers the new token only.  With a cache, the
+    normalized latent and rotated shared key are appended in compressed form.
+    Each head is reconstructed into the same reusable one-head HBM scratch and
+    consumed immediately, so no persistent 96-head expanded K/V cache exists.
     """
     shape.validate(prog.mlen)
     if rows < 1 or rows > hidden.shape[0]:
@@ -422,6 +611,18 @@ def emit_mla_residual_block(
         raise ValueError(
             f"{name}: RoPE cos/sin widths must be {shape.qk_rope}, got {cos.shape[1]}/{sin.shape[1]}"
         )
+    if (cache is None) != (token_index is None):
+        raise ValueError(f"{name}: cache and token_index must be provided together")
+    if cache is not None:
+        if rows != 1:
+            raise ValueError(f"{name}: incremental MLA decode requires rows=1")
+        if cache.heads != shape.heads:
+            raise ValueError(f"{name}: cache head count does not match MLA shape")
+        if cache.max_tokens <= token_index:
+            raise ValueError(
+                f"{name}: token_index={token_index} exceeds cache capacity={cache.max_tokens}"
+            )
+        cache.assert_compressed_only()
 
     prog.emit(f"; {moe_end_marker(f'{name} non-MoE region')}\n")
 
@@ -488,6 +689,68 @@ def emit_mla_residual_block(
     prog.rope(k_rope, k_rope_rot, cos, sin)
     prog.free_tensor(k_rope_rot)
 
+    history_rows = rows
+    history_compressed = None
+    history_kv_latent = kv_latent
+    history_k_rope = k_rope
+    owned_reconstructed_scratch: tuple[DecodeCacheTensor, DecodeCacheTensor] | None = (
+        None
+    )
+    if cache is not None:
+        prog.emit(
+            f"; MLA_COMPRESSED_CACHE_APPEND token={token_index} "
+            f"width={shape.kv_a_width} heads={shape.heads}\n"
+        )
+        cache.compressed.append_row(
+            prog,
+            compressed_kv,
+            token_index=token_index,
+            name=f"{name}_compressed_append",
+        )
+        history_rows = token_index + 1
+        history_compressed = prog.load_batch(
+            cache.compressed.prefix(history_rows),
+            name=f"{name}_compressed_history_t{token_index}",
+            storage_precision=2,
+            hbm_precision=1,
+        )
+        history_kv_latent = _view_columns(
+            prog,
+            history_compressed,
+            name=f"{name}_history_kv_latent_t{token_index}",
+            col_offset=0,
+            width=shape.kv_lora,
+        )
+        history_k_rope = _view_columns(
+            prog,
+            history_compressed,
+            name=f"{name}_history_k_rope_t{token_index}",
+            col_offset=shape.kv_lora,
+            width=shape.qk_rope,
+        )
+        reconstructed_k = cache.reconstructed_k
+        reconstructed_v = cache.reconstructed_v
+    else:
+        # Even the single-token path must not materialize one HBM K/V object per
+        # head.  Allocate one ephemeral BF16 pair and overwrite it before each
+        # head consumes it.  Freeing it after the block lets later MLA layers
+        # reuse the same HBM range.
+        reconstructed_k = allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_reconstructed_k_scratch",
+            max_tokens=history_rows,
+            width=shape.qk_head,
+            persistent=False,
+        )
+        reconstructed_v = allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_reconstructed_v_scratch",
+            max_tokens=history_rows,
+            width=shape.v_head,
+            persistent=False,
+        )
+        owned_reconstructed_scratch = (reconstructed_k, reconstructed_v)
+
     attention = prog.alloc(
         f"{name}_attention",
         rows=hidden.shape[0],
@@ -527,7 +790,7 @@ def emit_mla_residual_block(
         prog.free_tensor(q_rope_rot)
 
         kv_head = prog.linear_projection_slice(
-            kv_latent,
+            history_kv_latent,
             weights.kv_b,
             output_col_offset=head * shape.kv_b_head,
             output_features=shape.kv_b_head,
@@ -536,7 +799,7 @@ def emit_mla_residual_block(
         )
         k_head = prog.alloc(
             f"{name}_k_head{head}",
-            rows=hidden.shape[0],
+            rows=history_rows,
             cols=shape.qk_head,
             strict=False,
             physical_shape=(attention_tile_rows, shape.qk_head),
@@ -544,13 +807,13 @@ def emit_mla_residual_block(
         prog.vram_copy_region(
             k_head,
             kv_head,
-            num_rows=rows,
+            num_rows=history_rows,
             num_cols=shape.qk_nope,
         )
         prog.vram_copy_region(
             k_head,
-            k_rope,
-            num_rows=rows,
+            history_k_rope,
+            num_rows=history_rows,
             num_cols=shape.qk_rope,
             dst_col_offset=shape.qk_nope,
         )
@@ -562,10 +825,14 @@ def emit_mla_residual_block(
             width=shape.v_head,
         )
 
-        # The current attention primitive consumes K/V from HBM.  These stores
-        # are a real producer-consumer edge, not pre-staged placeholders.
-        k_hbm = prog.store(k_head, name=f"{name}_k_scratch{head}")
-        v_hbm = prog.store(v_head, name=f"{name}_v_scratch{head}")
+        prog.emit(
+            f"; MLA_RECONSTRUCTED_HEAD_TILE token={token_index} head={head} "
+            f"rows={history_rows}\n"
+        )
+        reconstructed_k.overwrite_from(prog, k_head)
+        reconstructed_v.overwrite_from(prog, v_head)
+        k_hbm = reconstructed_k.prefix(history_rows)
+        v_hbm = reconstructed_v.prefix(history_rows)
         head_out = prog.flash_attention(
             q_head,
             k_hbm,
@@ -573,7 +840,11 @@ def emit_mla_residual_block(
             scale=shape.qk_head**-0.5,
             batch_size=1,
             seq_len=rows,
-            kv_seq_len=rows,
+            kv_seq_len=history_rows,
+            k_matrix_precision="keyvalue",
+            v_matrix_precision="keyvalue",
+            k_hbm_element_bytes=2,
+            v_hbm_element_bytes=2,
         )
         prog.vram_copy_region(
             attention,
@@ -589,7 +860,9 @@ def emit_mla_residual_block(
 
     if weights.gate is not None:
         if norms.gate_one is None or norms.gate_neg_one is None:
-            raise ValueError(f"{name}: output gate requires gate_one and gate_neg_one constants")
+            raise ValueError(
+                f"{name}: output gate requires gate_one and gate_neg_one constants"
+            )
         gate = prog.linear_projection(
             mixer_input,
             weights.gate,
@@ -628,6 +901,11 @@ def emit_mla_residual_block(
         attention,
     ):
         prog.free_tensor(temporary)
+    if history_compressed is not None:
+        prog.free_tensor(history_compressed)
+    if owned_reconstructed_scratch is not None:
+        for scratch in owned_reconstructed_scratch:
+            prog.free_input(scratch.backing)
     if residual is not None:
         prog.free_tensor(residual)
     if weights.gate is not None:

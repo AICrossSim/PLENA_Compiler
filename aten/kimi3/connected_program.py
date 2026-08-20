@@ -176,9 +176,10 @@ def build_connected_kimi_k3_program(
         context_length = 1
     if context_length != 1:
         raise ValueError(
-            "context_length exceeds the connected Kimi decode capability: "
-            "it currently executes the new token only; "
-            "persistent multi-token MLA cache append is not implemented"
+            "context_length exceeds the full 93-layer connected Kimi builder's "
+            "single-token limit; "
+            "persistent compressed multi-token MLA append/reconstruct is implemented "
+            "and Rust-verified by the standalone MLA block path"
         )
 
     widths = MlaWidths.from_architecture(arch)

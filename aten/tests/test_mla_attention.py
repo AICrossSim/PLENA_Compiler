@@ -13,6 +13,7 @@ from aten.kimi3.blocks import (
     MlaBlockShape,
     MlaBlockWeights,
     MlaNormConstants,
+    allocate_mla_decode_cache,
     emit_kimi_attn_res,
     emit_mla_residual_block,
     emit_kimi_latent_moe_residual_block,
@@ -108,6 +109,26 @@ def test_plain_bf16_vector_load_selects_the_kv_decoder() -> None:
 
     assert "H_PREFETCH_V" in prog.compile()
     assert ", 1, 1" in prog.compile() or ", 0, 1, 0" in prog.compile()
+
+
+def test_plain_bf16_vector_load_advances_hbm_addresses_in_bytes() -> None:
+    from compiler.asm_templates.preload_act import preload_act_asm
+
+    assembly = preload_act_asm(
+        vlen=64,
+        preload_len=4,
+        batch=64,
+        hidden_size=128,
+        alive_registers=[1, 2, 3, 4, 5],
+        act_vram_offset=0,
+        activation_offset_reg=1,
+        stride_size=128,
+        storage_precision=2,
+        hbm_precision=1,
+    )
+
+    assert "S_ADDI_INT gp2, gp0, 256" in assembly
+    assert "S_ADDI_INT gp1, gp1, 128" in assembly
 
 
 def test_kimi_attn_res_emits_depth_softmax_and_weighted_sum() -> None:
@@ -301,6 +322,200 @@ def test_connected_mla_block_uses_projection_outputs_and_keeps_residual() -> Non
     assert "layer0_mla_out" in asm
     assert "layer0_mla_gate" in asm
     assert "layer0_mla_residual" in asm
+
+
+def test_four_token_mla_keeps_only_compressed_history_persistent() -> None:
+    prog = PlenaCompiler(mlen=64, blen=4)
+    shape = MlaBlockShape(
+        hidden=64,
+        q_lora=64,
+        kv_lora=64,
+        qk_nope=64,
+        qk_rope=64,
+        v_head=64,
+        heads=2,
+    )
+    hidden = prog.load_batch(
+        prog.input(
+            "cache_hidden",
+            shape=(1, 64),
+            physical_shape=(4, 64),
+            prestaged_vram_addr=0,
+        )
+    )
+    cos = prog.load_batch(
+        prog.input(
+            "cache_cos",
+            shape=(1, 64),
+            physical_shape=(4, 64),
+            prestaged_vram_addr=256,
+        )
+    )
+    sin = prog.load_batch(
+        prog.input(
+            "cache_sin",
+            shape=(1, 64),
+            physical_shape=(4, 64),
+            prestaged_vram_addr=512,
+        )
+    )
+
+    def weight(name: str, rows: int, cols: int):
+        return prog.input(name, shape=(rows, cols), physical_shape=(rows, cols))
+
+    weights = MlaBlockWeights(
+        q_a=weight("cache_w_q_a", 64, 64),
+        q_b=weight("cache_w_q_b", 64, 256),
+        kv_a=weight("cache_w_kv_a", 64, 128),
+        kv_b=weight("cache_w_kv_b", 64, 256),
+        out=weight("cache_w_o", 128, 64),
+        q_rope_rotate=weight("cache_w_q_rot", 64, 64),
+        k_rope_rotate=weight("cache_w_k_rot", 64, 64),
+        gate=None,
+    )
+    prog.fp_var("cache_zero", 1)
+    eps = prog.fp_var("cache_eps", 1)
+    reciprocal = prog.fp_var("cache_reciprocal", 1)
+    norms = MlaNormConstants(
+        eps.address,
+        reciprocal.address,
+        eps.address,
+        reciprocal.address,
+        eps.address,
+        reciprocal.address,
+    )
+    cache = allocate_mla_decode_cache(prog, shape=shape, max_tokens=4)
+
+    for token in range(4):
+        emit_mla_residual_block(
+            prog,
+            hidden,
+            shape=shape,
+            weights=weights,
+            cos=cos,
+            sin=sin,
+            norms=norms,
+            cache=cache,
+            token_index=token,
+            name=f"mla_token{token}",
+        )
+    assembly = prog.compile()
+
+    cache.assert_compressed_only()
+    cache.assert_hbm_contract(prog)
+    assert len(cache.persistent_backings) == 1
+    assert len(cache.scratch_backings) == 2
+    assert cache.logical_persistent_bytes == 4 * 128 * 2
+    assert cache.theoretical_expanded_cache_bytes == 4 * 2 * (128 + 64) * 2
+    assert assembly.count("MLA_COMPRESSED_CACHE_APPEND") == 4
+    assert assembly.count("MLA_RECONSTRUCTED_HEAD_TILE") == 8
+    assert "kimi_mla_cache_reconstructed_k_scratch" in assembly
+    assert "kimi_mla_cache_reconstructed_v_scratch" in assembly
+    assert "mla_token0_k_scratch0" not in assembly
+    pv_sections = assembly.split("; === Compute PV = P @ V")
+    assert len(pv_sections) > 1
+    for section in pv_sections[1:]:
+        prefetch = next(
+            line for line in section.splitlines() if line.startswith("H_PREFETCH_M")
+        )
+        assert prefetch.endswith(", 1, 1")
+
+
+def test_mla_cache_hbm_contract_rejects_an_expanded_cache_allocation() -> None:
+    prog = PlenaCompiler(mlen=64, blen=4)
+    shape = MlaBlockShape(
+        hidden=64,
+        q_lora=64,
+        kv_lora=64,
+        qk_nope=64,
+        qk_rope=64,
+        v_head=64,
+        heads=4,
+    )
+    cache = allocate_mla_decode_cache(prog, shape=shape, max_tokens=4)
+    prog.input(
+        "kimi_mla_cache_expanded_k",
+        shape=(4, shape.heads * shape.qk_head),
+        physical_shape=(64, shape.heads * shape.qk_head),
+        real_data_ratio=2.0,
+    )
+
+    with pytest.raises(AssertionError, match="unexpected=.*expanded_k"):
+        cache.assert_hbm_contract(prog)
+
+
+def test_single_token_mla_reuses_one_ephemeral_hbm_head_scratch() -> None:
+    prog = PlenaCompiler(mlen=64, blen=4)
+    hidden = prog.load_batch(
+        prog.input(
+            "ephemeral_hidden",
+            shape=(1, 64),
+            physical_shape=(64, 64),
+            prestaged_vram_addr=0,
+        )
+    )
+    cos = prog.alloc("ephemeral_cos", 1, 64, strict=False, physical_shape=(64, 64))
+    sin = prog.alloc("ephemeral_sin", 1, 64, strict=False, physical_shape=(64, 64))
+    shape = MlaBlockShape(
+        hidden=64,
+        q_lora=64,
+        kv_lora=64,
+        qk_nope=64,
+        qk_rope=64,
+        v_head=64,
+        heads=4,
+    )
+
+    def weight(name: str, rows: int, cols: int):
+        return prog.input(name, shape=(rows, cols), physical_shape=(rows, cols))
+
+    weights = MlaBlockWeights(
+        q_a=weight("ephemeral_q_a", 64, 64),
+        q_b=weight("ephemeral_q_b", 64, 512),
+        kv_a=weight("ephemeral_kv_a", 64, 128),
+        kv_b=weight("ephemeral_kv_b", 64, 512),
+        out=weight("ephemeral_out", 256, 64),
+        q_rope_rotate=weight("ephemeral_q_rotate", 64, 64),
+        k_rope_rotate=weight("ephemeral_k_rotate", 64, 64),
+        gate=None,
+    )
+    eps = prog.fp_var("ephemeral_eps", 1)
+    reciprocal = prog.fp_var("ephemeral_reciprocal", 1)
+    norms = MlaNormConstants(
+        eps.address,
+        reciprocal.address,
+        eps.address,
+        reciprocal.address,
+        eps.address,
+        reciprocal.address,
+    )
+
+    emit_mla_residual_block(
+        prog,
+        hidden,
+        shape=shape,
+        weights=weights,
+        cos=cos,
+        sin=sin,
+        norms=norms,
+        add_residual=False,
+        name="ephemeral_mla",
+    )
+    assembly = prog.compile()
+
+    assert assembly.count("MLA_RECONSTRUCTED_HEAD_TILE") == shape.heads
+    assert (
+        assembly.count("DECODE_CACHE_OVERWRITE ephemeral_mla_reconstructed_k_scratch")
+        == shape.heads
+    )
+    assert (
+        assembly.count("DECODE_CACHE_OVERWRITE ephemeral_mla_reconstructed_v_scratch")
+        == shape.heads
+    )
+    assert "ephemeral_mla_k_scratch0" not in assembly
+    assert "ephemeral_mla_v_scratch0" not in assembly
+    assert "ephemeral_mla_reconstructed_k_scratch" not in prog._inputs
+    assert "ephemeral_mla_reconstructed_v_scratch" not in prog._inputs
 
 
 def test_connected_kimi_latent_moe_emits_every_real_stage() -> None:

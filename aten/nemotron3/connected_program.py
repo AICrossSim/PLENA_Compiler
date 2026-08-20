@@ -79,8 +79,10 @@ def build_connected_nemotron3_program(
         context_length = 1
     if context_length != 1:
         raise ValueError(
-            "context_length exceeds the connected Nemotron decode capability: "
-            "persistent multi-token GQA K/V cache append/read is not implemented"
+            "context_length exceeds the full 52-layer connected Nemotron builder's "
+            "single-token limit; "
+            "persistent multi-token GQA K/V append/read is implemented and Rust-"
+            "verified by the standalone GQA block path"
         )
 
     mamba_assembly, mamba_program = _mamba_assembly_by_layer(
