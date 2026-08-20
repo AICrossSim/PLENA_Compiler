@@ -84,6 +84,39 @@ def test_state_regions_do_not_overlap() -> None:
             previous_end = start + descriptor.state_bytes
 
 
+def test_kda_parameter_regions_do_not_overlap_between_layers() -> None:
+    config = _config(hbm_arena_base=0x10000)
+    scheduler = KimiK3KdaScheduler(config)
+    trace = scheduler.build()
+    layout = scheduler.hbm_layout()
+    first_by_layer: dict[int, object] = {}
+    for event in trace.events:
+        if event.descriptor is not None:
+            first_by_layer.setdefault(event.descriptor.layer_id, event.descriptor)
+
+    key_elements = config.kda_num_heads * config.kda_key_dim
+    value_elements = config.kda_num_heads * config.kda_value_dim
+    parameter_bytes = config.parameter_precision.element_bytes
+    live_sizes = {
+        "q_conv_weight": key_elements * config.kda_conv_kernel * parameter_bytes,
+        "k_conv_weight": key_elements * config.kda_conv_kernel * parameter_bytes,
+        "v_conv_weight": value_elements * config.kda_conv_kernel * parameter_bytes,
+        "q_conv_bias": key_elements * parameter_bytes,
+        "k_conv_bias": key_elements * parameter_bytes,
+        "v_conv_bias": value_elements * parameter_bytes,
+        "a_log": config.kda_num_heads * parameter_bytes,
+        "dt_bias": key_elements * parameter_bytes,
+    }
+    for region, live_size in live_sizes.items():
+        assert layout.strides[region] >= live_size
+        addresses = [
+            getattr(descriptor.payload, f"{region}_addr")
+            for _, descriptor in sorted(first_by_layer.items())
+        ]
+        for start, following in zip(addresses, addresses[1:]):
+            assert start + live_size <= following
+
+
 def test_packed_regions_do_not_run_into_each_other() -> None:
     """Region-vs-region, not just entry-vs-entry within one region.
 

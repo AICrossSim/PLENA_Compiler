@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Iterator
 
 
 def load_isa_definitions(file_path: str) -> dict:
@@ -95,9 +96,20 @@ class Instruction:
 _REG_PREFIXES = ("gp", "f", "a")
 # Hoisted to module scope: these were previously re-created for every line of the
 # .asm (millions of times for large programs), which dominated sim_env re-parse time.
-vector_masked_unary_or_reduction_ops = frozenset({"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"})
+vector_masked_unary_or_reduction_ops = frozenset(
+    {"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"}
+)
 vector_masked_binary_ops = frozenset(
-    {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_MAX_VF", "V_MIN_VF", "V_TOPK"}
+    {
+        "V_ADD_VV",
+        "V_ADD_VF",
+        "V_MUL_VV",
+        "V_SUB_VV",
+        "V_MUL_VF",
+        "V_MAX_VF",
+        "V_MIN_VF",
+        "V_TOPK",
+    }
 )
 
 
@@ -120,191 +132,92 @@ def _parse_operand(operand):
             return None
 
 
-def parse_asm_file(file_path: str) -> list[Instruction]:
-    """
-    Parse an ASM file into a list of Instruction objects.
+def _optional_int(value: str) -> int | None:
+    try:
+        return int(value.rstrip(";"))
+    except ValueError:
+        return None
 
-    Supported formats:
-    - opcode rd, rs1, rs2, rs3, funct1, funct2;
-    - opcode rd, rs1, rs2, funct1, funct2;
-    - opcode rd, rs1, rs2;
-    - opcode rd, rs1, imm;
-    - opcode rd, rs1;
-    - opcode rd;
 
-    :param file_path: Path to the .asm file
-    :return: List of Instruction objects
-    """
-    instructions = []
+def _int_or_text(value: str) -> int | str:
+    value = value.rstrip(";")
+    try:
+        return int(value)
+    except ValueError:
+        return value
 
+
+def parse_asm_lines(lines: Iterable[str]) -> Iterator[Instruction]:
+    """Yield instructions without retaining the complete assembly in memory."""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line[0] == ";" or line.startswith("//"):
+            continue
+        comment = line.find("//")
+        if comment != -1:
+            line = line[:comment]
+        comment = line.find(";")
+        if comment != -1:
+            line = line[:comment]
+        parts = line.split()
+        if not parts or ";" in parts[0]:
+            continue
+
+        opcode = parts[0]
+        if len(parts) == 1:
+            yield Instruction(opcode, None, None, None, None, None, None, None)
+            continue
+
+        operands = [part.strip() for part in " ".join(parts[1:]).split(",")]
+        if not 1 <= len(operands) <= 6:
+            raise ValueError(
+                f"{opcode} has {len(operands)} operands; parser supports 1..6"
+            )
+
+        rd = _parse_operand(operands[0])
+        rs1 = None
+        rs2 = None
+        rstride = None
+        funct1 = None
+        funct2 = None
+        imm = None
+
+        if len(operands) >= 2:
+            if operands[1].startswith(_REG_PREFIXES):
+                rs1 = _parse_operand(operands[1])
+            else:
+                imm = _optional_int(operands[1])
+        if len(operands) >= 3:
+            if operands[2].startswith(_REG_PREFIXES):
+                rs2 = _parse_operand(operands[2])
+            else:
+                parsed = _optional_int(operands[2])
+                if parsed is not None:
+                    imm = parsed
+        if len(operands) == 3:
+            if opcode in vector_masked_unary_or_reduction_ops:
+                rstride = imm
+            elif opcode in vector_masked_binary_ops:
+                rstride = 0
+        if len(operands) >= 4:
+            rstride = _optional_int(operands[3])
+        if len(operands) >= 5:
+            funct1 = _int_or_text(operands[4])
+        if len(operands) == 6:
+            funct2 = _int_or_text(operands[5])
+
+        yield Instruction(opcode, rd, rs1, rs2, rstride, funct1, funct2, imm)
+
+
+def iter_asm_file(file_path: str) -> Iterator[Instruction]:
+    """Stream instructions from one assembly file."""
     with open(file_path) as file:
-        for line in file:
-            # Strip once, then skip blanks and whole-line comments with cheap char checks
-            # (most lines are neither). Comments are // or ; style.
-            line = line.strip()
-            if not line or line[0] == ";" or line.startswith("//"):
-                continue
-            # Remove inline // and ; comments only when present.
-            c = line.find("//")
-            if c != -1:
-                line = line[:c]
-            c = line.find(";")
-            if c != -1:
-                line = line[:c]
+        yield from parse_asm_lines(file)
 
-            # Split the opcode and operands
-            parts = line.split()
-            if len(parts) < 1 or ";" in parts[0]:
-                continue  # Invalid line
-            opcode = parts[0]
 
-            # Handle instructions with no operands (e.g., C_BREAK)
-            if len(parts) == 1:
-                instructions.append(Instruction(opcode, None, None, None, None, None, None, None))
-                continue
-
-            operands = [part.strip() for part in " ".join(parts[1:]).split(",")]
-            # print(f"Parsing instruction: {line}", "operand length:", len(operands), "operands:", operands)
-
-            # Decode based on number of operands, case-structure by length
-            rd = None
-            rs1 = None
-            rs2 = None
-            rstride = None
-            funct1 = None
-            funct2 = None
-            imm = None
-
-            if len(operands) == 1:
-                operand_0 = operands[0]
-                rd = _parse_operand(operand_0)
-            elif len(operands) == 2:
-                operand_0 = operands[0]
-                operand_1 = operands[1]
-                rd = _parse_operand(operand_0)
-                # rs1 is a register, imm is a number
-                # Heuristics: if it looks like a reg, it's rs1; else, it's imm
-                if operand_1.startswith(("gp", "f", "a")):
-                    rs1 = _parse_operand(operand_1)
-                else:
-                    try:
-                        imm = int(operand_1)
-                    except ValueError:
-                        imm = None
-            elif len(operands) == 3:
-                operand_0, operand_1, operand_2 = operands
-                rd = _parse_operand(operand_0)
-                # If looks like register, rs1; else, imm
-                if operand_1.startswith(("gp", "f", "a")):
-                    rs1 = _parse_operand(operand_1)
-                else:
-                    try:
-                        imm = int(operand_1)
-                    except ValueError:
-                        imm = None
-                # If it looks like register, rs2; else, imm (overwrites imm if rs1 not present)
-                if operand_2.startswith(("gp", "f", "a")):
-                    rs2 = _parse_operand(operand_2)
-                else:
-                    try:
-                        imm = int(operand_2)
-                    except ValueError:
-                        pass
-                if opcode in vector_masked_unary_or_reduction_ops:
-                    # Keep rmask/rstride aligned for 3-operand masked unary/reduction forms.
-                    rstride = imm
-                elif opcode in vector_masked_binary_ops:
-                    # Allow 3-operand vector ALU forms by defaulting omitted rmask to 0.
-                    rstride = 0
-            elif len(operands) == 4:
-                operand_0, operand_1, operand_2, operand_3 = operands
-                rd = _parse_operand(operand_0)
-                if operand_1.startswith(("gp", "f", "a")):
-                    rs1 = _parse_operand(operand_1)
-                else:
-                    try:
-                        imm = int(operand_1)
-                    except ValueError:
-                        imm = None
-                if operand_2.startswith(("gp", "f", "a")):
-                    rs2 = _parse_operand(operand_2)
-                else:
-                    try:
-                        imm = int(operand_2)
-                    except ValueError:
-                        pass
-                # Interpret 4th operand as rstride if int
-                try:
-                    rstride = int(operand_3)
-                except ValueError:
-                    rstride = None
-            elif len(operands) == 5:
-                operand_0, operand_1, operand_2, operand_3, operand_4 = operands
-                rd = _parse_operand(operand_0)
-                if operand_1.startswith(("gp", "f", "a")):
-                    rs1 = _parse_operand(operand_1)
-                else:
-                    try:
-                        imm = int(operand_1)
-                    except ValueError:
-                        imm = None
-                if operand_2.startswith(("gp", "f", "a")):
-                    rs2 = _parse_operand(operand_2)
-                else:
-                    try:
-                        imm = int(operand_2)
-                    except ValueError:
-                        pass
-                try:
-                    rstride = int(operand_3)
-                except ValueError:
-                    rstride = None
-                funct1_raw = operand_4.strip()
-                if funct1_raw.endswith(";"):
-                    funct1_raw = funct1_raw[:-1]
-                try:
-                    funct1 = int(funct1_raw)
-                except ValueError:
-                    funct1 = funct1_raw  # fallback, if not int, keep as string
-            elif len(operands) == 6:
-                operand_0, operand_1, operand_2, operand_3, operand_4, operand_5 = operands
-                rd = _parse_operand(operand_0)
-                if operand_1.startswith(("gp", "f", "a")):
-                    rs1 = _parse_operand(operand_1)
-                else:
-                    try:
-                        imm = int(operand_1)
-                    except ValueError:
-                        imm = None
-                if operand_2.startswith(("gp", "f", "a")):
-                    rs2 = _parse_operand(operand_2)
-                else:
-                    try:
-                        imm = int(operand_2)
-                    except ValueError:
-                        pass
-                try:
-                    rstride = int(operand_3)
-                except ValueError:
-                    rstride = None
-                funct1_raw = operand_4.strip()
-                if funct1_raw.endswith(";"):
-                    funct1_raw = funct1_raw[:-1]
-                try:
-                    funct1 = int(funct1_raw)
-                except ValueError:
-                    funct1 = funct1_raw  # fallback, if not int, keep as string
-                funct2_raw = operand_5.strip()
-                if funct2_raw.endswith(";"):
-                    funct2_raw = funct2_raw[:-1]
-                try:
-                    funct2 = int(funct2_raw)
-                except ValueError:
-                    funct2 = funct2_raw  # fallback, if not int, keep as string
-
-            instructions.append(Instruction(opcode, rd, rs1, rs2, rstride, funct1, funct2, imm))
-
-    return instructions
+def parse_asm_file(file_path: str) -> list[Instruction]:
+    """Parse an assembly file into a compatibility list."""
+    return list(iter_asm_file(file_path))
 
 
 if __name__ == "__main__":
@@ -313,7 +226,9 @@ if __name__ == "__main__":
     # enum_dict = load_isa_definitions(file_path)
     # print(enum_dict)
 
-    asm_file_path = "/home/george/Coprocessor_for_Llama/src/system/test/benchmarks/fixed.asm"
+    asm_file_path = (
+        "/home/george/Coprocessor_for_Llama/src/system/test/benchmarks/fixed.asm"
+    )
     loaded_instr = parse_asm_file(asm_file_path)
     for instr in loaded_instr:
         print(instr)

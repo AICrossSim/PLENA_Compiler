@@ -1,40 +1,51 @@
-# Kimi K3 Connected Lowering: Scaling Boundary
+# Kimi K3 Connected Lowering: Current Boundary
 
-The compact connected MLA, LatentMoE, AttnRes, KDA, and consecutive-block tests
-execute in the Rust transactional emulator and compare against CPU references.
-They prove dataflow and arithmetic for those blocks. They do not prove that the
-current compiler can emit one practical 93-layer Kimi binary.
+The connected builder now emits and assembles all 93 Kimi K3 layers for one
+decode token: 69 KDA mixers, 24 MLA mixers, 92 LatentMoE blocks, one dense FFN,
+and the AttnRes paths between them.
 
-Two measured full-model attempts exposed the static emitter boundary:
+## What changed
 
-- Before MRAM binding tracking was fixed, a 96-head build ran for 2 h 19 min
-  without completing its first test. `reset_mram()` scanned every registered
-  HBM tile for every projection tile.
-- After reset became O(resident MRAM tiles), a one-head build reached routed MoE
-  quickly but still exceeded a 10 min limit and 8 GiB RSS. The remaining cause
-  is the static expansion of `92 layers x Top-16 = 1,472` expert bodies.
+The old emitter repeated the full output-column body for every wide Matrix
+projection. A one-head diagnostic produced 100,221,916 instructions, 3.74 GB of
+assembly, took 7m10s, and peaked at 24.1 GiB RSS.
 
-The routed path now emits one dynamic expert body inside a 16-iteration
-`C_LOOP`. A compact Rust numerical run reads distinct expert IDs and route
-weights on each iteration, remains bit-exact against the CPU reference, and
-produces a 3,191-line compact test program in 24,297 cycles. Earlier static and
-dynamic measurements were taken before later address/lifetime fixes, so they
-are retained only in development history and are not presented as a controlled
-speedup comparison. The public full-scale builder now fails fast on the
-remaining Matrix and MLA expansion unless
-`allow_unbounded_static_expansion=True` is explicitly supplied for diagnostics.
-That override is not a deployable-binary claim.
+The compact lowering keeps K chunks explicit but moves the repeated output-tile
+and micro-column traversal into hardware `C_LOOP`s. The assembler also streams
+instructions directly to the `.mem` file instead of retaining a second list of
+millions of parsed instructions.
 
-After looped Top-K landed, a 93-layer `heads=1` diagnostic did finish, but it
-still emitted 100,221,916 instructions and 3,739,264,558 bytes of assembly,
-took 7m10s, and peaked at 24.1 GiB RSS. Latent MoE alone accounted for
-91,162,388 instructions. This proves that the next boundary is the static
-Matrix output-column/K-tile emitter, not merely MLA's head loop.
+The full 96-head result is:
 
-The required compiler work is:
+| Metric | Result |
+|---|---:|
+| Layers | 69 KDA + 24 MLA |
+| Instructions | 11,502,370 |
+| Raw 32-bit machine code | 43.88 MiB |
+| Assembly text | 292.29 MB |
+| Build + streaming assembly | about 2m10s |
+| Peak host RSS | about 4.7 GiB |
+| Symbolic HBM bindings | 2,713 |
 
-1. Roll Matrix output-column and K-tile traversal into address-carrying hardware
-   loops, including tile-major 64-bit expert-weight addressing.
-2. Emit MLA's per-head projection/attention body as a dynamic 96-iteration loop.
-3. Add Rust numerical tests for both loop bodies, then retry the 93-layer build
-   under an explicit compile-time and machine-code-size budget.
+Every instruction is encoded as one legal 32-bit word. The artifact builder
+also rejects duplicate, overlapping, or out-of-range parameter regions.
+
+## Numerical evidence
+
+Two compact Matrix paths execute in the Rust transactional emulator:
+
+- MXFP8 `1x320 @ 320x384`, two K chunks and six N tiles: 384/384 exact.
+- Plain-BF16 stream-K `1x320 @ 320x128`, five K tiles: 128/128 exact.
+
+The second test found and fixed a real address bug: the Matrix micro-column
+offset must advance by `BLEN*MLEN` elements, not `BLEN` elements. Assembly-only
+validation could not detect that error.
+
+## What this does not prove
+
+Weights are symbolic HBM ranges; no Kimi checkpoint has been packed or executed.
+The connected program supports one decode token only. Persistent multi-token MLA
+cache append/read, prefill, full-model Rust numerical replay, instruction-memory
+provisioning, RTL timing, and PPA remain future work. The 96 MLA head bodies are
+still emitted statically; looping them would reduce code size but is no longer a
+blocker for producing the bounded machine-code artifact.

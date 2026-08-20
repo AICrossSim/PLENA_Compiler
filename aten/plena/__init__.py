@@ -8,7 +8,9 @@ from compiler.aten.plena.expert_table import (
 )
 from compiler.aten.plena.full_model import (
     FullModelProgram,
+    SymbolicHbmBinding,
     assert_registers_are_free,
+    validate_symbolic_hbm_bindings,
 )
 from compiler.aten.plena.isa_compiler import IsaCompiler
 from compiler.aten.plena.memory_state import MemoryStateMixin
@@ -21,6 +23,7 @@ __all__ = [
     "FPVar",
     "ExpertWeightTable",
     "FullModelProgram",
+    "SymbolicHbmBinding",
     "InputVar",
     "IsaCompiler",
     "MemoryStateMixin",
@@ -29,4 +32,5 @@ __all__ = [
     "VRAMMatrixVar",
     "assert_registers_are_free",
     "reserve_expert_weight_table",
+    "validate_symbolic_hbm_bindings",
 ]

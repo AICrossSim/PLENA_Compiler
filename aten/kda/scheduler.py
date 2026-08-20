@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 
 from aten.mamba.scheduler import (
@@ -139,6 +140,7 @@ class KdaHbmLayout:
         arena_base: int | None,
         state_bytes: int = 0,
         conv_state_bytes: int = 0,
+        parameter_region_bytes: dict[str, int] | None = None,
     ) -> KdaHbmLayout:
         if entries <= 0 or layers <= 0:
             raise ValueError("KDA HBM layout needs at least one entry and layer")
@@ -158,12 +160,17 @@ class KdaHbmLayout:
                 raise ValueError(f"{name}_bytes must be non-negative")
             if size:
                 strides[name] = max(strides[name], ((size + 63) // 64) * 64)
+        for name, size in (parameter_region_bytes or {}).items():
+            if name not in strides:
+                raise ValueError(f"unknown KDA parameter region {name!r}")
+            if size < 0:
+                raise ValueError(f"{name} byte count must be non-negative")
+            strides[name] = max(strides[name], ((size + 63) // 64) * 64)
         region_counts = {name: counts[kind] for name, _, _, kind in _KDA_HBM_REGIONS}
         if arena_base is None:
             bases = {name: base for name, base, _, _ in _KDA_HBM_REGIONS}
             end = max(
-                bases[name] + strides[name] * region_counts[name]
-                for name in bases
+                bases[name] + strides[name] * region_counts[name] for name in bases
             )
             return cls(bases, strides, region_counts, None, end)
         if arena_base < 0 or arena_base % 64:
@@ -180,7 +187,9 @@ class KdaHbmLayout:
 
     def address(self, region: str, index: int) -> int:
         if index < 0:
-            raise ValueError(f"KDA HBM index for region {region!r} must be non-negative")
+            raise ValueError(
+                f"KDA HBM index for region {region!r} must be non-negative"
+            )
         # `completion` is last in the arena and intentionally unbounded; every
         # other region is fixed-size, so an out-of-range index there is a bug.
         if region != "completion" and index >= self.counts[region]:
@@ -233,7 +242,8 @@ class KimiK3KdaScheduler(Nemotron3MambaScheduler):
         request_id = key.request_id
         layer_id = key.layer_id
         key_index = (
-            self.config.kda_layer_ids.index(layer_id) * self.config.batch_size + request_id
+            self.config.kda_layer_ids.index(layer_id) * self.config.batch_size
+            + request_id
         )
         hbm = self._hbm_layout()
         payload = KdaPayload(
@@ -263,10 +273,12 @@ class KimiK3KdaScheduler(Nemotron3MambaScheduler):
             output_scale=1.0 / (self.config.kda_key_dim**0.5),
         )
         input_token_stride = _align_up(
-            payload.input_elements(self.config.kda_num_heads), self.config.vector_tile_size
+            payload.input_elements(self.config.kda_num_heads),
+            self.config.vector_tile_size,
         )
         output_token_stride = _align_up(
-            payload.output_elements(self.config.kda_num_heads), self.config.vector_tile_size
+            payload.output_elements(self.config.kda_num_heads),
+            self.config.vector_tile_size,
         )
         descriptor_chunk_size = (
             self.config.chunk_size
@@ -335,14 +347,44 @@ class KimiK3KdaScheduler(Nemotron3MambaScheduler):
                 self.config.conv_state_precision or self.config.state_precision
             )
             conv_state_bytes = (
-                heads * (2 * key_dim + value_dim) * kernel * conv_precision.element_bytes
+                heads
+                * (2 * key_dim + value_dim)
+                * kernel
+                * conv_precision.element_bytes
             )
+            parameter_bytes = self.config.parameter_precision.element_bytes
+            key_elements = heads * key_dim
+            value_elements = heads * value_dim
+            parameter_region_bytes = {
+                "q_conv_weight": key_elements * kernel * parameter_bytes,
+                "k_conv_weight": key_elements * kernel * parameter_bytes,
+                "v_conv_weight": value_elements * kernel * parameter_bytes,
+                "q_conv_bias": key_elements * parameter_bytes,
+                "k_conv_bias": key_elements * parameter_bytes,
+                "v_conv_bias": value_elements * parameter_bytes,
+                "a_log": heads * parameter_bytes,
+                "dt_bias": key_elements * parameter_bytes,
+            }
+            if self.config.parameter_precision == PrecisionCode.MX8_B128:
+                # ParameterReader advances one byte per 128-element block of
+                # each logical inner row, in the exact order below.
+                parameter_region_bytes["parameter_scale"] = (
+                    key_elements
+                    + key_elements
+                    + value_elements
+                    + math.ceil(key_elements / 128)
+                    + math.ceil(key_elements / 128)
+                    + math.ceil(value_elements / 128)
+                    + math.ceil(heads / 128)
+                    + heads
+                )
             cached = KdaHbmLayout.build(
                 entries=len(self.config.kda_layer_ids) * self.config.batch_size,
                 layers=max(self.config.kda_layer_ids) + 1,
                 arena_base=self.config.hbm_arena_base,
                 state_bytes=state_bytes,
                 conv_state_bytes=conv_state_bytes,
+                parameter_region_bytes=parameter_region_bytes,
             )
             object.__setattr__(self, "_hbm_layout_cache", cached)
         return cached

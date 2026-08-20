@@ -76,6 +76,7 @@ jobs:
       - name: Run hybrid Matrix and routed-MoE substrate guards
         run: |
           PYTHONPATH=. python3 -m pytest -v \
+            aten/tests/test_compact_matrix_loops.py \
             aten/tests/test_hybrid_substrate.py \
             aten/tests/test_mram_binding_tracking.py
       - name: Run Nemotron 3 hybrid compiler guards

@@ -11,7 +11,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 
-from aten.kda.scheduler import KdaScheduleConfig
+from aten.kda.scheduler import KdaScheduleConfig, KimiK3KdaScheduler
 from aten.kimi3.blocks import (
     AttnResConstants,
     KimiLatentMoeConstants,
@@ -30,11 +30,13 @@ from aten.mamba.scheduler import SchedulePhase
 from aten.plena import (
     FullModelProgram,
     PlenaCompiler,
+    SymbolicHbmBinding,
     VRAMMatrixVar,
     assert_registers_are_free,
     reserve_expert_weight_table,
 )
 from compiler.aten.plena.program_routed_moe import KimiSituFPConstants
+from aten.state import KdaPayload, PrecisionCode
 from aten.state.isa_lowering import KdaLayerMemoryMap
 
 
@@ -165,7 +167,10 @@ def build_connected_kimi_k3_program(
         raise ValueError("KDA schedule layer IDs must match the Kimi architecture")
     if config.kda_num_heads != arch.attention_heads:
         raise ValueError("KDA schedule heads must match the Kimi architecture")
-    if config.kda_key_dim != arch.kda_head_dim or config.kda_value_dim != arch.kda_head_dim:
+    if (
+        config.kda_key_dim != arch.kda_head_dim
+        or config.kda_value_dim != arch.kda_head_dim
+    ):
         raise ValueError("KDA state dimensions must match the Kimi architecture")
     if context_length is None:
         context_length = 1
@@ -183,22 +188,7 @@ def build_connected_kimi_k3_program(
     if unaligned:
         raise ValueError(f"mlen {mlen} does not tile these MLA widths: {unaligned}")
 
-    static_mla_heads = len(mla_layer_ids(arch.num_layers)) * widths.heads
-    if not allow_unbounded_static_expansion:
-        raise NotImplementedError(
-            "full connected Kimi lowering requires compact Matrix tile loops "
-            "and a looped MLA head body: a measured one-head diagnostic still "
-            "emitted 100,221,916 instructions (3,739,264,558 assembly bytes), "
-            "took 7m10s, and peaked at 24.1 GiB RSS; the requested configuration "
-            f"would also statically expand {static_mla_heads} MLA head bodies. "
-            "Routed Top-K is already looped; pass "
-            "allow_unbounded_static_expansion=True only for compiler-scaling "
-            "diagnostics, not deployable binaries"
-        )
-
-    kda_assembly, kda_program = _kda_assembly_by_layer(
-        config, mlen=mlen, blen=blen
-    )
+    kda_assembly, kda_program = _kda_assembly_by_layer(config, mlen=mlen, blen=blen)
     memories = {
         event.memory
         for event in kda_program.events
@@ -212,11 +202,13 @@ def build_connected_kimi_k3_program(
         memory.normalization_scratch_vram_addr + mlen for memory in memories
     )
 
-    prog = PlenaCompiler(mlen=mlen, blen=blen)
-    prog.hlen = 16
-    prog.vram_allocator._vmm.mark_used(
-        0, workspace_end, name="KDA_PHYSICAL_WORKSPACE"
+    prog = PlenaCompiler(
+        mlen=mlen,
+        blen=blen,
+        compact_matrix_loops=not allow_unbounded_static_expansion,
     )
+    prog.hlen = 16
+    prog.vram_allocator._vmm.mark_used(0, workspace_end, name="KDA_PHYSICAL_WORKSPACE")
     hidden = prog.load_batch(
         prog.input(
             "hidden",
@@ -228,18 +220,181 @@ def build_connected_kimi_k3_program(
     )
     fixed_hbm_end = max(
         kda_program.descriptor_base + len(kda_program.descriptor_image),
-        kda_program.layout_descriptor_base
-        + len(kda_program.layout_descriptor_image),
+        kda_program.layout_descriptor_base + len(kda_program.layout_descriptor_image),
         config.projection_weight_hbm_base
         + len(config.kda_layer_ids) * config.projection_weight_layer_stride,
     )
     prog._next_hbm_addr = ((fixed_hbm_end + mlen - 1) // mlen) * mlen
+    symbolic_bindings: list[SymbolicHbmBinding] = []
+
+    def bind(
+        *,
+        name: str,
+        hbm_addr: int,
+        byte_size: int,
+        logical_shape: tuple[int, ...],
+        physical_shape: tuple[int, ...] | None = None,
+        storage_format: str,
+        layout: str = "row_major",
+        source: str = "checkpoint_parameter",
+        layer_id: int | None = None,
+        metadata: tuple[tuple[str, int | float | str], ...] = (),
+    ) -> None:
+        symbolic_bindings.append(
+            SymbolicHbmBinding(
+                name=name,
+                hbm_addr=hbm_addr,
+                byte_size=byte_size,
+                logical_shape=logical_shape,
+                physical_shape=physical_shape or logical_shape,
+                storage_format=storage_format,
+                layout=layout,
+                source=source,
+                layer_id=layer_id,
+                metadata=metadata,
+            )
+        )
+
+    memory_by_layer = {memory.layer_id: memory for memory in memories}
+    # The lowered ISA events intentionally retain only executable assembly and
+    # memory maps. Read parameter addresses from the same scheduler trace that
+    # produced those events instead of duplicating the descriptor ABI here.
+    descriptor_by_layer = {}
+    for event in KimiK3KdaScheduler(config).build().events:
+        if event.descriptor is not None:
+            descriptor_by_layer[event.descriptor.layer_id] = event.descriptor
+    qk_features = arch.attention_heads * arch.kda_head_dim
+    value_features = arch.attention_heads * arch.kda_head_dim
+    for layer_id in sorted(memory_by_layer):
+        memory = memory_by_layer[layer_id]
+        descriptor = descriptor_by_layer[layer_id]
+        payload = descriptor.payload
+        if not isinstance(payload, KdaPayload):
+            raise TypeError(f"KDA layer {layer_id} has a non-KDA descriptor")
+        projection_specs = (
+            ("q_proj", memory.q_weight_hbm_addr, arch.hidden_size, qk_features),
+            ("k_proj", memory.k_weight_hbm_addr, arch.hidden_size, qk_features),
+            ("v_proj", memory.v_weight_hbm_addr, arch.hidden_size, value_features),
+            (
+                "gate_proj",
+                memory.gate_weight_hbm_addr,
+                arch.hidden_size,
+                value_features,
+            ),
+            (
+                "out_proj",
+                memory.output_weight_hbm_addr,
+                value_features,
+                arch.hidden_size,
+            ),
+            (
+                "decay_a_proj",
+                memory.decay_a_weight_hbm_addr,
+                arch.hidden_size,
+                payload.key_dim,
+            ),
+            (
+                "decay_b_proj",
+                memory.decay_b_weight_hbm_addr,
+                payload.key_dim,
+                qk_features,
+            ),
+            (
+                "beta_proj",
+                memory.beta_weight_hbm_addr,
+                arch.hidden_size,
+                math.ceil(arch.attention_heads / mlen) * mlen,
+            ),
+        )
+        for suffix, address, rows, cols in projection_specs:
+            bind(
+                name=f"kda.layer{layer_id}.{suffix}",
+                hbm_addr=address,
+                byte_size=prog.hbm_tensor_size(rows * cols),
+                logical_shape=(rows, cols),
+                storage_format="plena_matrix_weight",
+                layer_id=layer_id,
+                metadata=(("real_data_ratio", prog.real_data_ratio),),
+            )
+        bind(
+            name=f"kda.layer{layer_id}.group_norm_weight",
+            hbm_addr=memory.norm_weight_hbm_addr,
+            byte_size=value_features * 2,
+            logical_shape=(value_features,),
+            storage_format="bf16_le",
+            layer_id=layer_id,
+        )
+
+        parameter_elements = (
+            (
+                "q_conv_weight",
+                payload.q_conv_weight_addr,
+                qk_features * payload.conv_kernel,
+                (qk_features, payload.conv_kernel),
+            ),
+            (
+                "k_conv_weight",
+                payload.k_conv_weight_addr,
+                qk_features * payload.conv_kernel,
+                (qk_features, payload.conv_kernel),
+            ),
+            (
+                "v_conv_weight",
+                payload.v_conv_weight_addr,
+                value_features * payload.conv_kernel,
+                (value_features, payload.conv_kernel),
+            ),
+            ("q_conv_bias", payload.q_conv_bias_addr, qk_features, (qk_features,)),
+            ("k_conv_bias", payload.k_conv_bias_addr, qk_features, (qk_features,)),
+            (
+                "v_conv_bias",
+                payload.v_conv_bias_addr,
+                value_features,
+                (value_features,),
+            ),
+            (
+                "a_log",
+                payload.a_log_addr,
+                arch.attention_heads,
+                (arch.attention_heads,),
+            ),
+            ("dt_bias", payload.dt_bias_addr, qk_features, (qk_features,)),
+        )
+        for suffix, address, elements, shape in parameter_elements:
+            bind(
+                name=f"kda.layer{layer_id}.{suffix}",
+                hbm_addr=address,
+                byte_size=elements * descriptor.parameter_precision.element_bytes,
+                logical_shape=shape,
+                storage_format=f"state_{descriptor.parameter_precision.name.lower()}",
+                layer_id=layer_id,
+            )
+        if descriptor.parameter_precision == PrecisionCode.MX8_B128:
+            scale_bytes = (
+                qk_features
+                + qk_features
+                + value_features
+                + math.ceil(qk_features / 128)
+                + math.ceil(qk_features / 128)
+                + math.ceil(value_features / 128)
+                + math.ceil(arch.attention_heads / 128)
+                + arch.attention_heads
+            )
+            bind(
+                name=f"kda.layer{layer_id}.parameter_scales",
+                hbm_addr=payload.parameter_scale_addr,
+                byte_size=scale_bytes,
+                logical_shape=(scale_bytes,),
+                storage_format="mx8_b128_scale_stream",
+                layer_id=layer_id,
+            )
     mla_constants, moe_constants, fpram_preload = _allocate_constants(prog, arch)
     attnres_constants = AttnResConstants(
         eps=mla_constants.input_eps,
         reciprocal_hidden=mla_constants.input_reciprocal_hidden,
     )
     stage_counts: dict[str, int] = defaultdict(int)
+    current_layer_id: int | None = None
 
     def measured(stage: str, emit):
         # Counting the complete multi-million-line program around every stage is
@@ -250,47 +405,135 @@ def build_connected_kimi_k3_program(
         stage_counts[stage] += _instruction_count("".join(prog._code_chunks[before:]))
         return result
 
-    def weight(name: str, rows: int, cols: int, *, bf16: bool = False):
-        return prog.input(
+    def weight(
+        name: str,
+        rows: int,
+        cols: int,
+        *,
+        bf16: bool = False,
+        source: str = "checkpoint_parameter",
+        layer_id: int | None = None,
+    ):
+        var = prog.input(
             name,
             shape=(rows, cols),
             physical_shape=(rows, cols),
             real_data_ratio=2.0 if bf16 else None,
         )
-
-    def load_bf16_vector(name: str, width: int) -> VRAMMatrixVar:
-        return prog.load_batch(
-            weight(name, blen, width, bf16=True),
+        resolved_layer_id = current_layer_id if layer_id is None else layer_id
+        bind(
             name=name,
-            storage_precision=2,
-            hbm_precision=1,
+            hbm_addr=var.hbm_addr,
+            byte_size=var.hbm_size,
+            logical_shape=var.shape,
+            physical_shape=var.physical_shape,
+            storage_format="bf16_le" if bf16 else "plena_matrix_weight",
+            source=source,
+            layer_id=resolved_layer_id,
+            metadata=(("real_data_ratio", 2.0 if bf16 else prog.real_data_ratio),),
         )
+        return var
 
-    def load_bf16_router_vector(name: str, width: int) -> VRAMMatrixVar:
-        blocks = math.ceil(width / mlen)
-        physical_rows = math.ceil(blocks / blen) * blen
+    def load_bf16_vector(
+        name: str,
+        width: int,
+        *,
+        source: str = "checkpoint_parameter",
+        layer_id: int | None = None,
+    ) -> VRAMMatrixVar:
         return prog.load_batch(
-            prog.input(
+            weight(
                 name,
-                shape=(blocks, mlen),
-                physical_shape=(physical_rows, mlen),
-                real_data_ratio=2.0,
+                blen,
+                width,
+                bf16=True,
+                source=source,
+                layer_id=layer_id,
             ),
             name=name,
             storage_precision=2,
             hbm_precision=1,
         )
 
-    correction = load_bf16_router_vector(
-        "moe_correction_bias", arch.num_experts
+    def load_bf16_router_vector(
+        name: str,
+        width: int,
+        *,
+        source: str = "checkpoint_parameter",
+        layer_id: int | None = None,
+    ) -> VRAMMatrixVar:
+        blocks = math.ceil(width / mlen)
+        physical_rows = math.ceil(blocks / blen) * blen
+        var = prog.input(
+            name,
+            shape=(blocks, mlen),
+            physical_shape=(physical_rows, mlen),
+            real_data_ratio=2.0,
+        )
+        bind(
+            name=name,
+            hbm_addr=var.hbm_addr,
+            byte_size=var.hbm_size,
+            logical_shape=(width,),
+            physical_shape=var.physical_shape,
+            storage_format="bf16_le",
+            source=source,
+            layer_id=current_layer_id if layer_id is None else layer_id,
+            metadata=(("real_data_ratio", 2.0),),
+        )
+        return prog.load_batch(
+            var,
+            name=name,
+            storage_precision=2,
+            hbm_precision=1,
+        )
+
+    def expert_table(name: str, *, rows: int, cols: int):
+        table = reserve_expert_weight_table(
+            prog,
+            name=name,
+            num_experts=arch.num_experts,
+            rows=rows,
+            cols=cols,
+        )
+        assert table.tile_group_stride is not None
+        row_tiles = math.ceil(rows / mlen)
+        col_tiles = math.ceil(cols / mlen)
+        bind(
+            name=name,
+            hbm_addr=table.base,
+            byte_size=row_tiles * col_tiles * table.tile_group_stride,
+            logical_shape=(arch.num_experts, rows, cols),
+            physical_shape=(arch.num_experts, rows, cols),
+            storage_format="plena_matrix_weight",
+            layout="expert_tile_major",
+            layer_id=current_layer_id,
+            metadata=(
+                ("num_experts", arch.num_experts),
+                ("per_expert_stride", table.stride),
+                ("tile_group_stride", table.tile_group_stride),
+                ("mlen", mlen),
+            ),
+        )
+        return table
+
+    correction = load_bf16_router_vector("moe_correction_bias", arch.num_experts)
+    cos = load_bf16_vector(
+        "rope_cos",
+        arch.qk_rope_head_dim,
+        source="runtime_generated",
     )
-    cos = load_bf16_vector("rope_cos", arch.qk_rope_head_dim)
-    sin = load_bf16_vector("rope_sin", arch.qk_rope_head_dim)
+    sin = load_bf16_vector(
+        "rope_sin",
+        arch.qk_rope_head_dim,
+        source="runtime_generated",
+    )
     prefix = hidden
     block_residuals: list[VRAMMatrixVar] = []
     mla_layers = set(mla_layer_ids(arch.num_layers))
 
     for layer_id in range(arch.num_layers):
+        current_layer_id = layer_id
         kind = "mla" if layer_id in mla_layers else "kda"
         prog.emit_comment(f"==== connected layer {layer_id} ({kind}) ====")
         if layer_id % arch.attn_res_block_size == 0:
@@ -354,43 +597,29 @@ def build_connected_kimi_k3_program(
             input_norm = load_bf16_vector(
                 f"mla_input_norm_{layer_id}", arch.hidden_size
             )
-            q_norm = load_bf16_vector(
-                f"mla_q_norm_{layer_id}", arch.q_lora_rank
-            )
-            kv_norm = load_bf16_vector(
-                f"mla_kv_norm_{layer_id}", arch.kv_lora_rank
-            )
+            q_norm = load_bf16_vector(f"mla_q_norm_{layer_id}", arch.q_lora_rank)
+            kv_norm = load_bf16_vector(f"mla_kv_norm_{layer_id}", arch.kv_lora_rank)
             mla_weights = MlaBlockWeights(
-                q_a=weight(
-                    f"mla_q_a_{layer_id}", arch.hidden_size, arch.q_lora_rank
-                ),
-                q_b=weight(
-                    f"mla_q_b_{layer_id}", arch.q_lora_rank, widths.q_b_out
-                ),
-                kv_a=weight(
-                    f"mla_kv_a_{layer_id}", arch.hidden_size, widths.kv_a_out
-                ),
-                kv_b=weight(
-                    f"mla_kv_b_{layer_id}", arch.kv_lora_rank, widths.kv_b_out
-                ),
-                out=weight(
-                    f"mla_out_{layer_id}", widths.attn_out, arch.hidden_size
-                ),
+                q_a=weight(f"mla_q_a_{layer_id}", arch.hidden_size, arch.q_lora_rank),
+                q_b=weight(f"mla_q_b_{layer_id}", arch.q_lora_rank, widths.q_b_out),
+                kv_a=weight(f"mla_kv_a_{layer_id}", arch.hidden_size, widths.kv_a_out),
+                kv_b=weight(f"mla_kv_b_{layer_id}", arch.kv_lora_rank, widths.kv_b_out),
+                out=weight(f"mla_out_{layer_id}", widths.attn_out, arch.hidden_size),
                 q_rope_rotate=weight(
                     f"mla_q_rope_rotate_{layer_id}",
                     arch.qk_rope_head_dim,
                     arch.qk_rope_head_dim,
                     bf16=True,
+                    source="runtime_generated",
                 ),
                 k_rope_rotate=weight(
                     f"mla_k_rope_rotate_{layer_id}",
                     arch.qk_rope_head_dim,
                     arch.qk_rope_head_dim,
                     bf16=True,
+                    source="runtime_generated",
                 ),
-                gate=weight(
-                    f"mla_gate_{layer_id}", arch.hidden_size, widths.attn_out
-                ),
+                gate=weight(f"mla_gate_{layer_id}", arch.hidden_size, widths.attn_out),
             )
             mixer_out = measured(
                 "mla_mixer",
@@ -426,9 +655,7 @@ def build_connected_kimi_k3_program(
         if mixer_out is not hidden:
             prog.free_tensor(mixer_out)
 
-        ffn_score = load_bf16_vector(
-            f"attnres_ffn_score_{layer_id}", arch.hidden_size
-        )
+        ffn_score = load_bf16_vector(f"attnres_ffn_score_{layer_id}", arch.hidden_size)
         ffn_input = measured(
             "attn_res_before_ffn",
             lambda: emit_kimi_attn_res(
@@ -443,9 +670,7 @@ def build_connected_kimi_k3_program(
         )
         prog.free_tensor(ffn_score)
 
-        ffn_norm = load_bf16_vector(
-            f"ffn_input_norm_{layer_id}", arch.hidden_size
-        )
+        ffn_norm = load_bf16_vector(f"ffn_input_norm_{layer_id}", arch.hidden_size)
         if layer_id == 0:
             ffn_out = measured(
                 "dense_situ_ffn",
@@ -493,24 +718,18 @@ def build_connected_kimi_k3_program(
                     arch.routed_expert_hidden_size,
                     arch.hidden_size,
                 ),
-                routed_gate=reserve_expert_weight_table(
-                    prog,
+                routed_gate=expert_table(
                     name=f"moe_expert_gate_{layer_id}",
-                    num_experts=arch.num_experts,
                     rows=arch.routed_expert_hidden_size,
                     cols=arch.moe_intermediate_size,
                 ),
-                routed_up_expert=reserve_expert_weight_table(
-                    prog,
+                routed_up_expert=expert_table(
                     name=f"moe_expert_up_{layer_id}",
-                    num_experts=arch.num_experts,
                     rows=arch.routed_expert_hidden_size,
                     cols=arch.moe_intermediate_size,
                 ),
-                routed_down_expert=reserve_expert_weight_table(
-                    prog,
+                routed_down_expert=expert_table(
                     name=f"moe_expert_down_{layer_id}",
-                    num_experts=arch.num_experts,
                     rows=arch.moe_intermediate_size,
                     cols=arch.routed_expert_hidden_size,
                 ),
@@ -572,6 +791,7 @@ def build_connected_kimi_k3_program(
         prefix = new_prefix
         assert_registers_are_free(prog, f"connected Kimi layer {layer_id}")
 
+    current_layer_id = None
     final_score = load_bf16_vector("attnres_output_score", arch.hidden_size)
     output = measured(
         "output_attn_res",
@@ -620,6 +840,7 @@ def build_connected_kimi_k3_program(
         fpram_preload=fpram_preload,
         output_vram_addr=prog.get_vram_addr(output.name),
         hbm_size=prog._next_hbm_addr,
+        symbolic_hbm_bindings=tuple(symbolic_bindings),
     )
 
 

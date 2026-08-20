@@ -77,9 +77,9 @@ descriptor 仍不携带 layout，因此 state 数学语义不随排布变化。
 都已通过。这里冻结的是 Compiler/Simulator contract；Matrix writeback stream tap、
 bank mux PPA 和频率仍必须由 RTL 验证。
 
-## 为什么现在拒绝完整 Kimi binary
+## 完整 Kimi binary 的当前状态
 
-Top-K 循环化之后，`heads=1` 的 93 层诊断虽然完成，但仍产生：
+旧的静态 Matrix emitter 在 `heads=1` 时产生：
 
 ```text
 100,221,916 instructions
@@ -88,12 +88,21 @@ Top-K 循环化之后，`heads=1` 的 93 层诊断虽然完成，但仍产生：
 24.1 GiB peak RSS
 ```
 
-其中 LatentMoE 占 91,162,388 条。主要原因已经不是 route rank，而是每个大 GEMM
-仍静态展开 output-column/K-tile；默认 builder 因此 fail fast。RTL 前的通过条件是：
+其中 LatentMoE 占 91,162,388 条。加入 compact Matrix output-column 循环和 streaming
+assembler 后，真实 96-head、93 层程序现在是：
 
-1. compact Matrix loop 与现有展开版在 Rust 上逐元素一致；
-2. compact MLA 96-head loop 与 1/2-head reference 一致；
-3. 93 层构建在明确预算内完成，并能汇编为 32-bit words；
-4. multi-token compressed MLA cache append/read 有独立数值测试；
-5. Compiler/Simulator 的 `X_STATE`/`L_SCATTER_M` contract 与 golden words 一致；RTL
+```text
+11,502,370 instructions
+43.88 MiB raw 32-bit machine code
+2m10s build + assemble
+4.7 GiB peak RSS
+```
+
+全部指令可编码，MXFP8 与 BF16 stream-K 两条 compact Matrix 路径都已在 Rust 中
+逐元素对拍。MLA 的 96 个 head body 仍静态发射，是后续 code-size 优化，不再阻塞
+完整机器码产物。RTL 前剩余条件是：
+
+1. multi-token compressed MLA cache append/read 有独立数值测试；
+2. symbolic HBM manifest 绑定真实 checkpoint 后完成整模数值 replay；
+3. Compiler/Simulator 的 `X_STATE`/`L_SCATTER_M` contract 与 golden words 一致；RTL
    开始前再把同一 machine-readable contract 接入第三仓。

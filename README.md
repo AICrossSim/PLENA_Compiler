@@ -72,7 +72,9 @@ hidden state
 | Nemotron 3 层结构 | 完成 | 23 Mamba + 23 MoE + 6 Attention，完整程序可汇编 |
 | Kimi K3 层结构 | 完成 | 69 KDA + 24 MLA 的结构 trace 已生成 |
 | Matrix、Attention、MoE、residual 连接 | 完成 | 缩小外围尺寸的程序已在 Rust Simulator 数值对拍 |
-| 完整 Kimi 93 层机器码 | 未完成 | 大 GEMM 和 96-head MLA 还需要硬件循环，当前会明确拒绝生成 |
+| Compact Matrix 循环 | 完成 | MXFP8 GEMM 与 BF16 stream-K 均在 Rust 中逐元素一致 |
+| Nemotron 52 层机器码 | 完成 | 6,202,663 条、23.66 MiB；参数由 symbolic HBM manifest 描述 |
+| Kimi 93 层机器码 | 完成 | 96-head 共 11,502,370 条，原始机器码 43.88 MiB |
 | Prefill 和多 token MLA/GQA cache | 未完成 | 当前 connected 路径只验证单 token decode |
 | 真实权重整模执行 | 未完成 | 不能声称 Nemotron/Kimi 已在 PLENA 从第一层跑到最后一层 |
 | RTL、频率、面积和端到端加速比 | 未开始 | 属于下一阶段，不是本仓库当前结论 |
@@ -93,6 +95,7 @@ uv run pytest -q -m "not slow" \
   assembler/tests/test_x_state_encoding.py \
   assembler/tests/test_l_scatter_m_encoding.py \
   aten/tests/test_hybrid_substrate.py \
+  aten/tests/test_compact_matrix_loops.py \
   aten/tests/test_nemotron3_hybrid.py \
   aten/tests/test_kimi_k3_hybrid.py
 ```
@@ -120,8 +123,19 @@ uv run python -m aten.kimi3.trace \
   --output build/kimi-k3.json
 ```
 
-这些命令不下载模型权重。输出用于检查层顺序、指令、descriptor 和内存布局，
-不代表完整模型已经执行。
+生成完整单 token decode 机器码和 symbolic-weight 地址清单：
+
+```bash
+uv run python -m aten.nemotron3.artifact build/nemotron3-decode
+uv run python -m aten.kimi3.artifact build/kimi-k3-decode
+```
+
+每个目录包含 `.mem`、state/layout descriptors、FPRAM 常量、symbolic HBM
+manifest、SHA256 和一份 summary。Kimi 的全量构建约需 2 分钟和 5 GiB 主存；它不会
+下载 checkpoint。
+
+这些命令不下载模型权重。`.mem` 中的指令已经逐条编码，但 manifest 中的参数仍是
+待填充地址，所以不代表真实 checkpoint 已经从第一层执行到最后一层。
 
 ## 代码位置
 

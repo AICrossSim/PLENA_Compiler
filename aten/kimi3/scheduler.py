@@ -44,7 +44,9 @@ class KimiK3Architecture:
 
     def __post_init__(self) -> None:
         if self.num_layers != 93 or self.hidden_size != 7168:
-            raise ValueError("the pinned Kimi K3 structural contract has 93 layers and hidden size 7168")
+            raise ValueError(
+                "the pinned Kimi K3 structural contract has 93 layers and hidden size 7168"
+            )
 
     @property
     def kda_layers(self) -> tuple[int, ...]:
@@ -106,7 +108,9 @@ class KimiK3HybridTrace:
                 "mla_layers": list(self.architecture.mla_layers),
                 "dense_layers": list(self.architecture.dense_layers),
                 "moe_layers": list(self.architecture.moe_layers),
-                "attn_res_capture_layers": list(self.architecture.attn_res_capture_layers),
+                "attn_res_capture_layers": list(
+                    self.architecture.attn_res_capture_layers
+                ),
             },
             "summary": {
                 "event_count": len(self.events),
@@ -115,8 +119,12 @@ class KimiK3HybridTrace:
                     for stage in sorted({event.stage for event in self.events})
                 },
                 "implementation_counts": {
-                    implementation: sum(event.implementation == implementation for event in self.events)
-                    for implementation in sorted({event.implementation for event in self.events})
+                    implementation: sum(
+                        event.implementation == implementation for event in self.events
+                    )
+                    for implementation in sorted(
+                        {event.implementation for event in self.events}
+                    )
                 },
                 "kda_state_trace": self.kda_trace.to_dict()["summary"],
             },
@@ -132,8 +140,12 @@ class KimiK3HybridTrace:
             "events": [
                 {
                     **asdict(event),
-                    "mixer_type": event.mixer_type.value if event.mixer_type is not None else None,
-                    "ffn_type": event.ffn_type.value if event.ffn_type is not None else None,
+                    "mixer_type": event.mixer_type.value
+                    if event.mixer_type is not None
+                    else None,
+                    "ffn_type": event.ffn_type.value
+                    if event.ffn_type is not None
+                    else None,
                 }
                 for event in self.events
             ],
@@ -144,7 +156,10 @@ class KimiK3HybridTrace:
                     "compact MLA, LatentMoE, dense FFN, AttnRes, and KDA blocks for context_length=1"
                 ),
                 "single-token Top-16 MoE uses looped dynamic expert dispatch",
-                "the full 24-layer x 96-head MLA body needs looped lowering before one deployable binary can be emitted",
+                (
+                    "the full 93-layer, 96-head single-token program now assembles; "
+                    "MLA head bodies remain statically emitted and are a code-size optimization target"
+                ),
                 "persistent multi-token MLA cache append is not implemented",
                 "the trace is not an end-to-end GPU or RTL latency claim",
             ],
@@ -166,32 +181,67 @@ class KimiK3HybridScheduler:
         kda_trace = KimiK3KdaScheduler(self.config).build()
         buckets, tail = _bucket_kda_events(kda_trace)
         events: list[KimiHybridEvent] = []
-        passes = self.config.decode_tokens if self.config.phase == SchedulePhase.DECODE else 1
-        valid_tokens = 1 if self.config.phase == SchedulePhase.DECODE else self.config.sequence_length
+        passes = (
+            self.config.decode_tokens
+            if self.config.phase == SchedulePhase.DECODE
+            else 1
+        )
+        valid_tokens = (
+            1
+            if self.config.phase == SchedulePhase.DECODE
+            else self.config.sequence_length
+        )
 
         for pass_index in range(passes):
-            token_offset = pass_index if self.config.phase == SchedulePhase.DECODE else 0
+            token_offset = (
+                pass_index if self.config.phase == SchedulePhase.DECODE else 0
+            )
             captured_blocks = 0
             for layer_id in range(self.arch.num_layers):
-                mixer = KimiMixerType.KDA if layer_id in self.arch.kda_layers else KimiMixerType.MLA
+                mixer = (
+                    KimiMixerType.KDA
+                    if layer_id in self.arch.kda_layers
+                    else KimiMixerType.MLA
+                )
                 ffn = KimiFfnType.DENSE if layer_id == 0 else KimiFfnType.LATENT_MOE
                 if captured_blocks:
                     self._append(
-                        events, pass_index, layer_id, mixer, ffn,
-                        "attn_res_before_mixer", "matrix_vector", "existing_plena_service",
-                        token_offset, valid_tokens,
+                        events,
+                        pass_index,
+                        layer_id,
+                        mixer,
+                        ffn,
+                        "attn_res_before_mixer",
+                        "matrix_vector",
+                        "existing_plena_service",
+                        token_offset,
+                        valid_tokens,
                     )
                 if layer_id in self.arch.attn_res_capture_layers:
                     captured_blocks += 1
                     self._append(
-                        events, pass_index, layer_id, mixer, ffn,
-                        "attn_res_capture_prefix", "vector", "existing_plena_service",
-                        token_offset, valid_tokens,
+                        events,
+                        pass_index,
+                        layer_id,
+                        mixer,
+                        ffn,
+                        "attn_res_capture_prefix",
+                        "vector",
+                        "existing_plena_service",
+                        token_offset,
+                        valid_tokens,
                     )
                 self._append(
-                    events, pass_index, layer_id, mixer, ffn,
-                    "input_rms_norm", "vector", "existing_plena_service",
-                    token_offset, valid_tokens,
+                    events,
+                    pass_index,
+                    layer_id,
+                    mixer,
+                    ffn,
+                    "input_rms_norm",
+                    "vector",
+                    "existing_plena_service",
+                    token_offset,
+                    valid_tokens,
                 )
                 if mixer == KimiMixerType.KDA:
                     for state_event in buckets[(pass_index, layer_id)]:
@@ -205,29 +255,65 @@ class KimiK3HybridScheduler:
                         ("mla_out_projection", "matrix"),
                     ):
                         self._append(
-                            events, pass_index, layer_id, mixer, ffn, stage, resource,
-                            "existing_plena_service", token_offset, valid_tokens,
+                            events,
+                            pass_index,
+                            layer_id,
+                            mixer,
+                            ffn,
+                            stage,
+                            resource,
+                            "existing_plena_service",
+                            token_offset,
+                            valid_tokens,
                         )
                 self._append(
-                    events, pass_index, layer_id, mixer, ffn,
-                    "prefix_sum_after_mixer", "vector", "existing_plena_service",
-                    token_offset, valid_tokens,
+                    events,
+                    pass_index,
+                    layer_id,
+                    mixer,
+                    ffn,
+                    "prefix_sum_after_mixer",
+                    "vector",
+                    "existing_plena_service",
+                    token_offset,
+                    valid_tokens,
                 )
                 self._append(
-                    events, pass_index, layer_id, mixer, ffn,
-                    "attn_res_before_ffn", "matrix_vector", "existing_plena_service",
-                    token_offset, valid_tokens,
+                    events,
+                    pass_index,
+                    layer_id,
+                    mixer,
+                    ffn,
+                    "attn_res_before_ffn",
+                    "matrix_vector",
+                    "existing_plena_service",
+                    token_offset,
+                    valid_tokens,
                 )
                 self._append(
-                    events, pass_index, layer_id, mixer, ffn,
-                    "post_attention_rms_norm", "vector", "existing_plena_service",
-                    token_offset, valid_tokens,
+                    events,
+                    pass_index,
+                    layer_id,
+                    mixer,
+                    ffn,
+                    "post_attention_rms_norm",
+                    "vector",
+                    "existing_plena_service",
+                    token_offset,
+                    valid_tokens,
                 )
                 if ffn == KimiFfnType.DENSE:
                     self._append(
-                        events, pass_index, layer_id, mixer, ffn,
-                        "dense_situ_ffn", "matrix_vector", "existing_plena_service",
-                        token_offset, valid_tokens,
+                        events,
+                        pass_index,
+                        layer_id,
+                        mixer,
+                        ffn,
+                        "dense_situ_ffn",
+                        "matrix_vector",
+                        "existing_plena_service",
+                        token_offset,
+                        valid_tokens,
                     )
                 else:
                     for stage, resource in (
@@ -238,23 +324,52 @@ class KimiK3HybridScheduler:
                         ("latent_moe_shared_experts", "matrix_vector"),
                     ):
                         self._append(
-                            events, pass_index, layer_id, mixer, ffn, stage, resource,
-                            "existing_plena_service", token_offset, valid_tokens,
+                            events,
+                            pass_index,
+                            layer_id,
+                            mixer,
+                            ffn,
+                            stage,
+                            resource,
+                            "existing_plena_service",
+                            token_offset,
+                            valid_tokens,
                         )
                 self._append(
-                    events, pass_index, layer_id, mixer, ffn,
-                    "prefix_sum_after_ffn", "vector", "existing_plena_service",
-                    token_offset, valid_tokens,
+                    events,
+                    pass_index,
+                    layer_id,
+                    mixer,
+                    ffn,
+                    "prefix_sum_after_ffn",
+                    "vector",
+                    "existing_plena_service",
+                    token_offset,
+                    valid_tokens,
                 )
             self._append(
-                events, pass_index, -1, None, None,
-                "output_attn_res", "matrix_vector", "existing_plena_service",
-                token_offset, valid_tokens,
+                events,
+                pass_index,
+                -1,
+                None,
+                None,
+                "output_attn_res",
+                "matrix_vector",
+                "existing_plena_service",
+                token_offset,
+                valid_tokens,
             )
             self._append(
-                events, pass_index, -1, None, None,
-                "final_rms_norm", "vector", "existing_plena_service",
-                token_offset, valid_tokens,
+                events,
+                pass_index,
+                -1,
+                None,
+                None,
+                "final_rms_norm",
+                "vector",
+                "existing_plena_service",
+                token_offset,
+                valid_tokens,
             )
 
         for state_event in tail:
@@ -277,8 +392,16 @@ class KimiK3HybridScheduler:
     ) -> None:
         events.append(
             KimiHybridEvent(
-                len(events), pass_index, layer_id, mixer_type, ffn_type, stage,
-                resource, implementation, token_offset, valid_tokens,
+                len(events),
+                pass_index,
+                layer_id,
+                mixer_type,
+                ffn_type,
+                stage,
+                resource,
+                implementation,
+                token_offset,
+                valid_tokens,
                 source_kda_event_index,
             )
         )
@@ -319,7 +442,9 @@ def _bucket_kda_events(
     tail: list[TraceEvent] = []
     current_pass: dict[int, int] = {}
     for event in trace.events:
-        if event.layer_id is None or (event.operation == "COMMIT" and trace.config.flush_at_end):
+        if event.layer_id is None or (
+            event.operation == "COMMIT" and trace.config.flush_at_end
+        ):
             tail.append(event)
             continue
         if event.token_offset is not None:
