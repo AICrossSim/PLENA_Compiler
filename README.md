@@ -8,6 +8,47 @@
 Compiler 负责生成指令、内存地址和 descriptor；真正执行这些指令的是
 [PLENA Simulator](https://github.com/AICrossSim/PLENA_Simulator/tree/feature/mamba-kda-support)。
 
+## 架构图
+
+三张图分别回答三个问题：PLENA 整体增加了什么、一个 Mamba token 怎么执行，以及
+`L_SCATTER_M` 为什么能减少 Matrix SRAM bank conflict。
+
+### Figure 1：Hybrid PLENA 总体架构
+
+![Hybrid PLENA architecture for Mamba, Attention, and MoE](docs/architecture/hybrid_plena_mamba.svg)
+
+[SVG](docs/architecture/hybrid_plena_mamba.svg) · [论文用 PDF](docs/architecture/hybrid_plena_mamba.pdf)
+
+这张图保留原 PLENA 的 Scalar、Matrix、Vector、SRAM 和 HBM 主体，只在真实的
+Matrix 写回与状态数据路径上加入 Mamba 扩展。同一套 Matrix/Vector 单元继续执行
+Attention、MoE 和 Mamba 的矩阵计算。输入投影完成后，`L_SCATTER_M` 根据 `X_STATE`
+下一拍的读取方式重新安排 SRAM bank；`X_STATE` 再从独立的 persistent state cache
+读取并更新 recurrent state。图中虚线模块已在 Compiler 和 Rust Simulator 中实现，
+但尚未进入 RTL/PPA。
+
+### Figure 2：Nemotron 3 Mamba-2 decode 数据流
+
+![Nemotron 3 Mamba-2 decode step and L-Compute co-layout](docs/architecture/mamba2_lcompute_flow.svg)
+
+[SVG](docs/architecture/mamba2_lcompute_flow.svg) · [论文用 PDF](docs/architecture/mamba2_lcompute_flow.pdf)
+
+这张图展示一个真实尺寸的 Nemotron 3 Mamba decode token。`gate` 留在 Vector SRAM，
+`x/B/C/dt` 经过 16-bank group-major skew 排布后交给 state engine；该排布只改变物理
+bank 地址，不改变 tensor 数值，也不产生 HBM transpose/repack 流量。图中的 3.568x
+是 projection-buffer 的局部读取服务提升，不是整层或整模加速比。
+
+### Figure 3：L-Compute 如何消除热点 bank
+
+![Compiler-guided bank co-layout for Mamba state packets](docs/architecture/lcompute_bank_colayout.svg)
+
+[SVG](docs/architecture/lcompute_bank_colayout.svg) · [论文用 PDF](docs/architecture/lcompute_bank_colayout.pdf)
+
+这张图只解释 bank mapping 机制。`X_STATE` 同一拍需要 8 个 head 的 4 个 P-lane；
+row-major 会让这些值反复落到 bank 0–3。`L_SCATTER_M` 在 Matrix 写回时按 head
+将地址平移 4 个 bank，使同一个 32-value packet 均匀分布到 16 个 single-port bank。
+逻辑 tensor 和
+消费顺序都不变，也不需要经过 HBM 做 transpose。
+
 ## 数据怎么走
 
 ```text
