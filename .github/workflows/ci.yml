@@ -65,6 +65,7 @@ jobs:
             assembler/tests/test_l_scatter_m_encoding.py \
             assembler/tests/test_x_state_encoding.py \
             aten/tests/test_kda_scheduler.py \
+            aten/tests/test_hybrid_isa_freeze.py \
             aten/tests/test_layout_contract.py \
             aten/tests/test_mamba_scheduler.py \
             aten/tests/test_projection_scatter.py \
