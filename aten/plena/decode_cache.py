@@ -80,13 +80,33 @@ class DecodeCacheTensor:
                 f"match cache width={self.width}"
             )
 
+        packet_name = name or f"{self.backing.display_name}_append_t{token_index}"
+        self._store_guarded_row(
+            prog,
+            source,
+            token_index=token_index,
+            source_row=source_row,
+            packet_name=packet_name,
+            marker="DECODE_CACHE_APPEND",
+        )
+
+    def _store_guarded_row(
+        self,
+        prog,
+        source: VRAMMatrixVar,
+        *,
+        token_index: int,
+        source_row: int,
+        packet_name: str,
+        marker: str,
+    ) -> None:
+        """Store one finite row plus the hardware writeback guard rows."""
         packet_rows = prog.hbm_v_writeback_amount
         if token_index + packet_rows > self.storage_rows:
             raise ValueError(
-                f"{self.backing.name}: append at row {token_index} needs "
+                f"{self.backing.name}: write at row {token_index} needs "
                 f"{packet_rows} physical rows but storage has {self.storage_rows}"
             )
-        packet_name = name or f"{self.backing.display_name}_append_t{token_index}"
         packet = prog.alloc(
             packet_name,
             rows=packet_rows,
@@ -104,7 +124,7 @@ class DecodeCacheTensor:
                 src_row_offset=source_row,
             )
         prog.emit(
-            f"; DECODE_CACHE_APPEND {self.backing.name} token={token_index} "
+            f"; {marker} {self.backing.name} token={token_index} "
             f"row_bytes={self.row_bytes}\n"
         )
         prog.store_to_hbm(
@@ -116,6 +136,44 @@ class DecodeCacheTensor:
             hbm_real_data_ratio=float(self.element_bytes),
         )
         prog.free_tensor(packet)
+
+    def append_rows(
+        self,
+        prog,
+        source: VRAMMatrixVar,
+        *,
+        token_index: int,
+        rows: int,
+        source_row: int = 0,
+        name: str | None = None,
+    ) -> None:
+        """Append a contiguous prompt fragment to a persistent cache.
+
+        ``H_STORE_V`` still writes one hardware packet at a time.  This helper
+        deliberately reuses :meth:`append_row` for every logical token so
+        prefill and decode share exactly the same guarded-row semantics.
+        """
+        if rows <= 0:
+            raise ValueError(f"rows must be positive, got {rows}")
+        if token_index + rows > self.max_tokens:
+            raise ValueError(
+                f"{self.backing.name}: token range [{token_index}, "
+                f"{token_index + rows}) exceeds capacity={self.max_tokens}"
+            )
+        if source_row + rows > source.shape[0]:
+            raise ValueError(
+                f"{self.backing.name}: source range [{source_row}, "
+                f"{source_row + rows}) exceeds source rows={source.shape[0]}"
+            )
+        prefix = name or f"{self.backing.display_name}_append"
+        for offset in range(rows):
+            self.append_row(
+                prog,
+                source,
+                token_index=token_index + offset,
+                source_row=source_row + offset,
+                name=f"{prefix}_t{token_index + offset}",
+            )
 
     def overwrite_from(self, prog, source: VRAMMatrixVar) -> None:
         """Overwrite a reusable cache/scratch tile from a full VRAM tensor."""
@@ -141,6 +199,54 @@ class DecodeCacheTensor:
             hbm_element_bytes=self.element_bytes,
             hbm_real_data_ratio=float(self.element_bytes),
         )
+
+    def overwrite_rows(
+        self,
+        prog,
+        source: VRAMMatrixVar,
+        *,
+        rows: int,
+        source_row: int = 0,
+        name: str | None = None,
+    ) -> None:
+        """Overwrite valid scratch rows without storing undefined VRAM padding.
+
+        Reconstructed MLA K/V tensors have an MLEN-aligned physical height, but
+        only their logical history rows are initialized.  Storing the full
+        physical tensor can persist NaN padding; a later QK matmul observes the
+        NaN before the valid-column mask is added.  Guarded row writes keep the
+        logical rows exact and every hardware-overwritten neighbor finite.
+        """
+        if rows <= 0:
+            raise ValueError(f"rows must be positive, got {rows}")
+        if rows > self.max_tokens:
+            raise ValueError(
+                f"{self.backing.name}: rows={rows} exceed capacity={self.max_tokens}"
+            )
+        if source_row + rows > source.shape[0]:
+            raise ValueError(
+                f"{self.backing.name}: source range [{source_row}, "
+                f"{source_row + rows}) exceeds source rows={source.shape[0]}"
+            )
+        if source.shape[1] != self.width:
+            raise ValueError(
+                f"{self.backing.name}: source width={source.shape[1]} does not "
+                f"match cache width={self.width}"
+            )
+        prefix = name or f"{self.backing.display_name}_overwrite"
+        prog.emit(
+            f"; DECODE_CACHE_OVERWRITE_VALID {self.backing.name} "
+            f"rows={rows} width={self.width}\n"
+        )
+        for offset in range(rows):
+            self._store_guarded_row(
+                prog,
+                source,
+                token_index=offset,
+                source_row=source_row + offset,
+                packet_name=f"{prefix}_t{offset}",
+                marker="DECODE_CACHE_SCRATCH_ROW",
+            )
 
 
 def allocate_decode_cache_tensor(

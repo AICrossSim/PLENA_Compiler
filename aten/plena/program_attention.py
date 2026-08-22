@@ -738,18 +738,20 @@ class ProgramAttentionMixin:
         *,
         base_gp: int,
         rows: int,
+        zero_row_address: int,
     ) -> None:
-        """Reset an MLEN-wide VRAM row range whose base is held in a GP register."""
-        gp_addr, gp_loop = self.register_allocator.allocate_gp(2)
+        """True-zero an MLEN-wide VRAM range whose base is in a GP register."""
+        gp_addr, gp_zero, gp_loop = self.register_allocator.allocate_gp(3)
         lines = [
             "; Reset loop-carried packed attention output group",
             f"S_ADDI_INT gp{gp_addr}, gp{base_gp}, 0",
+            *load_large_int(gp_zero, zero_row_address),
             f"C_LOOP_START gp{gp_loop}, {rows}",
-            f"V_MUL_VF gp{gp_addr}, gp{gp_addr}, f0, 0",
+            f"S_MAP_V_FP gp{gp_addr}, gp{gp_zero}, 0",
             f"S_ADDI_INT gp{gp_addr}, gp{gp_addr}, {self.mlen}",
             f"C_LOOP_END gp{gp_loop}",
         ]
-        self.register_allocator.free_gp([gp_addr, gp_loop])
+        self.register_allocator.free_gp([gp_addr, gp_zero, gp_loop])
         self.emit("\n".join(lines) + "\n")
 
     def _pack_o_head_to_output(
@@ -911,12 +913,15 @@ class ProgramAttentionMixin:
         )
         pack_scratch_addr = self.get_vram_addr(pack_scratch.name)
 
+        zero_row_address = self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * mlen
+        self.emit(self._reset_fpsram_asm(zero_row_address, mlen, 0))
         self.emit(
             self._reset_vram_asm(
                 start_address=output_base_address,
                 rows=rows,
                 cols=mlen,
                 total_rows=output_physical_rows,
+                zero_row_address=zero_row_address,
                 mlen=mlen,
             )
         )
@@ -1147,6 +1152,8 @@ class ProgramAttentionMixin:
         )
         k_addr_reg, v_addr_reg = self.register_allocator.allocate_addr(2)
         try:
+            zero_row_address = self._ONLINE_SOFTMAX_FPSRAM_BASE + 2 * mlen
+            self.emit(self._reset_fpsram_asm(zero_row_address, mlen, 0))
             setup_lines = [
                 "; === Packed GQA attention core loop over KV groups ===",
                 *load_large_int(gp_q, self.get_vram_addr(Q_full.name)),
@@ -1159,7 +1166,11 @@ class ProgramAttentionMixin:
             ]
             self.emit("\n".join(setup_lines) + "\n")
 
-            self._reset_vram_from_gp(base_gp=gp_o, rows=rows)
+            self._reset_vram_from_gp(
+                base_gp=gp_o,
+                rows=rows,
+                zero_row_address=zero_row_address,
+            )
             self._emit_packed_qkt_to_s_dynamic(
                 q_base_gp=gp_q,
                 k_hbm_addr_reg=k_addr_reg,

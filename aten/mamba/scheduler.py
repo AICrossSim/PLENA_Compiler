@@ -80,6 +80,15 @@ class MambaScheduleConfig:
     state_head_dim_lanes: int = 4
     state_dim_lanes: int = 8
     matrix_input_features: int = 2688
+    # The defaults are Nemotron 3's real Mamba-2 geometry.  Keeping the shape in
+    # the schedule contract (instead of baking it into the descriptor builder)
+    # also permits compact, deterministic transactional tests without defining a
+    # second Mamba instruction format.
+    mamba_num_heads: int = 64
+    mamba_head_dim: int = 64
+    mamba_state_dim: int = 128
+    mamba_groups: int = 8
+    mamba_conv_kernel: int = 4
     kda_q_bank_rotation: int = 0
     kda_k_bank_rotation: int = 0
     kda_v_bank_rotation: int = 0
@@ -149,9 +158,16 @@ class MambaScheduleConfig:
             "state_head_dim_lanes",
             "state_dim_lanes",
             "matrix_input_features",
+            "mamba_num_heads",
+            "mamba_head_dim",
+            "mamba_state_dim",
+            "mamba_groups",
+            "mamba_conv_kernel",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.mamba_num_heads % self.mamba_groups:
+            raise ValueError("mamba_num_heads must be divisible by mamba_groups")
         for name in (
             "kda_q_bank_rotation",
             "kda_k_bank_rotation",
@@ -235,27 +251,48 @@ class MambaHbmLayout:
 
         entries = len(config.mamba_layer_ids) * config.batch_size
         layers = len(config.mamba_layer_ids)
-        state_bytes = 64 * 64 * 128 * config.state_precision.element_bytes
+        d_inner = config.mamba_num_heads * config.mamba_head_dim
+        conv_channels = d_inner + 2 * config.mamba_groups * config.mamba_state_dim
+        state_bytes = (
+            config.mamba_num_heads
+            * config.mamba_head_dim
+            * config.mamba_state_dim
+            * config.state_precision.element_bytes
+        )
         conv_precision = config.conv_state_precision or config.state_precision
-        conv_state_bytes = 96 * 1024
+        conv_state_bytes = (
+            conv_channels * config.mamba_conv_kernel * conv_precision.element_bytes
+        )
+        input_projection_width = _align_up(
+            2 * d_inner
+            + 2 * config.mamba_groups * config.mamba_state_dim
+            + config.mamba_num_heads,
+            config.vector_tile_size,
+        )
+        output_projection_width = _align_up(d_inner, config.vector_tile_size)
+        parameter_bytes = config.parameter_precision.element_bytes
         # Matrix HBM addresses are byte offsets in the transactional emulator.
         # Compact numerical tests use plain BF16 weights.
         strides = {
             "state": align64(state_bytes),
-            "conv_state": align64(
-                max(conv_state_bytes, 6144 * 3 * conv_precision.element_bytes)
-            ),
+            "conv_state": align64(conv_state_bytes),
             "state_scale": 0x1_0000,
-            "conv_weight": align64(6144 * 4 * 2),
-            "conv_bias": align64(6144 * 2),
-            "a_log": align64(64 * 4),
-            "dt_bias": align64(64 * 4),
-            "d_skip": align64(64 * 4),
+            "conv_weight": align64(
+                conv_channels * config.mamba_conv_kernel * parameter_bytes
+            ),
+            "conv_bias": align64(conv_channels * parameter_bytes),
+            "a_log": align64(config.mamba_num_heads * parameter_bytes),
+            "dt_bias": align64(config.mamba_num_heads * parameter_bytes),
+            "d_skip": align64(config.mamba_num_heads * parameter_bytes),
             "parameter_scale": 0x1_0000,
             "completion": 64,
-            "input_projection": align64(config.matrix_input_features * 10304 * 2),
-            "output_projection": align64(4096 * config.matrix_input_features * 2),
-            "norm_weight": align64(4096 * 2),
+            "input_projection": align64(
+                config.matrix_input_features * input_projection_width * 2
+            ),
+            "output_projection": align64(
+                output_projection_width * config.matrix_input_features * 2
+            ),
+            "norm_weight": align64(output_projection_width * 2),
         }
         counts = {
             "state": entries,
@@ -477,8 +514,15 @@ class Nemotron3MambaScheduler:
             + request_id
         )
         packed_hbm = MambaHbmLayout.build(self.config)
-        input_token_stride = _align_up(10304, self.config.vector_tile_size)
-        output_token_stride = _align_up(4096, self.config.vector_tile_size)
+        d_inner = self.config.mamba_num_heads * self.config.mamba_head_dim
+        conv_channels = (
+            d_inner + 2 * self.config.mamba_groups * self.config.mamba_state_dim
+        )
+        input_token_stride = _align_up(
+            d_inner + conv_channels + self.config.mamba_num_heads,
+            self.config.vector_tile_size,
+        )
+        output_token_stride = _align_up(d_inner, self.config.vector_tile_size)
         descriptor_chunk_size = (
             self.config.chunk_size
             if self.config.phase == SchedulePhase.PREFILL
@@ -499,6 +543,12 @@ class Nemotron3MambaScheduler:
             flags |= FLAG_LAST_CHUNK
         return MambaDescriptor(
             payload=Mamba2Payload(
+                head_dim=self.config.mamba_head_dim,
+                state_dim=self.config.mamba_state_dim,
+                groups=self.config.mamba_groups,
+                conv_kernel=self.config.mamba_conv_kernel,
+                xbc_offset=d_inner,
+                dt_offset=d_inner + conv_channels,
                 conv_weight_addr=packed_hbm.address(
                     "conv_weight", layer_id=layer_id, ordinal=key_index // self.config.batch_size
                 ),
@@ -517,7 +567,7 @@ class Nemotron3MambaScheduler:
                 parameter_scale_addr=packed_hbm.address("parameter_scale"),
             ),
             batch_size=1,
-            num_heads=64,
+            num_heads=self.config.mamba_num_heads,
             sequence_length=sequence_length,
             chunk_size=descriptor_chunk_size,
             state_precision=self.config.state_precision,
@@ -681,7 +731,10 @@ class Nemotron3MambaScheduler:
             "IN_PROJECTION",
             key=key,
             descriptor=descriptor,
-            note="2688 -> 10304 using existing Matrix service",
+            note=(
+                f"{self.config.matrix_input_features} -> "
+                f"{descriptor.input_token_stride} using existing Matrix service"
+            ),
         )
         self._emit(
             Resource.LAYOUT,
@@ -723,7 +776,10 @@ class Nemotron3MambaScheduler:
             "OUT_PROJECTION",
             key=key,
             descriptor=descriptor,
-            note="4096 -> 2688 using existing Matrix service",
+            note=(
+                f"{descriptor.output_token_stride} -> "
+                f"{self.config.matrix_input_features} using existing Matrix service"
+            ),
         )
 
     def _build_decode(self) -> None:

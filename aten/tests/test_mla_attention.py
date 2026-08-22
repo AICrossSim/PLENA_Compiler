@@ -73,6 +73,30 @@ def test_mha_releases_internal_score_and_pv_scratch() -> None:
     assert "PV" not in prog.vram_matrices
 
 
+def test_online_softmax_true_zeros_reused_output_vram() -> None:
+    """Attention output reset must overwrite NaNs rather than multiply by zero."""
+    prog = PlenaCompiler(mlen=64, blen=4)
+    q = prog.load_batch(
+        prog.input(
+            "Q_true_zero",
+            shape=(1, 64),
+            physical_shape=(64, 64),
+            prestaged_vram_addr=0,
+        )
+    )
+    k = prog.input("K_true_zero", shape=(1, 64), physical_shape=(64, 64))
+    v = prog.input("V_true_zero", shape=(1, 64), physical_shape=(64, 64))
+
+    prog.flash_attention(q, k, v, seq_len=1, kv_seq_len=1)
+    asm = prog.compile()
+    init = asm.split("=== Init Online Softmax", 1)[1].split(
+        "=== Online Softmax Block", 1
+    )[0]
+
+    assert "S_MAP_V_FP" in init
+    assert "V_MUL_VF" not in init
+
+
 def test_plain_bf16_hbm_inputs_allocate_their_full_two_byte_footprint() -> None:
     prog = PlenaCompiler(mlen=64, blen=4)
     first = prog.input(
@@ -421,6 +445,97 @@ def test_four_token_mla_keeps_only_compressed_history_persistent() -> None:
         assert prefetch.endswith(", 1, 1")
 
 
+def test_sixteen_token_mla_prefill_keeps_compressed_cache_and_causal_mask() -> None:
+    prog = PlenaCompiler(mlen=64, blen=4)
+    shape = MlaBlockShape(
+        hidden=64,
+        q_lora=64,
+        kv_lora=64,
+        qk_nope=64,
+        qk_rope=64,
+        v_head=64,
+        heads=1,
+    )
+    hidden = prog.load_batch(
+        prog.input(
+            "prefill_hidden",
+            shape=(16, 64),
+            physical_shape=(64, 64),
+            prestaged_vram_addr=0,
+        )
+    )
+    cos = prog.load_batch(
+        prog.input(
+            "prefill_cos",
+            shape=(16, 64),
+            physical_shape=(64, 64),
+            prestaged_vram_addr=4096,
+        )
+    )
+    sin = prog.load_batch(
+        prog.input(
+            "prefill_sin",
+            shape=(16, 64),
+            physical_shape=(64, 64),
+            prestaged_vram_addr=8192,
+        )
+    )
+
+    def weight(name: str, rows: int, cols: int):
+        return prog.input(name, shape=(rows, cols), physical_shape=(rows, cols))
+
+    cache = allocate_mla_decode_cache(prog, shape=shape, max_tokens=20)
+    eps = prog.fp_var("prefill_eps", 1)
+    reciprocal = prog.fp_var("prefill_reciprocal", 1)
+    output = emit_mla_residual_block(
+        prog,
+        hidden,
+        shape=shape,
+        weights=MlaBlockWeights(
+            q_a=weight("prefill_q_a", 64, 64),
+            q_b=weight("prefill_q_b", 64, 128),
+            kv_a=weight("prefill_kv_a", 64, 128),
+            kv_b=weight("prefill_kv_b", 64, 128),
+            out=weight("prefill_out", 64, 64),
+            q_rope_rotate=weight("prefill_q_rot", 64, 64),
+            k_rope_rotate=weight("prefill_k_rot", 64, 64),
+        ),
+        cos=cos,
+        sin=sin,
+        norms=MlaNormConstants(
+            eps.address,
+            reciprocal.address,
+            eps.address,
+            reciprocal.address,
+            eps.address,
+            reciprocal.address,
+        ),
+        rows=16,
+        cache=cache,
+        token_index=0,
+        causal=True,
+    )
+    assembly = prog.compile()
+
+    assert output.shape == (16, 64)
+    assert assembly.count("MLA_COMPRESSED_CACHE_APPEND") == 1
+    assert assembly.count("DECODE_CACHE_APPEND kimi_mla_cache_compressed") == 16
+    assert (
+        assembly.count(
+            "DECODE_CACHE_SCRATCH_ROW kimi_mla_cache_reconstructed_k_scratch"
+        )
+        == 16
+    )
+    assert (
+        assembly.count(
+            "DECODE_CACHE_SCRATCH_ROW kimi_mla_cache_reconstructed_v_scratch"
+        )
+        == 16
+    )
+    assert "_mha_causal_mask" in assembly
+    cache.assert_hbm_contract(prog)
+
+
 def test_mla_cache_hbm_contract_rejects_an_expanded_cache_allocation() -> None:
     prog = PlenaCompiler(mlen=64, blen=4)
     shape = MlaBlockShape(
@@ -505,11 +620,15 @@ def test_single_token_mla_reuses_one_ephemeral_hbm_head_scratch() -> None:
 
     assert assembly.count("MLA_RECONSTRUCTED_HEAD_TILE") == shape.heads
     assert (
-        assembly.count("DECODE_CACHE_OVERWRITE ephemeral_mla_reconstructed_k_scratch")
+        assembly.count(
+            "DECODE_CACHE_OVERWRITE_VALID ephemeral_mla_reconstructed_k_scratch"
+        )
         == shape.heads
     )
     assert (
-        assembly.count("DECODE_CACHE_OVERWRITE ephemeral_mla_reconstructed_v_scratch")
+        assembly.count(
+            "DECODE_CACHE_OVERWRITE_VALID ephemeral_mla_reconstructed_v_scratch"
+        )
         == shape.heads
     )
     assert "ephemeral_mla_k_scratch0" not in assembly

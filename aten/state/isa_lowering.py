@@ -23,6 +23,33 @@ from aten.state.lowering import (
 )
 
 
+# FPRAM[0:256] is the existing Attention ABI: zero, scale, -inf and the
+# online-softmax workspace.  State blocks keep immutable copies outside that
+# range, then restore their three fixed working slots immediately before the
+# gated normalization stage.  This is required when Attention and Mamba/KDA
+# alternate on one device because online softmax overwrites slots 3 onward.
+STATE_FPRAM_EPS_SLOT = 3
+STATE_FPRAM_RECIPROCAL_SLOT = 4
+STATE_FPRAM_ONE_SLOT = 5
+STATE_FPRAM_BACKUP_EPS = 256
+STATE_FPRAM_BACKUP_RECIPROCAL = 257
+STATE_FPRAM_BACKUP_ONE = 258
+
+
+def _restore_state_fpram_asm() -> str:
+    asm = IsaBuilder().comment(
+        "restore state constants after shared Attention FPRAM workspace"
+    )
+    for source, destination in (
+        (STATE_FPRAM_BACKUP_EPS, STATE_FPRAM_EPS_SLOT),
+        (STATE_FPRAM_BACKUP_RECIPROCAL, STATE_FPRAM_RECIPROCAL_SLOT),
+        (STATE_FPRAM_BACKUP_ONE, STATE_FPRAM_ONE_SLOT),
+    ):
+        asm.instr("S_LD_FP", "f1", gp(0), source)
+        asm.instr("S_ST_FP", "f1", gp(0), destination)
+    return asm.render()
+
+
 @dataclass(frozen=True)
 class MambaLayerMemoryMap:
     layer_id: int
@@ -213,7 +240,18 @@ def lower_mamba_trace_to_existing_isa(
         descriptor_base=descriptor_base,
         descriptor_image=lowered_state.descriptor_image,
         events=tuple(events),
-        fpram_constants=((1, 1.0e-5), (2, 1.0 / 512.0), (5, 1.0)),
+        fpram_constants=(
+            (STATE_FPRAM_BACKUP_EPS, 1.0e-5),
+            (
+                STATE_FPRAM_BACKUP_RECIPROCAL,
+                trace.config.mamba_groups
+                / (
+                    trace.config.mamba_num_heads
+                    * trace.config.mamba_head_dim
+                ),
+            ),
+            (STATE_FPRAM_BACKUP_ONE, 1.0),
+        ),
         layout_descriptor_base=lowered_state.layout_descriptor_base,
         layout_descriptor_image=lowered_state.layout_descriptor_image,
     )
@@ -303,10 +341,9 @@ def lower_kda_trace_to_existing_isa(
         descriptor_image=lowered_state.descriptor_image,
         events=tuple(events),
         fpram_constants=(
-            (1, 1.0e-5),
-            (2, 1.0 / 512.0),
-            (3, 1.0 / 128.0),
-            (5, 1.0),
+            (STATE_FPRAM_BACKUP_EPS, 1.0e-5),
+            (STATE_FPRAM_BACKUP_RECIPROCAL, 1.0 / trace.config.kda_value_dim),
+            (STATE_FPRAM_BACKUP_ONE, 1.0),
         ),
         layout_descriptor_base=lowered_state.layout_descriptor_base,
         layout_descriptor_image=lowered_state.layout_descriptor_image,
@@ -669,7 +706,10 @@ def _gated_group_rmsnorm_asm(
     gate_base = descriptor.input_vram_addr
     d_inner = descriptor.num_heads * payload.head_dim
     group_size = d_inner // payload.groups
-    parts = [_comment(event, f"gate -> group RMSNorm, rows={rows}, groups={payload.groups}")]
+    parts = [
+        _comment(event, f"gate -> group RMSNorm, rows={rows}, groups={payload.groups}"),
+        _restore_state_fpram_asm(),
+    ]
     parts.append(
         silu_asm(
             const_one_fp_address=5,
@@ -693,8 +733,8 @@ def _gated_group_rmsnorm_asm(
     for group in range(payload.groups):
         parts.append(
             rms_norm_asm(
-                _eps_offset=1,
-                reci_hid_offset=2,
+                _eps_offset=STATE_FPRAM_EPS_SLOT,
+                reci_hid_offset=STATE_FPRAM_RECIPROCAL_SLOT,
                 alive_registers=[1, 2, 3, 4],
                 activation_base_address=value_base + group * group_size * rows,
                 scratchpad_base_address=memory.normalization_scratch_vram_addr,
@@ -757,15 +797,20 @@ def _kda_gated_rmsnorm_asm(
     value_base = descriptor.output_vram_addr
     gate_base = event.aux_vram_addr
     projection = descriptor.num_heads * payload.value_dim
-    parts = [_comment(event, f"per-head RMSNorm then sigmoid gate, rows={rows}")]
+    parts = [
+        _comment(event, f"per-head RMSNorm then sigmoid gate, rows={rows}"),
+        _restore_state_fpram_asm(),
+    ]
 
     if payload.value_dim != 2 * vlen:
         raise ValueError("compact KDA head RMSNorm currently requires value_dim=2*VLEN")
     norm = IsaBuilder().comment("rolled per-head KDA RMSNorm")
     norm.instr("S_ADDI_INT", gp(1), gp(0), value_base)
     norm.instr("S_ADDI_INT", gp(4), gp(0), memory.normalization_scratch_vram_addr)
-    norm.instr("S_LD_FP", "f1", gp(0), 1)
-    norm.instr("S_LD_FP", "f3", gp(0), 3)
+    norm.instr("S_LD_FP", "f1", gp(0), STATE_FPRAM_EPS_SLOT)
+    norm.instr(
+        "S_LD_FP", "f3", gp(0), STATE_FPRAM_RECIPROCAL_SLOT
+    )
     norm.instr("C_LOOP_START", gp(5), descriptor.num_heads)
     norm.instr("S_ADDI_INT", gp(2), gp(1), 0)
     norm.instr("C_LOOP_START", gp(6), rows)
@@ -834,7 +879,7 @@ def _kda_gated_rmsnorm_asm(
     gate.instr("S_ADDI_INT", gp(1), gp(0), value_base)
     gate.instr("S_ADDI_INT", gp(2), gp(0), gate_base)
     gate.instr("S_ADDI_INT", gp(3), gp(0), memory.normalization_scratch_vram_addr)
-    gate.instr("S_LD_FP", "f1", gp(0), 5)
+    gate.instr("S_LD_FP", "f1", gp(0), STATE_FPRAM_ONE_SLOT)
     gate.instr("C_LOOP_START", gp(4), rows * projection // vlen)
     gate.instr("V_SUB_VF", gp(3), gp(2), "f0", 0, 1)
     gate.instr("V_EXP_V", gp(3), gp(3), 0)

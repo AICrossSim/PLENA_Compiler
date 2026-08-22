@@ -777,18 +777,20 @@ class IsaAttentionMixin:
         rows: int,
         cols: int,
         total_rows: int,
+        zero_row_address: int,
         mlen: int = 64,
         row_offset: int = 0,
     ) -> str:
         """
-        Reset a region of VRAM to zero.
+        Overwrite a region of VRAM with a known-zero FPRAM row.
 
-        V_MUL_VF processes mlen elements at a time; when cols > mlen, each
-        row is split into cols // mlen mlen-wide blocks.
+        Multiplying the previous VRAM contents by zero is not a valid clear:
+        IEEE NaN * 0 remains NaN.  S_MAP_V_FP performs a true overwrite.
         """
-        gp_regs = self.register_allocator.allocate_gp(2)
+        gp_regs = self.register_allocator.allocate_gp(3)
         gp_addr = gp_regs[0]
         gp_loop = gp_regs[1]
+        gp_zero = gp_regs[2]
 
         num_col_blocks = (cols + mlen - 1) // mlen
 
@@ -801,6 +803,7 @@ class IsaAttentionMixin:
             "; Storage layout: (total_rows, mlen, cols/mlen), column-block major"
         )
         lines.append(f"; total_rows = {total_rows}, row_offset = {row_offset}")
+        lines.extend(load_large_int(gp_zero, zero_row_address))
 
         if getattr(self, "unroll_attention", False):
             for row in range(rows):
@@ -812,14 +815,14 @@ class IsaAttentionMixin:
                         + actual_row * mlen
                     )
                     lines.extend(load_large_int(gp_addr, addr))
-                    lines.append(f"V_MUL_VF gp{gp_addr}, gp{gp_addr}, f0, 0")
+                    lines.append(f"S_MAP_V_FP gp{gp_addr}, gp{gp_zero}, 0")
         else:
             for col_block in range(num_col_blocks):
                 addr = start_address + col_block * total_rows * mlen + row_offset * mlen
                 lines.append(f"; Column block {col_block}")
                 lines.extend(load_large_int(gp_addr, addr))
                 lines.append(f"C_LOOP_START gp{gp_loop}, {rows}")
-                lines.append(f"V_MUL_VF gp{gp_addr}, gp{gp_addr}, f0, 0")
+                lines.append(f"S_MAP_V_FP gp{gp_addr}, gp{gp_zero}, 0")
                 lines.append(f"S_ADDI_INT gp{gp_addr}, gp{gp_addr}, {mlen}")
                 lines.append(f"C_LOOP_END gp{gp_loop}")
 
@@ -860,6 +863,7 @@ class IsaAttentionMixin:
             rows=self.mlen if rows is None else rows,
             cols=head_dim,
             total_rows=physical_seq_len,
+            zero_row_address=l_addr,
             mlen=self.mlen,
             row_offset=row_offset,
         )

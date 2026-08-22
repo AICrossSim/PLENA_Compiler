@@ -63,8 +63,9 @@ hidden state
 | Nemotron 52 层机器码 | 完成 | 6,202,663 条、23.66 MiB；参数由 symbolic HBM manifest 描述 |
 | Kimi 93 层机器码 | 完成 | 96-head 共 11,502,370 条，原始机器码 43.88 MiB |
 | 4-token GQA / compressed-MLA cache | 完成 | Nemotron 32Q/2KV GQA 与 Kimi 96-head MLA 已在同一 HBM 实例中逐 token 追加并完成 Rust 数值对拍 |
-| Prefill 和整模多 token decode | 未完成 | 4-token 证明目前覆盖独立 Attention/MLA block；52/93 层 connected builder 仍生成单 token decode |
-| 真实权重整模执行 | 未完成 | 不能声称 Nemotron/Kimi 已在 PLENA 从第一层跑到最后一层 |
+| Synthetic prefill | 完成 | S16/S128 Mamba/KDA chunk、GQA/compressed-MLA cache 和 multi-token MoE 均在 Rust 对拍 |
+| Compact synthetic 整模 | 完成 | Nemotron 52 层与 Kimi 93 层均连续执行 S16 prefill + decode 4 token |
+| 真实 checkpoint 整模执行 | 未完成 | 不能把 compact synthetic 周期写成真实 Nemotron/Kimi latency |
 | RTL、频率、面积和端到端加速比 | 未开始 | 属于下一阶段，不是本仓库当前结论 |
 
 4-token 测试保留真实 attention/cache 维度，只缩小外围 hidden rank：
@@ -105,6 +106,12 @@ uv run pytest -q -m "not slow" \
 ```bash
 nix develop --no-write-lock-file --command just test-nemotron3-gqa-cache
 nix develop --no-write-lock-file --command just test-kimi3-mla-cache
+nix develop --no-write-lock-file --command just test-state-prefill --model all --tokens 16
+nix develop --no-write-lock-file --command just test-state-prefill --model all --tokens 128
+nix develop --no-write-lock-file --command just test-moe-prefill --model all --tokens 16
+nix develop --no-write-lock-file --command just test-moe-prefill --model all --tokens 128
+nix develop --no-write-lock-file --command just test-nemotron3-full-synthetic
+nix develop --no-write-lock-file --command just test-kimi3-full-synthetic
 ```
 
 完整的分支测试列表见 [CI 配置](.github/workflows/ci.yml)。TileLang/TVM 不是
@@ -156,5 +163,6 @@ manifest、SHA256 和一份 summary。Kimi 的全量构建约需 2 分钟和 5 G
 
 ## 结果应该怎么理解
 
-本分支证明的是：Compiler 能生成一致的指令和数据布局，并把相邻计算阶段接起来。
-它还没有证明真实模型精度、RTL 时序、FPGA PPA 或相对 GPU 的端到端加速。
+本分支与配套 Simulator 已证明：Compiler 能生成一致的指令和数据布局，S16/S128
+prefill 可执行，且 compact synthetic 52/93 层能从第一层连续运行到最后一层。它还
+没有证明真实 checkpoint 精度与 latency、RTL 时序、FPGA PPA 或相对 GPU 的端到端加速。

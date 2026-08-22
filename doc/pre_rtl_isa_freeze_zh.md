@@ -108,8 +108,10 @@ assembler 后，真实 96-head、93 层程序现在是：
 完整机器码产物。
 
 4-token compressed MLA cache append/read 已独立通过 Rust 数值对拍，HBM manifest
-也会拒绝展开的 96-head K/V cache。Compiler/Simulator descriptor 与 golden 已有
-跨仓测试。RTL 前仍未完成的是：
+也会拒绝展开的 96-head K/V cache。S16/S128 transactional prefill 与 compact
+Nemotron 52 层、Kimi 93 层 S16+decode4 也已在 Rust 连续执行；后者分别是 426,814
+和 4,646,741 条指令，逐层 checkpoint 100% 对拍。Compiler/Simulator descriptor
+与 golden 已有跨仓测试。RTL 前仍未完成的是：
 
 1. symbolic HBM manifest 绑定真实 checkpoint 后的整模数值 replay；
 2. route extension 的实际实现（只有确定需要 batch dynamic route 时才加入）；

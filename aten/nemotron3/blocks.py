@@ -188,12 +188,15 @@ def emit_nemotron_attention_block(
     name: str = "nemotron_attention",
     cache: NemotronGqaDecodeCache | None = None,
     token_index: int | None = None,
+    causal: bool = False,
 ) -> VRAMMatrixVar:
     """Emit connected GQA and return the mixer output.
 
-    With ``cache=None`` this preserves the single-token scratch path.  With a
-    cache, one decode row is appended to each physical K/V head and the query
-    attends to the complete prefix ``[0, token_index]``.
+    With ``cache=None`` this preserves the scratch path.  With a cache, decode
+    appends one row while prefill appends a complete prompt fragment.  The first
+    multi-row cache fill must start at token zero; later calls use incremental
+    decode because the current attention mask cannot represent a non-zero
+    multi-row query offset.
     """
     shape.validate(prog.mlen)
     if rows < 1 or rows > hidden.shape[0]:
@@ -205,13 +208,16 @@ def emit_nemotron_attention_block(
     if (cache is None) != (token_index is None):
         raise ValueError(f"{name}: cache and token_index must be provided together")
     if cache is not None:
-        if rows != 1:
-            raise ValueError(f"{name}: incremental GQA decode requires rows=1")
         if len(cache.keys) != shape.kv_heads or len(cache.values) != shape.kv_heads:
             raise ValueError(f"{name}: cache head count does not match shape.kv_heads")
-        if cache.max_tokens <= token_index:
+        if rows > 1 and token_index != 0:
             raise ValueError(
-                f"{name}: token_index={token_index} exceeds cache capacity={cache.max_tokens}"
+                f"{name}: multi-row GQA cache fill must start at token_index=0"
+            )
+        if token_index + rows > cache.max_tokens:
+            raise ValueError(
+                f"{name}: token range [{token_index}, {token_index + rows}) "
+                f"exceeds cache capacity={cache.max_tokens}"
             )
 
     prog.emit(f"; {moe_end_marker(f'{name} non-MoE region')}\n")
@@ -266,22 +272,24 @@ def emit_nemotron_attention_block(
                 )
             )
         else:
-            cache.keys[kv_head].append_row(
+            cache.keys[kv_head].append_rows(
                 prog,
                 k_head,
                 token_index=token_index,
+                rows=rows,
                 name=f"{name}_k_append_head{kv_head}",
             )
-            cache.values[kv_head].append_row(
+            cache.values[kv_head].append_rows(
                 prog,
                 v_head,
                 token_index=token_index,
+                rows=rows,
                 name=f"{name}_v_append_head{kv_head}",
             )
             kv_inputs.append(
                 (
-                    cache.keys[kv_head].prefix(token_index + 1),
-                    cache.values[kv_head].prefix(token_index + 1),
+                    cache.keys[kv_head].prefix(token_index + rows),
+                    cache.values[kv_head].prefix(token_index + rows),
                 )
             )
         prog.free_tensor(k_head)
@@ -302,9 +310,10 @@ def emit_nemotron_attention_block(
             k_input,
             v_input,
             scale=shape.head_dim**-0.5,
+            causal_mask=causal,
             batch_size=1,
             seq_len=rows,
-            kv_seq_len=rows if cache is None else token_index + 1,
+            kv_seq_len=rows if cache is None else token_index + rows,
             k_matrix_precision="weights" if cache is None else "keyvalue",
             v_matrix_precision="weights" if cache is None else "keyvalue",
             k_hbm_element_bytes=1 if cache is None else 2,
@@ -466,12 +475,20 @@ def emit_nemotron_moe_block(
             policy_name="nemotron3",
             name=f"{name}_token{token_idx}",
         )
-    prog.fpvar_mul(
-        topk_weights,
-        constants.routed_scale,
-        topk_weights,
-        count=rows * shape.top_k,
-    )
+    if constants.routed_scale.size < shape.top_k:
+        raise ValueError(
+            "routed_scale must provide one value per selected expert"
+        )
+    for token_idx in range(rows):
+        route_offset = token_idx * shape.top_k
+        prog.fpvar_mul_region(
+            topk_weights,
+            constants.routed_scale,
+            topk_weights,
+            count=shape.top_k,
+            src1_offset=route_offset,
+            dst_offset=route_offset,
+        )
 
     accumulator = prog.alloc(
         f"{name}_routed_accumulator",

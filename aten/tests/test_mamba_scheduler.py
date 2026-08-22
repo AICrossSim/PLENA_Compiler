@@ -214,3 +214,35 @@ def test_decode_still_alternates_the_double_buffer_per_token() -> None:
     inputs = [step.input_vram_addr for step in steps]
     assert inputs[0] == inputs[2] and inputs[1] == inputs[3]
     assert inputs[0] != inputs[1]
+
+
+def test_compact_mamba_geometry_uses_the_same_descriptor_contract() -> None:
+    trace = Nemotron3MambaScheduler(
+        MambaScheduleConfig(
+            phase=SchedulePhase.PREFILL,
+            sequence_length=16,
+            chunk_size=16,
+            matrix_input_features=64,
+            mamba_layer_ids=(0,),
+            mamba_num_heads=1,
+            mamba_head_dim=64,
+            mamba_state_dim=128,
+            mamba_groups=1,
+            mamba_conv_kernel=4,
+            mamba_hbm_arena_base=0x10000,
+        )
+    ).build()
+    descriptor = next(
+        event.descriptor for event in trace.events if event.operation == "PREFILL"
+    )
+
+    assert descriptor.num_heads == 1
+    assert descriptor.payload.head_dim == 64
+    assert descriptor.payload.state_dim == 128
+    assert descriptor.payload.groups == 1
+    assert descriptor.payload.xbc_offset == 64
+    assert descriptor.payload.dt_offset == 384
+    assert descriptor.input_token_stride == 448
+    assert descriptor.output_token_stride == 64
+    assert descriptor.state_bytes == 64 * 128 * 4
+    assert descriptor.conv_state_bytes == (64 + 2 * 128) * 4 * 4

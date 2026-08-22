@@ -592,6 +592,7 @@ def emit_mla_residual_block(
     add_residual: bool = True,
     cache: MlaDecodeCache | None = None,
     token_index: int | None = None,
+    causal: bool = False,
 ) -> VRAMMatrixVar:
     """Emit pre-norm MLA and optionally add the ordinary residual.
 
@@ -614,13 +615,16 @@ def emit_mla_residual_block(
     if (cache is None) != (token_index is None):
         raise ValueError(f"{name}: cache and token_index must be provided together")
     if cache is not None:
-        if rows != 1:
-            raise ValueError(f"{name}: incremental MLA decode requires rows=1")
         if cache.heads != shape.heads:
             raise ValueError(f"{name}: cache head count does not match MLA shape")
-        if cache.max_tokens <= token_index:
+        if rows > 1 and token_index != 0:
             raise ValueError(
-                f"{name}: token_index={token_index} exceeds cache capacity={cache.max_tokens}"
+                f"{name}: multi-row compressed-MLA cache fill must start at token_index=0"
+            )
+        if token_index + rows > cache.max_tokens:
+            raise ValueError(
+                f"{name}: token range [{token_index}, {token_index + rows}) "
+                f"exceeds cache capacity={cache.max_tokens}"
             )
         cache.assert_compressed_only()
 
@@ -701,13 +705,14 @@ def emit_mla_residual_block(
             f"; MLA_COMPRESSED_CACHE_APPEND token={token_index} "
             f"width={shape.kv_a_width} heads={shape.heads}\n"
         )
-        cache.compressed.append_row(
+        cache.compressed.append_rows(
             prog,
             compressed_kv,
             token_index=token_index,
+            rows=rows,
             name=f"{name}_compressed_append",
         )
-        history_rows = token_index + 1
+        history_rows = token_index + rows
         history_compressed = prog.load_batch(
             cache.compressed.prefix(history_rows),
             name=f"{name}_compressed_history_t{token_index}",
@@ -829,8 +834,18 @@ def emit_mla_residual_block(
             f"; MLA_RECONSTRUCTED_HEAD_TILE token={token_index} head={head} "
             f"rows={history_rows}\n"
         )
-        reconstructed_k.overwrite_from(prog, k_head)
-        reconstructed_v.overwrite_from(prog, v_head)
+        reconstructed_k.overwrite_rows(
+            prog,
+            k_head,
+            rows=history_rows,
+            name=f"{name}_k_scratch_head{head}",
+        )
+        reconstructed_v.overwrite_rows(
+            prog,
+            v_head,
+            rows=history_rows,
+            name=f"{name}_v_scratch_head{head}",
+        )
         k_hbm = reconstructed_k.prefix(history_rows)
         v_hbm = reconstructed_v.prefix(history_rows)
         head_out = prog.flash_attention(
@@ -838,6 +853,7 @@ def emit_mla_residual_block(
             k_hbm,
             v_hbm,
             scale=shape.qk_head**-0.5,
+            causal_mask=causal,
             batch_size=1,
             seq_len=rows,
             kv_seq_len=history_rows,

@@ -146,6 +146,30 @@ class IsaFPOpsMixin:
         finally:
             self._reg.free_gp(gp_regs)
 
+    def fpvar_zero_asm(self, dst_addr: int, count: int) -> str:
+        """Write architectural f0 into every FPRAM element in a range."""
+        if count <= 0:
+            return self._emit_fpvar_skip("Zero", count)
+
+        gp_regs = self._reg.allocate_gp(2)
+        gp_dst, gp_loop = gp_regs
+        try:
+            asm = IsaBuilder().comment(
+                f"FPVar Zero: FPRAM[{dst_addr}:{dst_addr + count}] = 0"
+            )
+            asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
+            if self._unroll:
+                for i in range(count):
+                    asm.instr("S_ST_FP", fp(0), gp(gp_dst), i)
+            else:
+                asm.instr("C_LOOP_START", gp(gp_loop), count)
+                asm.instr("S_ST_FP", fp(0), gp(gp_dst), 0)
+                asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), 1)
+                asm.instr("C_LOOP_END", gp(gp_loop))
+            return self._emit(asm)
+        finally:
+            self._reg.free_gp(gp_regs)
+
     def fpvar_reci_asm(self, src_addr: int, dst_addr: int, count: int) -> str:
         return self._fpvar_unary_asm("Reci", "dst = 1/src", "S_RECI_FP", src_addr, dst_addr, count)
 

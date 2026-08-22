@@ -135,6 +135,42 @@ def test_nemotron_gqa_cache_rejects_an_out_of_range_token() -> None:
         )
 
 
+def test_sixteen_token_gqa_prefill_populates_cache_and_emits_causal_mask() -> None:
+    prog = PlenaCompiler(mlen=64, blen=4)
+    hidden = prog.load_batch(
+        prog.input(
+            "prefill_hidden",
+            shape=(16, 64),
+            physical_shape=(64, 64),
+            prestaged_vram_addr=0,
+        )
+    )
+    shape = NemotronAttentionShape(64, 2, 1, 64)
+    cache = allocate_nemotron_gqa_decode_cache(prog, shape=shape, max_tokens=20)
+    output = emit_nemotron_attention_block(
+        prog,
+        hidden,
+        shape=shape,
+        weights=NemotronAttentionWeights(
+            q=_weight(prog, "prefill_w_q", 64, 128),
+            k=_weight(prog, "prefill_w_k", 64, 64),
+            v=_weight(prog, "prefill_w_v", 64, 64),
+            out=_weight(prog, "prefill_w_o", 128, 64),
+        ),
+        rows=16,
+        cache=cache,
+        token_index=0,
+        causal=True,
+    )
+    assembly = prog.compile()
+
+    assert output.shape == (16, 64)
+    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_k_head0") == 16
+    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_v_head0") == 16
+    assert "_mha_causal_mask" in assembly
+    assert cache.keys[0].prefix(16).shape == (16, 64)
+
+
 def test_connected_nemotron_moe_executes_routed_and_shared_relu2() -> None:
     prog, hidden = _program()
     correction = prog.load_batch(
@@ -184,3 +220,53 @@ def test_connected_nemotron_moe_executes_routed_and_shared_relu2() -> None:
     assert "relu2 nemotron_moe_pair1" in assembly
     assert "relu2 nemotron_moe_shared" in assembly
     assert "nemotron_moe_combine" in assembly
+
+
+def test_multi_token_nemotron_moe_reuses_topk_scale_per_token() -> None:
+    prog = PlenaCompiler(mlen=64, blen=4)
+    hidden = prog.load_batch(
+        prog.input(
+            "multi_hidden",
+            shape=(16, 64),
+            physical_shape=(64, 64),
+            prestaged_vram_addr=0,
+        )
+    )
+    correction = prog.load_batch(
+        prog.input(
+            "multi_correction",
+            shape=(4, 64),
+            physical_shape=(4, 64),
+            prestaged_vram_addr=4096,
+        )
+    )
+    zero = prog.fp_var("multi_zero_row", 64)
+    routed_scale = prog.fp_var("multi_routed_scale", 2)
+    output = emit_nemotron_moe_block(
+        prog,
+        hidden,
+        shape=NemotronMoeShape(64, 64, 64, 4, 2),
+        weights=NemotronMoeWeights(
+            router=_weight(prog, "multi_router", 64, 4, bf16=True),
+            routed_up=reserve_expert_weight_table(
+                prog, name="multi_expert_up", num_experts=4, rows=64, cols=64
+            ),
+            routed_down=reserve_expert_weight_table(
+                prog,
+                name="multi_expert_down",
+                num_experts=4,
+                rows=64,
+                cols=64,
+            ),
+            shared_up=_weight(prog, "multi_shared_up", 64, 64),
+            shared_down=_weight(prog, "multi_shared_down", 64, 64),
+        ),
+        correction_bias=correction,
+        constants=NemotronMoeConstants(zero, routed_scale),
+        rows=16,
+    )
+    assembly = prog.compile()
+
+    assert output.shape == (16, 64)
+    assert sum(line.startswith("V_TOPK ") for line in assembly.splitlines()) == 16
+    assert assembly.count("FPVar Mul") == 16

@@ -41,11 +41,19 @@ The second test found and fixed a real address bug: the Matrix micro-column
 offset must advance by `BLEN*MLEN` elements, not `BLEN` elements. Assembly-only
 validation could not detect that error.
 
+The matching Simulator branch also runs a compact whole-backbone program in one
+Rust invocation: 69 KDA, 24 MLA, 92 LatentMoE, and one dense FFN across S16
+causal prefill plus four decode tokens. It executes 4,646,741 instructions in
+80,526,139 simulator cycles, and all 3,740 hidden/residual checkpoints match the
+CPU reference. All 69 KDA state lifetimes and 24 compressed MLA caches pass;
+the persistent HBM manifest contains no expanded all-head K/V object.
+
 ## What this does not prove
 
-Weights are symbolic HBM ranges; no Kimi checkpoint has been packed or executed.
-The connected program supports one decode token only. Persistent multi-token MLA
-cache append/read, prefill, full-model Rust numerical replay, instruction-memory
-provisioning, RTL timing, and PPA remain future work. The 96 MLA head bodies are
-still emitted statically; looping them would reduce code size but is no longer a
-blocker for producing the bounded machine-code artifact.
+The real-shape artifact still uses symbolic HBM ranges; no Kimi checkpoint has
+been packed or executed. Multi-token cache/prefill and 93-layer replay are
+implemented only in compact synthetic fixtures, so their cycles are not a Kimi
+performance estimate. Checkpoint packing, real-width whole-model replay,
+instruction-memory provisioning, RTL timing, and PPA remain future work. The 96
+MLA head bodies are still emitted statically; looping them would reduce code
+size but is no longer a blocker for producing the bounded machine-code artifact.
