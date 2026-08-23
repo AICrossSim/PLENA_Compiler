@@ -20,12 +20,13 @@ The full 96-head result is:
 | Metric | Result |
 |---|---:|
 | Layers | 69 KDA + 24 MLA |
-| Instructions | 11,502,370 |
-| Raw 32-bit machine code | 43.88 MiB |
+| Instructions | 11,662,716 |
+| Raw 32-bit machine code | 44.490 MiB |
 | Assembly text | 292.29 MB |
 | Build + streaming assembly | about 2m10s |
 | Peak host RSS | about 4.7 GiB |
 | Symbolic HBM bindings | 2,713 |
+| Symbolic HBM address span | 3.21 TB (2.92 TiB) |
 
 Every instruction is encoded as one legal 32-bit word. The artifact builder
 also rejects duplicate, overlapping, or out-of-range parameter regions.
@@ -41,19 +42,29 @@ The second test found and fixed a real address bug: the Matrix micro-column
 offset must advance by `BLEN*MLEN` elements, not `BLEN` elements. Assembly-only
 validation could not detect that error.
 
+The S128 campaign found a second boundary bug: an 80-row MLA history was backed
+by 80 physical rows even though attention reads 64-row Matrix tiles. History
+scratch is now rounded to 128 rows, and a five-chunk test pins both the shifted
+causal diagonals and the physical K/V allocation.
+
 The matching Simulator branch also runs a compact whole-backbone program in one
-Rust invocation: 69 KDA, 24 MLA, 92 LatentMoE, and one dense FFN across S16
-causal prefill plus four decode tokens. It executes 4,646,741 instructions in
-80,526,139 simulator cycles, and all 3,740 hidden/residual checkpoints match the
-CPU reference. All 69 KDA state lifetimes and 24 compressed MLA caches pass;
-the persistent HBM manifest contains no expanded all-head K/V object.
+Rust invocation: 69 KDA, 24 MLA, 92 LatentMoE, and one dense FFN. The base S16
+prefill plus four-token decode case executes 4,646,465 machine instructions in
+80,522,239 simulator cycles, and all 3,740 hidden/residual checkpoints match the
+CPU reference. The long S16 plus D128 gate executes 66,016,808 instructions in
+1,492,322,041 cycles with 100% allclose and 0.2163% relative-L2 error. All 69
+KDA state lifetimes and 24 compressed MLA caches pass; the persistent HBM
+manifest contains no expanded all-head K/V object. Recomputing each cache from
+the actual Rust producer hidden is bit exact, so cache correctness is checked
+independently from accumulated BF16 whole-model drift.
 
 ## What this does not prove
 
 The real-shape artifact still uses symbolic HBM ranges; no Kimi checkpoint has
-been packed or executed. Multi-token cache/prefill and 93-layer replay are
-implemented only in compact synthetic fixtures, so their cycles are not a Kimi
-performance estimate. Checkpoint packing, real-width whole-model replay,
+been packed or executed. Its 3.21 TB address span requires a sparse or streamed
+checkpoint backend rather than a dense Rust HBM image. Multi-token cache/prefill
+and 93-layer replay are implemented only in compact synthetic fixtures, so their
+cycles are not a Kimi performance estimate. Checkpoint packing, real-width whole-model replay,
 instruction-memory provisioning, RTL timing, and PPA remain future work. The 96
 MLA head bodies are still emitted statically; looping them would reduce code
 size but is no longer a blocker for producing the bounded machine-code artifact.

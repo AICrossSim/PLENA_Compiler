@@ -60,11 +60,11 @@ hidden state
 | Kimi K3 层结构 | 完成 | 69 KDA + 24 MLA 的结构 trace 已生成 |
 | Matrix、Attention、MoE、residual 连接 | 完成 | 缩小外围尺寸的程序已在 Rust Simulator 数值对拍 |
 | Compact Matrix 循环 | 完成 | MXFP8 GEMM 与 BF16 stream-K 均在 Rust 中逐元素一致 |
-| Nemotron 52 层机器码 | 完成 | 6,202,663 条、23.66 MiB；参数由 symbolic HBM manifest 描述 |
-| Kimi 93 层机器码 | 完成 | 96-head 共 11,502,370 条，原始机器码 43.88 MiB |
+| Nemotron 52 层机器码 | 完成 | 6,202,993 条、23.663 MiB；参数由 symbolic HBM manifest 描述 |
+| Kimi 93 层机器码 | 完成 | 96-head 共 11,662,716 条，原始机器码 44.490 MiB |
 | 4-token GQA / compressed-MLA cache | 完成 | Nemotron 32Q/2KV GQA 与 Kimi 96-head MLA 已在同一 HBM 实例中逐 token 追加并完成 Rust 数值对拍 |
 | Synthetic prefill | 完成 | S16/S128 Mamba/KDA chunk、GQA/compressed-MLA cache 和 multi-token MoE 均在 Rust 对拍 |
-| Compact synthetic 整模 | 完成 | Nemotron 52 层与 Kimi 93 层均连续执行 S16 prefill + decode 4 token |
+| Compact synthetic 整模 | 完成 | Nemotron 52 层与 Kimi 93 层均连续执行；覆盖 S128 prefill、D32 和 D128 |
 | 真实 checkpoint 整模执行 | 未完成 | 不能把 compact synthetic 周期写成真实 Nemotron/Kimi latency |
 | RTL、频率、面积和端到端加速比 | 未开始 | 属于下一阶段，不是本仓库当前结论 |
 
@@ -150,6 +150,8 @@ manifest、SHA256 和一份 summary。Kimi 的全量构建约需 2 分钟和 5 G
 
 这些命令不下载模型权重。`.mem` 中的指令已经逐条编码，但 manifest 中的参数仍是
 待填充地址，所以不代表真实 checkpoint 已经从第一层执行到最后一层。
+当前 manifest 的 HBM 地址跨度分别约为 66.17 GB（Nemotron）和 3.21 TB（Kimi）；
+后者需要稀疏或流式 checkpoint 后端，不能直接展开成普通 Rust 内存镜像。
 
 ## 代码位置
 
@@ -164,5 +166,6 @@ manifest、SHA256 和一份 summary。Kimi 的全量构建约需 2 分钟和 5 G
 ## 结果应该怎么理解
 
 本分支与配套 Simulator 已证明：Compiler 能生成一致的指令和数据布局，S16/S128
-prefill 可执行，且 compact synthetic 52/93 层能从第一层连续运行到最后一层。它还
+prefill 可执行，且 compact synthetic 52/93 层能从第一层连续运行到最后一层；
+Nemotron 与 Kimi 都已覆盖 128-token decode。它还
 没有证明真实 checkpoint 精度与 latency、RTL 时序、FPGA PPA 或相对 GPU 的端到端加速。

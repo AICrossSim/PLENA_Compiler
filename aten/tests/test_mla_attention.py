@@ -445,7 +445,7 @@ def test_four_token_mla_keeps_only_compressed_history_persistent() -> None:
         assert prefetch.endswith(", 1, 1")
 
 
-def test_sixteen_token_mla_prefill_keeps_compressed_cache_and_causal_mask() -> None:
+def test_five_chunk_mla_prefill_grows_compressed_history_past_one_tile() -> None:
     prog = PlenaCompiler(mlen=64, blen=4)
     shape = MlaBlockShape(
         hidden=64,
@@ -456,83 +456,111 @@ def test_sixteen_token_mla_prefill_keeps_compressed_cache_and_causal_mask() -> N
         v_head=64,
         heads=1,
     )
-    hidden = prog.load_batch(
-        prog.input(
-            "prefill_hidden",
-            shape=(16, 64),
-            physical_shape=(64, 64),
-            prestaged_vram_addr=0,
+    hidden_chunks = [
+        prog.load_batch(
+            prog.input(
+                f"prefill_hidden_{chunk}",
+                shape=(16, 64),
+                physical_shape=(64, 64),
+                prestaged_vram_addr=chunk * 12288,
+            )
         )
-    )
-    cos = prog.load_batch(
-        prog.input(
-            "prefill_cos",
-            shape=(16, 64),
-            physical_shape=(64, 64),
-            prestaged_vram_addr=4096,
+        for chunk in range(5)
+    ]
+    cos_chunks = [
+        prog.load_batch(
+            prog.input(
+                f"prefill_cos_{chunk}",
+                shape=(16, 64),
+                physical_shape=(64, 64),
+                prestaged_vram_addr=chunk * 12288 + 4096,
+            )
         )
-    )
-    sin = prog.load_batch(
-        prog.input(
-            "prefill_sin",
-            shape=(16, 64),
-            physical_shape=(64, 64),
-            prestaged_vram_addr=8192,
+        for chunk in range(5)
+    ]
+    sin_chunks = [
+        prog.load_batch(
+            prog.input(
+                f"prefill_sin_{chunk}",
+                shape=(16, 64),
+                physical_shape=(64, 64),
+                prestaged_vram_addr=chunk * 12288 + 8192,
+            )
         )
-    )
+        for chunk in range(5)
+    ]
 
     def weight(name: str, rows: int, cols: int):
         return prog.input(name, shape=(rows, cols), physical_shape=(rows, cols))
 
-    cache = allocate_mla_decode_cache(prog, shape=shape, max_tokens=20)
+    cache = allocate_mla_decode_cache(prog, shape=shape, max_tokens=80)
     eps = prog.fp_var("prefill_eps", 1)
     reciprocal = prog.fp_var("prefill_reciprocal", 1)
-    output = emit_mla_residual_block(
-        prog,
-        hidden,
-        shape=shape,
-        weights=MlaBlockWeights(
-            q_a=weight("prefill_q_a", 64, 64),
-            q_b=weight("prefill_q_b", 64, 128),
-            kv_a=weight("prefill_kv_a", 64, 128),
-            kv_b=weight("prefill_kv_b", 64, 128),
-            out=weight("prefill_out", 64, 64),
-            q_rope_rotate=weight("prefill_q_rot", 64, 64),
-            k_rope_rotate=weight("prefill_k_rot", 64, 64),
-        ),
-        cos=cos,
-        sin=sin,
-        norms=MlaNormConstants(
-            eps.address,
-            reciprocal.address,
-            eps.address,
-            reciprocal.address,
-            eps.address,
-            reciprocal.address,
-        ),
-        rows=16,
-        cache=cache,
-        token_index=0,
-        causal=True,
+    weights = MlaBlockWeights(
+        q_a=weight("prefill_q_a", 64, 64),
+        q_b=weight("prefill_q_b", 64, 128),
+        kv_a=weight("prefill_kv_a", 64, 128),
+        kv_b=weight("prefill_kv_b", 64, 128),
+        out=weight("prefill_out", 64, 64),
+        q_rope_rotate=weight("prefill_q_rot", 64, 64),
+        k_rope_rotate=weight("prefill_k_rot", 64, 64),
     )
+    norms = MlaNormConstants(
+        eps.address,
+        reciprocal.address,
+        eps.address,
+        reciprocal.address,
+        eps.address,
+        reciprocal.address,
+    )
+    outputs = [
+        emit_mla_residual_block(
+            prog,
+            hidden,
+            shape=shape,
+            weights=weights,
+            cos=cos,
+            sin=sin,
+            norms=norms,
+            rows=16,
+            name=f"prefill_chunk{chunk}",
+            cache=cache,
+            token_index=chunk * 16,
+            causal=True,
+        )
+        for chunk, (hidden, cos, sin) in enumerate(
+            zip(hidden_chunks, cos_chunks, sin_chunks, strict=True)
+        )
+    ]
     assembly = prog.compile()
 
-    assert output.shape == (16, 64)
-    assert assembly.count("MLA_COMPRESSED_CACHE_APPEND") == 1
-    assert assembly.count("DECODE_CACHE_APPEND kimi_mla_cache_compressed") == 16
+    assert all(output.shape == (16, 64) for output in outputs)
+    assert assembly.count("MLA_COMPRESSED_CACHE_APPEND") == 5
+    assert assembly.count("DECODE_CACHE_APPEND kimi_mla_cache_compressed") == 80
     assert (
         assembly.count(
             "DECODE_CACHE_SCRATCH_ROW kimi_mla_cache_reconstructed_k_scratch"
         )
-        == 16
+        == 240
     )
     assert (
         assembly.count(
             "DECODE_CACHE_SCRATCH_ROW kimi_mla_cache_reconstructed_v_scratch"
         )
-        == 16
+        == 240
     )
-    assert "_mha_causal_mask" in assembly
+    assert assembly.count("diagonal_offset=0") == 2
+    assert "diagonal_offset=16" in assembly
+    assert "diagonal_offset=32" in assembly
+    assert "diagonal_offset=48" in assembly
+    assert (
+        "Allocate VRAM Matrix prefill_chunk4_kv_b_head0: "
+        "logical=(80, 128) physical=(128, 128)" in assembly
+    )
+    assert (
+        "Allocate VRAM Matrix prefill_chunk4_k_head0: "
+        "logical=(80, 128) physical=(128, 128)" in assembly
+    )
     cache.assert_hbm_contract(prog)
 
 

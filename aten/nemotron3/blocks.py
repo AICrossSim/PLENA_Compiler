@@ -193,10 +193,8 @@ def emit_nemotron_attention_block(
     """Emit connected GQA and return the mixer output.
 
     With ``cache=None`` this preserves the scratch path.  With a cache, decode
-    appends one row while prefill appends a complete prompt fragment.  The first
-    multi-row cache fill must start at token zero; later calls use incremental
-    decode because the current attention mask cannot represent a non-zero
-    multi-row query offset.
+    appends one row while prefill appends prompt chunks at their global token
+    offsets. The attention mask shifts its diagonal for every later chunk.
     """
     shape.validate(prog.mlen)
     if rows < 1 or rows > hidden.shape[0]:
@@ -210,10 +208,6 @@ def emit_nemotron_attention_block(
     if cache is not None:
         if len(cache.keys) != shape.kv_heads or len(cache.values) != shape.kv_heads:
             raise ValueError(f"{name}: cache head count does not match shape.kv_heads")
-        if rows > 1 and token_index != 0:
-            raise ValueError(
-                f"{name}: multi-row GQA cache fill must start at token_index=0"
-            )
         if token_index + rows > cache.max_tokens:
             raise ValueError(
                 f"{name}: token range [{token_index}, {token_index + rows}) "
@@ -476,9 +470,7 @@ def emit_nemotron_moe_block(
             name=f"{name}_token{token_idx}",
         )
     if constants.routed_scale.size < shape.top_k:
-        raise ValueError(
-            "routed_scale must provide one value per selected expert"
-        )
+        raise ValueError("routed_scale must provide one value per selected expert")
     for token_idx in range(rows):
         route_offset = token_idx * shape.top_k
         prog.fpvar_mul_region(

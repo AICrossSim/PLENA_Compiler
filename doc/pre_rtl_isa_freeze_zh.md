@@ -97,8 +97,8 @@ bank mux PPA 和频率仍必须由 RTL 验证。
 assembler 后，真实 96-head、93 层程序现在是：
 
 ```text
-11,502,370 instructions
-43.88 MiB raw 32-bit machine code
+11,662,716 instructions
+44.490 MiB raw 32-bit machine code
 2m10s build + assemble
 4.7 GiB peak RSS
 ```
@@ -109,8 +109,10 @@ assembler 后，真实 96-head、93 层程序现在是：
 
 4-token compressed MLA cache append/read 已独立通过 Rust 数值对拍，HBM manifest
 也会拒绝展开的 96-head K/V cache。S16/S128 transactional prefill 与 compact
-Nemotron 52 层、Kimi 93 层 S16+decode4 也已在 Rust 连续执行；后者分别是 426,814
-和 4,646,741 条指令，逐层 checkpoint 100% 对拍。Compiler/Simulator descriptor
+Nemotron 52 层、Kimi 93 层均已在 Rust 连续执行，并覆盖 D32/D128；基础 S16+D4
+分别是 426,814 和 4,646,465 条指令。Kimi S16+D128 执行 66,016,808 条指令，
+全部 hidden checkpoint 100% allclose，24 个 producer-conditioned compressed
+cache 逐元素一致。Compiler/Simulator descriptor
 与 golden 已有跨仓测试。RTL 前仍未完成的是：
 
 1. symbolic HBM manifest 绑定真实 checkpoint 后的整模数值 replay；

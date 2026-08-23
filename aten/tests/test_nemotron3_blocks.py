@@ -135,40 +135,49 @@ def test_nemotron_gqa_cache_rejects_an_out_of_range_token() -> None:
         )
 
 
-def test_sixteen_token_gqa_prefill_populates_cache_and_emits_causal_mask() -> None:
+def test_two_chunk_gqa_prefill_appends_cache_with_shifted_causal_mask() -> None:
     prog = PlenaCompiler(mlen=64, blen=4)
-    hidden = prog.load_batch(
-        prog.input(
-            "prefill_hidden",
-            shape=(16, 64),
-            physical_shape=(64, 64),
-            prestaged_vram_addr=0,
+    hidden_chunks = [
+        prog.load_batch(
+            prog.input(
+                f"prefill_hidden_{chunk}",
+                shape=(16, 64),
+                physical_shape=(64, 64),
+                prestaged_vram_addr=chunk * 4096,
+            )
         )
-    )
+        for chunk in range(2)
+    ]
     shape = NemotronAttentionShape(64, 2, 1, 64)
-    cache = allocate_nemotron_gqa_decode_cache(prog, shape=shape, max_tokens=20)
-    output = emit_nemotron_attention_block(
-        prog,
-        hidden,
-        shape=shape,
-        weights=NemotronAttentionWeights(
-            q=_weight(prog, "prefill_w_q", 64, 128),
-            k=_weight(prog, "prefill_w_k", 64, 64),
-            v=_weight(prog, "prefill_w_v", 64, 64),
-            out=_weight(prog, "prefill_w_o", 128, 64),
-        ),
-        rows=16,
-        cache=cache,
-        token_index=0,
-        causal=True,
+    cache = allocate_nemotron_gqa_decode_cache(prog, shape=shape, max_tokens=32)
+    weights = NemotronAttentionWeights(
+        q=_weight(prog, "prefill_w_q", 64, 128),
+        k=_weight(prog, "prefill_w_k", 64, 64),
+        v=_weight(prog, "prefill_w_v", 64, 64),
+        out=_weight(prog, "prefill_w_o", 128, 64),
     )
+    outputs = [
+        emit_nemotron_attention_block(
+            prog,
+            hidden,
+            shape=shape,
+            weights=weights,
+            rows=16,
+            name=f"prefill_chunk{chunk}",
+            cache=cache,
+            token_index=chunk * 16,
+            causal=True,
+        )
+        for chunk, hidden in enumerate(hidden_chunks)
+    ]
     assembly = prog.compile()
 
-    assert output.shape == (16, 64)
-    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_k_head0") == 16
-    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_v_head0") == 16
-    assert "_mha_causal_mask" in assembly
-    assert cache.keys[0].prefix(16).shape == (16, 64)
+    assert all(output.shape == (16, 64) for output in outputs)
+    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_k_head0") == 32
+    assert assembly.count("DECODE_CACHE_APPEND nemotron_gqa_cache_v_head0") == 32
+    assert "diagonal_offset=0" in assembly
+    assert "diagonal_offset=16" in assembly
+    assert cache.keys[0].prefix(32).shape == (32, 64)
 
 
 def test_connected_nemotron_moe_executes_routed_and_shared_relu2() -> None:

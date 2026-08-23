@@ -617,10 +617,6 @@ def emit_mla_residual_block(
     if cache is not None:
         if cache.heads != shape.heads:
             raise ValueError(f"{name}: cache head count does not match MLA shape")
-        if rows > 1 and token_index != 0:
-            raise ValueError(
-                f"{name}: multi-row compressed-MLA cache fill must start at token_index=0"
-            )
         if token_index + rows > cache.max_tokens:
             raise ValueError(
                 f"{name}: token range [{token_index}, {token_index + rows}) "
@@ -768,7 +764,11 @@ def emit_mla_residual_block(
     # only BLEN physical rows, which is sufficient for projections but not for
     # the attention SRAM interface.  Pad only the per-head scratch tensors;
     # the logical row count and the final mixer output remain unchanged.
-    attention_tile_rows = max(prog.mlen, hidden.physical_shape[0])
+    query_tile_rows = max(prog.mlen, hidden.physical_shape[0])
+    history_tile_rows = max(
+        query_tile_rows,
+        ((history_rows + prog.mlen - 1) // prog.mlen) * prog.mlen,
+    )
     for head in range(shape.heads):
         q_head = prog.linear_projection_slice(
             q_latent,
@@ -776,7 +776,7 @@ def emit_mla_residual_block(
             output_col_offset=head * shape.qk_head,
             output_features=shape.qk_head,
             name=f"{name}_q_b_head{head}",
-            physical_shape=(attention_tile_rows, shape.qk_head),
+            physical_shape=(query_tile_rows, shape.qk_head),
         )
         q_rope = _view_columns(
             prog,
@@ -800,14 +800,14 @@ def emit_mla_residual_block(
             output_col_offset=head * shape.kv_b_head,
             output_features=shape.kv_b_head,
             name=f"{name}_kv_b_head{head}",
-            physical_shape=(attention_tile_rows, shape.kv_b_head),
+            physical_shape=(history_tile_rows, shape.kv_b_head),
         )
         k_head = prog.alloc(
             f"{name}_k_head{head}",
             rows=history_rows,
             cols=shape.qk_head,
             strict=False,
-            physical_shape=(attention_tile_rows, shape.qk_head),
+            physical_shape=(history_tile_rows, shape.qk_head),
         )
         prog.vram_copy_region(
             k_head,

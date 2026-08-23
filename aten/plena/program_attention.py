@@ -61,29 +61,35 @@ class ProgramAttentionMixin:
         self.emit("\n".join(lines) + "\n")
         return mask
 
-    def _build_causal_score_mask(self, name: str) -> VRAMMatrixVar:
+    def _build_causal_score_mask(
+        self, name: str, *, diagonal_offset: int = 0
+    ) -> VRAMMatrixVar:
         """Materialize an MLEN x MLEN causal score mask.
 
-        The mask is 0 on and below the diagonal and -inf above it. This is the
-        same single-tile triangular mask that the MHA path uses when callers pass
-        an explicit VRAM mask. Multi-sequence-tile causal geometry remains owned
-        by the existing MHA tile-skipping logic; packed GQA still rejects
-        seq_len > MLEN.
+        ``diagonal_offset`` shifts the visible diagonal to the right when the
+        query tile appends to an existing K/V history. Row ``r`` may consume
+        columns through ``diagonal_offset + r``. Multi-tile causal geometry is
+        still owned by the MHA tile-skipping logic; this mask is applied only to
+        the one key block that straddles the shifted diagonal.
         """
+        if diagonal_offset < 0 or diagonal_offset >= self.mlen:
+            raise ValueError(
+                f"diagonal_offset must be in [0, {self.mlen}), got {diagonal_offset}"
+            )
         mask = self.alloc(name, self.mlen, self.mlen)
         mask_addr = self.get_vram_addr(mask.name)
         fp_scratch_base = self._ONLINE_SOFTMAX_FPSRAM_BASE
         gp_mask, gp_fp = self.register_allocator.allocate_gp(2)
 
         lines = [
-            f"; === Build causal score mask: MLEN={self.mlen} ===",
+            f"; === Build causal score mask: MLEN={self.mlen}, diagonal_offset={diagonal_offset} ===",
             f"S_ADDI_INT gp{gp_fp}, gp0, {fp_scratch_base}",
             "S_LD_FP f7, gp0, 2",
         ]
         lines.extend(load_large_int(gp_mask, mask_addr))
         for row in range(self.mlen):
             for col in range(self.mlen):
-                value_reg = "f0" if col <= row else "f7"
+                value_reg = "f0" if col <= diagonal_offset + row else "f7"
                 lines.append(f"S_ST_FP {value_reg}, gp{gp_fp}, {col}")
             lines.extend(
                 [
@@ -288,10 +294,21 @@ class ProgramAttentionMixin:
                 f"V physical rows per batch {v_rows_per_batch} must be multiple of MLEN={mlen}"
             )
 
+        # Queries are the final ``seq_len`` positions in the K/V history. The
+        # modulo offset identifies the shifted diagonal inside the one
+        # straddling MLEN-wide key block.
+        q_offset = kv_seq_len - seq_len
+        if q_offset < 0:
+            raise ValueError(
+                f"kv_seq_len={kv_seq_len} must be at least seq_len={seq_len}"
+            )
+        auto_causal_mask = causal_mask is True
         if scale is None:
             scale = 1.0 / math.sqrt(qk_dim)
-        if causal_mask is True:
-            causal_mask = self._build_causal_score_mask("_mha_causal_mask")
+        if auto_causal_mask:
+            causal_mask = self._build_causal_score_mask(
+                "_mha_causal_mask", diagonal_offset=q_offset % mlen
+            )
 
         num_q_blocks = math.ceil(seq_len / mlen)
         num_k_blocks = math.ceil(kv_seq_len / mlen)
@@ -330,12 +347,6 @@ class ProgramAttentionMixin:
         # O packs batches contiguously by seq_len rows (the decoder reads O_h batch b at
         # b*seq_len*mlen), so its per-batch base offset is seq_len*mlen.
         o_batch_stride = seq_len * mlen
-
-        # Position of the first query relative to the keys: queries are the LAST
-        # seq_len of the kv_seq_len key positions, so query row r of block q_idx is
-        # global position q_offset + q_idx*mlen + r. For prefill (kv_seq_len ==
-        # seq_len) this is 0.
-        q_offset = kv_seq_len - seq_len
 
         for batch_idx in range(batch_size):
             if batch_size == 1 and total_q_rows == seq_len:
@@ -378,23 +389,21 @@ class ProgramAttentionMixin:
                         # key block entirely in the strict future of every query row
                         # contributes nothing (exp(-inf)=0) and is skipped; one
                         # entirely in the past is fully visible (no mask); only a
-                        # straddling block needs the triangular mask. The static
-                        # (mlen, mlen) mask encodes a zero-diagonal triangle, which is
-                        # exactly right when the straddle sits on the q_idx == k_idx
-                        # diagonal (q_offset == 0, i.e. prefill). seq_len <= mlen is
-                        # the single-block special case of this and is unchanged.
+                        # straddling block needs the shifted triangular mask.
                         key_first = k_idx * mlen
                         query_first = q_offset + q_idx * mlen
                         query_last = query_first + block_rows - 1
                         if key_first > query_last:
                             continue  # whole key block is in the strict future
                         needs_triangular_mask = key_first + block_cols - 1 > query_first
-                        if needs_triangular_mask and query_first != key_first:
+                        if (
+                            needs_triangular_mask
+                            and query_first != key_first
+                            and not auto_causal_mask
+                        ):
                             raise NotImplementedError(
-                                "Causal mask across tiles with kv_seq_len != seq_len "
-                                "(non-zero query offset) is unsupported: the static "
-                                "(mlen, mlen) mask only encodes the zero diagonal "
-                                f"(q_offset={q_offset}, q_idx={q_idx}, k_idx={k_idx})."
+                                "An explicit causal mask does not declare its diagonal "
+                                "offset; pass causal_mask=True for appended query chunks."
                             )
                     physical_k_idx = batch_k_block_base + k_idx
                     self.vram_sub_projection_T_to(
