@@ -115,10 +115,11 @@ def test_vram_fill_zero_all_column_blocks():
     prog.vram_fill_zero(x)
     code = prog.get_code()
 
-    # 384/64 = 6 column blocks, each needs a V_MUL_VF zeroing loop
-    assert code.count("V_MUL_VF") >= 6, (
-        f"Expected >= 6 V_MUL_VF (one per column block), got {code.count('V_MUL_VF')}"
+    # 384/64 = 6 column blocks, each must be overwritten from a true-zero row.
+    assert code.count("S_MAP_V_FP") >= 6, (
+        f"Expected >= 6 S_MAP_V_FP (one per column block), got {code.count('S_MAP_V_FP')}"
     )
+    assert "V_MUL_VF" not in code
     print("  PASS test_vram_fill_zero_all_column_blocks")
 
 

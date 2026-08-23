@@ -13,9 +13,12 @@ def preload_act_asm(
     activation_offset_reg: int,
     stride_size=None,
     vram_stride_mult: int = 1,
-    storage_precision: int = 1 # bytes per element
+    storage_precision: int = 1,  # bytes per element
+    hbm_precision: int = 0,
 ) -> str:
     """Preload activation from HBM to VRAM. Layout: (hidden//mlen, batch, mlen)."""
+    if hbm_precision not in (0, 1):
+        raise ValueError("hbm_precision must select activation (0) or key/value (1)")
     generated_code = "; Preload Activation Generation \n"
     a_actual_register = alive_registers[0]
     set_stride_register = alive_registers[1]
@@ -26,7 +29,9 @@ def preload_act_asm(
     stride_len = vlen if stride_size is None else stride_size
 
     # Set scale offset
-    generated_code += _load_large_int(a_actual_register, int(hidden_size * batch * storage_precision))
+    generated_code += _load_large_int(
+        a_actual_register, int(hidden_size * batch * storage_precision)
+    )
     generated_code += f"C_SET_SCALE_REG gp{a_actual_register} \n"
     generated_code += f"S_ADDI_INT gp{a_actual_register}, gp0, 0 \n"
     generated_code += _load_large_int(result_register, act_vram_offset)
@@ -39,25 +44,42 @@ def preload_act_asm(
         vram_step = elements_per_prefetch * vram_stride_mult
         for i in range(math.ceil(hidden_size / elements_per_prefetch)):
             generated_code += (
-                f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, a{activation_offset_reg}, 0, 0, 0 \n"
+                f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, "
+                f"a{activation_offset_reg}, 0, {hbm_precision}, 0 \n"
             )
-            generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vram_step} \n"
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {elements_per_prefetch} \n"
+            generated_code += (
+                f"S_ADDI_INT gp{result_register}, gp{result_register}, {vram_step} \n"
+            )
+            generated_code += (
+                f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, "
+                f"{elements_per_prefetch * storage_precision} \n"
+            )
     else:
-        generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len} \n"
+        generated_code += (
+            f"S_ADDI_INT gp{set_stride_register}, gp0, "
+            f"{stride_len * storage_precision} \n"
+        )
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register} \n"
         a_offset_register = set_stride_register
-        generated_code += f"C_LOOP_START gp{outer_loop_register}, {load_amount_per_hidden} \n"
-        generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_actual_register}, 0 \n"
+        generated_code += (
+            f"C_LOOP_START gp{outer_loop_register}, {load_amount_per_hidden} \n"
+        )
+        generated_code += (
+            f"S_ADDI_INT gp{a_offset_register}, gp{a_actual_register}, 0 \n"
+        )
         if batch > preload_len:
             generated_code += f"C_LOOP_START gp{inner_loop_register}, {math.ceil(batch / preload_len)} \n"
-        generated_code += f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, a{activation_offset_reg}, 1, 0 \n"
         generated_code += (
-            f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len * vram_stride_mult} \n"
+            f"H_PREFETCH_V gp{result_register}, gp{a_offset_register}, "
+            f"a{activation_offset_reg}, 1, {hbm_precision} \n"
         )
+        generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vlen * preload_len * vram_stride_mult} \n"
         if batch > preload_len:
             generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {int(hidden_size * preload_len * storage_precision)} \n"
             generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
-        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
+        generated_code += (
+            f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, "
+            f"{vlen * storage_precision} \n"
+        )
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
     return generated_code

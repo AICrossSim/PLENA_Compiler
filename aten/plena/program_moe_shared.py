@@ -47,6 +47,7 @@ from compiler.aten.plena.program_routed_moe import (
     ExpertBiases,
     ExpertWeights,
     GptOssFPConstants,
+    KimiSituFPConstants,
     moe_stage_marker,
 )
 from compiler.aten.plena.vars import FPVar, VRAMMatrixVar
@@ -259,7 +260,7 @@ class ProgramMoeSharedMixin:
         biases: ExpertBiases | None = None,
         rows: int,
         intermediate: int,
-        constants: GptOssFPConstants,
+        constants: GptOssFPConstants | KimiSituFPConstants,
         gate_weight_row: VRAMMatrixVar | None = None,
         gate_fp_scratch: FPVar | None = None,
         zero_row: FPVar | None = None,
@@ -353,6 +354,12 @@ class ProgramMoeSharedMixin:
                 name=f"{name}_gate_sigmoid",
             )
             self.vram_mul(out, gate_matrix, num_rows=rows)
+            self.free_tensor(gate_matrix)
+        seen: set[str] = set()
+        for temporary in (gate, up, hidden):
+            if temporary.name != out.name and temporary.name not in seen:
+                self.free_tensor(temporary)
+                seen.add(temporary.name)
         return out
 
     def moe_combine_shared_and_routed_v0(

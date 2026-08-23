@@ -41,7 +41,7 @@ class ProgramTensorMixin:
 
         h, w = physical_shape or shape
         size = h * w
-        hbm_size = self.hbm_tensor_size(size)
+        hbm_size = self.hbm_tensor_size(size, real_data_ratio)
 
         if hbm_addr is None:
             hbm_addr = self._allocate_hbm(hbm_size)
@@ -73,6 +73,9 @@ class ProgramTensorMixin:
         self,
         input_var: InputVar,
         name: str | None = None,
+        *,
+        storage_precision: int = 1,
+        hbm_precision: int = 0,
     ) -> VRAMMatrixVar:
         """
         Load tensor from HBM to VRAM (Batch type).
@@ -119,6 +122,8 @@ class ProgramTensorMixin:
                 vram_object_name=internal_name,
                 vlen=self.mlen,
                 preload_len=self.hbm_v_prefetch_amount,
+                storage_precision=storage_precision,
+                hbm_precision=hbm_precision,
             )
 
         var = VRAMMatrixVar(
@@ -156,14 +161,17 @@ class ProgramTensorMixin:
         display_name = name if name is not None else f"{tensor_var.display_name}_stored"
         internal_name = self._scoped_name(display_name)
 
+        if real_data_ratio is None:
+            real_data_ratio = self.real_data_ratio
+
         if hbm_addr is None:
             h, w = tensor_var.physical_shape
             size = h * w
-            hbm_size = self.hbm_tensor_size(size)
+            hbm_size = self.hbm_tensor_size(size, real_data_ratio)
             hbm_addr = self._allocate_hbm(hbm_size)
         else:
             h, w = tensor_var.physical_shape
-            hbm_size = self.hbm_tensor_size(h * w)
+            hbm_size = self.hbm_tensor_size(h * w, real_data_ratio)
 
         super().store_to_hbm(
             tensor_name=tensor_var.name,  # internal name for symbol table lookup

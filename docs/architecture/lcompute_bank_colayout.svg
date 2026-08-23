@@ -1,0 +1,235 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="760" viewBox="0 0 1800 760" role="img" aria-labelledby="title desc">
+  <title id="title">How L-Compute removes Mamba projection SRAM bank conflicts</title>
+  <desc id="desc">A side-by-side paper figure using the exact Nemotron 3 x packet. In row-major placement, every one of eight head rows maps four requested lanes to banks zero through three. With L_SCATTER_M, every head row is shifted by four banks, so the same thirty-two logical values are balanced two per bank across sixteen single-port banks.</desc>
+  <defs>
+    <marker id="b-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#34434b"/></marker>
+    <marker id="b-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#007f7b"/></marker>
+    <style>
+      text { font-family: 'Liberation Sans', Helvetica, Arial, sans-serif; fill: #1f2b31; }
+      .panel { fill: #fbfcfc; stroke: #81939b; stroke-width: 1.4; }
+      .box { fill: #eef3f5; stroke: #526873; stroke-width: 1.3; }
+      .newbox { fill: #e6f5f2; stroke: #007f7b; stroke-width: 1.7; stroke-dasharray: 6 4; }
+      .title { font-size: 28px; font-weight: 700; }
+      .subtitle { font-size: 15px; fill: #51636b; }
+      .panel-title { font-size: 21px; font-weight: 700; }
+      .head { font-size: 17px; font-weight: 700; }
+      .label { font-size: 14px; }
+      .small { font-size: 12px; }
+      .tiny { font-size: 10px; }
+      .teal { fill: #006e6a; }
+      .red { fill: #a33e43; }
+      .flow { fill: none; stroke: #34434b; stroke-width: 2; marker-end: url(#b-arrow); }
+      .teal-flow { fill: none; stroke: #007f7b; stroke-width: 2.3; marker-end: url(#b-teal); }
+      .blue-cell { fill: #dceaf2; stroke: #55717d; stroke-width: 1; }
+      .green-cell { fill: #deecd8; stroke: #55717d; stroke-width: 1; }
+      .amber-cell { fill: #f3e4c6; stroke: #55717d; stroke-width: 1; }
+      .purple-cell { fill: #e9ddeb; stroke: #55717d; stroke-width: 1; }
+      .empty-bank { fill: #f1f3f4; stroke: #a5b1b6; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="760" fill="#ffffff"/>
+  <text class="title" x="45" y="45">Why L-Compute Eliminates Mamba Projection-SRAM Bank Conflicts</text>
+  <text class="subtitle" x="45" y="72">Exact x-field packet for one Nemotron 3 group: X_STATE requests 8 heads × 4 adjacent P-lanes = 32 values from 16 single-port banks</text>
+  <line x1="45" y1="91" x2="1755" y2="91" stroke="#9aa9af" stroke-width="1.1"/>
+
+  <!-- Baseline panel -->
+  <rect class="panel" x="45" y="110" width="820" height="565"/>
+  <text class="panel-title" x="70" y="144">(a) Baseline: Row-Major Matrix Writeback</text>
+
+  <rect class="box" x="72" y="162" width="112" height="54"/>
+  <text class="head" text-anchor="middle" x="128" y="184">Buffer Y</text>
+  <text class="small" text-anchor="middle" x="128" y="203">Matrix result</text>
+  <path d="M184 189h29" class="flow"/>
+  <rect class="box" x="213" y="156" width="170" height="66"/>
+  <text class="head" text-anchor="middle" x="298" y="183">Row-Major Write</text>
+  <text class="small" text-anchor="middle" x="298" y="204">physical order = logical order</text>
+  <path d="M383 189h29" class="flow"/>
+  <rect class="box" x="412" y="162" width="126" height="54"/>
+  <text class="head" text-anchor="middle" x="475" y="184">Matrix SRAM</text>
+  <text class="small" text-anchor="middle" x="475" y="203">16 banks</text>
+  <path d="M538 189h29" class="flow"/>
+  <rect class="box" x="567" y="162" width="150" height="54"/>
+  <text class="head" text-anchor="middle" x="642" y="184">X_STATE</text>
+  <text class="small" text-anchor="middle" x="642" y="203">same 32-value packet</text>
+
+  <text class="head red" x="72" y="252">bank = p</text>
+  <text class="small" x="162" y="252">because each 64-value head row starts again at bank 0</text>
+
+  <!-- Baseline bank-index table -->
+  <text class="label" x="72" y="282" font-weight="700">Bank selected for each logical value</text>
+  <text class="small" text-anchor="middle" x="254" y="303">P-lane</text>
+  <g class="small" text-anchor="middle">
+    <text x="166" y="324">p0</text><text x="226" y="324">p1</text><text x="286" y="324">p2</text><text x="346" y="324">p3</text>
+  </g>
+  <g class="small" text-anchor="end">
+    <text x="125" y="353">h0</text><text x="125" y="385">h1</text><text x="125" y="417">h2</text><text x="125" y="449">h3</text>
+    <text x="125" y="481">h4</text><text x="125" y="513">h5</text><text x="125" y="545">h6</text><text x="125" y="577">h7</text>
+  </g>
+
+  <!-- Every row repeats B0..B3. -->
+  <g>
+    <g class="blue-cell"><rect x="138" y="333" width="56" height="26"/><rect x="198" y="333" width="56" height="26"/><rect x="258" y="333" width="56" height="26"/><rect x="318" y="333" width="56" height="26"/></g>
+    <g class="green-cell"><rect x="138" y="365" width="56" height="26"/><rect x="198" y="365" width="56" height="26"/><rect x="258" y="365" width="56" height="26"/><rect x="318" y="365" width="56" height="26"/></g>
+    <g class="amber-cell"><rect x="138" y="397" width="56" height="26"/><rect x="198" y="397" width="56" height="26"/><rect x="258" y="397" width="56" height="26"/><rect x="318" y="397" width="56" height="26"/></g>
+    <g class="purple-cell"><rect x="138" y="429" width="56" height="26"/><rect x="198" y="429" width="56" height="26"/><rect x="258" y="429" width="56" height="26"/><rect x="318" y="429" width="56" height="26"/></g>
+    <g class="blue-cell"><rect x="138" y="461" width="56" height="26"/><rect x="198" y="461" width="56" height="26"/><rect x="258" y="461" width="56" height="26"/><rect x="318" y="461" width="56" height="26"/></g>
+    <g class="green-cell"><rect x="138" y="493" width="56" height="26"/><rect x="198" y="493" width="56" height="26"/><rect x="258" y="493" width="56" height="26"/><rect x="318" y="493" width="56" height="26"/></g>
+    <g class="amber-cell"><rect x="138" y="525" width="56" height="26"/><rect x="198" y="525" width="56" height="26"/><rect x="258" y="525" width="56" height="26"/><rect x="318" y="525" width="56" height="26"/></g>
+    <g class="purple-cell"><rect x="138" y="557" width="56" height="26"/><rect x="198" y="557" width="56" height="26"/><rect x="258" y="557" width="56" height="26"/><rect x="318" y="557" width="56" height="26"/></g>
+  </g>
+  <g class="label" text-anchor="middle">
+    <text x="166" y="352">B0</text><text x="226" y="352">B1</text><text x="286" y="352">B2</text><text x="346" y="352">B3</text>
+    <text x="166" y="384">B0</text><text x="226" y="384">B1</text><text x="286" y="384">B2</text><text x="346" y="384">B3</text>
+    <text x="166" y="416">B0</text><text x="226" y="416">B1</text><text x="286" y="416">B2</text><text x="346" y="416">B3</text>
+    <text x="166" y="448">B0</text><text x="226" y="448">B1</text><text x="286" y="448">B2</text><text x="346" y="448">B3</text>
+    <text x="166" y="480">B0</text><text x="226" y="480">B1</text><text x="286" y="480">B2</text><text x="346" y="480">B3</text>
+    <text x="166" y="512">B0</text><text x="226" y="512">B1</text><text x="286" y="512">B2</text><text x="346" y="512">B3</text>
+    <text x="166" y="544">B0</text><text x="226" y="544">B1</text><text x="286" y="544">B2</text><text x="346" y="544">B3</text>
+    <text x="166" y="576">B0</text><text x="226" y="576">B1</text><text x="286" y="576">B2</text><text x="346" y="576">B3</text>
+  </g>
+
+  <path d="M393 458h35" class="flow"/>
+
+  <!-- Baseline occupancy: B0..B3 each hold 8 packet values. -->
+  <text class="label" x="448" y="282" font-weight="700">Packet occupancy in 16 banks</text>
+  <g class="tiny" text-anchor="middle">
+    <text x="459" y="310">0</text><text x="480" y="310">1</text><text x="501" y="310">2</text><text x="522" y="310">3</text>
+    <text x="543" y="310">4</text><text x="564" y="310">5</text><text x="585" y="310">6</text><text x="606" y="310">7</text>
+    <text x="627" y="310">8</text><text x="648" y="310">9</text><text x="669" y="310">10</text><text x="690" y="310">11</text>
+    <text x="711" y="310">12</text><text x="732" y="310">13</text><text x="753" y="310">14</text><text x="774" y="310">15</text>
+  </g>
+  <g>
+    <rect class="empty-bank" x="451" y="320" width="16" height="264"/><rect class="empty-bank" x="472" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="493" y="320" width="16" height="264"/><rect class="empty-bank" x="514" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="535" y="320" width="16" height="264"/><rect class="empty-bank" x="556" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="577" y="320" width="16" height="264"/><rect class="empty-bank" x="598" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="619" y="320" width="16" height="264"/><rect class="empty-bank" x="640" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="661" y="320" width="16" height="264"/><rect class="empty-bank" x="682" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="703" y="320" width="16" height="264"/><rect class="empty-bank" x="724" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="745" y="320" width="16" height="264"/><rect class="empty-bank" x="766" y="320" width="16" height="264"/>
+  </g>
+  <g stroke="#a33e43" stroke-width="0.8">
+    <g fill="#dceaf2"><rect x="451" y="551" width="16" height="33"/><rect x="472" y="551" width="16" height="33"/><rect x="493" y="551" width="16" height="33"/><rect x="514" y="551" width="16" height="33"/></g>
+    <g fill="#deecd8"><rect x="451" y="518" width="16" height="33"/><rect x="472" y="518" width="16" height="33"/><rect x="493" y="518" width="16" height="33"/><rect x="514" y="518" width="16" height="33"/></g>
+    <g fill="#f3e4c6"><rect x="451" y="485" width="16" height="33"/><rect x="472" y="485" width="16" height="33"/><rect x="493" y="485" width="16" height="33"/><rect x="514" y="485" width="16" height="33"/></g>
+    <g fill="#e9ddeb"><rect x="451" y="452" width="16" height="33"/><rect x="472" y="452" width="16" height="33"/><rect x="493" y="452" width="16" height="33"/><rect x="514" y="452" width="16" height="33"/></g>
+    <g fill="#dceaf2"><rect x="451" y="419" width="16" height="33"/><rect x="472" y="419" width="16" height="33"/><rect x="493" y="419" width="16" height="33"/><rect x="514" y="419" width="16" height="33"/></g>
+    <g fill="#deecd8"><rect x="451" y="386" width="16" height="33"/><rect x="472" y="386" width="16" height="33"/><rect x="493" y="386" width="16" height="33"/><rect x="514" y="386" width="16" height="33"/></g>
+    <g fill="#f3e4c6"><rect x="451" y="353" width="16" height="33"/><rect x="472" y="353" width="16" height="33"/><rect x="493" y="353" width="16" height="33"/><rect x="514" y="353" width="16" height="33"/></g>
+    <g fill="#e9ddeb"><rect x="451" y="320" width="16" height="33"/><rect x="472" y="320" width="16" height="33"/><rect x="493" y="320" width="16" height="33"/><rect x="514" y="320" width="16" height="33"/></g>
+  </g>
+  <path d="M441 316h93v272h-93" fill="none" stroke="#a33e43" stroke-width="1.8"/>
+  <text class="head red" x="661" y="430" text-anchor="middle">B0–B3:</text>
+  <text class="head red" x="661" y="455" text-anchor="middle">8 values / bank</text>
+  <text class="label red" x="661" y="487" text-anchor="middle">12 banks idle</text>
+
+  <rect x="72" y="615" width="765" height="38" fill="#fae8e8" stroke="#a33e43" stroke-width="1"/>
+  <text class="head red" text-anchor="middle" x="454" y="640">Correct packet, but the four hot banks serialize X_STATE reads</text>
+
+  <!-- Proposed panel -->
+  <rect class="panel" x="935" y="110" width="820" height="565"/>
+  <text class="panel-title teal" x="960" y="144">(b) Proposed: L_SCATTER_M Skew-on-Write</text>
+
+  <rect class="box" x="962" y="162" width="112" height="54"/>
+  <text class="head" text-anchor="middle" x="1018" y="184">Buffer Y</text>
+  <text class="small" text-anchor="middle" x="1018" y="203">same result</text>
+  <path d="M1074 189h16" class="teal-flow"/>
+  <rect class="newbox" x="1090" y="151" width="220" height="76"/>
+  <text class="head teal" text-anchor="middle" x="1200" y="178">L-Compute</text>
+  <text class="small teal" text-anchor="middle" x="1200" y="198">descriptor: local-row stride = 4</text>
+  <text class="head teal" text-anchor="middle" x="1200" y="219">bank = (p + 4h) mod 16</text>
+  <path d="M1310 189h12" class="teal-flow"/>
+  <rect class="box" x="1322" y="162" width="126" height="54"/>
+  <text class="head" text-anchor="middle" x="1385" y="184">Matrix SRAM</text>
+  <text class="small" text-anchor="middle" x="1385" y="203">same 16 banks</text>
+  <path d="M1448 189h29" class="teal-flow"/>
+  <rect class="box" x="1477" y="162" width="150" height="54"/>
+  <text class="head" text-anchor="middle" x="1552" y="184">X_STATE</text>
+  <text class="small" text-anchor="middle" x="1552" y="203">same packet order</text>
+
+  <text class="head teal" x="962" y="252">shift each head row by 4 banks</text>
+  <text class="small" x="1225" y="252">the logical tensor and P-lane order do not change</text>
+
+  <!-- Proposed bank-index table -->
+  <text class="label" x="962" y="282" font-weight="700">Bank selected for each logical value</text>
+  <text class="small" text-anchor="middle" x="1144" y="303">P-lane</text>
+  <g class="small" text-anchor="middle">
+    <text x="1056" y="324">p0</text><text x="1116" y="324">p1</text><text x="1176" y="324">p2</text><text x="1236" y="324">p3</text>
+  </g>
+  <g class="small" text-anchor="end">
+    <text x="1015" y="353">h0</text><text x="1015" y="385">h1</text><text x="1015" y="417">h2</text><text x="1015" y="449">h3</text>
+    <text x="1015" y="481">h4</text><text x="1015" y="513">h5</text><text x="1015" y="545">h6</text><text x="1015" y="577">h7</text>
+  </g>
+
+  <!-- Exact cyclic bank mapping for h0..h7 and p0..p3. -->
+  <g>
+    <g class="blue-cell"><rect x="1028" y="333" width="56" height="26"/><rect x="1088" y="333" width="56" height="26"/><rect x="1148" y="333" width="56" height="26"/><rect x="1208" y="333" width="56" height="26"/></g>
+    <g class="green-cell"><rect x="1028" y="365" width="56" height="26"/><rect x="1088" y="365" width="56" height="26"/><rect x="1148" y="365" width="56" height="26"/><rect x="1208" y="365" width="56" height="26"/></g>
+    <g class="amber-cell"><rect x="1028" y="397" width="56" height="26"/><rect x="1088" y="397" width="56" height="26"/><rect x="1148" y="397" width="56" height="26"/><rect x="1208" y="397" width="56" height="26"/></g>
+    <g class="purple-cell"><rect x="1028" y="429" width="56" height="26"/><rect x="1088" y="429" width="56" height="26"/><rect x="1148" y="429" width="56" height="26"/><rect x="1208" y="429" width="56" height="26"/></g>
+    <g class="blue-cell"><rect x="1028" y="461" width="56" height="26"/><rect x="1088" y="461" width="56" height="26"/><rect x="1148" y="461" width="56" height="26"/><rect x="1208" y="461" width="56" height="26"/></g>
+    <g class="green-cell"><rect x="1028" y="493" width="56" height="26"/><rect x="1088" y="493" width="56" height="26"/><rect x="1148" y="493" width="56" height="26"/><rect x="1208" y="493" width="56" height="26"/></g>
+    <g class="amber-cell"><rect x="1028" y="525" width="56" height="26"/><rect x="1088" y="525" width="56" height="26"/><rect x="1148" y="525" width="56" height="26"/><rect x="1208" y="525" width="56" height="26"/></g>
+    <g class="purple-cell"><rect x="1028" y="557" width="56" height="26"/><rect x="1088" y="557" width="56" height="26"/><rect x="1148" y="557" width="56" height="26"/><rect x="1208" y="557" width="56" height="26"/></g>
+  </g>
+  <g class="label" text-anchor="middle">
+    <text x="1056" y="352">B0</text><text x="1116" y="352">B1</text><text x="1176" y="352">B2</text><text x="1236" y="352">B3</text>
+    <text x="1056" y="384">B4</text><text x="1116" y="384">B5</text><text x="1176" y="384">B6</text><text x="1236" y="384">B7</text>
+    <text x="1056" y="416">B8</text><text x="1116" y="416">B9</text><text x="1176" y="416">B10</text><text x="1236" y="416">B11</text>
+    <text x="1056" y="448">B12</text><text x="1116" y="448">B13</text><text x="1176" y="448">B14</text><text x="1236" y="448">B15</text>
+    <text x="1056" y="480">B0</text><text x="1116" y="480">B1</text><text x="1176" y="480">B2</text><text x="1236" y="480">B3</text>
+    <text x="1056" y="512">B4</text><text x="1116" y="512">B5</text><text x="1176" y="512">B6</text><text x="1236" y="512">B7</text>
+    <text x="1056" y="544">B8</text><text x="1116" y="544">B9</text><text x="1176" y="544">B10</text><text x="1236" y="544">B11</text>
+    <text x="1056" y="576">B12</text><text x="1116" y="576">B13</text><text x="1176" y="576">B14</text><text x="1236" y="576">B15</text>
+  </g>
+
+  <path d="M1283 458h35" class="teal-flow"/>
+
+  <!-- Proposed occupancy: every bank gets exactly two values. -->
+  <text class="label" x="1338" y="282" font-weight="700">Packet occupancy in 16 banks</text>
+  <g class="tiny" text-anchor="middle">
+    <text x="1349" y="310">0</text><text x="1370" y="310">1</text><text x="1391" y="310">2</text><text x="1412" y="310">3</text>
+    <text x="1433" y="310">4</text><text x="1454" y="310">5</text><text x="1475" y="310">6</text><text x="1496" y="310">7</text>
+    <text x="1517" y="310">8</text><text x="1538" y="310">9</text><text x="1559" y="310">10</text><text x="1580" y="310">11</text>
+    <text x="1601" y="310">12</text><text x="1622" y="310">13</text><text x="1643" y="310">14</text><text x="1664" y="310">15</text>
+  </g>
+  <g>
+    <rect class="empty-bank" x="1341" y="320" width="16" height="264"/><rect class="empty-bank" x="1362" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="1383" y="320" width="16" height="264"/><rect class="empty-bank" x="1404" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="1425" y="320" width="16" height="264"/><rect class="empty-bank" x="1446" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="1467" y="320" width="16" height="264"/><rect class="empty-bank" x="1488" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="1509" y="320" width="16" height="264"/><rect class="empty-bank" x="1530" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="1551" y="320" width="16" height="264"/><rect class="empty-bank" x="1572" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="1593" y="320" width="16" height="264"/><rect class="empty-bank" x="1614" y="320" width="16" height="264"/>
+    <rect class="empty-bank" x="1635" y="320" width="16" height="264"/><rect class="empty-bank" x="1656" y="320" width="16" height="264"/>
+  </g>
+  <g stroke="#007f7b" stroke-width="0.9">
+    <g fill="#dceaf2">
+      <rect x="1341" y="518" width="16" height="33"/><rect x="1362" y="518" width="16" height="33"/><rect x="1383" y="518" width="16" height="33"/><rect x="1404" y="518" width="16" height="33"/>
+      <rect x="1341" y="551" width="16" height="33"/><rect x="1362" y="551" width="16" height="33"/><rect x="1383" y="551" width="16" height="33"/><rect x="1404" y="551" width="16" height="33"/>
+    </g>
+    <g fill="#deecd8">
+      <rect x="1425" y="518" width="16" height="33"/><rect x="1446" y="518" width="16" height="33"/><rect x="1467" y="518" width="16" height="33"/><rect x="1488" y="518" width="16" height="33"/>
+      <rect x="1425" y="551" width="16" height="33"/><rect x="1446" y="551" width="16" height="33"/><rect x="1467" y="551" width="16" height="33"/><rect x="1488" y="551" width="16" height="33"/>
+    </g>
+    <g fill="#f3e4c6">
+      <rect x="1509" y="518" width="16" height="33"/><rect x="1530" y="518" width="16" height="33"/><rect x="1551" y="518" width="16" height="33"/><rect x="1572" y="518" width="16" height="33"/>
+      <rect x="1509" y="551" width="16" height="33"/><rect x="1530" y="551" width="16" height="33"/><rect x="1551" y="551" width="16" height="33"/><rect x="1572" y="551" width="16" height="33"/>
+    </g>
+    <g fill="#e9ddeb">
+      <rect x="1593" y="518" width="16" height="33"/><rect x="1614" y="518" width="16" height="33"/><rect x="1635" y="518" width="16" height="33"/><rect x="1656" y="518" width="16" height="33"/>
+      <rect x="1593" y="551" width="16" height="33"/><rect x="1614" y="551" width="16" height="33"/><rect x="1635" y="551" width="16" height="33"/><rect x="1656" y="551" width="16" height="33"/>
+    </g>
+  </g>
+  <path d="M1331 513h345v76h-345" fill="none" stroke="#007f7b" stroke-width="1.8"/>
+  <text class="head teal" x="1504" y="400" text-anchor="middle">B0–B15:</text>
+  <text class="head teal" x="1504" y="425" text-anchor="middle">2 values / bank</text>
+  <text class="label teal" x="1504" y="457" text-anchor="middle">all banks active</text>
+
+  <rect x="962" y="615" width="765" height="38" fill="#e8f7f4" stroke="#007f7b" stroke-width="1"/>
+  <text class="head teal" text-anchor="middle" x="1344" y="640">Same packet, balanced across all banks at the 32/16 lower bound</text>
+
+  <line x1="45" y1="704" x2="1755" y2="704" stroke="#9aa9af" stroke-width="1.1"/>
+  <text class="small" x="45" y="730">Only the physical (row, bank) placement changes. Every source remains unique, no tensor value is modified, and X_STATE reconstructs the original logical packet order from the descriptor.</text>
+</svg>

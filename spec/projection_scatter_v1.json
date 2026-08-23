@@ -1,0 +1,44 @@
+{
+  "contract": "plena.projection_scatter",
+  "version": 1,
+  "transport": "l-scatter-m-v1-plus-lowered-trace-debug-view",
+  "isa_opcode": 63,
+  "required_plan_fields": [
+    "algorithm",
+    "phase",
+    "context_id",
+    "request_id",
+    "layer_id",
+    "token_offset",
+    "valid_tokens",
+    "source_input_features",
+    "source_values_per_token",
+    "layout",
+    "banks",
+    "ports_per_bank",
+    "physical_buffer_index",
+    "physical_buffer_base_row",
+    "physical_token_stride_rows",
+    "fallback_vram_addr",
+    "fallback_token_stride",
+    "flow",
+    "fifo_capacity_values",
+    "producer_burst_values",
+    "spill_write_values_per_cycle",
+    "spill_policy",
+    "fields",
+    "mapping_sha256"
+  ],
+  "invariants": [
+    "Every logical source value maps to exactly one physical (row, bank).",
+    "The descriptor input_vram_addr is the complete fallback packet address.",
+    "L_SCATTER_M executes before the matching X_STATE command.",
+    "The executable bank layout is encoded in the L_SCATTER_M descriptor, not X_STATE."
+  ],
+  "supported_skew_kinds": [
+    "none",
+    "local_row_stride",
+    "field_constant",
+    "group_stride"
+  ]
+}

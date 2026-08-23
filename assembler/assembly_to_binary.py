@@ -1,6 +1,10 @@
 from utils.load_config import load_svh_settings
 
-from .parser import load_isa_definitions, parse_asm_file
+from .parser import (
+    load_isa_definitions,
+    parse_asm_file,
+    parse_asm_lines,
+)
 
 
 # Opcode groups for binary encoding. Module-level frozensets so they are not rebuilt
@@ -38,9 +42,27 @@ _IMM_RS1_RD_OPS = frozenset(
     }
 )
 _IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"})
-_RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"})
-_RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_SET_TOPK_REG", "C_LOOP_END"})
-_FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})
+_RS1_RD_OPS = frozenset(
+    {"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"}
+)
+_RD_ONLY_OPS = frozenset(
+    {
+        "C_SET_SCALE_REG",
+        "C_SET_STRIDE_REG",
+        "C_SET_V_MASK_REG",
+        "C_LOOP_END",
+    }
+)
+_FUNCT_RSTRIDE_OPS = frozenset(
+    {
+        "H_PREFETCH_M",
+        "H_PREFETCH_V",
+        "H_STORE_V",
+        "V_SUB_VF",
+        "X_STATE",
+        "L_SCATTER_M",
+    }
+)
 _RS2_RS1_RD_OPS = frozenset(
     {
         "S_ADD_INT",
@@ -98,6 +120,7 @@ class AssemblyToBinary:
         imm = instruction.imm
         rmask = instruction.rmask
         binary_instruction = 0
+        topk_register_target = None
         ow = self.operands_width
         opw = self.opcode_width
 
@@ -105,14 +128,109 @@ class AssemblyToBinary:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
 
+        if instruction.opcode == "X_STATE":
+            fields = {
+                "context_gp": rd,
+                "descriptor_offset_gp": rs1,
+                "descriptor_hbm_reg": rs2,
+                "queue_id": rstride,
+                "subop": funct1,
+            }
+            if any(value is None for value in fields.values()):
+                raise ValueError(
+                    "X_STATE requires context, descriptor, queue, and subop operands"
+                )
+            # Every operand owns exactly four bits. Without this an out-of-range
+            # register silently carries into the neighbouring field instead of
+            # tripping the 32-bit overflow guard below, which would encode a
+            # different instruction than the one that was written.
+            for operand_name, operand in (
+                ("context_gp", rd),
+                ("descriptor_offset_gp", rs1),
+            ):
+                if not 0 <= operand < 16:
+                    raise ValueError(
+                        f"X_STATE {operand_name} must fit the four-bit instruction field"
+                    )
+            if not 0 <= rs2 < 8:
+                raise ValueError("X_STATE descriptor_hbm_reg must select a0..a7")
+            if not 0 <= rstride < 16:
+                raise ValueError("X_STATE queue_id must fit four bits")
+            if not 0 <= funct1 <= 6:
+                raise ValueError("X_STATE subop must be PRELOAD..FENCE (0..6)")
+            if funct1 == 6 and any((rd, rs1, rs2)):
+                raise ValueError(
+                    "X_STATE FENCE requires gp0, gp0, a0 descriptor operands"
+                )
+
+        if instruction.opcode == "L_SCATTER_M":
+            fields = {
+                "context_gp": rd,
+                "descriptor_offset_gp": rs1,
+                "descriptor_hbm_reg": rs2,
+                "buffer_id": rstride,
+                "layout_mode": funct1,
+            }
+            if any(value is None for value in fields.values()):
+                raise ValueError(
+                    "L_SCATTER_M requires context, descriptor, buffer, and mode operands"
+                )
+            for operand_name, operand in (
+                ("context_gp", rd),
+                ("descriptor_offset_gp", rs1),
+                ("buffer_id", rstride),
+            ):
+                if not 0 <= operand < 16:
+                    raise ValueError(
+                        f"L_SCATTER_M {operand_name} must fit the four-bit instruction field"
+                    )
+            if not 0 <= rs2 < 8:
+                raise ValueError("L_SCATTER_M descriptor_hbm_reg must select a0..a7")
+            if not 0 <= funct1 <= 4:
+                raise ValueError(
+                    "L_SCATTER_M layout_mode must be ROW_MAJOR..CUSTOM (0..4)"
+                )
+
+        if instruction.opcode == "C_SET_TOPK_REG":
+            if rd is None or not 0 <= rd < 16:
+                raise ValueError(
+                    "C_SET_TOPK_REG rd must fit the four-bit instruction field"
+                )
+            if any(
+                value is not None
+                for value in (
+                    rs1,
+                    rs2,
+                    rstride,
+                    funct1,
+                    instruction.funct2,
+                )
+            ):
+                raise ValueError(
+                    "C_SET_TOPK_REG accepts only rd and an optional numeric target"
+                )
+            # The parser puts a numeric second operand in ``imm``. Omitting it is
+            # the legacy spelling and must remain byte-identical to target=0.
+            topk_register_target = 0 if imm is None else imm
+            if topk_register_target not in (0, 1):
+                raise ValueError(
+                    "C_SET_TOPK_REG target must be 0 (policy) or 1 (bias VRAM address)"
+                )
+
         if instruction.opcode in _IMM_RS1_RD_OPS:
-            binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+            binary_instruction = (
+                (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+            )
         elif instruction.opcode in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _RS1_RD_OPS:
             binary_instruction = (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode == "C_BREAK":
             binary_instruction = opcode
+        elif instruction.opcode == "C_SET_TOPK_REG":
+            binary_instruction = (
+                (topk_register_target << (opw + ow)) + (rd << opw) + opcode
+            )
         elif instruction.opcode in _RD_ONLY_OPS:
             binary_instruction = (rd << opw) + opcode
         elif instruction.opcode == "C_LOOP_START":
@@ -129,12 +247,20 @@ class AssemblyToBinary:
             )
         elif instruction.opcode in _RMASK_VECTOR_OPS:
             binary_instruction = (
-                (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+                (rmask << (opw + 3 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
             )
         elif instruction.opcode in _RS2_RS1_RD_OPS:
-            binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+            binary_instruction = (
+                (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+            )
         else:
-            binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+            binary_instruction = (
+                (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+            )
 
         if binary_instruction > 0xFFFFFFFF:
             raise ValueError(
@@ -162,3 +288,17 @@ class AssemblyToBinary:
         # Write the binary instructions to a file
         self.write_binary_to_file(binary_instructions, output_file)
         return binary_instructions
+
+    def generate_binary_streaming(self, asm_file: str, output_file: str) -> int:
+        """Encode a large assembly file without retaining instructions or words."""
+        with open(asm_file) as assembly:
+            return self.generate_binary_streaming_lines(assembly, output_file)
+
+    def generate_binary_streaming_lines(self, lines, output_file: str) -> int:
+        """Encode an iterable of assembly lines directly into a hex memory file."""
+        count = 0
+        with open(output_file, "w") as output:
+            for instruction in parse_asm_lines(lines):
+                output.write(f"0x{self._convert_to_binary(instruction):08X}\n")
+                count += 1
+        return count

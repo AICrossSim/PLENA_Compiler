@@ -12,6 +12,7 @@ from typing import ClassVar
 
 from asm_templates._imm import add_large_int as _add_large_int
 from asm_templates._imm import load_large_int as _load_large_int
+from asm_templates.preload_addr_reg import preload_addr_reg_asm
 from asm_templates.projection_asm import projection_asm, projection_T_asm
 
 
@@ -72,6 +73,10 @@ class TestLoadLargeInt(unittest.TestCase):
         self.assertIn("S_ADDI_INT gp0, gp0, 0", asm)
         self.assertNotIn("S_LUI_INT", asm)
 
+    def test_value_above_u32_is_rejected_at_codegen(self):
+        with self.assertRaisesRegex(ValueError, "GP immediates must fit u32"):
+            _load_large_int(1, 1 << 32)
+
     def test_64x64_small(self):
         """64*64 = 4096 < 2^18: fits in 18-bit immediate -> single S_ADDI_INT from gp0."""
         val = 64 * 64  # 4096
@@ -97,6 +102,19 @@ class TestLoadLargeInt(unittest.TestCase):
         self.assertIn("S_ADDI_INT gp5, gp5, 37857", asm)
         self.assertNotIn("S_ADDI_INT gp5, gp3, 300000", asm)
         _check_all_addi_immediates(self, asm, "add_large_int(no temp)")
+
+    def test_hbm_address_above_4_gib_uses_high_and_low_gp_halves(self):
+        address = (4 << 32) | 0x1234_5000
+        asm = preload_addr_reg_asm([3], [5, 6], [address])
+
+        self.assertIn("S_LUI_INT gp5, 74565", asm)
+        self.assertIn("S_ADDI_INT gp6, gp0, 4", asm)
+        self.assertIn("C_SET_ADDR_REG a3, gp6, gp5", asm)
+        _check_all_addi_immediates(self, asm, "64-bit HBM address")
+
+    def test_hbm_address_above_4_gib_requires_two_scratch_registers(self):
+        with self.assertRaisesRegex(ValueError, "two distinct scratch"):
+            preload_addr_reg_asm([1], [5], [1 << 32])
 
 
 class TestProjectionAsmLargeMatrix(unittest.TestCase):

@@ -323,6 +323,37 @@ class ProgramFPTileOpsMixin:
     def fpvar_mul(self, src1: FPVar, src2: FPVar, dst: FPVar, count: int | None = None):
         return self._fpvar_binary("fpram_mul", src1, src2, dst, count)
 
+    def fpvar_mul_region(
+        self,
+        src1: FPVar,
+        src2: FPVar,
+        dst: FPVar,
+        *,
+        count: int,
+        src1_offset: int = 0,
+        src2_offset: int = 0,
+        dst_offset: int = 0,
+    ):
+        """Multiply bounded FPRAM slices without allocating alias variables."""
+        if count <= 0:
+            raise ValueError(f"count must be positive, got {count}")
+        for label, var, offset in (
+            ("src1", src1, src1_offset),
+            ("src2", src2, src2_offset),
+            ("dst", dst, dst_offset),
+        ):
+            if offset < 0 or offset + count > var.size:
+                raise ValueError(
+                    f"{label} region [{offset}, {offset + count}) exceeds "
+                    f"{var.name}.size={var.size}"
+                )
+        return self.fpvar_mul_asm(
+            src1.address + src1_offset,
+            src2.address + src2_offset,
+            dst.address + dst_offset,
+            count,
+        )
+
     def fpvar_add(self, src1: FPVar, src2: FPVar, dst: FPVar, count: int | None = None):
         return self._fpvar_binary("fpram_add", src1, src2, dst, count)
 
@@ -368,11 +399,25 @@ class ProgramFPTileOpsMixin:
                 f"vram_fill_zero rows out of bounds for {matrix.name}: shape={matrix.shape}, rows={resolved_rows}"
             )
 
-        # VRAM matrices are column-block-major. The low-level helper zeros one
-        # tile column, so walk every column block for wide matrices.
-        num_col_blocks = (cols + self.mlen - 1) // self.mlen
-        for col_block in range(num_col_blocks):
-            super().vram_fill_zero(matrix.name, resolved_rows, tile_col_idx=col_block)
+        # VRAM matrices are column-block-major. Build one known-zero FPRAM row,
+        # then map it over every requested row and column block. A multiply by
+        # zero is not a clear because NaN * 0 remains NaN.
+        self._scratch_serial += 1
+        zero_row = self.fp_var(
+            f"_vram_true_zero_row_{self._scratch_serial}", size=self.mlen
+        )
+        try:
+            super().fpvar_zero_asm(zero_row.address, self.mlen)
+            num_col_blocks = (cols + self.mlen - 1) // self.mlen
+            for col_block in range(num_col_blocks):
+                super().vram_fill_zero(
+                    matrix.name,
+                    resolved_rows,
+                    tile_col_idx=col_block,
+                    zero_row_addr=zero_row.address,
+                )
+        finally:
+            self.free_fp_var(zero_row)
 
 
 __all__ = ["ProgramFPTileOpsMixin"]
