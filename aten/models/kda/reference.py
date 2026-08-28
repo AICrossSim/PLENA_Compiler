@@ -1,9 +1,10 @@
-"""Readable FP32 CPU reference for the recurrent core of Kimi K3 KDA.
+"""Readable FP32 CPU references for Kimi K3 KDA.
 
 The state layout follows FlashKDA's ``transpose_state_layout=True`` contract:
 ``[batch, head, value_dim, key_dim]``. This module models the recurrent KDA
-core after q/k/v/decay/beta projection and short convolution. Output gating,
-RMSNorm, and the output projection remain ordinary PLENA Vector/Matrix work.
+core after q/k/v/decay/beta projection and short convolution.
+``kda_official_layer_step`` additionally covers all eight official projections,
+the output gate, RMSNorm, and the final projection.
 """
 
 from __future__ import annotations
