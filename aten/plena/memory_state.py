@@ -214,14 +214,26 @@ class MemoryStateMixin:
         self.fpram_matrices.pop(name, None)
         return info
 
-    def hbm_tensor_size(self, num_elements: int) -> int:
+    def hbm_tensor_size(self, num_elements: int, hbm_element_bytes: int | None = None) -> int:
         """Row-aligned HBM byte footprint of one tensor: element rows + scale rows,
         each padded up to hbm_row_width, matching the stager (create_mem_for_sim /
         plena_utils.calculate_instr_storage_offset_from_shapes). Replaces the packed
         `int(size * real_data_ratio)` estimate, which ignored per-tensor row padding
         and mislaid every following tensor whenever a region was not naturally
-        row-aligned (weights/K/V read zeros; common at small MLEN)."""
+        row-aligned (weights/K/V read zeros; common at small MLEN).
+
+        Pass `hbm_element_bytes` for a Plain (non-MX) tensor -- a BF16 write-back,
+        for instance -- so the region is sized from the width actually written
+        rather than from the MX layout."""
         row_bits = self.hbm_row_width
+        if hbm_element_bytes is not None and hbm_element_bytes * 8 != self.hbm_element_width:
+            # A Plain (non-MX) tensor: no scale stream, and a wider element than the
+            # MX layout assumes. Sizing such a tensor with the MX formula under-reserves
+            # it -- a BF16 write-back needs 2 bytes per element against the MX layout's
+            # 1.125 -- and the overrun silently lands on whatever tensor follows.
+            bytes_per_row = row_bits // 8
+            total_bytes = num_elements * hbm_element_bytes
+            return -(-total_bytes // bytes_per_row) * bytes_per_row
         ew, bs, sw = self.hbm_element_width, self.hbm_block_size, self.hbm_scale_width
         bytes_per_row = row_bits // 8
         elements_per_row = (row_bits // (ew * bs)) * bs
