@@ -43,9 +43,18 @@ def preload_act_asm(
                 f"H_PREFETCH_V gp{result_register}, gp{a_actual_register}, a{activation_offset_reg}, 0, {precision}, 0 \n"
             )
             generated_code += f"S_ADDI_INT gp{result_register}, gp{result_register}, {vram_step} \n"
-            generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {elements_per_prefetch} \n"
+            generated_code += (
+                f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, "
+                f"{elements_per_prefetch * storage_precision} \n"
+            )
     else:
-        generated_code += f"S_ADDI_INT gp{set_stride_register}, gp0, {stride_len} \n"
+        # C_SET_STRIDE_REG is byte-addressed. ``stride_size`` is expressed in
+        # tensor elements, matching the rest of this helper's public API, so a
+        # Plain BF16 row must advance twice as far as an MX8 row.
+        generated_code += (
+            f"S_ADDI_INT gp{set_stride_register}, gp0, "
+            f"{stride_len * storage_precision} \n"
+        )
         generated_code += f"C_SET_STRIDE_REG gp{set_stride_register} \n"
         a_offset_register = set_stride_register
         generated_code += f"C_LOOP_START gp{outer_loop_register}, {load_amount_per_hidden} \n"
@@ -59,6 +68,9 @@ def preload_act_asm(
         if batch > preload_len:
             generated_code += f"S_ADDI_INT gp{a_offset_register}, gp{a_offset_register}, {int(hidden_size * preload_len * storage_precision)} \n"
             generated_code += f"C_LOOP_END gp{inner_loop_register} \n"
-        generated_code += f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, {vlen} \n"
+        generated_code += (
+            f"S_ADDI_INT gp{a_actual_register}, gp{a_actual_register}, "
+            f"{vlen * storage_precision} \n"
+        )
         generated_code += f"C_LOOP_END gp{outer_loop_register} \n"
     return generated_code

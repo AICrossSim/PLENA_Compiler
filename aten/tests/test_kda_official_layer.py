@@ -244,3 +244,39 @@ def test_consecutive_bf16_weights_reserve_the_bytes_the_matrix_reader_consumes()
         hbm_element_bytes=2,
     )
     assert second.hbm_addr >= first.hbm_addr + 16 * 16 * 2
+
+
+def test_plain_bf16_batch_load_programs_a_byte_stride():
+    """A multi-row BF16 load advances by bytes, not element count."""
+    p = PlenaCompiler(mlen=MLEN, blen=2, real_data_ratio=2.0)
+    source = p.input(
+        "plain_bf16",
+        (8, 16),
+        physical_shape=(8, 16),
+        real_data_ratio=2.0,
+        hbm_element_bytes=2,
+    )
+
+    p.load_batch(source, storage_precision=2, precision=1)
+    code = p.compile()
+
+    assert "S_ADDI_INT gp3, gp0, 32" in code
+    assert "C_SET_STRIDE_REG gp3" in code
+    assert "S_ADDI_INT gp2, gp2, 16" in code
+
+
+def test_plain_bf16_single_batch_load_advances_hbm_offsets_in_bytes():
+    p = PlenaCompiler(mlen=MLEN, blen=2, real_data_ratio=2.0)
+    source = p.input(
+        "plain_bf16_single",
+        (1, 64),
+        physical_shape=(1, 64),
+        real_data_ratio=2.0,
+        hbm_element_bytes=2,
+    )
+
+    p.load_batch(source, storage_precision=2, precision=1)
+    code = p.compile()
+
+    # One H_PREFETCH_V moves 4 * MLEN = 32 BF16 values, hence 64 HBM bytes.
+    assert "S_ADDI_INT gp2, gp2, 64" in code
