@@ -14,6 +14,7 @@ _RMASK_VECTOR_OPS = frozenset(
         "V_MUL_VV",
         "V_SUB_VV",
         "V_MUL_VF",
+        "V_FMA_VF",
         "V_EXP_V",
         "V_RECI_V",
         "V_RED_SUM",
@@ -21,6 +22,7 @@ _RMASK_VECTOR_OPS = frozenset(
         "V_MAX_VF",
         "V_MIN_VF",
         "V_TOPK",
+        "V_SOFTPLUS_V",
     }
 )
 _IMM_RS1_RD_OPS = frozenset(
@@ -32,13 +34,11 @@ _IMM_RS1_RD_OPS = frozenset(
         "S_LD_INT",
         "S_ST_INT",
         "S_MAP_V_FP",
-        "V_RED_MAX",
-        "V_RECI_V",
-        "V_EXP_V",
+        "S_MAP_FP_V",
     }
 )
 _IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"})
-_RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"})
+_RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP"})
 _RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_SET_TOPK_REG", "C_LOOP_END"})
 _FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})
 _RS2_RS1_RD_OPS = frozenset(
@@ -105,7 +105,25 @@ class AssemblyToBinary:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
 
-        if instruction.opcode in _IMM_RS1_RD_OPS:
+        # _RMASK_VECTOR_OPS MUST be tested before _IMM_RS1_RD_OPS / _RS1_RD_OPS.
+        # V_EXP_V, V_RECI_V, V_RED_MAX and V_RED_SUM appear in more than one set,
+        # and the earlier branch encodes the third operand as `imm` at bit
+        # OPCODE_WIDTH + 2*OPERAND_WIDTH (the rs2 field) while the emulator reads
+        # rmask from rs3 at OPCODE_WIDTH + 3*OPERAND_WIDTH (op.rs `Opcode::decode`).
+        # With the old ordering a masked V_EXP_V silently executed on the whole
+        # tile: no diagnostic, wrong answer. rmask == 0 encodes identically under
+        # either ordering, so this is a no-op for every unmasked call site.
+        if instruction.opcode in _RMASK_VECTOR_OPS:
+            # 2- and 3-operand forms leave rs1/rs2 unset; the hardware reads those
+            # fields regardless, so encode them as 0 rather than crashing on None.
+            binary_instruction = (
+                (rmask << (opw + 3 * ow))
+                + ((rs2 or 0) << (opw + 2 * ow))
+                + ((rs1 or 0) << (opw + ow))
+                + ((rd or 0) << opw)
+                + opcode
+            )
+        elif instruction.opcode in _IMM_RS1_RD_OPS:
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
@@ -126,10 +144,6 @@ class AssemblyToBinary:
                 + (rs1 << (opw + ow))
                 + (rd << opw)
                 + opcode
-            )
-        elif instruction.opcode in _RMASK_VECTOR_OPS:
-            binary_instruction = (
-                (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
             )
         elif instruction.opcode in _RS2_RS1_RD_OPS:
             binary_instruction = (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
