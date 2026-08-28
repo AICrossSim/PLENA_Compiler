@@ -502,6 +502,7 @@ class ProgramKdaCommonMixin:
         acc_fp: FPVar,
         consts,
         first_row: int = 0,
+        marker_kind: str = "kda_normalize",
     ) -> VRAMMatrixVar:
         """L2-normalise ``vectors`` vectors that each span ``blocks`` rows.
 
@@ -552,7 +553,7 @@ class ProgramKdaCommonMixin:
             raise ValueError(f"acc_fp holds {acc_fp.size} slots, needs {vectors}")
 
         self.emit_comment(
-            kda_stage_marker("kda_normalize", f"vectors={vectors} blocks={blocks}")
+            kda_stage_marker(marker_kind, f"vectors={vectors} blocks={blocks}")
         )
         # `first_row` lets the mixer normalise one head's slice of a tile that
         # holds every head, rather than copying it out first.

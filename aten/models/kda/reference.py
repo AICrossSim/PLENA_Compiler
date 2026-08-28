@@ -84,6 +84,30 @@ class KdaConvWeights:
     v_bias: Tensor | None = None
 
 
+@dataclass(frozen=True)
+class KdaOfficialLayerWeights:
+    """The tensors owned by one official ``KimiDeltaAttention`` layer.
+
+    Matrix weights use PLENA's ``[input, output]`` convention, the transpose of
+    ``torch.nn.Linear.weight``.  Keeping the eight projections separate is
+    intentional: the official Kimi K3 module executes eight independent
+    linears rather than a packed QKV projection.
+    """
+
+    q: Tensor
+    k: Tensor
+    v: Tensor
+    decay_a: Tensor
+    decay_b: Tensor
+    beta: Tensor
+    output_gate: Tensor
+    output: Tensor
+    conv: KdaConvWeights
+    norm_weight: Tensor
+    a_log: Tensor
+    dt_bias: Tensor
+
+
 def _require_shape(name: str, value: Tensor, expected: tuple[int, ...]) -> None:
     if tuple(value.shape) != expected:
         raise ValueError(f"{name} has shape {tuple(value.shape)}, expected {expected}")
@@ -281,6 +305,79 @@ def kda_state_engine_prefill(
         )
         outputs.append(output)
     return torch.stack(outputs, dim=1), current
+
+
+def kda_official_layer_step(
+    hidden: Tensor,
+    state: KdaRecurrentState,
+    weights: KdaOfficialLayerWeights,
+    shape: KdaShape,
+    *,
+    norm_eps: float = 1.0e-5,
+    scale: float | None = None,
+    state_storage: StateStorage | str = StateStorage.FP32,
+    conv_state_storage: StateStorage | str = StateStorage.BF16,
+) -> tuple[Tensor, KdaRecurrentState]:
+    """Execute one official Kimi K3 KDA decode layer from hidden to output.
+
+    This is the reference boundary missing from :func:`kda_state_engine_step`:
+    eight independent projections, three short convolutions, recurrent KDA,
+    per-head ``RMSNorm(value) * sigmoid(output_gate)``, and the final output
+    projection.  It follows the source and GPU-profiled execution order.
+    """
+    if hidden.ndim != 2:
+        raise ValueError("hidden must have shape [batch, hidden_size]")
+    batch = hidden.shape[0]
+    _require_shape("hidden", hidden, (batch, shape.hidden_size))
+    key_width = shape.projection_size
+    value_width = shape.num_heads * shape.value_dim
+
+    _require_shape("q weight", weights.q, (shape.hidden_size, key_width))
+    _require_shape("k weight", weights.k, (shape.hidden_size, key_width))
+    _require_shape("v weight", weights.v, (shape.hidden_size, value_width))
+    if weights.decay_a.ndim != 2 or weights.decay_a.shape[0] != shape.hidden_size:
+        raise ValueError(
+            "decay_a weight must have shape [hidden_size, decay_rank], got "
+            f"{tuple(weights.decay_a.shape)}"
+        )
+    decay_rank = weights.decay_a.shape[1]
+    _require_shape("decay_b weight", weights.decay_b, (decay_rank, key_width))
+    _require_shape("beta weight", weights.beta, (shape.hidden_size, shape.num_heads))
+    _require_shape(
+        "output_gate weight", weights.output_gate, (shape.hidden_size, value_width)
+    )
+    _require_shape("output weight", weights.output, (value_width, shape.hidden_size))
+    _require_shape("norm_weight", weights.norm_weight, (shape.value_dim,))
+
+    hidden_fp = hidden.float()
+    q = hidden_fp @ weights.q.float()
+    k = hidden_fp @ weights.k.float()
+    v = hidden_fp @ weights.v.float()
+    decay = (hidden_fp @ weights.decay_a.float()) @ weights.decay_b.float()
+    beta = hidden_fp @ weights.beta.float()
+    output_gate = hidden_fp @ weights.output_gate.float()
+    projected = torch.cat((q, k, v, decay, beta), dim=-1)
+
+    mixed, next_state = kda_state_engine_step(
+        projected,
+        state,
+        weights.conv,
+        weights.a_log,
+        weights.dt_bias,
+        shape,
+        scale=scale,
+        state_storage=state_storage,
+        conv_state_storage=conv_state_storage,
+    )
+    mixed = mixed.reshape(batch, shape.num_heads, shape.value_dim).float()
+    gate = output_gate.reshape(batch, shape.num_heads, shape.value_dim).float()
+    normalized = mixed * torch.rsqrt(
+        mixed.square().mean(dim=-1, keepdim=True) + norm_eps
+    )
+    normalized = normalized * weights.norm_weight.float()[None, None, :]
+    gated = normalized * torch.sigmoid(gate)
+    output = gated.reshape(batch, value_width) @ weights.output.float()
+    return output, next_state
 
 
 def kda_recurrent_sequence(

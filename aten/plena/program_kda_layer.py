@@ -87,17 +87,68 @@ problem that is not on the path.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 from compiler.aten.models.kda.shape import KdaShape
-from compiler.aten.plena.program_kda_common import kda_stage_marker
+from compiler.aten.plena.program_kda_common import (
+    kda_stage_marker,
+    kda_vector_rows,
+)
+from compiler.aten.plena.program_kda_conv import kda_conv_blocks
 from compiler.aten.plena.program_kda_gates import kda_key_blocks
-from compiler.aten.plena.vars import InputVar, VRAMMatrixVar
+from compiler.aten.plena.vars import FPVar, InputVar, VRAMMatrixVar
+
+if TYPE_CHECKING:
+    from compiler.aten.plena.program_kda_mixer import KdaMixerBuffers
 
 __all__ = [
     "ProgramKdaLayerMixin",
+    "KdaOfficialLayerBuffers",
+    "KdaOfficialProjectionWeights",
     "kda_projection_features",
     "kda_projection_sections",
     "kda_projection_width",
 ]
+
+
+@dataclass(frozen=True)
+class KdaOfficialProjectionWeights:
+    """The eight independent Matrix weights in official Kimi K3 KDA.
+
+    All tensors follow PLENA's ``[input, output]`` Matrix convention.  This is
+    deliberately not a packed QKV weight: GPU source inspection and runtime
+    hooks show eight separate ``nn.Linear`` calls.
+    """
+
+    q: InputVar
+    k: InputVar
+    v: InputVar
+    decay_a: InputVar
+    decay_b: InputVar
+    beta: InputVar
+    output_gate: InputVar
+    output: InputVar
+
+
+@dataclass
+class KdaOfficialLayerBuffers:
+    """State and scratch required around an official KDA decode layer."""
+
+    mixer: KdaMixerBuffers
+    conv_state: dict[str, VRAMMatrixVar]
+    conv_weight: dict[str, VRAMMatrixVar]
+    conv_bias: dict[str, VRAMMatrixVar | None]
+    conv_scratch: VRAMMatrixVar
+    decay: VRAMMatrixVar
+    beta: VRAMMatrixVar
+    output_gate: VRAMMatrixVar
+    norm_weight: VRAMMatrixVar
+    norm_sq_scratch: VRAMMatrixVar
+    norm_part_fp: FPVar
+    norm_acc_fp: FPVar
+    norm_consts: object
+    packed_output: VRAMMatrixVar
 
 
 def kda_projection_features(shape: KdaShape) -> int:
@@ -294,6 +345,293 @@ class ProgramKdaLayerMixin:
             src_rows=[(first + c) * stride + token for c in range(count)],
         )
         return dst
+
+    def kda_gather_linear_output_v0(
+        self,
+        *,
+        projected: VRAMMatrixVar,
+        dst: VRAMMatrixVar,
+        blocks: int,
+        consts,
+        token: int = 0,
+        name: str,
+        marker_kind: str,
+    ) -> VRAMMatrixVar:
+        """Gather one token from an independent projection into dense rows.
+
+        Matrix writeback stores feature block ``c`` at row
+        ``c * physical_rows + token``.  KDA's vector consumers want blocks in
+        rows ``0..blocks``.  Both sides are arithmetic progressions, so this is
+        one ``V_FMA_VF`` hardware loop, independent of projection width.
+        """
+        if blocks < 1:
+            raise ValueError(f"blocks must be positive, got {blocks}")
+        if dst.shape[0] < blocks or dst.shape[1] != self.mlen:
+            raise ValueError(
+                f"dst must hold {blocks} rows x mlen {self.mlen}, got {dst.shape}"
+            )
+        tall, stride = self.vram_tall_view(projected, name=name)
+        if not 0 <= token < stride:
+            raise ValueError(f"token {token} is outside projection stride {stride}")
+        rows = list(range(blocks))
+        self.emit_comment(kda_stage_marker(marker_kind, f"gather blocks={blocks}"))
+        self.vram_fill_zero(dst, rows=rows)
+        self.tile_row_fma_fp_broadcast(
+            dst,
+            tall,
+            consts.one,
+            dst_rows=rows,
+            src_rows=[c * stride + token for c in rows],
+        )
+        return dst
+
+    def kda_pack_output_for_projection_v0(
+        self,
+        *,
+        value: VRAMMatrixVar,
+        packed: VRAMMatrixVar,
+        shape: KdaShape,
+        consts,
+        token: int = 0,
+        name: str = "kda_output_tall",
+    ) -> VRAMMatrixVar:
+        """Pack the per-head recurrent output into a Matrix projection row.
+
+        The recurrence uses one dense row per ``(head, value block)``.  Matrix
+        input uses token rows inside column blocks.  This is the inverse of
+        :meth:`kda_gather_linear_output_v0` and likewise collapses to one
+        hardware loop.
+        """
+        value_width = shape.num_heads * shape.value_dim
+        blocks = kda_vector_rows(shape, self.mlen)
+        if value.shape[0] < blocks or value.shape[1] != self.mlen:
+            raise ValueError(f"value must hold {blocks} dense rows, got {value.shape}")
+        if packed.shape != (1, value_width):
+            raise ValueError(
+                f"packed must have logical shape {(1, value_width)}, got {packed.shape}"
+            )
+        tall, stride = self.vram_tall_view(packed, name=name)
+        if not 0 <= token < stride:
+            raise ValueError(f"token {token} is outside packed stride {stride}")
+        dst_rows = [c * stride + token for c in range(blocks)]
+        src_rows = list(range(blocks))
+        self.emit_comment(kda_stage_marker("kda_out_proj", f"pack blocks={blocks}"))
+        self.vram_fill_zero(tall, rows=dst_rows)
+        self.tile_row_fma_fp_broadcast(
+            tall,
+            value,
+            consts.one,
+            dst_rows=dst_rows,
+            src_rows=src_rows,
+        )
+        return packed
+
+    def kda_gated_rmsnorm_v0(
+        self,
+        *,
+        value: VRAMMatrixVar,
+        gate: VRAMMatrixVar,
+        norm_weight: VRAMMatrixVar,
+        sq_scratch: VRAMMatrixVar,
+        part_fp: FPVar,
+        acc_fp: FPVar,
+        consts,
+        shape: KdaShape,
+    ) -> VRAMMatrixVar:
+        """Official KDA ``RMSNorm(value) * weight * sigmoid(gate)`` per head.
+
+        This differs from Mamba's gate-before-normalization SiLU.  Kimi applies
+        RMSNorm first, uses one learned ``value_dim`` scale shared by all heads,
+        and finally multiplies by a sigmoid output gate.  Heads are streamed so
+        the reduction scratch is ``value_dim / mlen`` slots rather than one
+        allocation per head.
+        """
+        if shape.value_dim % self.mlen:
+            raise ValueError(
+                f"value_dim ({shape.value_dim}) must be a multiple of mlen "
+                f"({self.mlen})"
+            )
+        blocks = shape.value_dim // self.mlen
+        rows_needed = shape.num_heads * blocks
+        for label, tile in (("value", value), ("gate", gate), ("sq_scratch", sq_scratch)):
+            if tile.shape[0] < rows_needed or tile.shape[1] != self.mlen:
+                raise ValueError(
+                    f"{label} must hold {rows_needed} rows x {self.mlen}, got {tile.shape}"
+                )
+        if norm_weight.shape[0] < blocks or norm_weight.shape[1] != self.mlen:
+            raise ValueError(
+                f"norm_weight must hold {blocks} shared rows, got {norm_weight.shape}"
+            )
+        if part_fp.size < blocks or acc_fp.size < 1:
+            raise ValueError("norm scratch needs value_blocks partials and one accumulator")
+
+        self.emit_comment(kda_stage_marker("kda_gated_norm", f"heads={shape.num_heads}"))
+        for head in range(shape.num_heads):
+            first = head * blocks
+            rows = list(range(first, first + blocks))
+            self.kda_l2_normalize_blocked_v0(
+                value,
+                vectors=1,
+                blocks=blocks,
+                first_row=first,
+                sq_scratch=sq_scratch,
+                part_fp=part_fp,
+                acc_fp=acc_fp,
+                consts=consts,
+                marker_kind="kda_gated_norm",
+            )
+            self.vram_mul(
+                value,
+                norm_weight,
+                dst_row_offset=first,
+                src_row_offset=0,
+                num_rows=blocks,
+            )
+            self._kda_sigmoid_inplace(gate, rows, consts)
+            self.tile_row_mul(value, gate, rows=rows)
+        return value
+
+    @staticmethod
+    def _kda_require_weight_shape(weight: InputVar, expected: tuple[int, int], name: str) -> None:
+        if weight.shape != expected:
+            raise ValueError(f"{name} weight has shape {weight.shape}, expected {expected}")
+
+    def kda_official_layer_decode_v0(
+        self,
+        *,
+        hidden: VRAMMatrixVar,
+        weights: KdaOfficialProjectionWeights,
+        buffers: KdaOfficialLayerBuffers,
+        shape: KdaShape,
+        token: int = 0,
+        name: str = "kda_official",
+    ) -> VRAMMatrixVar:
+        """Lower one official Kimi K3 KDA decode layer from hidden to output.
+
+        The path is eight independent Matrix projections, three short
+        convolutions, the static recurrent core, per-head gated RMSNorm, and
+        the final output projection.  No ``X_STATE`` or private state cache is
+        involved; state and scratch are explicit compiler-managed tensors.
+        """
+        if hidden.shape != (1, shape.hidden_size):
+            raise ValueError(
+                f"decode hidden must have shape {(1, shape.hidden_size)}, got {hidden.shape}"
+            )
+        key_width = shape.projection_size
+        value_width = shape.num_heads * shape.value_dim
+        decay_rank = weights.decay_a.shape[1]
+        for weight, expected, label in (
+            (weights.q, (shape.hidden_size, key_width), "q"),
+            (weights.k, (shape.hidden_size, key_width), "k"),
+            (weights.v, (shape.hidden_size, value_width), "v"),
+            (weights.decay_a, (shape.hidden_size, decay_rank), "decay_a"),
+            (weights.decay_b, (decay_rank, key_width), "decay_b"),
+            (weights.beta, (shape.hidden_size, shape.num_heads), "beta"),
+            (weights.output_gate, (shape.hidden_size, value_width), "output_gate"),
+            (weights.output, (value_width, shape.hidden_size), "output"),
+        ):
+            self._kda_require_weight_shape(weight, expected, label)
+
+        self.emit_comment(kda_stage_marker("kda_qkv_proj", "8-projection official layer"))
+        projected = {
+            "q": self.linear_projection_bf16(hidden, weights.q, name=f"{name}_q"),
+            "k": self.linear_projection_bf16(hidden, weights.k, name=f"{name}_k"),
+            "v": self.linear_projection_bf16(hidden, weights.v, name=f"{name}_v"),
+        }
+        self.emit_comment(kda_stage_marker("kda_decay", "decay_a -> decay_b, beta"))
+        decay_low_rank = self.linear_projection_bf16(
+            hidden, weights.decay_a, name=f"{name}_decay_a"
+        )
+        decay_projected = self.linear_projection_bf16(
+            decay_low_rank, weights.decay_b, name=f"{name}_decay_b"
+        )
+        beta_projected = self.linear_projection_bf16(
+            hidden, weights.beta, name=f"{name}_beta"
+        )
+        self.emit_comment(kda_stage_marker("kda_gated_norm", "output gate projection"))
+        output_gate_projected = self.linear_projection_bf16(
+            hidden, weights.output_gate, name=f"{name}_output_gate"
+        )
+
+        widths = {"q": key_width, "k": key_width, "v": value_width}
+        outs = {"q": buffers.mixer.q, "k": buffers.mixer.k, "v": buffers.mixer.v}
+        for section in ("q", "k", "v"):
+            tall, stride = self.vram_tall_view(
+                projected[section], name=f"{name}_{section}_tall"
+            )
+            self.kda_conv_step_v0(
+                x_new=tall,
+                x_new_row_base=token,
+                x_new_row_stride=stride,
+                conv_state=buffers.conv_state[section],
+                weight=buffers.conv_weight[section],
+                bias=buffers.conv_bias.get(section),
+                out=outs[section],
+                scratch=buffers.conv_scratch,
+                consts=buffers.mixer.consts,
+                channels=widths[section],
+                kernel=shape.conv_kernel,
+            )
+
+        self.kda_gather_linear_output_v0(
+            projected=decay_projected,
+            dst=buffers.decay,
+            blocks=kda_conv_blocks(key_width, self.mlen),
+            consts=buffers.mixer.consts,
+            token=token,
+            name=f"{name}_decay_tall",
+            marker_kind="kda_decay",
+        )
+        self.kda_gather_linear_output_v0(
+            projected=beta_projected,
+            dst=buffers.beta,
+            blocks=max(1, -(-shape.num_heads // self.mlen)),
+            consts=buffers.mixer.consts,
+            token=token,
+            name=f"{name}_beta_tall",
+            marker_kind="kda_decay",
+        )
+        self.kda_gather_linear_output_v0(
+            projected=output_gate_projected,
+            dst=buffers.output_gate,
+            blocks=kda_conv_blocks(value_width, self.mlen),
+            consts=buffers.mixer.consts,
+            token=token,
+            name=f"{name}_output_gate_tall",
+            marker_kind="kda_gated_norm",
+        )
+
+        buffers.mixer.gate = buffers.decay
+        buffers.mixer.beta_logit = buffers.beta
+        self.kda_beta_scalars_v0(
+            beta_logit=buffers.beta,
+            beta_fp=buffers.mixer.beta_fp,
+            consts=buffers.mixer.consts,
+            shape=shape,
+        )
+        self.kda_mixer_step_v0(buffers=buffers.mixer, shape=shape)
+        self.kda_gated_rmsnorm_v0(
+            value=buffers.mixer.out,
+            gate=buffers.output_gate,
+            norm_weight=buffers.norm_weight,
+            sq_scratch=buffers.norm_sq_scratch,
+            part_fp=buffers.norm_part_fp,
+            acc_fp=buffers.norm_acc_fp,
+            consts=buffers.norm_consts,
+            shape=shape,
+        )
+        self.kda_pack_output_for_projection_v0(
+            value=buffers.mixer.out,
+            packed=buffers.packed_output,
+            shape=shape,
+            consts=buffers.mixer.consts,
+            token=token,
+            name=f"{name}_packed_tall",
+        )
+        self.emit_comment(kda_stage_marker("kda_out_proj", "o_proj"))
+        return self.linear_projection_bf16(
+            buffers.packed_output, weights.output, name=f"{name}_out"
+        )
 
     def kda_split_projection_v0(
         self,

@@ -26,10 +26,12 @@ from compiler.aten.models.kda.shape import KdaShape
 if TYPE_CHECKING:  # pragma: no cover - import-time typing only
     from compiler.aten.models.kda.reference import (
         KdaConvWeights,
+        KdaOfficialLayerWeights,
         KdaState,
         KdaRecurrentState,
         activate_log_decay,
         kda_recurrent_sequence,
+        kda_official_layer_step,
         kda_state_engine_prefill,
         kda_state_engine_step,
         kda_step,
@@ -43,10 +45,12 @@ if TYPE_CHECKING:  # pragma: no cover - import-time typing only
 _REFERENCE_EXPORTS = frozenset(
     {
         "KdaConvWeights",
+        "KdaOfficialLayerWeights",
         "KdaState",
         "KdaRecurrentState",
         "activate_log_decay",
         "kda_recurrent_sequence",
+        "kda_official_layer_step",
         "kda_state_engine_prefill",
         "kda_state_engine_step",
         "kda_step",
