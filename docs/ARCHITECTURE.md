@@ -31,9 +31,16 @@ PLENA_Compiler/
 |   |   |-- compiler.py      #     PlenaCompiler composition class
 |   |   |-- memory_state.py  #     Tensor/input/FP memory state
 |   |   |-- program_*.py     #     High-level program operations
+|   |   |   program_routed_moe.py / program_moe_shared.py  # MoE substrate
+|   |   |   program_mamba_common.py    # Mamba-2 shapes, conv1d, dt, gated norm
+|   |   |   program_ssd.py             # Mamba-2 chunked-scan prefill
+|   |   |   program_ssm_recurrent.py   # Mamba-2 decode + persistent HBM state
 |   |   +-- isa_*.py         #     Low-level ISA emitters
+|   |-- models/              #   Per-architecture reference semantics
+|   |   |-- gpt_oss/         #     Routed-MoE golden + checkpoint loading
+|   |   +-- mamba2/          #     Recurrent + chunked SSD golden
 |   +-- ops/                 #   Registered ATen op implementations
-|       |-- registry.py      #     Op dispatch registry
+|       |-- registry.py      #     Op dispatch registry (native_ops.yaml)
 |       |-- plena/           #     PLENA backend wrappers
 |       +-- cpu/             #     CPU reference implementations
 |
@@ -106,6 +113,19 @@ HF config.json
   -> assembler/ (ASM -> .mem binary)
   -> emulator smoke / utilization analysis
 ```
+
+## Architectures
+
+| Family | Compiler substrate | Reference | Emulator tests |
+|--------|--------------------|-----------|----------------|
+| Dense decoder (Llama, Qwen) | `asm_templates/` + `aten/plena/program_attention.py` | `aten/ops/cpu/` | `testbench/aten/` |
+| Routed MoE (GPT-OSS, DeepSeek, Qwen2-MoE) | `aten/plena/program_routed_moe.py`, `program_moe_shared.py` | `aten/models/gpt_oss/` | `testbench/routed_moe/` |
+| Mamba-2 / selective SSM | `aten/plena/program_mamba_common.py`, `program_ssd.py`, `program_ssm_recurrent.py` | `aten/models/mamba2/` | `testbench/mamba2/` |
+
+Mamba-2 uses two ISA extensions added with it: `V_SOFTPLUS_V` (0x39) and
+`S_MAP_FP_V` (0x3A). Scope is Mamba-2 only -- Mamba-1's `A` is a
+`[d_inner, state_size]` diagonal, which PLENA's scalar-only broadcast cannot
+express cheaply. See the module docstrings for the full reasoning.
 
 See `docs/COMPILATION_PIPELINES.md` for detailed comparison, known gaps,
 and guidance on when to use which pipeline.
