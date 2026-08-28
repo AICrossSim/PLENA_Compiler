@@ -19,6 +19,7 @@ class ProgramTensorMixin:
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float | None = None,
+        hbm_element_bytes: int | None = None,
     ) -> InputVar:
         """
         Declare an input tensor (in HBM).
@@ -32,6 +33,9 @@ class ProgramTensorMixin:
                 ``load_batch`` will register it at that address without emitting
                 any HBM→VRAM prefetch instructions.  If None (default), the
                 normal HBM→VRAM load path is used.
+            hbm_element_bytes: Explicit element width for Plain HBM tensors.
+                BF16 Matrix/KV inputs must pass ``2`` so consecutive regions do
+                not overlap; the default keeps the configured MX layout.
 
         Returns:
             InputVar proxy object
@@ -41,7 +45,7 @@ class ProgramTensorMixin:
 
         h, w = physical_shape or shape
         size = h * w
-        hbm_size = self.hbm_tensor_size(size)
+        hbm_size = self.hbm_tensor_size(size, hbm_element_bytes=hbm_element_bytes)
 
         if hbm_addr is None:
             hbm_addr = self._allocate_hbm(hbm_size)

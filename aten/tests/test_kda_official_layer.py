@@ -126,6 +126,7 @@ def _compiler_layer():
             name,
             (rows, cols),
             physical_shape=(up(rows), up(cols)),
+            hbm_element_bytes=2,
         )
 
     weights = KdaOfficialProjectionWeights(
@@ -227,3 +228,19 @@ def test_official_lowering_emits_eight_matrix_projections_and_all_stages():
     ):
         assert weight in code
 
+
+def test_consecutive_bf16_weights_reserve_the_bytes_the_matrix_reader_consumes():
+    p = PlenaCompiler(mlen=MLEN, blen=2)
+    first = p.input(
+        "first_bf16",
+        (16, 16),
+        physical_shape=(16, 16),
+        hbm_element_bytes=2,
+    )
+    second = p.input(
+        "second_bf16",
+        (16, 16),
+        physical_shape=(16, 16),
+        hbm_element_bytes=2,
+    )
+    assert second.hbm_addr >= first.hbm_addr + 16 * 16 * 2
