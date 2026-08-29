@@ -240,11 +240,17 @@ Fetch an (MLEN, 1) vector from the Vector SRAM using the address provided by `rs
 
 **Format:** `V_SUB_VV rd, rs1, rs2, rmask`
 
-**Operation:** `Vector[gp_reg<rd>] & gp_rmask = (Vector[gp_reg<rs2>] & gp_reg<rmask>) - (Vector[gp_reg<rs1>] & gp_reg<rmask>)`
+**Operation:** `Vector[gp_reg<rd>] & gp_rmask = (Vector[gp_reg<rs1>] & gp_reg<rmask>) - (Vector[gp_reg<rs2>] & gp_reg<rmask>)`
 
 **Description:**
 
 Similar to `V_ADD_VV`, but performs element-wise subtraction.
+
+**Note:** this line previously read `rs2 - rs1`. The hardware computes
+`rs1 - rs2` -- `vector_machine.rs`'s `sub(vd, vs1, vs2)` returns
+`read(vs1) - read(vs2)`, and `dispatch.rs` passes `(rd, rs1, rs2)` in that
+order. Subtraction does not commute, so the old wording inverted the sign of
+anything written against the spec rather than against the emulator.
 
 ### V_SUB_VF
 
@@ -286,6 +292,35 @@ Similar to `V_ADD_VV`, but performs element-wise multiplication.
 **Description:**
 
 Similar to `V_ADD_VF`, but performs element-wise multiplication.
+
+### V_FMA_VF
+
+**Format:** `V_FMA_VF rd, rs1, fp2, rmask`
+
+**Operation:** `Vector[gp_reg<rd>] & gp_reg<rmask> = (Vector[gp_reg<rd>] + Vector[gp_reg<rs1>] * Broadcast(fp_reg<fp2>)) & gp_reg<rmask>`
+
+**Opcode:** `6'h3B`
+
+**Description:**
+
+Fused broadcast multiply-add. **`rd` is read as well as written** -- the only
+V-type instruction for which that is true, so a register allocator must treat it
+as a read-modify-write and not as a pure destination.
+
+The multiply and the add are fused: the result is quantised **once**, on the sum.
+That is a numerical difference from the `V_MUL_VF` + `V_ADD_VV` pair it replaces,
+not just a shorter encoding.
+
+Lanes masked off by `rmask` keep the destination's existing value. Note this is
+the opposite base from `V_MUL_VF`, where a masked-off lane keeps the *source*'s
+value -- there the source is what the result is built from, here it is the
+destination.
+
+Its purpose is the state recurrences. A rank-1 update or a state contraction
+otherwise costs `copy + multiply + add` through a scratch row; the fused form
+removes both the copy and the scratch. Removing the scratch is the larger effect:
+without it a whole key sweep is a single arithmetic row progression, which the
+compiler turns into a hardware loop instead of unrolling.
 
 ### V_MAX_VF
 
@@ -364,6 +399,39 @@ Fetch a (VLEN, 1) vector from the Vector SRAM using the address provided by `rs1
 **Example:**
 ```asm
 V_RECI_V gp2, gp1, 0   ; Vector[gp2] = 1.0 / Vector[gp1]
+```
+
+### V_SOFTPLUS_V
+
+**Format:** `V_SOFTPLUS_V rd, rs1, rmask`
+
+**Operation:** `Vector[gp_reg<rd>] = log(1 + exp(Vector[gp_reg<rs1>]))`
+
+**Description:**
+
+Element-wise softplus over a (VLEN, 1) vector.
+
+Exists because the ISA has **no logarithm** anywhere -- `S_FP_OP` is
+{ADD, SUB, MAX, MUL, EXP, RECI, SQRT, LD, ST, MV, MAP} and `V_ELEMENT_OP` is
+{ADD, SUB, MUL, EXP, RECI, HADAMARD, PREFIX_SCAN, SHIFT} -- so `log(1+exp(x))`
+has no exact software lowering. A lookup table is architecturally impossible too:
+there is no float-to-int conversion instruction, so FP_MEM cannot be indexed by a
+data-dependent value.
+
+Mamba / Mamba-2 needs `dt = softplus(dt_raw + dt_bias)` on the critical path of a
+multiplicative recurrence, where an approximation's error compounds across the
+sequence rather than being normalised away the way attention's softmax normalises
+`exp` error.
+
+**Implementation note:** evaluate as `relu(x) + log1p(exp(-|x|))`, not as the
+naive `log1p(exp(x))`. The two are algebraically identical, but the first never
+feeds `exp` a positive argument and therefore cannot overflow for any finite
+input -- no clamp is needed, and none should be applied, since `dt` feeds
+`exp(A*dt)` and a clamp would silently flatten the decay for large `dt`.
+
+**Example:**
+```asm
+V_SOFTPLUS_V gp2, gp1, 0   ; Vector[gp2] = softplus(Vector[gp1])
 ```
 
 ### V_RED_SUM
@@ -550,6 +618,39 @@ Load upper immediate value into the integer register.
 **Description:**
 
 Copy a vector of length VLEN from FP_MEM to Vector SRAM.
+
+#### S_MAP_FP_V
+
+**Format:** `S_MAP_FP_V rd, rs1, imm`
+
+**Operation:** `FP_MEM[gp_reg<rd> + imm :+ VLEN] = Vector[gp_reg<rs1> :+ VLEN]`
+
+**Description:**
+
+The exact inverse of `S_MAP_V_FP`: copy one VLEN-wide Vector SRAM row into VLEN
+consecutive FP_MEM slots. Note the operand roles mirror rather than repeat --
+`rd` is the FP_MEM base and `rs1` the VRAM row, so that in both instructions `rd`
+names the *destination* memory.
+
+Before this existed the only VRAM-to-scalar path was `V_RED_SUM` / `V_RED_MAX`,
+which collapse the whole row, so extracting a single lane cost a one-hot
+`V_MUL_VV` + `V_RED_SUM` + `S_ST_FP` triple -- 3 instructions per *scalar*
+against 1 per *row* here.
+
+That mattered because `V_MUL_VF` can only broadcast from an FP register, while
+every value a kernel wants to broadcast is computed on chip and lands in a VRAM
+row. Mamba-2's chunked scan needs one such scalar per row (`cs_i` for the
+segment-sum matrix, `exp(cs_C - cs_t)` for the decay-scaled X, `exp(cs_i)` for
+the inter-chunk term), which made the extraction, not the matmuls, the dominant
+instruction cost of the kernel.
+
+**Cost:** VLEN cycles, the same as `S_MAP_V_FP`.
+
+**Example:**
+```asm
+S_MAP_FP_V gp3, gp1, 0   ; FP_MEM[gp3 :+ VLEN] = Vector[gp1 :+ VLEN]
+S_LD_FP    f1,  gp3, 5   ; then broadcast lane 5 with V_MUL_VF
+```
 
 ---
 
