@@ -41,7 +41,8 @@ typedef enum logic [3:0] {
     RECI_V_ELEMENT  = 4'h5,
     INNER_HADAMARD_TRANSFORM    = 4'h6,
     PREFIX_SCAN_V_ELEMENT       = 4'h7,
-    SHIFT_V_LANES_ELEMENT       = 4'h8   // renamed, use this everywhere
+    SHIFT_V_LANES_ELEMENT       = 4'h8,  // renamed, use this everywhere
+    SOFTPLUS_V_ELEMENT          = 4'h9   // log(1+exp(x)) with large-|x| passthrough
 } V_ELEMENT_OP;
 
 typedef enum logic [2:0] {
@@ -64,7 +65,8 @@ typedef enum logic [3:0] {
     ST_REG_FP   = 4'hA,
     ST_IN_FP    = 4'hB,
     MV_FP       = 4'hC,
-    MAP_V_FP    = 4'hD
+    MAP_V_FP    = 4'hD,
+    MAP_FP_V    = 4'hE   // inverse of MAP_V_FP: one VLEN Vector SRAM row -> VLEN FP_MEM slots
 } S_FP_OP;
 
 typedef enum logic [3:0] {
@@ -180,7 +182,14 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_MAX_VF               = 6'h35,
     V_MIN_VF               = 6'h36,
     V_TOPK                 = 6'h37,
-    C_SET_TOPK_REG         = 6'h38
+    C_SET_TOPK_REG         = 6'h38,
+
+    // Mamba / selective-SSM extensions
+    V_SOFTPLUS_V           = 6'h39,
+    S_MAP_FP_V             = 6'h3A,
+    // Vector[rd] += Vector[rs1] * fp_reg<rs2>. The only V-type op that reads
+    // rd as well as writing it.
+    V_FMA_VF               = 6'h3B
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {
