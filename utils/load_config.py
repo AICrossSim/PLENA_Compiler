@@ -3,6 +3,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+try:  # stdlib since 3.11, and the reason this file used to read nothing
+    import tomllib
+except ImportError:  # pragma: no cover - Python < 3.11
+    tomllib = None
+
 try:
     import toml
 except ImportError:
@@ -42,9 +47,25 @@ def load_svh_settings(file_path: str | Path) -> dict[str, int]:
 
 
 def load_toml_config(file_path, section_to_load=None, mode="BEHAVIOR"):
-    if toml is None:
-        raise ImportError("'toml' package required for load_toml_config. Install with: pip install toml")
-    with open(file_path) as f:
-        full_toml = toml.load(f)
+    """``full_toml[mode][section_to_load]``, or ``{}`` if either is absent.
+
+    Reads through `tomllib` when it is available, which since Python 3.11 is
+    always. It used to require the third-party `toml` package and raise
+    `ImportError` without it -- and `toml` is not a declared dependency and is
+    not installed in CI, so every caller that wrapped this in a try/except and
+    fell back to a default was taking the fallback unconditionally. That was
+    silent: the compiler's `plena_settings.toml` values had never once been
+    read.
+    """
+    if tomllib is not None:
+        with open(file_path, "rb") as f:
+            full_toml = tomllib.load(f)
+    elif toml is not None:
+        with open(file_path) as f:
+            full_toml = toml.load(f)
+    else:  # pragma: no cover - Python < 3.11 without `toml`
+        raise ImportError(
+            "load_toml_config needs `tomllib` (Python 3.11+) or the `toml` package"
+        )
     mode_section = full_toml.get(mode, {})
     return mode_section.get(section_to_load, {})

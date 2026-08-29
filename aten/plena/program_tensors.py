@@ -73,6 +73,8 @@ class ProgramTensorMixin:
         self,
         input_var: InputVar,
         name: str | None = None,
+        storage_precision: int = 1,
+        precision: int = 0,
     ) -> VRAMMatrixVar:
         """
         Load tensor from HBM to VRAM (Batch type).
@@ -119,6 +121,8 @@ class ProgramTensorMixin:
                 vram_object_name=internal_name,
                 vlen=self.mlen,
                 preload_len=self.hbm_v_prefetch_amount,
+                storage_precision=storage_precision,
+                precision=precision,
             )
 
         var = VRAMMatrixVar(
@@ -156,14 +160,13 @@ class ProgramTensorMixin:
         display_name = name if name is not None else f"{tensor_var.display_name}_stored"
         internal_name = self._scoped_name(display_name)
 
+        # Size the region from the width actually being written. store() previously
+        # used the MX layout unconditionally, so a BF16 write-back (2 bytes/element)
+        # was allocated 1.125 and overran its region by ~78% onto the next tensor.
+        h, w = tensor_var.physical_shape
+        hbm_size = self.hbm_tensor_size(h * w, hbm_element_bytes=hbm_element_bytes)
         if hbm_addr is None:
-            h, w = tensor_var.physical_shape
-            size = h * w
-            hbm_size = self.hbm_tensor_size(size)
             hbm_addr = self._allocate_hbm(hbm_size)
-        else:
-            h, w = tensor_var.physical_shape
-            hbm_size = self.hbm_tensor_size(h * w)
 
         super().store_to_hbm(
             tensor_name=tensor_var.name,  # internal name for symbol table lookup

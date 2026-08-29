@@ -62,6 +62,8 @@ class IsaCompiler(
         vram_object_name: str,
         vlen: int = 64,
         preload_len: int | None = None,
+        storage_precision: int = 1,
+        precision: int = 0,
     ) -> str:
         """
         Load a Batch tensor from HBM to VRAM.
@@ -69,6 +71,15 @@ class IsaCompiler(
         HBM storage is MXFP (1 scale per 8 elements), so HBM actual size =
         logical size * real_data_ratio = 1.125. VRAM stores only the vector
         data (no scale), so VRAM size = logical size.
+
+        `storage_precision` is HBM bytes per element and `precision` is the
+        H_PREFETCH_V precision-class selector (0 = Activation, 1 = KeyValue). Both
+        default to the MX-FP8 activation path, which is what every existing caller
+        wants. They exist because `store_to_hbm` already takes the matching pair,
+        and a load that cannot express what the store wrote is not an inverse: the
+        cross-token SSM state is written KeyValue/2-byte and would otherwise be read
+        back as Activation/1-byte, at half the row stride and against a different
+        scale-section base -- garbage, silently.
 
         Order (matters): allocate VRAM → register in symbol table → emit ISA.
         """
@@ -115,6 +126,8 @@ class IsaCompiler(
             act_vram_offset=vram_base,
             activation_offset_reg=addr_reg,
             stride_size=w,
+            storage_precision=storage_precision,
+            precision=precision,
         )
 
         self.register_allocator.free_gp(gp_regs_for_addr)

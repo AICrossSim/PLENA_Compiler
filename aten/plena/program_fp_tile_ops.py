@@ -174,6 +174,36 @@ class ProgramFPTileOpsMixin:
     ):
         super().tile_row_reci(source.name, self._default_rows(rows), tile_col_idx=tile_col_idx)
 
+    def tile_row_softplus(
+        self,
+        source: VRAMMatrixVar,
+        rows: Iterable[int] | None = None,
+        tile_col_idx: int = 0,
+    ):
+        """In-place `x = log(1 + exp(x))` over whole VRAM rows (V_SOFTPLUS_V)."""
+        super().tile_row_softplus(source.name, self._default_rows(rows), tile_col_idx=tile_col_idx)
+
+    def tile_row_to_fpram(
+        self,
+        source: VRAMMatrixVar,
+        target_fpram_addr: int | FPVar,
+        rows: Iterable[int] | None = None,
+        target_base_offset: int = 0,
+        tile_col_idx: int = 0,
+    ):
+        """Copy whole VRAM rows into FPRAM (S_MAP_FP_V), MLEN scalars per row.
+
+        Unlike `tile_row_sum`/`tile_row_max`, which reduce a row to ONE FPRAM slot,
+        this moves the row across intact. Row `rows[i]` lands at
+        `target_fpram_addr + target_base_offset + i * MLEN`.
+        """
+        resolved_rows = self._default_rows(rows)
+        row_map = [
+            (row, self._resolve_fpram_addr(target_fpram_addr, target_base_offset + i * self.mlen))
+            for i, row in enumerate(resolved_rows)
+        ]
+        return super().tile_row_to_fpram(source.name, row_map, tile_col_idx=tile_col_idx)
+
     def tile_row_sub_fp(
         self,
         source: VRAMMatrixVar,
@@ -240,8 +270,28 @@ class ProgramFPTileOpsMixin:
         resolved_rows = self._default_rows(rows)
         super().tile_row_add_fp(source.name, [(row, fp_var[row]) for row in resolved_rows], tile_col_idx=tile_col_idx)
 
-    def _tile_row_binary(self, isa_method: str, dst: VRAMMatrixVar, src: VRAMMatrixVar, rows: Iterable[int] | None):
-        return getattr(super(), isa_method)(dst.name, src.name, self._default_rows(rows))
+    def _tile_row_binary(
+        self,
+        isa_method: str,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        rows: Iterable[int] | None,
+        tile_col_idx: int = 0,
+    ):
+        # One index for both operands: a binary row op is elementwise, so the
+        # two tiles are the same width by construction and a column block of one
+        # only ever pairs with the same block of the other. `vram_fill_zero`
+        # walks the blocks itself because it takes a single matrix; here the
+        # caller drives the loop, because which blocks are live differs per
+        # kernel (prefill's `contrib` is wider than the range any one of its
+        # three uses touches).
+        return getattr(super(), isa_method)(
+            dst.name,
+            src.name,
+            self._default_rows(rows),
+            dst_tile_col_idx=tile_col_idx,
+            src_tile_col_idx=tile_col_idx,
+        )
 
     def _tile_row_fp_scalar(
         self,
@@ -271,24 +321,27 @@ class ProgramFPTileOpsMixin:
         dst: VRAMMatrixVar,
         src: VRAMMatrixVar,
         rows: Iterable[int] | None = None,
+        tile_col_idx: int = 0,
     ):
-        return self._tile_row_binary("tile_row_add", dst, src, rows)
+        return self._tile_row_binary("tile_row_add", dst, src, rows, tile_col_idx)
 
     def tile_row_sub(
         self,
         dst: VRAMMatrixVar,
         src: VRAMMatrixVar,
         rows: Iterable[int] | None = None,
+        tile_col_idx: int = 0,
     ):
-        return self._tile_row_binary("tile_row_sub", dst, src, rows)
+        return self._tile_row_binary("tile_row_sub", dst, src, rows, tile_col_idx)
 
     def tile_row_mul(
         self,
         dst: VRAMMatrixVar,
         src: VRAMMatrixVar,
         rows: Iterable[int] | None = None,
+        tile_col_idx: int = 0,
     ):
-        return self._tile_row_binary("tile_row_mul", dst, src, rows)
+        return self._tile_row_binary("tile_row_mul", dst, src, rows, tile_col_idx)
 
     def tile_row_mul_fp_broadcast(
         self,
@@ -297,9 +350,125 @@ class ProgramFPTileOpsMixin:
         row_idx: int | None = None,
         rows: Iterable[int] | None = None,
         fpram_offset: int = 0,
+        tile_col_idx: int = 0,
     ):
         scalar_addr = self._resolve_fpram_addr(fpram_scalar_addr, fpram_offset)
-        super().tile_row_mul_fp_broadcast(source.name, scalar_addr, self._resolve_rows(row_idx=row_idx, rows=rows))
+        super().tile_row_mul_fp_broadcast(
+            source.name,
+            scalar_addr,
+            self._resolve_rows(row_idx=row_idx, rows=rows),
+            tile_col_idx=tile_col_idx,
+        )
+
+    def tile_row_fma_fp_sweep(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        fpram_base: int | FPVar,
+        dst_rows: Iterable[int],
+        src_rows: Iterable[int],
+        fpram_offset: int = 0,
+    ):
+        """``dst[d] += src[s] * FPRAM[base + i]``, one slot per row pair.
+
+        The FMA reads ``dst`` as well as writing it, so unlike every other tile
+        helper here the destination must already hold what is being accumulated
+        into -- typically a zeroed accumulator row or the state itself.
+        """
+        dst_rows, src_rows = list(dst_rows), list(src_rows)
+        base = self._resolve_fpram_addr(fpram_base, fpram_offset)
+        # The predecessor resolved -- and bounds-checked -- one slot per
+        # iteration. This resolves the base once and lets the hardware walk the
+        # rest, so an over-long sweep would read into whatever FPVar was
+        # allocated next with nothing to say so. Check the far end too.
+        if isinstance(fpram_base, FPVar) and dst_rows:
+            end = fpram_offset + len(dst_rows) - 1
+            if end >= fpram_base.size:
+                raise ValueError(
+                    f"FPRAM sweep of {len(dst_rows)} rows from offset "
+                    f"{fpram_offset} reads slot {end}, past {fpram_base.name}'s "
+                    f"{fpram_base.size}"
+                )
+        super().tile_row_fma_fp_sweep(dst.name, src.name, base, dst_rows, src_rows)
+
+    def tile_row_fma_fp_broadcast(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        fpram_scalar_addr: int | FPVar,
+        dst_rows: Iterable[int],
+        src_rows: Iterable[int],
+        fpram_offset: int = 0,
+    ):
+        """``dst[d] += src[s] * FPRAM[addr]``, one slot for every row pair."""
+        addr = self._resolve_fpram_addr(fpram_scalar_addr, fpram_offset)
+        super().tile_row_fma_fp_broadcast(
+            dst.name, src.name, addr, list(dst_rows), list(src_rows)
+        )
+
+    # One FPRAM slot applied to EVERY listed row, as opposed to the
+    # `tile_row_*_fp` family which walks a different slot per row.
+    def tile_row_add_fp_broadcast(
+        self,
+        source: VRAMMatrixVar,
+        fpram_scalar_addr: int | FPVar,
+        rows: Iterable[int] | None = None,
+        fpram_offset: int = 0,
+        tile_col_idx: int = 0,
+    ):
+        scalar_addr = self._resolve_fpram_addr(fpram_scalar_addr, fpram_offset)
+        super().tile_row_add_fp_broadcast(
+            source.name, scalar_addr, self._default_rows(rows), tile_col_idx=tile_col_idx
+        )
+
+    def tile_row_max_fp_broadcast(
+        self,
+        source: VRAMMatrixVar,
+        fpram_scalar_addr: int | FPVar,
+        rows: Iterable[int] | None = None,
+        fpram_offset: int = 0,
+        tile_col_idx: int = 0,
+    ):
+        scalar_addr = self._resolve_fpram_addr(fpram_scalar_addr, fpram_offset)
+        super().tile_row_max_fp_broadcast(
+            source.name, scalar_addr, self._default_rows(rows), tile_col_idx=tile_col_idx
+        )
+
+    def tile_row_min_fp_broadcast(
+        self,
+        source: VRAMMatrixVar,
+        fpram_scalar_addr: int | FPVar,
+        rows: Iterable[int] | None = None,
+        fpram_offset: int = 0,
+        tile_col_idx: int = 0,
+    ):
+        scalar_addr = self._resolve_fpram_addr(fpram_scalar_addr, fpram_offset)
+        super().tile_row_min_fp_broadcast(
+            source.name, scalar_addr, self._default_rows(rows), tile_col_idx=tile_col_idx
+        )
+
+    def tile_row_sub_fp_broadcast(
+        self,
+        source: VRAMMatrixVar,
+        fpram_scalar_addr: int | FPVar,
+        rows: Iterable[int] | None = None,
+        fpram_offset: int = 0,
+        reverse: bool = False,
+        tile_col_idx: int = 0,
+    ):
+        """``row -= c``, or ``row = c - row`` when ``reverse``.
+
+        The reverse form is `V_SUB_VF`'s `rorder=1`. Mamba's decay matrix builds
+        ``cs_i - cs_j`` from a row of ``cs_j`` and a scalar ``cs_i`` with it.
+        """
+        scalar_addr = self._resolve_fpram_addr(fpram_scalar_addr, fpram_offset)
+        super().tile_row_sub_fp_broadcast(
+            source.name,
+            scalar_addr,
+            self._default_rows(rows),
+            reverse=reverse,
+            tile_col_idx=tile_col_idx,
+        )
 
     # ========================================================================
     # FPVar operations
