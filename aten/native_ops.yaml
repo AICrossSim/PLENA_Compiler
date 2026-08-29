@@ -147,3 +147,109 @@
     uses_fpram: false
     uses_mram: true
   doc: "Conv2d via im2col + linear projection: input_col @ weight_2d"
+
+# ---------------------------------------------------------------------------
+# Mamba-2 / selective state-space model
+#
+# These are `composite`: each is several ISA stages, and the layer as a whole is
+# deliberately NOT a single op. The chunk loop, the cross-chunk state carry and
+# the transposed in_proj stay in the caller because they force HBM round trips
+# (MRAM is writable only by H_PREFETCH_M) that a monolithic op would hide, taking
+# the cost model with it.
+# ---------------------------------------------------------------------------
+
+- func: "causal_conv1d(Tensor x, Tensor weight, Tensor? bias=None) -> Tensor"
+  category: composite
+  in_place: false
+  dispatch:
+    cpu:   compiler.aten.ops.cpu.mamba_ops.causal_conv1d_cpu
+    plena: compiler.aten.ops.plena.mamba_ops.causal_conv1d_plena
+  plena_backend:
+    asm_template: null
+    memory_pattern: batch_only
+    tile_loops: manual
+    uses_fpram: false
+    uses_mram: false
+  doc: |
+    Causal depthwise conv1d over the sequence axis, kernel `conv_kernel`.
+    NOT routed through conv_ops.py's im2col: that hardcodes a square KxK patch,
+    has no padding (so it cannot express the causal left pad), and would build a
+    dense GEMM against a block-diagonal weight. With sequence on the VRAM row
+    axis the shift is a free row offset and the per-channel tap is a V_MUL_VV
+    operand.
+
+- func: "dt_activation(Tensor dt_raw, Tensor? dt_bias=None, float dt_min=0.0, float dt_max=inf) -> Tensor(dt_raw!)"
+  category: primitive
+  in_place: true
+  dispatch:
+    cpu:   compiler.aten.ops.cpu.mamba_ops.dt_activation_cpu
+    plena: compiler.aten.ops.plena.mamba_ops.dt_activation_plena
+  plena_backend:
+    asm_template: null
+    memory_pattern: batch_only
+    tile_loops: none
+    uses_fpram: true
+    uses_mram: false
+  doc: |
+    dt = clamp(softplus(dt_raw + dt_bias), time_step_limit). Uses V_SOFTPLUS_V:
+    the ISA has no logarithm and no float-to-int conversion, so softplus has
+    neither an exact software lowering nor a table lowering, and dt feeds
+    exp(A*dt) on a multiplicative recurrence where an approximation compounds.
+
+- func: "mamba_gated_rmsnorm(Tensor y, Tensor z, Tensor? norm_weight=None) -> Tensor(y!)"
+  category: composite
+  in_place: true
+  dispatch:
+    cpu:   compiler.aten.ops.cpu.mamba_ops.gated_rmsnorm_cpu
+    plena: compiler.aten.ops.plena.mamba_ops.gated_rmsnorm_plena
+  plena_backend:
+    asm_template: null
+    memory_pattern: batch_only
+    tile_loops: none
+    uses_fpram: true
+    uses_mram: false
+  doc: |
+    RMSNorm(y * silu(z)) -- the gate is applied BEFORE the variance, matching
+    HuggingFace's MambaRMSNormGated and mamba_ssm's norm_before_gate=False. The
+    reduction is over d_inner/n_groups rather than hidden_size, which is why
+    normalization_asm.py cannot be reused unchanged.
+
+- func: "ssd_scan(Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, Tensor D, int chunk_size) -> (Tensor y, Tensor final_state)"
+  category: composite
+  in_place: false
+  dispatch:
+    cpu:   compiler.aten.ops.cpu.mamba_ops.ssd_scan_cpu
+    plena: compiler.aten.ops.plena.mamba_ops.ssd_scan_plena
+  plena_backend:
+    asm_template: null
+    memory_pattern: flash_attn
+    tile_loops: manual
+    uses_fpram: true
+    uses_mram: true
+  doc: |
+    Mamba-2 chunked (SSD) scan, prefill. Structurally an attention-shaped tiled
+    loop with a decay mask in place of the online softmax: G = C@B^T reuses
+    flashattn/qkt.py's M_TMM loop and Y_intra = (LoG)@X reuses pv.py's M_MM loop.
+    Returns (y, final_state); the caller owns the cross-chunk state carry, so the
+    second element is not optional bookkeeping. chunk_size has no default on
+    purpose: the PLENA lowering requires chunk_size == MLEN, so any literal here
+    would encode one build's tile size as if it were a property of Mamba-2 (whose
+    own config default is 256).
+
+- func: "ssm_recurrent_step(Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, Tensor D, Tensor state) -> (Tensor y, Tensor final_state)"
+  category: composite
+  in_place: false
+  dispatch:
+    cpu:   compiler.aten.ops.cpu.mamba_ops.ssm_recurrent_step_cpu
+    plena: compiler.aten.ops.plena.mamba_ops.ssm_recurrent_step_plena
+  plena_backend:
+    asm_template: null
+    memory_pattern: batch_only
+    tile_loops: manual
+    uses_fpram: true
+    uses_mram: false
+  doc: |
+    One decode step: h = dA*h + dB*x, y = C.h + D*x. Returns (y, new_state).
+    State layout is [head][state][head_dim] with head_dim on lanes -- the only
+    layout under which the decay broadcast, the rank-1 input and the d_state
+    contraction are all existing opcodes.
