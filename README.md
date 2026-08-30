@@ -15,6 +15,13 @@ The Compiler performs two independent optimizations:
    selected only after checking bijection, producer writes, consumer reads,
    bank stalls, and lane-restore cost.
 
+For recurrent decay and rank-one updates, one existing Vector operation can
+consume a 64-value packet assembled from sixteen logical rows. The same
+lowering supports Mamba-2 and KDA; cross-row reductions stay on the ordinary
+row fallback. The Rust simulator executes these packets and shows that affine
+placement removes their bank conflicts, while remaining slightly slower than
+the best ordinary-row stream at the current 64-lane design point.
+
 The official manifests are pinned to 52 Nemotron layers (23 Mamba, 23 MoE,
 6 GQA) and 93 Kimi layers (69 KDA, 24 MLA). The checked report uses their real
 dimensions, but projection weights remain symbolic; this is a performance and

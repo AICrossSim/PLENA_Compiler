@@ -24,8 +24,10 @@ existing hardware-loop instructions execute repetition.
 
 A configured stream can supply a GP address or an FP-memory address, advance it
 after each consuming Matrix/Vector operation, and carry affine placement
-metadata. Unsupported, short, reverse, or unprofitable walks keep the original
-static lowering.
+metadata. In packet mode, one existing Vector operation consumes several
+logical rows whose atoms are restored into one VLEN-wide operand. Unsupported,
+short, reverse, reduction, or unprofitable walks keep the original static
+lowering.
 
 This is the review justification for one opcode: the static baseline can
 already compute the formulas, but regular loops spend issue slots on pointer
@@ -71,25 +73,28 @@ win.
 - Baseline output is byte-stable when stream addressing is disabled.
 - Stream lowering removes address/scalar issue from regular FMA, unary, binary,
   reduction, and map loops; short and reverse walks fall back.
+- Mamba state decay/rank-one update and KDA state decay/rank-one update emit
+  executable multi-row packets. Cross-row prediction/readout reductions retain
+  the ordinary-row fallback.
 - Affine physical mappings round-trip without aliasing, and deliberately bad
   mappings fail.
-- The Compiler report separately prices projection packets and candidate
-  multirow state packets.
+- The Compiler report separately identifies ordinary stream operations and the
+  exact `V_MUL_VF`/`V_FMA_VF` operations issued by recurrent packets.
 
 At the official decode shapes, dynamic issue counts are:
 
-| Workload | Static baseline | Arlo post-increment | `L_STREAM_CFG` | Baseline / stream |
-|---|---:|---:|---:|---:|
-| Nemotron Mamba recurrence | 92,399 | 51,311 | 32,623 | 2.832x |
-| Kimi K3 KDA mixer | 428,238 | 226,242 | 158,094 | 2.709x |
-| Model-independent SAXPY | 1,284 | 516 | 299 | 4.294x |
+| Workload | Static baseline | Arlo post-increment | Ordinary stream | Affine packet | Baseline / ordinary stream |
+|---|---:|---:|---:|---:|---:|
+| Nemotron Mamba recurrence | 92,399 | 51,311 | 33,257 | 35,177 | 2.778x |
+| Kimi K3 KDA mixer | 428,238 | 226,242 | 160,782 | 165,774 | 2.663x |
+| Model-independent SAXPY | 1,284 | 516 | 301 | 301 | 4.266x |
 
 These are issued-instruction reductions, not hardware-cycle or full-model
 speedups. The Simulator shared-resource campaign provides those separately.
 
-The multirow state layout is not counted as executable speedup until a matching
-packetized consumer lowering executes it. Its current result is an architecture
-upper bound, not an end-to-end claim.
+The packet counts above include setup and arithmetic issue, but not physical
+bank stalls. The Simulator executes the same packets against row-major and
+affine physical placement to price those stalls on the full model schedule.
 
 ## Freeze result
 
@@ -99,10 +104,12 @@ bank/FIFO service, Matrix, Vector, HBM, MoE routing pressure, and the full
 
 - stream addressing earns the one general opcode: it improves decode on
   Mamba, KDA, and generic affine loops without changing their arithmetic;
-- affine co-layout remains an implemented architecture candidate, but does not
-  earn an architectural mode on the current one-row-at-a-time consumer. Its
-  conflict-free multirow packet result is an upper bound until a packetized
-  consumer executes that packet.
+- affine co-layout removes every measured conflict from the executable
+  multi-row Mamba/KDA packet path;
+- on the current 64-lane datapath, affine packet execution is still 0.46%
+  slower than the best ordinary-row stream for Nemotron and 0.056% slower for
+  Kimi. Conflict removal is therefore validated, but superiority over the
+  ordinary-row path is not claimed.
 
 Real dimensions with symbolic weights and real-checkpoint numerical execution
 remain separate completion levels. Full Nemotron/Kimi checkpoint execution is
