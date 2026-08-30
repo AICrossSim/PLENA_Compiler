@@ -57,6 +57,7 @@ class StreamBinding:
     advance: int
     packet_elements: int
     storage_atom: int
+    auto_advance: bool = True
     write: bool = False
     lane_restore: bool = True
 
@@ -172,7 +173,9 @@ def emit_stream_configuration(
         if field == StreamConfigField.BASE or value != defaults[field]:
             write(field, value)
 
-    flags = StreamFlags.ENABLE | StreamFlags.AUTO_ADVANCE | StreamFlags.STRICT_BOUNDS
+    flags = StreamFlags.ENABLE | StreamFlags.STRICT_BOUNDS
+    if binding.auto_advance:
+        flags |= StreamFlags.AUTO_ADVANCE
     if layout.alpha or layout.beta or layout.gamma:
         flags |= StreamFlags.AFFINE
     if binding.target_is_fp:

@@ -76,23 +76,23 @@ def _up(value: int, multiple: int) -> int:
     return math.ceil(value / multiple) * multiple
 
 
-def _compiler(*, stream: bool, alpha: int = 0, mlen: int = 64) -> PlenaCompiler:
+def _compiler(*, stream: bool, affine: bool = False, mlen: int = 64) -> PlenaCompiler:
     return PlenaCompiler(
         mlen=mlen,
         blen=4,
         mram_tile_capacity=64,
         stream_addressing=stream,
-        stream_affine_alpha=alpha,
+        stream_affine_alpha=int(affine),
         stream_storage_atom=4,
     )
 
 
-def kimi_k3_mixer_assembly(*, stream: bool) -> str:
+def kimi_k3_mixer_assembly(*, stream: bool, affine: bool = False) -> str:
     """Official Kimi K3 recurrent mixer geometry, excluding Matrix projections."""
 
     mlen = 64
     shape = KdaShape.kimi_k3()
-    program = _compiler(stream=stream, alpha=1, mlen=mlen)
+    program = _compiler(stream=stream, affine=affine, mlen=mlen)
     key_blocks = kda_key_blocks(shape, mlen)
 
     def alloc(name: str, rows: int):
@@ -135,7 +135,7 @@ def kimi_k3_mixer_assembly(*, stream: bool) -> str:
     return program.get_code()[start:]
 
 
-def nemotron3_mamba_decode_assembly(*, stream: bool) -> str:
+def nemotron3_mamba_decode_assembly(*, stream: bool, affine: bool = False) -> str:
     """Real Nemotron 3 recurrent geometry, after projection/conv scalar setup.
 
     B/C are shared by eight heads.  The fixed 1024-entry FPRAM cannot hold all
@@ -155,7 +155,7 @@ def nemotron3_mamba_decode_assembly(*, stream: bool) -> str:
         chunk_size=128,
         seq_len=1,
     )
-    program = _compiler(stream=stream, alpha=1, mlen=mlen)
+    program = _compiler(stream=stream, affine=affine, mlen=mlen)
     b_fp = program.fp_var("b_group_window", size=group_shape.state_size)
     c_fp = program.fp_var("c_group_window", size=group_shape.state_size)
     da_fp = program.fp_var("da_group_window", size=group_shape.num_heads)
@@ -190,11 +190,11 @@ def nemotron3_mamba_decode_assembly(*, stream: bool) -> str:
     return program.get_code()[start:]
 
 
-def generic_affine_saxpy_assembly(*, stream: bool) -> str:
+def generic_affine_saxpy_assembly(*, stream: bool, affine: bool = False) -> str:
     """A non-model-specific affine row sweep used as the ISA generality gate."""
 
     mlen = 64
-    program = _compiler(stream=stream, alpha=1, mlen=mlen)
+    program = _compiler(stream=stream, affine=affine, mlen=mlen)
     dst = program.alloc("generic_dst", 256, mlen)
     src = program.alloc("generic_src", 256, mlen)
     scalars = program.fp_var("generic_scalars", size=256)
@@ -211,7 +211,10 @@ def generic_affine_saxpy_assembly(*, stream: bool) -> str:
 
 def _pair(builder) -> dict[str, object]:
     baseline = AssemblyMetrics.from_assembly(builder(stream=False))
-    stream = AssemblyMetrics.from_assembly(builder(stream=True))
+    # Keep address-stream extraction and physical co-layout independent.  The
+    # instruction reduction below is therefore measured with an identity
+    # layout; affine banking is priced separately by the layout planner.
+    stream = AssemblyMetrics.from_assembly(builder(stream=True, affine=False))
     return {
         "baseline": asdict(baseline),
         "stream": asdict(stream),
@@ -229,6 +232,7 @@ def _pair(builder) -> dict[str, object]:
             "scope": "compiler_issue_stream_not_hardware_cycles",
         },
         "scope": "compiler_issue_stream_not_hardware_cycles",
+        "physical_layout": "identity; affine co-layout is reported separately",
     }
 
 

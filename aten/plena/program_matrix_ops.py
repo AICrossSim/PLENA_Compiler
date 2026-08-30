@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+from compiler.aten.plena.affine_layout import AffineLayout
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -90,6 +91,7 @@ class ProgramMatrixOpsMixin:
         matrix_precision: str | int = "weights",
         set_scale: bool = True,
         hbm_element_bytes: int = 1,
+        output_layout: AffineLayout | None = None,
     ):
         """
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[:][mram_col_idx]
@@ -115,6 +117,7 @@ class ProgramMatrixOpsMixin:
             target_col_idx=target_col_idx,
             k_block_start=k_block_start,
             k_block_count=k_block_count,
+            output_layout=output_layout,
         )
 
     def vram_sub_projection_T_to(
@@ -130,6 +133,7 @@ class ProgramMatrixOpsMixin:
         matrix_precision: str | int = "weights",
         set_scale: bool = True,
         hbm_element_bytes: int = 1,
+        output_layout: AffineLayout | None = None,
     ):
         """
         target[target_row_idx][target_col_idx] = vram_matrix[vram_row_idx][:] @ mram_input[mram_row_idx][:]^T
@@ -150,6 +154,7 @@ class ProgramMatrixOpsMixin:
             target_matrix=target.name,
             target_row_idx=target_row_idx,
             target_col_idx=target_col_idx,
+            output_layout=output_layout,
         )
 
     def vram_sub_projection_stream_k_accum_to(
@@ -166,6 +171,7 @@ class ProgramMatrixOpsMixin:
         matrix_precision: str | int = "keyvalue",
         set_scale: bool = False,
         hbm_element_bytes: int = 2,
+        output_layout: AffineLayout | None = None,
     ):
         """Project one output tile while keeping K chunks in the FP32 accumulator.
 
@@ -189,34 +195,53 @@ class ProgramMatrixOpsMixin:
         valid_rows = vram_row_blocks[0].valid_shape[0] if vram_row_blocks[0].valid_shape else self.mlen
         row_loop_count = min(tiles_per_mlen, max(1, math.ceil(valid_rows / self.blen)))
         chunks = list(_iter_k_chunks(num_k_tiles, max_k_tiles))
-
-        for micro_col_idx in range(tiles_per_mlen):
-            for micro_row_idx in range(row_loop_count):
-                for chunk_idx, (k_block_start, k_block_count) in enumerate(chunks):
-                    super().reset_mram()
-                    super().load_sub_matrix_col(
-                        name=mram_input.name,
-                        col_idx=mram_col_idx,
-                        k_block_start=k_block_start,
-                        k_block_count=k_block_count,
-                        precision=_matrix_precision_code(matrix_precision),
-                        set_scale=set_scale,
-                        hbm_element_bytes=hbm_element_bytes,
-                    )
-                    super().vram_sub_projection_microtile_accumulate_to(
-                        vram_mat_name=vram_matrix.name,
-                        vram_row_idx=vram_row_idx,
-                        mram_mat_name=mram_input.name,
-                        mram_col_idx=mram_col_idx,
-                        target_matrix=target.name,
-                        target_row_idx=target_row_idx,
-                        target_col_idx=target_col_idx,
-                        micro_row_idx=micro_row_idx,
-                        micro_col_idx=micro_col_idx,
-                        k_block_start=k_block_start,
-                        k_block_count=k_block_count,
-                        write_out=(chunk_idx == len(chunks) - 1),
-                    )
+        gp_regs = self.register_allocator.allocate_gp(3)
+        result_vram_addr, target_base_addr, _target_rows = self._target_tile_addr(
+            target.name, target_row_idx, target_col_idx
+        )
+        setup, reset = self._projection_output_stream(
+            output_layout=output_layout,
+            output_layout_base=target_base_addr,
+            result_vram_addr=result_vram_addr,
+            target_register=gp_regs[2],
+            value_register=gp_regs[1],
+            stream_slot=3,
+        )
+        if setup:
+            self._emit("\n".join(setup) + "\n")
+        try:
+            for micro_col_idx in range(tiles_per_mlen):
+                for micro_row_idx in range(row_loop_count):
+                    for chunk_idx, (k_block_start, k_block_count) in enumerate(chunks):
+                        super().reset_mram()
+                        super().load_sub_matrix_col(
+                            name=mram_input.name,
+                            col_idx=mram_col_idx,
+                            k_block_start=k_block_start,
+                            k_block_count=k_block_count,
+                            precision=_matrix_precision_code(matrix_precision),
+                            set_scale=set_scale,
+                            hbm_element_bytes=hbm_element_bytes,
+                        )
+                        super().vram_sub_projection_microtile_accumulate_to(
+                            vram_mat_name=vram_matrix.name,
+                            vram_row_idx=vram_row_idx,
+                            mram_mat_name=mram_input.name,
+                            mram_col_idx=mram_col_idx,
+                            target_matrix=target.name,
+                            target_row_idx=target_row_idx,
+                            target_col_idx=target_col_idx,
+                            micro_row_idx=micro_row_idx,
+                            micro_col_idx=micro_col_idx,
+                            k_block_start=k_block_start,
+                            k_block_count=k_block_count,
+                            write_out=(chunk_idx == len(chunks) - 1),
+                            gp_regs=gp_regs,
+                        )
+        finally:
+            if reset:
+                self._emit(reset + "\n")
+            self.register_allocator.free_gp(gp_regs)
 
     def vram_sub_projection_packed_skinny_stream_k_accum_to(
         self,
@@ -318,6 +343,7 @@ class ProgramMatrixOpsMixin:
         matrix_precision: str | int = "weights",
         set_scale: bool = True,
         hbm_element_bytes: int = 1,
+        output_layout: AffineLayout | None = None,
     ):
         """Emit tiled PLENA linear projection, including K-split accumulation."""
         mlen = self.mlen
@@ -362,6 +388,7 @@ class ProgramMatrixOpsMixin:
                 matrix_precision=matrix_precision,
                 set_scale=set_scale,
                 hbm_element_bytes=hbm_element_bytes,
+                output_layout=output_layout,
                 **k_split,
             )
 
@@ -369,6 +396,29 @@ class ProgramMatrixOpsMixin:
             for col_idx in range(num_col_blocks):
                 for row_idx in range(num_row_blocks):
                     emit_projection(row_idx, col_idx, output, row_idx, col_idx)
+            return output
+
+        if output_layout is not None:
+            # A K-split output cannot be skewed on the first partial sum and
+            # then consumed by row-major block-adds.  Keep all K chunks in the
+            # Matrix FP32 accumulator and apply the physical layout exactly once
+            # at final writeback.
+            for col_idx in range(num_col_blocks):
+                for row_idx in range(num_row_blocks):
+                    self.vram_sub_projection_stream_k_accum_to(
+                        input_var,
+                        row_idx,
+                        weight_var,
+                        col_idx,
+                        output,
+                        row_idx,
+                        col_idx,
+                        max_k_tiles=max_k_tiles,
+                        matrix_precision=matrix_precision,
+                        set_scale=set_scale,
+                        hbm_element_bytes=hbm_element_bytes,
+                        output_layout=output_layout,
+                    )
             return output
 
         # Temp buffer for one partial-sum tile. Allocating the full output shape
@@ -406,6 +456,7 @@ class ProgramMatrixOpsMixin:
         name: str = "linear_out_bf16_stream_k_accum",
         physical_shape: tuple[int, int] | None = None,
         max_k_tiles: int | None = None,
+        output_layout: AffineLayout | None = None,
     ):
         """BF16 projection with cross-K-chunk matrix accumulator retention."""
         mlen = self.mlen
@@ -450,6 +501,7 @@ class ProgramMatrixOpsMixin:
                         matrix_precision="keyvalue",
                         set_scale=False,
                         hbm_element_bytes=2,
+                        output_layout=output_layout,
                     )
             return output
 
@@ -467,6 +519,7 @@ class ProgramMatrixOpsMixin:
                     matrix_precision="keyvalue",
                     set_scale=False,
                     hbm_element_bytes=2,
+                    output_layout=output_layout,
                 )
         return output
 
@@ -476,6 +529,7 @@ class ProgramMatrixOpsMixin:
         weight_var: InputVar,
         name: str = "linear_out_bf16",
         physical_shape: tuple[int, int] | None = None,
+        output_layout: AffineLayout | None = None,
     ):
         """Emit a high-precision BF16 matrix projection through HBM_M_KV_TYPE.
 
@@ -491,6 +545,7 @@ class ProgramMatrixOpsMixin:
             matrix_precision="keyvalue",
             set_scale=False,
             hbm_element_bytes=2,
+            output_layout=output_layout,
         )
 
     def linear_projection_bias_bf16(

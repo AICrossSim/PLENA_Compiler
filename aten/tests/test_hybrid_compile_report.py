@@ -27,6 +27,7 @@ def test_real_shape_report_uses_one_general_stream_isa_and_reduces_issue():
             == pair["baseline"]["dynamic_issued_instructions"]
             - pair["baseline"]["foldable_self_advances"]
         ), name
+        assert pair["physical_layout"].startswith("identity"), name
     assert report["isa"]["cache"] is False
 
 

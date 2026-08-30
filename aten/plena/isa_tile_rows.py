@@ -366,6 +366,7 @@ class IsaTileRowMixin:
         count: int,
         packet_elements: int,
         storage_atom: int,
+        auto_advance: bool = True,
         write: bool = False,
     ) -> None:
         if count <= 0:
@@ -401,6 +402,7 @@ class IsaTileRowMixin:
             advance=advance,
             packet_elements=packet_elements,
             storage_atom=storage_atom,
+            auto_advance=auto_advance,
             write=write,
         )
         asm.extend(emit_stream_configuration(value_gp=value_gp, binding=binding, layout=layout).items)
