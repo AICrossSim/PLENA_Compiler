@@ -56,6 +56,16 @@ def test_l_stream_cfg_rejects_noncanonical_high_bits():
         decode_l_stream_cfg_word(word | (1 << 31))
 
 
+def test_l_stream_cfg_rejects_reserved_field_at_encode_time():
+    with pytest.raises(ValueError, match="reserved"):
+        encode_l_stream_cfg_word(
+            value_register=1,
+            target_register=2,
+            slot=0,
+            field=15,
+        )
+
+
 def test_configuration_is_model_independent_and_enables_last():
     layout = AffineLayout(
         LayoutKind.AFFINE_SKEW,
@@ -109,3 +119,30 @@ def test_linear_configuration_elides_default_dimensions_and_zero_coefficients():
         int(StreamConfigField.STORAGE_ATOM),
         int(StreamConfigField.FLAGS),
     }
+
+
+def test_configuration_legalizes_real_scale_addresses_before_assembly(tmp_path):
+    """A full-model VRAM base is not guaranteed to fit S_ADDI_INT's 18 bits."""
+
+    layout = AffineLayout(LayoutKind.ROW_MAJOR, 1, 1, 8, 64)
+    binding = StreamBinding(
+        slot=0,
+        target_register=3,
+        target_is_fp=False,
+        base=(1 << 22) + 0x345,
+        advance=64,
+        packet_elements=64,
+        storage_atom=4,
+    )
+    code = emit_stream_configuration(value_gp=7, binding=binding, layout=layout).render()
+
+    assert "S_LUI_INT gp7" in code
+    assert f"S_ADDI_INT gp7, gp0, {binding.base}" not in code
+    asm_path = tmp_path / "large_lstream.asm"
+    mem_path = tmp_path / "large_lstream.mem"
+    asm_path.write_text(code)
+    assembler = AssemblyToBinary(
+        str(ROOT / "doc/operation.svh"), str(ROOT / "doc/configuration.svh")
+    )
+    words = assembler.generate_binary(str(asm_path), str(mem_path))
+    assert any(word & 0x3F == L_STREAM_CFG_OPCODE for word in words)

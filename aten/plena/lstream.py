@@ -81,6 +81,10 @@ def encode_l_stream_cfg_word(
     """Encode the canonical register-register-immediate L_STREAM_CFG word."""
 
     field_value = int(field)
+    try:
+        StreamConfigField(field_value)
+    except ValueError as error:
+        raise ValueError(f"reserved L_STREAM_CFG field {field_value}") from error
     for name, value in (
         ("value_register", value_register),
         ("target_register", target_register),

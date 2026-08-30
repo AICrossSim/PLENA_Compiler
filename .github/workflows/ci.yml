@@ -156,6 +156,20 @@ jobs:
       - name: Run the static-path guard
         run: |
           PYTHONPATH=. python3 -m pytest -q aten/tests/test_no_state_engine.py
+      # One model-independent stream contract is shared by Mamba, KDA and a
+      # generic affine loop. These tests pin the encoding, fallbacks, physical
+      # writeback and official hybrid-model workload manifests together.
+      - name: Run the Hybrid L-Compute ISA and layout guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -q \
+            aten/tests/test_affine_layout.py \
+            aten/tests/test_hybrid_compile_report.py \
+            aten/tests/test_hybrid_workloads.py \
+            aten/tests/test_kda_official_layer.py \
+            aten/tests/test_l_stream_cfg.py \
+            aten/tests/test_layout_planner.py \
+            aten/tests/test_lstream_lowering.py \
+            aten/tests/test_projection_affine_writeback.py
       # Real published weights. Skips when the checkpoint is not cached, so it
       # never requires network -- fetch once with
       # snapshot_download("AntonV/mamba2-130m-hf").

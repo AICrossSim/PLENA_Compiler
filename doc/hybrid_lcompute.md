@@ -33,6 +33,12 @@ updates and scalar loads that are fully known at compile time. The same stream
 semantics is tested on Nemotron Mamba, Kimi KDA, and a model-independent SAXPY
 sweep.
 
+Configuration is fail-closed. Reserved fields, unsupported flags, out-of-range
+slots/registers, zero extents, aliased bank rows, duplicate live targets,
+address overflow, and a packet outside its declared extent are rejected. A
+failed update is atomic: it cannot leave a partially changed live slot. The
+Compiler emits `ENABLE` last and emits `RESET` before a slot is reused.
+
 ## Layout planning
 
 The planner consumes logical producer and consumer packets, not a model name.
@@ -70,14 +76,34 @@ win.
 - The Compiler report separately prices projection packets and candidate
   multirow state packets.
 
+At the official decode shapes, dynamic issue counts are:
+
+| Workload | Static baseline | Arlo post-increment | `L_STREAM_CFG` | Baseline / stream |
+|---|---:|---:|---:|---:|
+| Nemotron Mamba recurrence | 92,399 | 51,311 | 32,623 | 2.832x |
+| Kimi K3 KDA mixer | 428,238 | 226,242 | 158,094 | 2.709x |
+| Model-independent SAXPY | 1,284 | 516 | 299 | 4.294x |
+
+These are issued-instruction reductions, not hardware-cycle or full-model
+speedups. The Simulator shared-resource campaign provides those separately.
+
 The multirow state layout is not counted as executable speedup until a matching
 packetized consumer lowering executes it. Its current result is an architecture
 upper bound, not an end-to-end claim.
 
-## Remaining evidence gates
+## Freeze result
 
-The Simulator must place Compiler issue counts, bank/FIFO service, Matrix and
-Vector work, HBM traffic, MoE routing, and producer-consumer overlap on one
-shared timeline. Only that A-G comparison may be used for stage, layer, or
-model speedups. Real dimensions with symbolic weights and real-checkpoint
-numerical execution remain separate completion levels.
+The shared-resource Simulator campaign now includes Compiler issue counts,
+bank/FIFO service, Matrix, Vector, HBM, MoE routing pressure, and the full
+52/93-layer schedules. It supports two different decisions:
+
+- stream addressing earns the one general opcode: it improves decode on
+  Mamba, KDA, and generic affine loops without changing their arithmetic;
+- affine co-layout remains an implemented architecture candidate, but does not
+  earn an architectural mode on the current one-row-at-a-time consumer. Its
+  conflict-free multirow packet result is an upper bound until a packetized
+  consumer executes that packet.
+
+Real dimensions with symbolic weights and real-checkpoint numerical execution
+remain separate completion levels. Full Nemotron/Kimi checkpoint execution is
+not claimed.
