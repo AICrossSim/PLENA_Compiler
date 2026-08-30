@@ -409,6 +409,7 @@ class IsaTileRowMixin:
         extent_major: int | None = None,
         auto_advance: bool = True,
         write: bool = False,
+        affine: bool = False,
     ) -> None:
         if count <= 0:
             raise ValueError(f"stream trip count must be positive, got {count}")
@@ -434,19 +435,25 @@ class IsaTileRowMixin:
             span = (count - 1) * step_units + 1 if step_units else 1
             majors = span if extent_major is None else extent_major
             minors = packet_elements if extent_minor is None else extent_minor
+        use_affine = affine and not target_is_fp
         layout = AffineLayout(
             kind=(
                 LayoutKind.AFFINE_SKEW
-                if self.stream_affine_alpha or self.stream_affine_beta or self.stream_affine_gamma
+                if use_affine
+                and (
+                    self.stream_affine_alpha
+                    or self.stream_affine_beta
+                    or self.stream_affine_gamma
+                )
                 else LayoutKind.ROW_MAJOR
             ),
             groups=1,
             fields=1,
             majors=majors,
             minors=minors,
-            alpha=self.stream_affine_alpha,
-            beta=self.stream_affine_beta,
-            gamma=self.stream_affine_gamma,
+            alpha=self.stream_affine_alpha if use_affine else 0,
+            beta=self.stream_affine_beta if use_affine else 0,
+            gamma=self.stream_affine_gamma if use_affine else 0,
             bank_row_base=0 if target_is_fp else base // self.mlen,
         )
         binding = StreamBinding(
@@ -522,6 +529,7 @@ class IsaTileRowMixin:
                 extent_minor=self.mlen,
                 extent_major=count,
                 write=True,
+                affine=True,
             )
             self._append_stream_binding(
                 asm,
@@ -581,9 +589,16 @@ class IsaTileRowMixin:
             asm = IsaBuilder().comment(
                 f"Packetized multi-row FMA: VRAM[{dst_addr}] += VRAM[{src_addr}] * FPRAM"
             )
-            for slot, target, base, stride, write in (
-                (0, gp_dst, dst_addr + dst_start * self.mlen, self.mlen, True),
-                (1, gp_src, src_addr + src_start * self.mlen, src_step * self.mlen, False),
+            for slot, target, base, stride, write, affine in (
+                (0, gp_dst, dst_addr + dst_start * self.mlen, self.mlen, True, True),
+                (
+                    1,
+                    gp_src,
+                    src_addr + src_start * self.mlen,
+                    src_step * self.mlen,
+                    False,
+                    bool(src_step),
+                ),
             ):
                 self._append_stream_binding(
                     asm,
@@ -601,6 +616,7 @@ class IsaTileRowMixin:
                     extent_minor=self.mlen,
                     extent_major=count,
                     write=write,
+                    affine=affine,
                 )
             self._append_stream_binding(
                 asm,

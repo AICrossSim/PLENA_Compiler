@@ -23,6 +23,17 @@ def _packet_flag_lines(assembly: str) -> list[str]:
     return [line for line in assembly.splitlines() if line.startswith("L_STREAM_CFG") and line.endswith(marker)]
 
 
+def _packet_setup(assembly: str, marker: str) -> list[str]:
+    lines = assembly.splitlines()
+    start = next(index for index, line in enumerate(lines) if marker in line)
+    end = next(
+        index
+        for index in range(start + 1, len(lines))
+        if lines[index].startswith("C_LOOP_START")
+    )
+    return lines[start:end]
+
+
 def test_nemotron_recurrence_uses_packetized_decay_and_rank_update() -> None:
     assembly = nemotron3_mamba_decode_assembly(
         stream=True, affine=True, packetized=True
@@ -52,6 +63,24 @@ def test_packet_mode_is_a_stream_flag_not_a_model_specific_opcode() -> None:
         assert "MAMBA_STEP" not in assembly
         assert "KDA_STEP" not in assembly
         assert "L_STREAM_CFG" in assembly
+
+
+def test_affine_rotation_is_bound_only_to_the_physically_skewed_state() -> None:
+    assembly = nemotron3_mamba_decode_assembly(
+        stream=True, affine=True, packetized=True
+    )
+    for marker in ("Packetized multi-row Mul", "Packetized multi-row FMA"):
+        setup = _packet_setup(assembly, marker)
+        alpha_writes = [
+            line
+            for line in setup
+            if line.startswith("L_STREAM_CFG")
+            and line.endswith(f", {int(StreamConfigField.ALPHA)}")
+        ]
+        # The moving state is skewed. The pinned source and segmented FPRAM
+        # scalars remain identity-layout operands; rotating them would silently
+        # change the recurrence values.
+        assert len(alpha_writes) == 1
 
 
 def test_real_shape_report_counts_only_packet_fed_vector_operations() -> None:
