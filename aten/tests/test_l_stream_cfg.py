@@ -60,13 +60,14 @@ def test_l_stream_cfg_field_15_encodes_packet_stride():
     word = encode_l_stream_cfg_word(
         value_register=1,
         target_register=2,
-        slot=0,
+        slot=3,
         field=StreamConfigField.PACKET_STRIDE,
     )
+    assert word == 0x003C_C87C
     assert decode_l_stream_cfg_word(word) == (
         1,
         2,
-        0,
+        3,
         StreamConfigField.PACKET_STRIDE,
     )
 
