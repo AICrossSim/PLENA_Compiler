@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 from compiler.aten.isa_builder import IsaBuilder, fp, gp
+from compiler.aten.plena.affine_layout import AffineLayout, LayoutKind
+from compiler.aten.plena.lstream import (
+    StreamBinding,
+    StreamConfigField,
+    emit_stream_configuration,
+)
 
 
 class IsaTileRowMixin:
@@ -347,6 +353,83 @@ class IsaTileRowMixin:
     def _row_progression(self, rows: list[int]) -> tuple[int, int, int] | None:
         return None if self._unroll else self._arith_progression(rows)
 
+    def _append_stream_binding(
+        self,
+        asm: IsaBuilder,
+        *,
+        value_gp: int,
+        slot: int,
+        target_register: int,
+        target_is_fp: bool,
+        base: int,
+        advance: int,
+        count: int,
+        packet_elements: int,
+        storage_atom: int,
+        write: bool = False,
+    ) -> None:
+        if count <= 0:
+            raise ValueError(f"stream trip count must be positive, got {count}")
+        if advance < 0:
+            raise ValueError("L-stream v1 does not encode negative address advances")
+        if advance and advance % packet_elements:
+            raise ValueError(
+                f"stream advance {advance} is not a multiple of packet width "
+                f"{packet_elements}"
+            )
+        step_units = advance // packet_elements if advance else 0
+        span = (count - 1) * step_units + 1 if step_units else 1
+        layout = AffineLayout(
+            kind=(
+                LayoutKind.AFFINE_SKEW
+                if self.stream_affine_alpha or self.stream_affine_beta or self.stream_affine_gamma
+                else LayoutKind.ROW_MAJOR
+            ),
+            groups=1,
+            fields=1,
+            majors=span,
+            minors=packet_elements,
+            alpha=self.stream_affine_alpha,
+            beta=self.stream_affine_beta,
+            gamma=self.stream_affine_gamma,
+        )
+        binding = StreamBinding(
+            slot=slot,
+            target_register=target_register,
+            target_is_fp=target_is_fp,
+            base=base,
+            advance=advance,
+            packet_elements=packet_elements,
+            storage_atom=storage_atom,
+            write=write,
+        )
+        asm.extend(emit_stream_configuration(value_gp=value_gp, binding=binding, layout=layout).items)
+
+    @staticmethod
+    def _stream_is_profitable(
+        *,
+        trips: int,
+        slots: int,
+        saved_per_trip: int,
+        baseline_setup_instructions: int,
+    ) -> bool:
+        """Whether explicit stream setup beats the ordinary loop issue count.
+
+        A linear slot needs at most fifteen setup instructions after default
+        elision (large immediates may add one more). The conservative threshold
+        keeps short and irregular loops on the ordinary Arlo path.
+        """
+
+        stream_setup = slots * 15
+        return trips * saved_per_trip + baseline_setup_instructions > stream_setup
+
+    @staticmethod
+    def _append_stream_reset(
+        asm: IsaBuilder, *, slot: int, target_register: int, target_is_fp: bool
+    ) -> None:
+        target = fp(target_register) if target_is_fp else gp(target_register)
+        asm.instr("L_STREAM_CFG", gp(0), target, slot, int(StreamConfigField.RESET))
+
     def _emit_tile_row_reduce(
         self,
         label: str,
@@ -368,22 +451,71 @@ class IsaTileRowMixin:
             if row_prog is not None and fp_prog is not None:
                 row_start, row_count, row_step = row_prog
                 fp_start, _, fp_step = fp_prog
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(0), source_vram_addr + row_start * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), fp_start)
-                asm.instr("C_LOOP_START", gp(gp_loop), row_count)
-                if clear_accumulator:
-                    asm.instr("S_ADD_FP", fp(1), fp(0), fp(0))
-                asm.instr(opcode, fp(1), gp(gp_src), 0, *opcode_extra_args)
-                asm.instr("S_ST_FP", fp(1), gp(gp_dst), 0)
-                # A zero step is a no-op add. The FMA emitter has always skipped
-                # it; these three did not, and since the step-0 relaxation they
-                # can actually see one -- a reduction into a single FPRAM slot,
-                # or a broadcast constant applied down a tile.
-                if row_step:
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen)
-                if fp_step:
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), fp_step)
-                asm.instr("C_LOOP_END", gp(gp_loop))
+                use_stream = (
+                    self.stream_addressing
+                    and row_step >= 0
+                    and self._stream_is_profitable(
+                        trips=row_count,
+                        slots=1,
+                        saved_per_trip=int(bool(row_step)),
+                        baseline_setup_instructions=1,
+                    )
+                )
+                if use_stream:
+                    gp_value = self._reg.allocate_gp(1)[0]
+                    try:
+                        self._append_stream_binding(
+                            asm,
+                            value_gp=gp_value,
+                            slot=0,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                            base=source_vram_addr + row_start * self.mlen,
+                            advance=row_step * self.mlen,
+                            count=row_count,
+                            packet_elements=self.mlen,
+                            storage_atom=self.stream_storage_atom,
+                        )
+                        asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), fp_start)
+                        asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                        if clear_accumulator:
+                            asm.instr("S_ADD_FP", fp(1), fp(0), fp(0))
+                        asm.instr(opcode, fp(1), gp(gp_src), 0, *opcode_extra_args)
+                        asm.instr("S_ST_FP", fp(1), gp(gp_dst), 0)
+                        if fp_step:
+                            asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), fp_step)
+                        asm.instr("C_LOOP_END", gp(gp_loop))
+                        self._append_stream_reset(
+                            asm,
+                            slot=0,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                        )
+                    finally:
+                        self._reg.free_gp([gp_value])
+                else:
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_src),
+                        gp(0),
+                        source_vram_addr + row_start * self.mlen,
+                    )
+                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), fp_start)
+                    asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                    if clear_accumulator:
+                        asm.instr("S_ADD_FP", fp(1), fp(0), fp(0))
+                    asm.instr(opcode, fp(1), gp(gp_src), 0, *opcode_extra_args)
+                    asm.instr("S_ST_FP", fp(1), gp(gp_dst), 0)
+                    if row_step:
+                        asm.instr(
+                            "S_ADDI_INT",
+                            gp(gp_src),
+                            gp(gp_src),
+                            row_step * self.mlen,
+                        )
+                    if fp_step:
+                        asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), fp_step)
+                    asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for row_idx, fpram_addr in row_map:
                     row_addr = source_vram_addr + row_idx * self.mlen
@@ -407,11 +539,60 @@ class IsaTileRowMixin:
 
             if prog is not None:
                 row_start, row_count, row_step = prog
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_start * self.mlen)
-                asm.instr("C_LOOP_START", gp(gp_loop), row_count)
-                asm.instr(opcode, gp(gp_src), gp(gp_src), 0)
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen)
-                asm.instr("C_LOOP_END", gp(gp_loop))
+                use_stream = (
+                    self.stream_addressing
+                    and row_step >= 0
+                    and self._stream_is_profitable(
+                        trips=row_count,
+                        slots=1,
+                        saved_per_trip=int(bool(row_step)),
+                        baseline_setup_instructions=1,
+                    )
+                )
+                if use_stream:
+                    gp_value = self._reg.allocate_gp(1)[0]
+                    try:
+                        self._append_stream_binding(
+                            asm,
+                            value_gp=gp_value,
+                            slot=0,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                            base=vram_addr + row_start * self.mlen,
+                            advance=row_step * self.mlen,
+                            count=row_count,
+                            packet_elements=self.mlen,
+                            storage_atom=self.stream_storage_atom,
+                            write=True,
+                        )
+                        asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                        asm.instr(opcode, gp(gp_src), gp(gp_src), 0)
+                        asm.instr("C_LOOP_END", gp(gp_loop))
+                        self._append_stream_reset(
+                            asm,
+                            slot=0,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                        )
+                    finally:
+                        self._reg.free_gp([gp_value])
+                else:
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_src),
+                        gp(0),
+                        vram_addr + row_start * self.mlen,
+                    )
+                    asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                    asm.instr(opcode, gp(gp_src), gp(gp_src), 0)
+                    if row_step:
+                        asm.instr(
+                            "S_ADDI_INT",
+                            gp(gp_src),
+                            gp(gp_src),
+                            row_step * self.mlen,
+                        )
+                    asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for row_idx in rows:
                     row_addr = vram_addr + row_idx * self.mlen
@@ -442,16 +623,61 @@ class IsaTileRowMixin:
             if row_prog is not None and fp_prog is not None:
                 row_start, row_count, row_step = row_prog
                 fp_start, _, fp_step = fp_prog
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_start * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_start)
-                asm.instr("C_LOOP_START", gp(gp_loop), row_count)
-                asm.instr("S_LD_FP", fp(1), gp(gp_fp), 0)
-                asm.instr(opcode, gp(gp_src), gp(gp_src), fp(1), *opcode_extra_args)
-                if row_step:
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen)
-                if fp_step:
-                    asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), fp_step)
-                asm.instr("C_LOOP_END", gp(gp_loop))
+                use_stream = (
+                    self.stream_addressing
+                    and min(row_step, fp_step) >= 0
+                    and self._stream_is_profitable(
+                        trips=row_count,
+                        slots=2,
+                        saved_per_trip=1 + int(bool(row_step)) + int(bool(fp_step)),
+                        baseline_setup_instructions=2,
+                    )
+                )
+                if use_stream:
+                    gp_value = self._reg.allocate_gp(1)[0]
+                    try:
+                        self._append_stream_binding(
+                            asm,
+                            value_gp=gp_value,
+                            slot=0,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                            base=vram_addr + row_start * self.mlen,
+                            advance=row_step * self.mlen,
+                            count=row_count,
+                            packet_elements=self.mlen,
+                            storage_atom=self.stream_storage_atom,
+                        )
+                        self._append_stream_binding(
+                            asm,
+                            value_gp=gp_value,
+                            slot=1,
+                            target_register=1,
+                            target_is_fp=True,
+                            base=fp_start,
+                            advance=fp_step,
+                            count=row_count,
+                            packet_elements=1,
+                            storage_atom=1,
+                        )
+                        asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                        asm.instr(opcode, gp(gp_src), gp(gp_src), fp(1), *opcode_extra_args)
+                        asm.instr("C_LOOP_END", gp(gp_loop))
+                        self._append_stream_reset(asm, slot=0, target_register=gp_src, target_is_fp=False)
+                        self._append_stream_reset(asm, slot=1, target_register=1, target_is_fp=True)
+                    finally:
+                        self._reg.free_gp([gp_value])
+                else:
+                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_start * self.mlen)
+                    asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_start)
+                    asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                    asm.instr("S_LD_FP", fp(1), gp(gp_fp), 0)
+                    asm.instr(opcode, gp(gp_src), gp(gp_src), fp(1), *opcode_extra_args)
+                    if row_step:
+                        asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen)
+                    if fp_step:
+                        asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), fp_step)
+                    asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for row_idx, fpram_addr in row_map:
                     row_addr = vram_addr + row_idx * self.mlen
@@ -500,21 +726,77 @@ class IsaTileRowMixin:
                 dst_start, count, dst_step = dst_prog
                 src_start, _, src_step = src_prog
                 fp_start, _, fp_step = fp_prog
-                asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr + dst_start * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr + src_start * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_start)
-                asm.instr("C_LOOP_START", gp(gp_loop), count)
-                asm.instr("S_LD_FP", fp(1), gp(gp_fp), 0)
-                asm.instr("V_FMA_VF", gp(gp_dst), gp(gp_src), fp(1), 0)
-                # A zero step is a no-op add; skipping it keeps the pinned side
-                # from costing an instruction per iteration.
-                if dst_step:
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), dst_step * self.mlen)
-                if src_step:
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), src_step * self.mlen)
-                if fp_step:
-                    asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), fp_step)
-                asm.instr("C_LOOP_END", gp(gp_loop))
+                use_stream = (
+                    self.stream_addressing
+                    and min(dst_step, src_step, fp_step) >= 0
+                    and self._stream_is_profitable(
+                        trips=count,
+                        slots=3,
+                        saved_per_trip=(
+                            1
+                            + int(bool(dst_step))
+                            + int(bool(src_step))
+                            + int(bool(fp_step))
+                        ),
+                        baseline_setup_instructions=3,
+                    )
+                )
+                if use_stream:
+                    gp_value = self._reg.allocate_gp(1)[0]
+                    try:
+                        for slot, target, base, step, write in (
+                            (0, gp_dst, dst_addr + dst_start * self.mlen, dst_step, True),
+                            (1, gp_src, src_addr + src_start * self.mlen, src_step, False),
+                        ):
+                            self._append_stream_binding(
+                                asm,
+                                value_gp=gp_value,
+                                slot=slot,
+                                target_register=target,
+                                target_is_fp=False,
+                                base=base,
+                                advance=step * self.mlen,
+                                count=count,
+                                packet_elements=self.mlen,
+                                storage_atom=self.stream_storage_atom,
+                                write=write,
+                            )
+                        self._append_stream_binding(
+                            asm,
+                            value_gp=gp_value,
+                            slot=2,
+                            target_register=1,
+                            target_is_fp=True,
+                            base=fp_start,
+                            advance=fp_step,
+                            count=count,
+                            packet_elements=1,
+                            storage_atom=1,
+                        )
+                        asm.instr("C_LOOP_START", gp(gp_loop), count)
+                        asm.instr("V_FMA_VF", gp(gp_dst), gp(gp_src), fp(1), 0)
+                        asm.instr("C_LOOP_END", gp(gp_loop))
+                        self._append_stream_reset(asm, slot=0, target_register=gp_dst, target_is_fp=False)
+                        self._append_stream_reset(asm, slot=1, target_register=gp_src, target_is_fp=False)
+                        self._append_stream_reset(asm, slot=2, target_register=1, target_is_fp=True)
+                    finally:
+                        self._reg.free_gp([gp_value])
+                else:
+                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr + dst_start * self.mlen)
+                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr + src_start * self.mlen)
+                    asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_start)
+                    asm.instr("C_LOOP_START", gp(gp_loop), count)
+                    asm.instr("S_LD_FP", fp(1), gp(gp_fp), 0)
+                    asm.instr("V_FMA_VF", gp(gp_dst), gp(gp_src), fp(1), 0)
+                    # A zero step is a no-op add; skipping it keeps the pinned side
+                    # from costing an instruction per iteration.
+                    if dst_step:
+                        asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), dst_step * self.mlen)
+                    if src_step:
+                        asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), src_step * self.mlen)
+                    if fp_step:
+                        asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), fp_step)
+                    asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for dst_row, src_row, fpram_addr in row_map:
                     asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr + dst_row * self.mlen)
@@ -544,13 +826,82 @@ class IsaTileRowMixin:
 
             if prog is not None:
                 row_start, row_count, row_step = prog
-                asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr + row_start * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr + row_start * self.mlen)
-                asm.instr("C_LOOP_START", gp(gp_loop), row_count)
-                asm.instr(opcode, gp(gp_dst), gp(gp_dst), gp(gp_src), 0)
-                asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), row_step * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen)
-                asm.instr("C_LOOP_END", gp(gp_loop))
+                use_stream = (
+                    self.stream_addressing
+                    and row_step >= 0
+                    and self._stream_is_profitable(
+                        trips=row_count,
+                        slots=2,
+                        saved_per_trip=2 * int(bool(row_step)),
+                        baseline_setup_instructions=2,
+                    )
+                )
+                if use_stream:
+                    gp_value = self._reg.allocate_gp(1)[0]
+                    try:
+                        for slot, target, base, write in (
+                            (0, gp_dst, dst_addr + row_start * self.mlen, True),
+                            (1, gp_src, src_addr + row_start * self.mlen, False),
+                        ):
+                            self._append_stream_binding(
+                                asm,
+                                value_gp=gp_value,
+                                slot=slot,
+                                target_register=target,
+                                target_is_fp=False,
+                                base=base,
+                                advance=row_step * self.mlen,
+                                count=row_count,
+                                packet_elements=self.mlen,
+                                storage_atom=self.stream_storage_atom,
+                                write=write,
+                            )
+                        asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                        asm.instr(opcode, gp(gp_dst), gp(gp_dst), gp(gp_src), 0)
+                        asm.instr("C_LOOP_END", gp(gp_loop))
+                        self._append_stream_reset(
+                            asm,
+                            slot=0,
+                            target_register=gp_dst,
+                            target_is_fp=False,
+                        )
+                        self._append_stream_reset(
+                            asm,
+                            slot=1,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                        )
+                    finally:
+                        self._reg.free_gp([gp_value])
+                else:
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_dst),
+                        gp(0),
+                        dst_addr + row_start * self.mlen,
+                    )
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_src),
+                        gp(0),
+                        src_addr + row_start * self.mlen,
+                    )
+                    asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                    asm.instr(opcode, gp(gp_dst), gp(gp_dst), gp(gp_src), 0)
+                    if row_step:
+                        asm.instr(
+                            "S_ADDI_INT",
+                            gp(gp_dst),
+                            gp(gp_dst),
+                            row_step * self.mlen,
+                        )
+                        asm.instr(
+                            "S_ADDI_INT",
+                            gp(gp_src),
+                            gp(gp_src),
+                            row_step * self.mlen,
+                        )
+                    asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for row_idx in rows:
                     dst_row_addr = dst_addr + row_idx * self.mlen
@@ -609,13 +960,81 @@ class IsaTileRowMixin:
             if row_prog is not None and fp_prog is not None:
                 row_start, row_count, row_step = row_prog
                 fp_start, _, fp_step = fp_prog
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_start * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), fp_start)
-                asm.instr("C_LOOP_START", gp(gp_loop), row_count)
-                asm.instr("S_MAP_FP_V", gp(gp_dst), gp(gp_src), 0)
-                asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen)
-                asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), fp_step)
-                asm.instr("C_LOOP_END", gp(gp_loop))
+                use_stream = (
+                    self.stream_addressing
+                    and min(row_step, fp_step) >= 0
+                    and self._stream_is_profitable(
+                        trips=row_count,
+                        slots=2,
+                        saved_per_trip=int(bool(row_step)) + int(bool(fp_step)),
+                        baseline_setup_instructions=2,
+                    )
+                )
+                if use_stream:
+                    gp_value = self._reg.allocate_gp(1)[0]
+                    try:
+                        self._append_stream_binding(
+                            asm,
+                            value_gp=gp_value,
+                            slot=0,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                            base=vram_addr + row_start * self.mlen,
+                            advance=row_step * self.mlen,
+                            count=row_count,
+                            packet_elements=self.mlen,
+                            storage_atom=self.stream_storage_atom,
+                        )
+                        self._append_stream_binding(
+                            asm,
+                            value_gp=gp_value,
+                            slot=1,
+                            target_register=gp_dst,
+                            target_is_fp=False,
+                            base=fp_start,
+                            advance=fp_step,
+                            count=row_count,
+                            packet_elements=1,
+                            storage_atom=1,
+                            write=True,
+                        )
+                        asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                        asm.instr("S_MAP_FP_V", gp(gp_dst), gp(gp_src), 0)
+                        asm.instr("C_LOOP_END", gp(gp_loop))
+                        self._append_stream_reset(
+                            asm,
+                            slot=0,
+                            target_register=gp_src,
+                            target_is_fp=False,
+                        )
+                        self._append_stream_reset(
+                            asm,
+                            slot=1,
+                            target_register=gp_dst,
+                            target_is_fp=False,
+                        )
+                    finally:
+                        self._reg.free_gp([gp_value])
+                else:
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_src),
+                        gp(0),
+                        vram_addr + row_start * self.mlen,
+                    )
+                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), fp_start)
+                    asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                    asm.instr("S_MAP_FP_V", gp(gp_dst), gp(gp_src), 0)
+                    if row_step:
+                        asm.instr(
+                            "S_ADDI_INT",
+                            gp(gp_src),
+                            gp(gp_src),
+                            row_step * self.mlen,
+                        )
+                    if fp_step:
+                        asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), fp_step)
+                    asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for row_idx, fpram_addr in row_map:
                     asm.instr("S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_idx * self.mlen)

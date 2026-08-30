@@ -194,6 +194,11 @@ class PlenaCompiler(
         mram_tile_capacity: int | None = None,
         hbm_v_prefetch_amount: int | None = None,
         hbm_v_writeback_amount: int | None = None,
+        stream_addressing: bool = False,
+        stream_affine_alpha: int = 0,
+        stream_affine_beta: int = 0,
+        stream_affine_gamma: int = 0,
+        stream_storage_atom: int = 4,
     ):
         """
         Args:
@@ -218,6 +223,10 @@ class PlenaCompiler(
             unroll_loops: If True, unroll sub-projection and attention helper loops
                           at ASM-gen time to eliminate C_LOOP_START/END overhead.
                           Overridden by the ATEN_OPS_UNROLL env var ("1"=True, "0"=False).
+            stream_addressing: Bind affine operand streams so existing Matrix/Vector
+                          instructions auto-advance their operands. Existing C_LOOP
+                          opcodes still own repetition; no model-specific operation is
+                          introduced.
         """
         if mram_tile_capacity is None:
             mram_tile_capacity = _derive_mram_tile_capacity(mlen) or 4
@@ -247,6 +256,15 @@ class PlenaCompiler(
         self.broadcast_amount = _behavior_config_value(
             "BROADCAST_AMOUNT", max(1, mlen // max(1, self.hlen)), mlen
         )
+        if min(stream_affine_alpha, stream_affine_beta, stream_affine_gamma) < 0:
+            raise ValueError("stream affine coefficients must be non-negative")
+        if stream_storage_atom <= 0:
+            raise ValueError("stream_storage_atom must be positive")
+        self.stream_addressing = stream_addressing
+        self.stream_affine_alpha = stream_affine_alpha
+        self.stream_affine_beta = stream_affine_beta
+        self.stream_affine_gamma = stream_affine_gamma
+        self.stream_storage_atom = stream_storage_atom
 
         # HBM address auto-allocation
         self._next_hbm_addr: int = 0

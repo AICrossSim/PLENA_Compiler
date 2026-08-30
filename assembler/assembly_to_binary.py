@@ -136,6 +136,27 @@ class AssemblyToBinary:
         elif instruction.opcode == "C_LOOP_START":
             # C_LOOP_START rd, imm - uses 22-bit immediate like S_LUI_INT
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
+        elif instruction.opcode == "L_STREAM_CFG":
+            # L_STREAM_CFG value_gp, target, slot, field
+            # Parser stores the numeric slot in imm and the fourth operand in
+            # rstride. Bits [31:22] are canonical zero.
+            slot = imm
+            field = rstride
+            if rd is None or rs1 is None or slot is None or field is None:
+                raise ValueError(
+                    "L_STREAM_CFG requires value register, target register, slot, and field"
+                )
+            if not 0 <= slot < 4:
+                raise ValueError(f"L_STREAM_CFG slot must be in [0, 4), got {slot}")
+            if not 0 <= field < 15:
+                raise ValueError(f"L_STREAM_CFG field must be in [0, 15), got {field}")
+            binary_instruction = (
+                (field << (opw + 3 * ow))
+                + (slot << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
         elif instruction.opcode in _FUNCT_RSTRIDE_OPS:
             binary_instruction = (
                 (funct1 << (opw + 4 * ow))

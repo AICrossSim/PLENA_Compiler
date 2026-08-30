@@ -189,7 +189,11 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     S_MAP_FP_V             = 6'h3A,
     // Vector[rd] += Vector[rs1] * fp_reg<rs2>. The only V-type op that reads
     // rd as well as writing it.
-    V_FMA_VF               = 6'h3B
+    V_FMA_VF               = 6'h3B,
+
+    // Generic affine stream configuration. Arithmetic remains in the existing
+    // Matrix/Vector opcodes and repetition remains in C_LOOP_START/END.
+    L_STREAM_CFG           = 6'h3C
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {
