@@ -53,7 +53,11 @@ from compiler.aten.models.kda.shape import KdaShape  # noqa: E402
 from compiler.aten.plena import PlenaCompiler  # noqa: E402
 from compiler.aten.plena.program_kda_common import kda_blocks  # noqa: E402
 from compiler.aten.plena.instruction_stream import (  # noqa: E402
+    ARITHMETIC,
+    arithmetic_share,
     dynamic_count as _dynamic,
+    opcode_census,
+    self_advance_counts,
     static_count as _static,
 )
 from compiler.aten.plena.program_mamba_common import Mamba2Shape  # noqa: E402
@@ -751,3 +755,125 @@ def test_the_configuration_is_actually_read():
         "these reach the emitters, so a change here moves every load_batch on "
         "the branch and needs its own decision"
     )
+
+
+# ---------------------------------------------------------------------------
+# What the issue slots are actually spent on, and what an addressing mode
+# would buy. Measured 2026-08-29.
+
+#: A quarter of the issued layer computes; the rest is scaffolding.
+KIMI_ARITHMETIC_SHARE_MIN = 0.22
+
+#: `S_ADDI_INT gpN, gpN, step` inside a loop, folded into the instruction that
+#: consumes the pointer. Every one of them has such a consumer today.
+KIMI_FOLDABLE_ADVANCES_MIN = 200_000
+
+
+def _kimi_layer_parts() -> dict[str, str]:
+    return {
+        "conv": "".join(_kimi_conv_asm()),
+        "mixer": _kimi_mixer_asm(),
+        "gather": _kimi_gather_asm(),
+    }
+
+
+def test_three_quarters_of_the_issued_layer_is_not_arithmetic():
+    """Where the issue slots go, per opcode.
+
+    `dynamic_count` says a Kimi K3 layer issues 492,681 instructions. This says
+    what they are: **124,428 compute and 368,253 do not**. The scaffolding is
+    pointer arithmetic (215,634 self-advances inside loops), scalar loads from
+    FPRAM (102,918), and loop setup.
+
+    It is the shape of the recurrent sweep that does it. Every `V_FMA_VF` sits
+    in a body of five:
+
+        S_LD_FP     f1, gp3, 0        <- the scalar for this row
+        V_FMA_VF    gp1, gp2, f1, 0   <- the only instruction that computes
+        S_ADDI_INT  gp1, gp1, mlen    <- advance the destination
+        S_ADDI_INT  gp2, gp2, mlen    <- advance the source
+        C_LOOP_END  gp4               <- free, see `dynamic_count`
+
+    One in four. This is the number to beat, and it is what a dedicated
+    recurrence engine beats by construction -- one instruction covering a whole
+    head has no instruction overhead at all.
+    """
+    parts = _kimi_layer_parts()
+    issued = sum(_dynamic(a) for a in parts.values())
+    work = sum(
+        sum(v for op, v in opcode_census(a).items() if op in ARITHMETIC)
+        for a in parts.values()
+    )
+    share = work / issued
+    for name, asm in parts.items():
+        print(f"KIMI_K3_{name.upper()} arithmetic_share={arithmetic_share(asm):.1%}")
+    print(f"KIMI_K3_LAYER issued={issued} arithmetic={work} share={share:.1%}")
+    assert share >= KIMI_ARITHMETIC_SHARE_MIN, (
+        f"only {share:.1%} of the issued layer computes; it was 25.3% when "
+        f"measured, and a fall means scaffolding grew"
+    )
+    assert share < 0.5, (
+        "if arithmetic ever exceeds half the issue stream, the sweeps have "
+        "changed shape and the addressing-mode case below needs re-pricing"
+    )
+
+
+def test_every_pointer_advance_could_fold_into_a_post_increment():
+    """Pricing an addressing mode instead of an engine.
+
+    A post-increment operand -- the pointer carrying its own stride, the way
+    `_emit_tile_row_fma` already carries independent row progressions -- would
+    fold `S_ADDI_INT gpN, gpN, step` into the instruction that consumes the
+    pointer. That only works where the register has a consumer in the same loop
+    body, so the saving is priced against those and not against every advance
+    that happens to sit in a loop.
+
+    **Every one of them qualifies.** 215,634 foldable, 0 not, across the
+    convolutions, the mixer and the gather. 86% fold into a single consumer;
+    the rest are read more than once in the body and would need the increment
+    on the last use.
+
+    Two proposals, measured on the Kimi K3 layer:
+
+        now                  492,681 issued    25.3% arithmetic
+        P1  post-inc on the  277,047 issued    44.9% arithmetic   1.78x
+            vector operands
+        P2  P1 + the FPRAM   174,129 issued    71.5% arithmetic   2.83x
+            scalar auto-advancing too
+
+    P2 is an addressing field on instructions that already exist. The
+    alternative it is competing with is a dedicated recurrence datapath with
+    its own banked state SRAM plus a layout engine to feed it, and the two are
+    not close in cost.
+
+    What neither proposal touches: KDA's decay is channel-wise on the key axis,
+    so the operand is `key_dim` lanes wide -- 6.2% of `VLEN` 2048. That is a
+    *width* mismatch, not an encoding one, and no addressing mode reaches it.
+    On a machine whose width matches the operand the two inefficiencies do not
+    compound; on a wide one they do, and that is the one place a purpose-built
+    engine wins on architecture rather than on encoding.
+    """
+    parts = _kimi_layer_parts()
+    issued = sum(_dynamic(a) for a in parts.values())
+    foldable = unfoldable = 0
+    fp_loads = 0
+    for asm in parts.values():
+        f, u = self_advance_counts(asm)
+        foldable += f
+        unfoldable += u
+        fp_loads += opcode_census(asm).get("S_LD_FP", 0)
+    p1, p2 = issued - foldable, issued - foldable - fp_loads
+    print(
+        f"KIMI_K3_LAYER issued={issued} foldable={foldable} unfoldable={unfoldable} "
+        f"fp_loads={fp_loads} P1={p1} ({issued / p1:.2f}x) P2={p2} ({issued / p2:.2f}x)"
+    )
+    assert unfoldable == 0, (
+        f"{unfoldable} pointer advances have no consumer in their loop body and "
+        f"could not fold; the P1 figure above would need re-deriving"
+    )
+    assert foldable >= KIMI_FOLDABLE_ADVANCES_MIN, (
+        f"{foldable} foldable advances, below the {KIMI_FOLDABLE_ADVANCES_MIN} "
+        f"measured; the sweeps changed shape"
+    )
+    assert issued / p1 > 1.6, f"P1 is worth {issued / p1:.2f}x, was 1.78x"
+    assert issued / p2 > 2.4, f"P2 is worth {issued / p2:.2f}x, was 2.83x"

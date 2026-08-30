@@ -439,6 +439,12 @@ def test_emits_exactly_one_opcode_beyond_the_phase0_set():
     What still has to hold is that it is exactly *one*. The interpreter raises
     on anything it does not model, so a lowering that reaches for a second new
     opcode fails here rather than being silently half-checked.
+
+    "One" is a statement about **this kernel**, not about the branch. The
+    branch adds three opcodes -- `V_SOFTPLUS_V` 0x39, `S_MAP_FP_V` 0x3A and
+    `V_FMA_VF` 0x3B -- and `test_no_state_engine.py` pins that count. The
+    decode step reaches for only the third of them; the other two belong to
+    Mamba's `dt` and to the FPRAM window fill.
     """
     shape, ref = _case(1, num_heads=2, key_dim=4)
     code = _Harness(shape).emit()

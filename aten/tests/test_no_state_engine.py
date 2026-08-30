@@ -139,18 +139,41 @@ def test_the_descriptor_opcodes_are_still_free():
     )
 
 
-def test_exactly_one_opcode_was_added():
-    """The whole design rests on this. If a second one appears, the claim that
-    KDA and Mamba need no new mechanism is no longer true and the plan needs
-    reopening."""
+#: What `origin/main` stops at -- `C_SET_TOPK_REG`. Everything past it is this
+#: branch's, and there are three.
+MAIN_LAST_OPCODE = 0x38
+
+#: `V_SOFTPLUS_V`, `S_MAP_FP_V`, `V_FMA_VF`.
+OPCODES_ADDED_HERE = {0x39, 0x3A, 0x3B}
+
+
+def test_exactly_three_opcodes_were_added():
+    """The whole design rests on the count staying at three, and on what they are.
+
+    This test used to be called `test_exactly_one_opcode_was_added` and asserted
+    `{0x3B}`, with a comment claiming `0x35..0x3A` predate this work. Half of
+    that was wrong: `origin/main`'s `operation.svh` stops at `0x38`
+    (`C_SET_TOPK_REG`), and `V_SOFTPLUS_V` at `0x39` and `S_MAP_FP_V` at `0x3A`
+    are both added here. The branch adds **three**.
+
+    The old form did not merely misdescribe itself -- it looked only at
+    `c > 0x3A`, so a fourth opcode landing on `0x39` or `0x3A` would have gone
+    straight through. It passed while asserting something false about a range
+    it had excluded.
+
+    What the count is guarding is the claim that a static recurrence needs no
+    new *mechanism*: all three are ordinary fixed-function ops with their
+    operands in the instruction word. A fourth that reads a descriptor, holds a
+    queue, or keeps residency would break that claim however few of them there
+    were, which is what the other tests in this file check.
+    """
     root = _repo_root()
     svh = (root / "PLENA_Compiler" / "doc" / "operation.svh").read_text()
     codes = {int(m.group(1), 16)
              for m in re.finditer(r"\w+\s*=\s*6'h([0-9A-Fa-f]+)", svh)}
-    # PLENA_RTL stops at 0x34; 0x35..0x3A predate this work (V_MAX_VF, V_MIN_VF,
-    # V_TOPK, C_SET_TOPK_REG, V_SOFTPLUS_V, S_MAP_FP_V).
-    added_by_this_work = {c for c in codes if c > 0x3A}
-    assert added_by_this_work == {0x3B}, (
-        f"opcodes past 0x3A: {sorted(hex(c) for c in added_by_this_work)}; this "
-        f"work added exactly one, V_FMA_VF"
+    added_by_this_work = {c for c in codes if c > MAIN_LAST_OPCODE}
+    assert added_by_this_work == OPCODES_ADDED_HERE, (
+        f"opcodes past {hex(MAIN_LAST_OPCODE)}: "
+        f"{sorted(hex(c) for c in added_by_this_work)}; this work adds exactly "
+        f"three -- V_SOFTPLUS_V 0x39, S_MAP_FP_V 0x3A, V_FMA_VF 0x3B"
     )
