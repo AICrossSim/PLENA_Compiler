@@ -43,3 +43,46 @@ def test_layout_speedups_are_explicitly_local_not_layer_claims():
         "kimi_k3_kda_projection",
         "kimi_k3_kda_state",
     }
+
+
+def test_paper_2048_report_records_the_wide_packet_without_changing_model_shapes():
+    model_lib = Path(__file__).resolve().parents[2] / "doc/Model_Lib"
+    report = build_report(
+        model_lib,
+        packet_elements=2048,
+        storage_atom=64,
+        banks=32,
+        bank_width=64,
+        blen=32,
+        mamba_recurrent_row_elements=64,
+        kda_recurrent_row_elements=128,
+    )
+
+    assert report["schema_version"] == 4
+    assert report["execution_config"] == {
+        "recurrent_storage_row_elements": {
+            "nemotron3": 64,
+            "kimi_k3": 128,
+        },
+        "packet_elements": 2048,
+        "storage_atom": 64,
+        "banks": 32,
+        "bank_width": 64,
+        "blen": 32,
+    }
+    assert report["workloads"]["nemotron3"]["layer_counts"]["mamba"] == 23
+    assert report["workloads"]["kimi_k3"]["layer_counts"]["kda"] == 69
+    assert report["assembly"]["nemotron_mamba_decode_recurrence"]["packet_affine"][
+        "packetized_opcode_census"
+    ] == {"V_FMA_VF": 256, "V_MUL_VF": 256}
+    assert report["assembly"]["kimi_k3_decode_recurrent_mixer"]["packet_affine"][
+        "packetized_opcode_census"
+    ] == {"V_FMA_VF": 768, "V_MUL_VF": 768}
+    assert (
+        report["assembly"]["kimi_k3_decode_recurrent_mixer"]["baseline"][
+            "dynamic_issued_instructions"
+        ]
+        < build_report(model_lib)["assembly"]["kimi_k3_decode_recurrent_mixer"][
+            "baseline"
+        ]["dynamic_issued_instructions"]
+    )

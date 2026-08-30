@@ -16,7 +16,9 @@ class IsaTileRowMixin:
     # Tile-row helpers (name-based)
     # =========================================================================
 
-    def _tile_addr(self, matrix_name: str, tile_row_idx: int = 0, tile_col_idx: int = 0) -> int:
+    def _tile_addr(
+        self, matrix_name: str, tile_row_idx: int = 0, tile_col_idx: int = 0
+    ) -> int:
         return self.get_vram_tile_addr(matrix_name, tile_row_idx, tile_col_idx)
 
     def _tile_row_single_matrix_op(
@@ -27,7 +29,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return getattr(self, asm_method)(self._tile_addr(matrix_name, tile_row_idx, tile_col_idx), arg)
+        return getattr(self, asm_method)(
+            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx), arg
+        )
 
     def _tile_row_binary_matrix_op(
         self,
@@ -53,7 +57,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_max_asm", source_matrix, row_map, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_max_asm", source_matrix, row_map, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_sum(
         self,
@@ -62,7 +68,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_sum_asm", source_matrix, row_map, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_sum_asm", source_matrix, row_map, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_exp(
         self,
@@ -71,7 +79,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_exp_asm", matrix_name, rows, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_exp_asm", matrix_name, rows, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_reci(
         self,
@@ -80,7 +90,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_reci_asm", matrix_name, rows, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_reci_asm", matrix_name, rows, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_softplus(
         self,
@@ -111,7 +123,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_sub_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_sub_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_mul_fp(
         self,
@@ -120,7 +134,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_mul_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_mul_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_max_fp(
         self,
@@ -129,7 +145,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_max_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_max_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_min_fp(
         self,
@@ -138,7 +156,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_min_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_min_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_add_fp(
         self,
@@ -147,7 +167,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("tile_row_add_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "tile_row_add_fp_asm", matrix_name, row_map, tile_row_idx, tile_col_idx
+        )
 
     def tile_row_add(
         self,
@@ -221,7 +243,9 @@ class IsaTileRowMixin:
         tile_col_idx: int = 0,
     ) -> str:
         return self.tile_row_add_fp_broadcast_asm(
-            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx), fpram_scalar_addr, rows
+            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
+            fpram_scalar_addr,
+            rows,
         )
 
     def tile_row_max_fp_broadcast(
@@ -233,7 +257,9 @@ class IsaTileRowMixin:
         tile_col_idx: int = 0,
     ) -> str:
         return self.tile_row_max_fp_broadcast_asm(
-            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx), fpram_scalar_addr, rows
+            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
+            fpram_scalar_addr,
+            rows,
         )
 
     def tile_row_min_fp_broadcast(
@@ -245,7 +271,9 @@ class IsaTileRowMixin:
         tile_col_idx: int = 0,
     ) -> str:
         return self.tile_row_min_fp_broadcast_asm(
-            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx), fpram_scalar_addr, rows
+            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
+            fpram_scalar_addr,
+            rows,
         )
 
     def tile_row_sub_fp_broadcast(
@@ -258,7 +286,10 @@ class IsaTileRowMixin:
         tile_col_idx: int = 0,
     ) -> str:
         return self.tile_row_sub_fp_broadcast_asm(
-            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx), fpram_scalar_addr, rows, reverse
+            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
+            fpram_scalar_addr,
+            rows,
+            reverse,
         )
 
     def tile_row_mul_fp_broadcast(
@@ -359,7 +390,9 @@ class IsaTileRowMixin:
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
     ) -> str:
-        return self._tile_row_single_matrix_op("vram_fill_zero_asm", matrix_name, rows, tile_row_idx, tile_col_idx)
+        return self._tile_row_single_matrix_op(
+            "vram_fill_zero_asm", matrix_name, rows, tile_row_idx, tile_col_idx
+        )
 
     # =========================================================================
     # Tile-row ISA helpers (address-based)
@@ -436,6 +469,10 @@ class IsaTileRowMixin:
             majors = span if extent_major is None else extent_major
             minors = packet_elements if extent_minor is None else extent_minor
         use_affine = affine and not target_is_fp
+        if packetized and use_affine and base % packet_elements:
+            raise ValueError(
+                "compact affine packet base must be aligned to packet_elements"
+            )
         layout = AffineLayout(
             kind=(
                 LayoutKind.AFFINE_SKEW
@@ -454,7 +491,12 @@ class IsaTileRowMixin:
             alpha=self.stream_affine_alpha if use_affine else 0,
             beta=self.stream_affine_beta if use_affine else 0,
             gamma=self.stream_affine_gamma if use_affine else 0,
-            bank_row_base=0 if target_is_fp else base // self.mlen,
+            bank_row_base=(
+                0
+                if target_is_fp
+                else base
+                // (packet_elements if packetized and use_affine else self.mlen)
+            ),
         )
         binding = StreamBinding(
             slot=slot,
@@ -469,9 +511,15 @@ class IsaTileRowMixin:
             write=write,
             packetized=packetized,
         )
-        asm.extend(emit_stream_configuration(value_gp=value_gp, binding=binding, layout=layout).items)
+        asm.extend(
+            emit_stream_configuration(
+                value_gp=value_gp, binding=binding, layout=layout
+            ).items
+        )
 
-    def _packet_rows_supported(self, rows: list[int]) -> tuple[int, int] | None:
+    def _packet_rows_supported(
+        self, rows: list[int]
+    ) -> tuple[int, int, int, int] | None:
         if not (self.stream_addressing and self.stream_packetized):
             return None
         if self.mlen % self.stream_storage_atom:
@@ -480,10 +528,13 @@ class IsaTileRowMixin:
         if progression is None:
             return None
         start, count, step = progression
-        segments = self.mlen // self.stream_storage_atom
+        packet_elements = self.stream_packet_elements
+        segments = packet_elements // self.stream_storage_atom
         if step != 1 or count < segments or count % segments:
             return None
-        return start, count
+        minor_steps = self.mlen // self.stream_storage_atom
+        packet_steps = minor_steps * (count // segments)
+        return start, count, packet_elements, packet_steps
 
     def tile_multirow_mul_fp_asm(
         self,
@@ -495,23 +546,29 @@ class IsaTileRowMixin:
     ) -> str:
         """Multiply rows by a segmented scalar packet when the walk is regular.
 
-        One ordinary ``V_MUL_VF`` still computes exactly ``MLEN`` values. In
-        packet mode those lanes are assembled from ``MLEN / storage_atom``
-        logical rows, and one FPRAM scalar is broadcast over each atom.
+        One packetized ``V_MUL_VF`` computes ``stream_packet_elements`` values.
+        Those lanes are assembled from short logical rows, and one FPRAM scalar
+        is broadcast over each storage atom. The default packet width remains
+        ``MLEN``; a paper-width configuration may coalesce several MLEN rows.
         """
 
         if fp_step not in (0, 1):
             raise ValueError(f"packet scalar step must be 0 or 1, got {fp_step}")
         supported = self._packet_rows_supported(rows)
         if supported is None:
-            row_map = [(row, fpram_base + index * fp_step) for index, row in enumerate(rows)]
-            return self._emit_tile_row_fp_scalar("Mul", "V_MUL_VF", vram_addr, row_map, (0,))
+            row_map = [
+                (row, fpram_base + index * fp_step) for index, row in enumerate(rows)
+            ]
+            return self._emit_tile_row_fp_scalar(
+                "Mul", "V_MUL_VF", vram_addr, row_map, (0,)
+            )
 
-        row_start, count = supported
+        row_start, count, packet_elements, packet_steps = supported
         gp_data, gp_loop, gp_value = self._reg.allocate_gp(3)
         try:
             asm = IsaBuilder().comment(
-                f"Packetized multi-row Mul: VRAM[{vram_addr}], rows={count}"
+                f"Packetized multi-row Mul: VRAM[{vram_addr}], rows={count}, "
+                f"packet_elements={packet_elements}"
             )
             self._append_stream_binding(
                 asm,
@@ -522,7 +579,7 @@ class IsaTileRowMixin:
                 base=vram_addr + row_start * self.mlen,
                 advance=self.stream_storage_atom,
                 count=count,
-                packet_elements=self.mlen,
+                packet_elements=packet_elements,
                 storage_atom=self.stream_storage_atom,
                 packet_stride=self.mlen,
                 packetized=True,
@@ -540,17 +597,19 @@ class IsaTileRowMixin:
                 base=fpram_base,
                 advance=0,
                 count=count,
-                packet_elements=self.mlen,
+                packet_elements=packet_elements,
                 storage_atom=self.stream_storage_atom,
                 packet_stride=fp_step,
                 packetized=True,
                 extent_minor=self.mlen,
                 extent_major=count,
             )
-            asm.instr("C_LOOP_START", gp(gp_loop), count)
+            asm.instr("C_LOOP_START", gp(gp_loop), packet_steps)
             asm.instr("V_MUL_VF", gp(gp_data), gp(gp_data), fp(1), 0)
             asm.instr("C_LOOP_END", gp(gp_loop))
-            self._append_stream_reset(asm, slot=0, target_register=gp_data, target_is_fp=False)
+            self._append_stream_reset(
+                asm, slot=0, target_register=gp_data, target_is_fp=False
+            )
             self._append_stream_reset(asm, slot=1, target_register=1, target_is_fp=True)
             return self._emit(asm)
         finally:
@@ -575,19 +634,24 @@ class IsaTileRowMixin:
             raise ValueError("packet FMA source and destination row counts differ")
         supported = self._packet_rows_supported(dst_rows)
         src_progression = self._arith_progression(src_rows)
-        if supported is None or src_progression is None or src_progression[2] not in (0, 1):
+        if (
+            supported is None
+            or src_progression is None
+            or src_progression[2] not in (0, 1)
+        ):
             return self.tile_row_fma_fp_sweep_asm(
                 dst_addr, src_addr, fpram_base, dst_rows, src_rows
             )
 
-        dst_start, count = supported
+        dst_start, count, packet_elements, packet_steps = supported
         src_start, src_count, src_step = src_progression
         if src_count != count:
             raise ValueError("packet FMA source and destination row counts differ")
         gp_dst, gp_src, gp_loop, gp_value = self._reg.allocate_gp(4)
         try:
             asm = IsaBuilder().comment(
-                f"Packetized multi-row FMA: VRAM[{dst_addr}] += VRAM[{src_addr}] * FPRAM"
+                f"Packetized multi-row FMA: VRAM[{dst_addr}] += VRAM[{src_addr}] * FPRAM, "
+                f"packet_elements={packet_elements}"
             )
             for slot, target, base, stride, write, affine in (
                 (0, gp_dst, dst_addr + dst_start * self.mlen, self.mlen, True, True),
@@ -609,7 +673,7 @@ class IsaTileRowMixin:
                     base=base,
                     advance=self.stream_storage_atom,
                     count=count,
-                    packet_elements=self.mlen,
+                    packet_elements=packet_elements,
                     storage_atom=self.stream_storage_atom,
                     packet_stride=stride,
                     packetized=True,
@@ -627,18 +691,22 @@ class IsaTileRowMixin:
                 base=fpram_base,
                 advance=0,
                 count=count,
-                packet_elements=self.mlen,
+                packet_elements=packet_elements,
                 storage_atom=self.stream_storage_atom,
                 packet_stride=1,
                 packetized=True,
                 extent_minor=self.mlen,
                 extent_major=count,
             )
-            asm.instr("C_LOOP_START", gp(gp_loop), count)
+            asm.instr("C_LOOP_START", gp(gp_loop), packet_steps)
             asm.instr("V_FMA_VF", gp(gp_dst), gp(gp_src), fp(1), 0)
             asm.instr("C_LOOP_END", gp(gp_loop))
-            self._append_stream_reset(asm, slot=0, target_register=gp_dst, target_is_fp=False)
-            self._append_stream_reset(asm, slot=1, target_register=gp_src, target_is_fp=False)
+            self._append_stream_reset(
+                asm, slot=0, target_register=gp_dst, target_is_fp=False
+            )
+            self._append_stream_reset(
+                asm, slot=1, target_register=gp_src, target_is_fp=False
+            )
             self._append_stream_reset(asm, slot=2, target_register=1, target_is_fp=True)
             return self._emit(asm)
         finally:
@@ -681,7 +749,9 @@ class IsaTileRowMixin:
         gp_regs = self._reg.allocate_gp(3)
         gp_src, gp_dst, gp_loop = gp_regs
         try:
-            asm = IsaBuilder().comment(f"Tile Row {label} from VRAM[{source_vram_addr}]")
+            asm = IsaBuilder().comment(
+                f"Tile Row {label} from VRAM[{source_vram_addr}]"
+            )
             rows = [row for row, _ in row_map]
             fp_addrs = [addr_ for _, addr_ in row_map]
             row_prog = self._row_progression(rows)
@@ -769,7 +839,9 @@ class IsaTileRowMixin:
         finally:
             self._reg.free_gp(gp_regs)
 
-    def _emit_tile_row_unary(self, label: str, opcode: str, vram_addr: int, rows: list[int]) -> str:
+    def _emit_tile_row_unary(
+        self, label: str, opcode: str, vram_addr: int, rows: list[int]
+    ) -> str:
         gp_regs = self._reg.allocate_gp(2)
         gp_src, gp_loop = gp_regs
         try:
@@ -900,20 +972,33 @@ class IsaTileRowMixin:
                             storage_atom=1,
                         )
                         asm.instr("C_LOOP_START", gp(gp_loop), row_count)
-                        asm.instr(opcode, gp(gp_src), gp(gp_src), fp(1), *opcode_extra_args)
+                        asm.instr(
+                            opcode, gp(gp_src), gp(gp_src), fp(1), *opcode_extra_args
+                        )
                         asm.instr("C_LOOP_END", gp(gp_loop))
-                        self._append_stream_reset(asm, slot=0, target_register=gp_src, target_is_fp=False)
-                        self._append_stream_reset(asm, slot=1, target_register=1, target_is_fp=True)
+                        self._append_stream_reset(
+                            asm, slot=0, target_register=gp_src, target_is_fp=False
+                        )
+                        self._append_stream_reset(
+                            asm, slot=1, target_register=1, target_is_fp=True
+                        )
                     finally:
                         self._reg.free_gp([gp_value])
                 else:
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_start * self.mlen)
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_src),
+                        gp(0),
+                        vram_addr + row_start * self.mlen,
+                    )
                     asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_start)
                     asm.instr("C_LOOP_START", gp(gp_loop), row_count)
                     asm.instr("S_LD_FP", fp(1), gp(gp_fp), 0)
                     asm.instr(opcode, gp(gp_src), gp(gp_src), fp(1), *opcode_extra_args)
                     if row_step:
-                        asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen)
+                        asm.instr(
+                            "S_ADDI_INT", gp(gp_src), gp(gp_src), row_step * self.mlen
+                        )
                     if fp_step:
                         asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), fp_step)
                     asm.instr("C_LOOP_END", gp(gp_loop))
@@ -984,8 +1069,20 @@ class IsaTileRowMixin:
                     gp_value = self._reg.allocate_gp(1)[0]
                     try:
                         for slot, target, base, step, write in (
-                            (0, gp_dst, dst_addr + dst_start * self.mlen, dst_step, True),
-                            (1, gp_src, src_addr + src_start * self.mlen, src_step, False),
+                            (
+                                0,
+                                gp_dst,
+                                dst_addr + dst_start * self.mlen,
+                                dst_step,
+                                True,
+                            ),
+                            (
+                                1,
+                                gp_src,
+                                src_addr + src_start * self.mlen,
+                                src_step,
+                                False,
+                            ),
                         ):
                             self._append_stream_binding(
                                 asm,
@@ -1015,14 +1112,30 @@ class IsaTileRowMixin:
                         asm.instr("C_LOOP_START", gp(gp_loop), count)
                         asm.instr("V_FMA_VF", gp(gp_dst), gp(gp_src), fp(1), 0)
                         asm.instr("C_LOOP_END", gp(gp_loop))
-                        self._append_stream_reset(asm, slot=0, target_register=gp_dst, target_is_fp=False)
-                        self._append_stream_reset(asm, slot=1, target_register=gp_src, target_is_fp=False)
-                        self._append_stream_reset(asm, slot=2, target_register=1, target_is_fp=True)
+                        self._append_stream_reset(
+                            asm, slot=0, target_register=gp_dst, target_is_fp=False
+                        )
+                        self._append_stream_reset(
+                            asm, slot=1, target_register=gp_src, target_is_fp=False
+                        )
+                        self._append_stream_reset(
+                            asm, slot=2, target_register=1, target_is_fp=True
+                        )
                     finally:
                         self._reg.free_gp([gp_value])
                 else:
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr + dst_start * self.mlen)
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr + src_start * self.mlen)
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_dst),
+                        gp(0),
+                        dst_addr + dst_start * self.mlen,
+                    )
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_src),
+                        gp(0),
+                        src_addr + src_start * self.mlen,
+                    )
                     asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fp_start)
                     asm.instr("C_LOOP_START", gp(gp_loop), count)
                     asm.instr("S_LD_FP", fp(1), gp(gp_fp), 0)
@@ -1030,16 +1143,24 @@ class IsaTileRowMixin:
                     # A zero step is a no-op add; skipping it keeps the pinned side
                     # from costing an instruction per iteration.
                     if dst_step:
-                        asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), dst_step * self.mlen)
+                        asm.instr(
+                            "S_ADDI_INT", gp(gp_dst), gp(gp_dst), dst_step * self.mlen
+                        )
                     if src_step:
-                        asm.instr("S_ADDI_INT", gp(gp_src), gp(gp_src), src_step * self.mlen)
+                        asm.instr(
+                            "S_ADDI_INT", gp(gp_src), gp(gp_src), src_step * self.mlen
+                        )
                     if fp_step:
                         asm.instr("S_ADDI_INT", gp(gp_fp), gp(gp_fp), fp_step)
                     asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for dst_row, src_row, fpram_addr in row_map:
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr + dst_row * self.mlen)
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr + src_row * self.mlen)
+                    asm.instr(
+                        "S_ADDI_INT", gp(gp_dst), gp(0), dst_addr + dst_row * self.mlen
+                    )
+                    asm.instr(
+                        "S_ADDI_INT", gp(gp_src), gp(0), src_addr + src_row * self.mlen
+                    )
                     asm.instr("S_ADDI_INT", gp(gp_fp), gp(0), fpram_addr)
                     asm.instr("S_LD_FP", fp(1), gp(gp_fp), 0)
                     asm.instr("V_FMA_VF", gp(gp_dst), gp(gp_src), fp(1), 0)
@@ -1060,7 +1181,9 @@ class IsaTileRowMixin:
         gp_dst, gp_src, gp_loop = gp_regs
         try:
             assignment_op = {"Add": "+", "Sub": "-", "Mul": "*"}.get(label, label)
-            asm = IsaBuilder().comment(f"Tile Row {label}: VRAM[{dst_addr}] {assignment_op}= VRAM[{src_addr}]")
+            asm = IsaBuilder().comment(
+                f"Tile Row {label}: VRAM[{dst_addr}] {assignment_op}= VRAM[{src_addr}]"
+            )
             prog = self._row_progression(rows)
 
             if prog is not None:
@@ -1153,10 +1276,14 @@ class IsaTileRowMixin:
         finally:
             self._reg.free_gp(gp_regs)
 
-    def tile_row_max_asm(self, source_vram_addr: int, row_map: list[tuple[int, int]]) -> str:
+    def tile_row_max_asm(
+        self, source_vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
         return self._emit_tile_row_reduce("Max", source_vram_addr, row_map, "V_RED_MAX")
 
-    def tile_row_sum_asm(self, source_vram_addr: int, row_map: list[tuple[int, int]]) -> str:
+    def tile_row_sum_asm(
+        self, source_vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
         return self._emit_tile_row_reduce(
             "Sum",
             source_vram_addr,
@@ -1175,7 +1302,9 @@ class IsaTileRowMixin:
     def tile_row_softplus_asm(self, vram_addr: int, rows: list[int]) -> str:
         return self._emit_tile_row_unary("Softplus", "V_SOFTPLUS_V", vram_addr, rows)
 
-    def tile_row_to_fpram_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
+    def tile_row_to_fpram_asm(
+        self, vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
         """Copy whole VRAM rows into FPRAM via S_MAP_FP_V, one instruction per row.
 
         `row_map` is [(vram_row_idx, fpram_base_addr)], and each entry moves the full
@@ -1276,7 +1405,9 @@ class IsaTileRowMixin:
                     asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for row_idx, fpram_addr in row_map:
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_idx * self.mlen)
+                    asm.instr(
+                        "S_ADDI_INT", gp(gp_src), gp(0), vram_addr + row_idx * self.mlen
+                    )
                     asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), fpram_addr)
                     asm.instr("S_MAP_FP_V", gp(gp_dst), gp(gp_src), 0)
 
@@ -1284,29 +1415,55 @@ class IsaTileRowMixin:
         finally:
             self._reg.free_gp(gp_regs)
 
-    def tile_row_sub_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
-        return self._emit_tile_row_fp_scalar("Sub", "V_SUB_VF", vram_addr, row_map, opcode_extra_args=(0, 0))
+    def tile_row_sub_fp_asm(
+        self, vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
+        return self._emit_tile_row_fp_scalar(
+            "Sub", "V_SUB_VF", vram_addr, row_map, opcode_extra_args=(0, 0)
+        )
 
-    def tile_row_mul_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
-        return self._emit_tile_row_fp_scalar("Mul", "V_MUL_VF", vram_addr, row_map, opcode_extra_args=(0,))
+    def tile_row_mul_fp_asm(
+        self, vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
+        return self._emit_tile_row_fp_scalar(
+            "Mul", "V_MUL_VF", vram_addr, row_map, opcode_extra_args=(0,)
+        )
 
-    def tile_row_max_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
-        return self._emit_tile_row_fp_scalar("Max", "V_MAX_VF", vram_addr, row_map, opcode_extra_args=(0,))
+    def tile_row_max_fp_asm(
+        self, vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
+        return self._emit_tile_row_fp_scalar(
+            "Max", "V_MAX_VF", vram_addr, row_map, opcode_extra_args=(0,)
+        )
 
-    def tile_row_min_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
-        return self._emit_tile_row_fp_scalar("Min", "V_MIN_VF", vram_addr, row_map, opcode_extra_args=(0,))
+    def tile_row_min_fp_asm(
+        self, vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
+        return self._emit_tile_row_fp_scalar(
+            "Min", "V_MIN_VF", vram_addr, row_map, opcode_extra_args=(0,)
+        )
 
-    def tile_row_add_fp_asm(self, vram_addr: int, row_map: list[tuple[int, int]]) -> str:
-        return self._emit_tile_row_fp_scalar("Add", "V_ADD_VF", vram_addr, row_map, opcode_extra_args=(0,))
+    def tile_row_add_fp_asm(
+        self, vram_addr: int, row_map: list[tuple[int, int]]
+    ) -> str:
+        return self._emit_tile_row_fp_scalar(
+            "Add", "V_ADD_VF", vram_addr, row_map, opcode_extra_args=(0,)
+        )
 
     def tile_row_add_asm(self, dst_addr: int, src_addr: int, rows: list[int]) -> str:
-        return self._emit_tile_row_vector_op("Add", "V_ADD_VV", dst_addr, src_addr, rows)
+        return self._emit_tile_row_vector_op(
+            "Add", "V_ADD_VV", dst_addr, src_addr, rows
+        )
 
     def tile_row_sub_asm(self, dst_addr: int, src_addr: int, rows: list[int]) -> str:
-        return self._emit_tile_row_vector_op("Sub", "V_SUB_VV", dst_addr, src_addr, rows)
+        return self._emit_tile_row_vector_op(
+            "Sub", "V_SUB_VV", dst_addr, src_addr, rows
+        )
 
     def tile_row_mul_asm(self, dst_addr: int, src_addr: int, rows: list[int]) -> str:
-        return self._emit_tile_row_vector_op("Mul", "V_MUL_VV", dst_addr, src_addr, rows)
+        return self._emit_tile_row_vector_op(
+            "Mul", "V_MUL_VV", dst_addr, src_addr, rows
+        )
 
     def tile_row_fma_fp_asm(
         self,
@@ -1337,8 +1494,7 @@ class IsaTileRowMixin:
                 f"{len(dst_rows)} destinations, {len(src_rows)} sources"
             )
         row_map = [
-            (d, s, fpram_base + i)
-            for i, (d, s) in enumerate(zip(dst_rows, src_rows))
+            (d, s, fpram_base + i) for i, (d, s) in enumerate(zip(dst_rows, src_rows))
         ]
         return self._emit_tile_row_fma(dst_addr, src_addr, row_map)
 
@@ -1359,7 +1515,9 @@ class IsaTileRowMixin:
         row_map = [(d, s, fpram_scalar_addr) for d, s in zip(dst_rows, src_rows)]
         return self._emit_tile_row_fma(dst_addr, src_addr, row_map)
 
-    def tile_row_mul_fp_broadcast_asm(self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]) -> str:
+    def tile_row_mul_fp_broadcast_asm(
+        self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]
+    ) -> str:
         row_map = [(r, fpram_scalar_addr) for r in rows]
         return self.tile_row_mul_fp_asm(vram_addr, row_map)
 
@@ -1367,14 +1525,26 @@ class IsaTileRowMixin:
     # opposed to the `tile_row_*_fp` family which walks a different slot per row.
     # Both shapes are needed by Mamba: the decay scalars are per-row, while the
     # dt clamp bounds and the +1.0 of the sigmoid are single constants.
-    def tile_row_add_fp_broadcast_asm(self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]) -> str:
-        return self.tile_row_add_fp_asm(vram_addr, [(r, fpram_scalar_addr) for r in rows])
+    def tile_row_add_fp_broadcast_asm(
+        self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]
+    ) -> str:
+        return self.tile_row_add_fp_asm(
+            vram_addr, [(r, fpram_scalar_addr) for r in rows]
+        )
 
-    def tile_row_max_fp_broadcast_asm(self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]) -> str:
-        return self.tile_row_max_fp_asm(vram_addr, [(r, fpram_scalar_addr) for r in rows])
+    def tile_row_max_fp_broadcast_asm(
+        self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]
+    ) -> str:
+        return self.tile_row_max_fp_asm(
+            vram_addr, [(r, fpram_scalar_addr) for r in rows]
+        )
 
-    def tile_row_min_fp_broadcast_asm(self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]) -> str:
-        return self.tile_row_min_fp_asm(vram_addr, [(r, fpram_scalar_addr) for r in rows])
+    def tile_row_min_fp_broadcast_asm(
+        self, vram_addr: int, fpram_scalar_addr: int, rows: list[int]
+    ) -> str:
+        return self.tile_row_min_fp_asm(
+            vram_addr, [(r, fpram_scalar_addr) for r in rows]
+        )
 
     def tile_row_sub_fp_broadcast_asm(
         self,
@@ -1411,17 +1581,25 @@ class IsaTileRowMixin:
             VRAM[row] = 0
         """
         if not rows:
-            return self._emit(IsaBuilder().comment(f"=== VRAM Fill Zero: VRAM[{vram_addr}] rows [] = 0 ==="))
+            return self._emit(
+                IsaBuilder().comment(
+                    f"=== VRAM Fill Zero: VRAM[{vram_addr}] rows [] = 0 ==="
+                )
+            )
 
         gp_regs = self._reg.allocate_gp(2)
         gp_dst, gp_loop = gp_regs
         try:
-            asm = IsaBuilder().comment(f"=== VRAM Fill Zero: VRAM[{vram_addr}] rows {rows} = 0 ===")
+            asm = IsaBuilder().comment(
+                f"=== VRAM Fill Zero: VRAM[{vram_addr}] rows {rows} = 0 ==="
+            )
             prog = self._row_progression(rows)
 
             if prog is not None:
                 row_start, row_count, row_step = prog
-                asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), vram_addr + row_start * self.mlen)
+                asm.instr(
+                    "S_ADDI_INT", gp(gp_dst), gp(0), vram_addr + row_start * self.mlen
+                )
                 asm.instr("C_LOOP_START", gp(gp_loop), row_count)
                 asm.instr("V_MUL_VF", gp(gp_dst), gp(gp_dst), fp(0), 0)
                 asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), row_step * self.mlen)

@@ -127,27 +127,44 @@ def _compiler(
     affine: bool = False,
     packetized: bool = False,
     mlen: int = 64,
+    blen: int = 4,
+    packet_elements: int = 64,
+    storage_atom: int = 4,
 ) -> PlenaCompiler:
     return PlenaCompiler(
         mlen=mlen,
-        blen=4,
+        blen=blen,
         mram_tile_capacity=64,
         stream_addressing=stream,
         stream_affine_alpha=int(affine),
-        stream_storage_atom=4,
+        stream_storage_atom=storage_atom,
+        stream_packet_elements=packet_elements,
         stream_packetized=packetized,
     )
 
 
 def kimi_k3_mixer_assembly(
-    *, stream: bool, affine: bool = False, packetized: bool = False
+    *,
+    stream: bool,
+    affine: bool = False,
+    packetized: bool = False,
+    packet_elements: int = 64,
+    storage_atom: int = 4,
+    blen: int = 4,
+    recurrent_row_elements: int = 64,
 ) -> str:
     """Official Kimi K3 recurrent mixer geometry, excluding Matrix projections."""
 
-    mlen = 64
+    mlen = recurrent_row_elements
     shape = KdaShape.kimi_k3()
     program = _compiler(
-        stream=stream, affine=affine, packetized=packetized, mlen=mlen
+        stream=stream,
+        affine=affine,
+        packetized=packetized,
+        mlen=mlen,
+        blen=blen,
+        packet_elements=packet_elements,
+        storage_atom=storage_atom,
     )
     key_blocks = kda_key_blocks(shape, mlen)
 
@@ -170,9 +187,7 @@ def kimi_k3_mixer_assembly(
         decay_fp=decay_or_q,
         q_hat_fp=decay_or_q,
         k_hat_fp=program.fp_var("k_hat", size=shape.key_dim),
-        beta_fp=program.fp_var(
-            "beta", size=kda_head_blocks(shape, mlen) * mlen
-        ),
+        beta_fp=program.fp_var("beta", size=kda_head_blocks(shape, mlen) * mlen),
         part_fp=program.fp_var("part", size=key_blocks),
         acc_fp=program.fp_var("acc", size=1),
         output_scale_fp=program.fp_var("output_scale", size=1),
@@ -192,7 +207,14 @@ def kimi_k3_mixer_assembly(
 
 
 def nemotron3_mamba_decode_assembly(
-    *, stream: bool, affine: bool = False, packetized: bool = False
+    *,
+    stream: bool,
+    affine: bool = False,
+    packetized: bool = False,
+    packet_elements: int = 64,
+    storage_atom: int = 4,
+    blen: int = 4,
+    recurrent_row_elements: int = 64,
 ) -> str:
     """Real Nemotron 3 recurrent geometry, after projection/conv scalar setup.
 
@@ -202,7 +224,7 @@ def nemotron3_mamba_decode_assembly(
     group.  This is compiler-managed tiling, not a hidden state cache.
     """
 
-    mlen = 64
+    mlen = recurrent_row_elements
     group_shape = Mamba2Shape(
         hidden_size=8 * 64,
         num_heads=8,
@@ -214,7 +236,13 @@ def nemotron3_mamba_decode_assembly(
         seq_len=1,
     )
     program = _compiler(
-        stream=stream, affine=affine, packetized=packetized, mlen=mlen
+        stream=stream,
+        affine=affine,
+        packetized=packetized,
+        mlen=mlen,
+        blen=blen,
+        packet_elements=packet_elements,
+        storage_atom=storage_atom,
     )
     b_fp = program.fp_var("b_group_window", size=group_shape.state_size)
     c_fp = program.fp_var("c_group_window", size=group_shape.state_size)
@@ -251,13 +279,25 @@ def nemotron3_mamba_decode_assembly(
 
 
 def generic_affine_saxpy_assembly(
-    *, stream: bool, affine: bool = False, packetized: bool = False
+    *,
+    stream: bool,
+    affine: bool = False,
+    packetized: bool = False,
+    packet_elements: int = 64,
+    storage_atom: int = 4,
+    blen: int = 4,
 ) -> str:
     """A non-model-specific affine row sweep used as the ISA generality gate."""
 
     mlen = 64
     program = _compiler(
-        stream=stream, affine=affine, packetized=packetized, mlen=mlen
+        stream=stream,
+        affine=affine,
+        packetized=packetized,
+        mlen=mlen,
+        blen=blen,
+        packet_elements=packet_elements,
+        storage_atom=storage_atom,
     )
     dst = program.alloc("generic_dst", 256, mlen)
     src = program.alloc("generic_src", 256, mlen)
@@ -296,8 +336,7 @@ def _pair(builder) -> dict[str, object]:
         ),
         "postincrement_only": {
             "dynamic_issued_instructions": (
-                baseline.dynamic_issued_instructions
-                - baseline.foldable_self_advances
+                baseline.dynamic_issued_instructions - baseline.foldable_self_advances
             ),
             "removed_foldable_self_advances": baseline.foldable_self_advances,
             "preserved_unfoldable_self_advances": baseline.unfoldable_self_advances,
@@ -310,7 +349,9 @@ def _pair(builder) -> dict[str, object]:
 
 def _layout_summary(plan) -> dict[str, object]:
     keep = {"row_major", "consumer_major", "transpose", plan.selected.name}
-    candidates = [candidate.to_dict() for candidate in plan.candidates if candidate.name in keep]
+    candidates = [
+        candidate.to_dict() for candidate in plan.candidates if candidate.name in keep
+    ]
     return {
         "request": plan.request,
         "selected": plan.selected.name,
@@ -323,11 +364,42 @@ def _layout_summary(plan) -> dict[str, object]:
     }
 
 
-def build_report(model_lib: Path) -> dict[str, object]:
+def build_report(
+    model_lib: Path,
+    *,
+    packet_elements: int = 64,
+    storage_atom: int = 4,
+    banks: int = 16,
+    bank_width: int = 4,
+    blen: int = 4,
+    mamba_recurrent_row_elements: int = 64,
+    kda_recurrent_row_elements: int = 64,
+) -> dict[str, object]:
+    if packet_elements != banks * bank_width:
+        raise ValueError("packet_elements must equal banks * bank_width")
+    if storage_atom != bank_width:
+        raise ValueError("the executable packet storage atom must equal one bank word")
+    for model, row_elements in (
+        ("nemotron3", mamba_recurrent_row_elements),
+        ("kimi_k3", kda_recurrent_row_elements),
+    ):
+        if row_elements % storage_atom:
+            raise ValueError(f"the {model} recurrent row must contain whole bank words")
     nemotron = nemotron3_manifest(model_lib / "nemotron-3-nano-30b-a3b.json")
     kimi = kimi_k3_manifest(model_lib / "kimi-k3-text.json")
-    geometry = BankGeometry(banks=16, bank_width=4, read_ports=1, write_ports=1)
+    geometry = BankGeometry(
+        banks=banks, bank_width=bank_width, read_ports=1, write_ports=1
+    )
     planner = AffineLayoutPlanner(geometry)
+    builder_kwargs = {
+        "packet_elements": packet_elements,
+        "storage_atom": storage_atom,
+        "blen": blen,
+    }
+
+    def configured(builder, **fixed_kwargs):
+        return lambda **kwargs: builder(**kwargs, **builder_kwargs, **fixed_kwargs)
+
     layout_plans = {
         "nemotron_mamba_projection": _layout_summary(
             planner.plan(nemotron_projection_layout_request(nemotron, geometry))
@@ -348,8 +420,7 @@ def build_report(model_lib: Path) -> dict[str, object]:
                         nemotron.dimensions["mamba_heads"]
                         * math.ceil(nemotron.dimensions["mamba_state_dim"] / 8)
                         * math.ceil(
-                            nemotron.dimensions["mamba_head_dim"]
-                            / geometry.bank_width
+                            nemotron.dimensions["mamba_head_dim"] / geometry.bank_width
                         )
                     ),
                 )
@@ -368,8 +439,7 @@ def build_report(model_lib: Path) -> dict[str, object]:
                         kimi.dimensions["kda_heads"]
                         * math.ceil(kimi.dimensions["kda_key_dim"] / 8)
                         * math.ceil(
-                            kimi.dimensions["kda_value_dim"]
-                            / geometry.bank_width
+                            kimi.dimensions["kda_value_dim"] / geometry.bank_width
                         )
                     ),
                 )
@@ -377,12 +447,27 @@ def build_report(model_lib: Path) -> dict[str, object]:
         ),
     }
     return {
-        "schema_version": 2,
+        "schema_version": 4,
         "claim_boundaries": {
             "weights": "symbolic addresses; no full checkpoint numeric execution",
             "dimensions": "official pinned model dimensions",
             "layout_cycles": "layout-buffer service only",
             "instruction_counts": "compiler issue stream; not PLENA hardware cycles",
+            "storage_rows": (
+                "Mamba and KDA retain independently selected semantic rows; L_STREAM_CFG "
+                "may coalesce bank-word atoms from several rows into one wider packet"
+            ),
+        },
+        "execution_config": {
+            "recurrent_storage_row_elements": {
+                "nemotron3": mamba_recurrent_row_elements,
+                "kimi_k3": kda_recurrent_row_elements,
+            },
+            "packet_elements": packet_elements,
+            "storage_atom": storage_atom,
+            "banks": banks,
+            "bank_width": bank_width,
+            "blen": blen,
         },
         "workloads": {
             "nemotron3": nemotron.to_dict(),
@@ -390,10 +475,18 @@ def build_report(model_lib: Path) -> dict[str, object]:
         },
         "assembly": {
             "nemotron_mamba_decode_recurrence": _pair(
-                nemotron3_mamba_decode_assembly
+                configured(
+                    nemotron3_mamba_decode_assembly,
+                    recurrent_row_elements=mamba_recurrent_row_elements,
+                )
             ),
-            "kimi_k3_decode_recurrent_mixer": _pair(kimi_k3_mixer_assembly),
-            "generic_affine_saxpy": _pair(generic_affine_saxpy_assembly),
+            "kimi_k3_decode_recurrent_mixer": _pair(
+                configured(
+                    kimi_k3_mixer_assembly,
+                    recurrent_row_elements=kda_recurrent_row_elements,
+                )
+            ),
+            "generic_affine_saxpy": _pair(configured(generic_affine_saxpy_assembly)),
         },
         "layout_plans": layout_plans,
         "isa": {
@@ -410,8 +503,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-lib", type=Path, default=Path("doc/Model_Lib"))
     parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--packet-elements", type=int, default=64)
+    parser.add_argument("--storage-atom", type=int, default=4)
+    parser.add_argument("--banks", type=int, default=16)
+    parser.add_argument("--bank-width", type=int, default=4)
+    parser.add_argument("--blen", type=int, default=4)
+    parser.add_argument("--mamba-row-elements", type=int, default=64)
+    parser.add_argument("--kda-row-elements", type=int, default=64)
     args = parser.parse_args(argv)
-    report = build_report(args.model_lib)
+    report = build_report(
+        args.model_lib,
+        packet_elements=args.packet_elements,
+        storage_atom=args.storage_atom,
+        banks=args.banks,
+        bank_width=args.bank_width,
+        blen=args.blen,
+        mamba_recurrent_row_elements=args.mamba_row_elements,
+        kda_recurrent_row_elements=args.kda_row_elements,
+    )
     rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.json_out is not None:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)

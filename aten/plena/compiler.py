@@ -199,6 +199,7 @@ class PlenaCompiler(
         stream_affine_beta: int = 0,
         stream_affine_gamma: int = 0,
         stream_storage_atom: int = 4,
+        stream_packet_elements: int | None = None,
         stream_packetized: bool = False,
     ):
         """
@@ -232,6 +233,11 @@ class PlenaCompiler(
                           VLEN-wide packet assembled from storage atoms in several
                           logical rows. This changes addressing only; arithmetic and
                           loop opcodes remain unchanged.
+            stream_packet_elements: Number of logical elements consumed by one
+                          packetized Vector operation. Defaults to ``mlen`` for
+                          backward compatibility. Keeping this separate from the
+                          recurrent tensor's 64-element storage row lets a wider
+                          architectural VLEN coalesce several short state rows.
         """
         if mram_tile_capacity is None:
             mram_tile_capacity = _derive_mram_tile_capacity(mlen) or 4
@@ -248,13 +254,21 @@ class PlenaCompiler(
             mram_tile_capacity=mram_tile_capacity,
         )
         if hbm_v_prefetch_amount is None:
-            hbm_v_prefetch_amount = _behavior_config_value("HBM_V_Prefetch_Amount", 4, mlen)
+            hbm_v_prefetch_amount = _behavior_config_value(
+                "HBM_V_Prefetch_Amount", 4, mlen
+            )
         if hbm_v_writeback_amount is None:
-            hbm_v_writeback_amount = _behavior_config_value("HBM_V_Writeback_Amount", 4, mlen)
+            hbm_v_writeback_amount = _behavior_config_value(
+                "HBM_V_Writeback_Amount", 4, mlen
+            )
         if hbm_v_prefetch_amount <= 0:
-            raise ValueError(f"hbm_v_prefetch_amount must be > 0, got {hbm_v_prefetch_amount}")
+            raise ValueError(
+                f"hbm_v_prefetch_amount must be > 0, got {hbm_v_prefetch_amount}"
+            )
         if hbm_v_writeback_amount <= 0:
-            raise ValueError(f"hbm_v_writeback_amount must be > 0, got {hbm_v_writeback_amount}")
+            raise ValueError(
+                f"hbm_v_writeback_amount must be > 0, got {hbm_v_writeback_amount}"
+            )
         self.hbm_v_prefetch_amount = hbm_v_prefetch_amount
         self.hbm_v_writeback_amount = hbm_v_writeback_amount
         self.hlen = _behavior_config_value("HLEN", mlen, mlen)
@@ -265,11 +279,22 @@ class PlenaCompiler(
             raise ValueError("stream affine coefficients must be non-negative")
         if stream_storage_atom <= 0:
             raise ValueError("stream_storage_atom must be positive")
+        if stream_packet_elements is None:
+            stream_packet_elements = mlen
+        if stream_packet_elements <= 0:
+            raise ValueError("stream_packet_elements must be positive")
+        if mlen % stream_storage_atom:
+            raise ValueError("mlen must contain a whole number of stream storage atoms")
+        if stream_packet_elements % stream_storage_atom:
+            raise ValueError(
+                "stream_packet_elements must contain a whole number of stream storage atoms"
+            )
         self.stream_addressing = stream_addressing
         self.stream_affine_alpha = stream_affine_alpha
         self.stream_affine_beta = stream_affine_beta
         self.stream_affine_gamma = stream_affine_gamma
         self.stream_storage_atom = stream_storage_atom
+        self.stream_packet_elements = stream_packet_elements
         self.stream_packetized = stream_packetized
 
         # HBM address auto-allocation
@@ -321,7 +346,11 @@ class PlenaCompiler(
         best_idx = None
         best_waste = None
         for i, (addr, size) in enumerate(self._hbm_free_blocks):
-            aligned_addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes if needs_tile_align else addr
+            aligned_addr = (
+                ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+                if needs_tile_align
+                else addr
+            )
             aligned_waste = aligned_addr - addr
             effective_size = size - aligned_waste
             if effective_size >= hbm_size:
@@ -348,7 +377,9 @@ class PlenaCompiler(
             addr = ((addr + tile_bytes - 1) // tile_bytes) * tile_bytes
         self._next_hbm_addr = ((addr + hbm_size + m - 1) // m) * m
         if needs_tile_align:
-            self._next_hbm_addr = ((self._next_hbm_addr + tile_bytes - 1) // tile_bytes) * tile_bytes
+            self._next_hbm_addr = (
+                (self._next_hbm_addr + tile_bytes - 1) // tile_bytes
+            ) * tile_bytes
         return addr
 
     def _recycle_hbm(self, hbm_addr: int, hbm_size: int):

@@ -81,13 +81,24 @@ win.
 - The Compiler report separately identifies ordinary stream operations and the
   exact `V_MUL_VF`/`V_FMA_VF` operations issued by recurrent packets.
 
-At the official decode shapes, dynamic issue counts are:
+At the official decode shapes and the PLENA paper's 2048-element packet point,
+dynamic issue counts are:
 
 | Workload | Static baseline | Arlo post-increment | Ordinary stream | Affine packet | Baseline / ordinary stream |
 |---|---:|---:|---:|---:|---:|
-| Nemotron Mamba recurrence | 92,399 | 51,311 | 33,257 | 35,177 | 2.778x |
-| Kimi K3 KDA mixer | 428,238 | 226,242 | 160,782 | 165,774 | 2.663x |
+| Nemotron Mamba recurrence | 92,399 | 51,311 | 33,257 | 19,049 | 2.778x |
+| Kimi K3 KDA mixer | 215,387 | 116,219 | 81,659 | 61,115 | 2.638x |
 | Model-independent SAXPY | 1,284 | 516 | 301 | 301 | 4.266x |
+
+Nemotron uses 64-element semantic state rows. Kimi uses its natural
+128-element state rows; using the old 64-wide KDA split at a 2048-wide system
+point would unfairly weaken the ordinary baseline. Packet arithmetic still
+uses 64-element bank words and preserves exact element work.
+
+The affine packet base is aligned and expressed in packet rows. One 2048-value
+packet occupies one 32-bank physical row; the row-major comparison retains 32
+padded short-row locations. This capacity check is part of the executable
+round-trip test, not an assumed zero-cost layout.
 
 These are issued-instruction reductions, not hardware-cycle or full-model
 speedups. The Simulator shared-resource campaign provides those separately.
@@ -106,10 +117,16 @@ bank/FIFO service, Matrix, Vector, HBM, MoE routing pressure, and the full
   Mamba, KDA, and generic affine loops without changing their arithmetic;
 - affine co-layout removes every measured conflict from the executable
   multi-row Mamba/KDA packet path;
-- on the current 64-lane datapath, affine packet execution is still 0.46%
-  slower than the best ordinary-row stream for Nemotron and 0.056% slower for
-  Kimi. Conflict removal is therefore validated, but superiority over the
-  ordinary-row path is not claimed.
+- the 64-lane negative control remains slower than the best ordinary-row
+  stream, so conflict removal alone is not enough to justify the mechanism;
+- at the paper's 2048-wide point, affine packet beats ordinary stream by
+  1.13473x for Nemotron and 1.01497x for Kimi; packet plus writeback overlap
+  beats the Arlo post-increment full-model baseline by 1.30910x and 1.04025x.
+
+The exact Compiler/Simulator lane sweep places the crossover near 128 lanes
+for Mamba and 256 lanes for KDA. This is the ISA freeze condition: the same
+general stream semantics is retained, but the affine packet performance claim
+is limited to widths above the measured crossover.
 
 Real dimensions with symbolic weights and real-checkpoint numerical execution
 remain separate completion levels. Full Nemotron/Kimi checkpoint execution is
