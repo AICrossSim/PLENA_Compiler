@@ -181,10 +181,12 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_MIN_VF               = 6'h36,
     V_TOPK                 = 6'h37,
     C_SET_TOPK_REG         = 6'h38,
-    C_ROUTE_BEGIN          = 6'h39,
-    C_ROUTE_LOOP_START     = 6'h3A,
-    C_ROUTE_LOOP_END       = 6'h3B,
-    V_ROUTE_MUL            = 6'h3C
+    // 0x39-0x3B belong to the static state path (V_SOFTPLUS_V, S_MAP_FP_V,
+    // V_FMA_VF). The three route-control operations are one controller, so they
+    // share a single opcode and select the operation with funct1 rather than
+    // spending three encodings the state path needs.
+    V_ROUTE_MUL            = 6'h3C,
+    C_ROUTE                = 6'h3D
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {

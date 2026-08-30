@@ -25,9 +25,18 @@ _RMASK_VECTOR_OPS = frozenset(
         "V_ROUTE_MUL",
     }
 )
-_NO_OPERAND_OPS = frozenset(
-    {"C_BREAK", "C_ROUTE_LOOP_START", "C_ROUTE_LOOP_END"}
-)
+_NO_OPERAND_OPS = frozenset({"C_BREAK"})
+
+#: The route controller is one opcode. Assembly keeps the three readable names
+#: because they are three distinct operations to a reader, but they encode as
+#: ``C_ROUTE`` with a funct1 selector, which frees 0x39-0x3B for the static
+#: state path. `C_ROUTE_BEGIN` carries the policy in rmask; the two loop
+#: operations take no operands.
+C_ROUTE_SUBOPS: dict[str, int] = {
+    "C_ROUTE_BEGIN": 0,
+    "C_ROUTE_LOOP_START": 1,
+    "C_ROUTE_LOOP_END": 2,
+}
 _IMM_RS1_RD_OPS = frozenset(
     {
         "S_ADDI_INT",
@@ -94,7 +103,11 @@ class AssemblyToBinary:
         :return: Binary representation of the instruction
         """
         # Example conversion logic (to be replaced with actual logic)
-        opcode = self.isa_definitions[instruction.opcode]
+        # The three route mnemonics resolve to one encoding; everything else
+        # looks itself up.
+        opcode = self.isa_definitions[
+            "C_ROUTE" if instruction.opcode in C_ROUTE_SUBOPS else instruction.opcode
+        ]
         rd = instruction.rd
         rs1 = instruction.rs1
         rs2 = instruction.rs2
@@ -110,16 +123,29 @@ class AssemblyToBinary:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
 
-        if instruction.opcode == "C_ROUTE_BEGIN" and rmask not in (0, 1, 15):
-            raise ValueError(
-                "C_ROUTE_BEGIN policy must be 0 (32 experts/top-4), "
-                "1 (128 experts/top-8), or 15 (C_SET_TOPK_REG)"
-            )
         if instruction.opcode == "V_ROUTE_MUL":
             if rs2 != 0:
                 raise ValueError("V_ROUTE_MUL reserves rs2 and requires gp0")
             if rmask not in range(4):
                 raise ValueError("V_ROUTE_MUL token must be in the batch4 range [0, 4)")
+
+        if instruction.opcode in C_ROUTE_SUBOPS:
+            subop = C_ROUTE_SUBOPS[instruction.opcode]
+            if subop == 0:
+                if rmask not in (0, 1, 15):
+                    raise ValueError(
+                        "C_ROUTE_BEGIN policy must be 0 (32 experts/top-4), "
+                        "1 (128 experts/top-8), or 15 (C_SET_TOPK_REG)"
+                    )
+                operands = (rmask << (opw + 3 * ow)) + (rs2 << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw)
+            else:
+                # The loop operations carry no state; every operand field stays
+                # reserved so a later revision can use them without colliding
+                # with programs assembled today.
+                if any(value not in (None, 0) for value in (rd, rs1, rs2, rstride, rmask)):
+                    raise ValueError(f"{instruction.opcode} takes no operands")
+                operands = 0
+            return (subop << (opw + 4 * ow)) + operands + opcode
 
         if instruction.opcode in _IMM_RS1_RD_OPS:
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
