@@ -56,14 +56,19 @@ def test_l_stream_cfg_rejects_noncanonical_high_bits():
         decode_l_stream_cfg_word(word | (1 << 31))
 
 
-def test_l_stream_cfg_rejects_reserved_field_at_encode_time():
-    with pytest.raises(ValueError, match="reserved"):
-        encode_l_stream_cfg_word(
-            value_register=1,
-            target_register=2,
-            slot=0,
-            field=15,
-        )
+def test_l_stream_cfg_field_15_encodes_packet_stride():
+    word = encode_l_stream_cfg_word(
+        value_register=1,
+        target_register=2,
+        slot=0,
+        field=StreamConfigField.PACKET_STRIDE,
+    )
+    assert decode_l_stream_cfg_word(word) == (
+        1,
+        2,
+        0,
+        StreamConfigField.PACKET_STRIDE,
+    )
 
 
 def test_configuration_is_model_independent_and_enables_last():
@@ -119,6 +124,30 @@ def test_linear_configuration_elides_default_dimensions_and_zero_coefficients():
         int(StreamConfigField.STORAGE_ATOM),
         int(StreamConfigField.FLAGS),
     }
+
+
+def test_packet_configuration_emits_stride_and_packet_flag():
+    layout = AffineLayout(LayoutKind.AFFINE_SKEW, 1, 1, 16, 64, alpha=1)
+    binding = StreamBinding(
+        slot=0,
+        target_register=3,
+        target_is_fp=False,
+        base=1024,
+        advance=4,
+        packet_elements=64,
+        storage_atom=4,
+        packet_stride=64,
+        packetized=True,
+    )
+    code = emit_stream_configuration(value_gp=7, binding=binding, layout=layout).render()
+    assert f", {int(StreamConfigField.PACKET_STRIDE)}" in code
+    flags_line = next(
+        line
+        for line in code.splitlines()
+        if line.startswith("L_STREAM_CFG")
+        and line.endswith(f", {int(StreamConfigField.FLAGS)}")
+    )
+    assert flags_line
 
 
 def test_configuration_legalizes_real_scale_addresses_before_assembly(tmp_path):

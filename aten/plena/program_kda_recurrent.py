@@ -273,7 +273,7 @@ class ProgramKdaRecurrentMixin:
                 )
                 # state[row] += err[acc] * k_hat[i] -- the mirror of the
                 # prediction: the source is pinned and the destination walks.
-                self.tile_row_fma_fp_sweep(
+                self.tile_multirow_fma_fp_sweep(
                     state, err, k_fp,
                     dst_rows=key_rows, src_rows=[acc] * len(key_rows),
                     fpram_offset=fp_base,

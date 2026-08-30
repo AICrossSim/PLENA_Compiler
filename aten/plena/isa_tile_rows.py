@@ -315,6 +315,43 @@ class IsaTileRowMixin:
             src_rows,
         )
 
+    def tile_multirow_mul_fp(
+        self,
+        matrix_name: str,
+        fpram_base: int,
+        rows: list[int],
+        *,
+        fp_step: int,
+        tile_row_idx: int = 0,
+        tile_col_idx: int = 0,
+    ) -> str:
+        return self.tile_multirow_mul_fp_asm(
+            self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
+            fpram_base,
+            rows,
+            fp_step=fp_step,
+        )
+
+    def tile_multirow_fma_fp_sweep(
+        self,
+        dst_matrix: str,
+        src_matrix: str,
+        fpram_base: int,
+        dst_rows: list[int],
+        src_rows: list[int],
+        dst_tile_row_idx: int = 0,
+        dst_tile_col_idx: int = 0,
+        src_tile_row_idx: int = 0,
+        src_tile_col_idx: int = 0,
+    ) -> str:
+        return self.tile_multirow_fma_fp_sweep_asm(
+            self._tile_addr(dst_matrix, dst_tile_row_idx, dst_tile_col_idx),
+            self._tile_addr(src_matrix, src_tile_row_idx, src_tile_col_idx),
+            fpram_base,
+            dst_rows,
+            src_rows,
+        )
+
     def vram_fill_zero(
         self,
         matrix_name: str,
@@ -366,6 +403,10 @@ class IsaTileRowMixin:
         count: int,
         packet_elements: int,
         storage_atom: int,
+        packet_stride: int | None = None,
+        packetized: bool = False,
+        extent_minor: int | None = None,
+        extent_major: int | None = None,
         auto_advance: bool = True,
         write: bool = False,
     ) -> None:
@@ -373,13 +414,26 @@ class IsaTileRowMixin:
             raise ValueError(f"stream trip count must be positive, got {count}")
         if advance < 0:
             raise ValueError("L-stream v1 does not encode negative address advances")
-        if advance and advance % packet_elements:
+        if not packetized and advance and advance % packet_elements:
             raise ValueError(
                 f"stream advance {advance} is not a multiple of packet width "
                 f"{packet_elements}"
             )
-        step_units = advance // packet_elements if advance else 0
-        span = (count - 1) * step_units + 1 if step_units else 1
+        if packetized:
+            if packet_elements % storage_atom:
+                raise ValueError("packetized stream must contain whole storage atoms")
+            segments = packet_elements // storage_atom
+            if count % segments:
+                raise ValueError(
+                    f"packetized trip count {count} must be divisible by {segments} segments"
+                )
+            minors = packet_elements if extent_minor is None else extent_minor
+            majors = count if extent_major is None else extent_major
+        else:
+            step_units = advance // packet_elements if advance else 0
+            span = (count - 1) * step_units + 1 if step_units else 1
+            majors = span if extent_major is None else extent_major
+            minors = packet_elements if extent_minor is None else extent_minor
         layout = AffineLayout(
             kind=(
                 LayoutKind.AFFINE_SKEW
@@ -388,11 +442,12 @@ class IsaTileRowMixin:
             ),
             groups=1,
             fields=1,
-            majors=span,
-            minors=packet_elements,
+            majors=majors,
+            minors=minors,
             alpha=self.stream_affine_alpha,
             beta=self.stream_affine_beta,
             gamma=self.stream_affine_gamma,
+            bank_row_base=0 if target_is_fp else base // self.mlen,
         )
         binding = StreamBinding(
             slot=slot,
@@ -402,10 +457,176 @@ class IsaTileRowMixin:
             advance=advance,
             packet_elements=packet_elements,
             storage_atom=storage_atom,
+            packet_stride=packet_stride,
             auto_advance=auto_advance,
             write=write,
+            packetized=packetized,
         )
         asm.extend(emit_stream_configuration(value_gp=value_gp, binding=binding, layout=layout).items)
+
+    def _packet_rows_supported(self, rows: list[int]) -> tuple[int, int] | None:
+        if not (self.stream_addressing and self.stream_packetized):
+            return None
+        if self.mlen % self.stream_storage_atom:
+            return None
+        progression = self._arith_progression(rows)
+        if progression is None:
+            return None
+        start, count, step = progression
+        segments = self.mlen // self.stream_storage_atom
+        if step != 1 or count < segments or count % segments:
+            return None
+        return start, count
+
+    def tile_multirow_mul_fp_asm(
+        self,
+        vram_addr: int,
+        fpram_base: int,
+        rows: list[int],
+        *,
+        fp_step: int,
+    ) -> str:
+        """Multiply rows by a segmented scalar packet when the walk is regular.
+
+        One ordinary ``V_MUL_VF`` still computes exactly ``MLEN`` values. In
+        packet mode those lanes are assembled from ``MLEN / storage_atom``
+        logical rows, and one FPRAM scalar is broadcast over each atom.
+        """
+
+        if fp_step not in (0, 1):
+            raise ValueError(f"packet scalar step must be 0 or 1, got {fp_step}")
+        supported = self._packet_rows_supported(rows)
+        if supported is None:
+            row_map = [(row, fpram_base + index * fp_step) for index, row in enumerate(rows)]
+            return self._emit_tile_row_fp_scalar("Mul", "V_MUL_VF", vram_addr, row_map, (0,))
+
+        row_start, count = supported
+        gp_data, gp_loop, gp_value = self._reg.allocate_gp(3)
+        try:
+            asm = IsaBuilder().comment(
+                f"Packetized multi-row Mul: VRAM[{vram_addr}], rows={count}"
+            )
+            self._append_stream_binding(
+                asm,
+                value_gp=gp_value,
+                slot=0,
+                target_register=gp_data,
+                target_is_fp=False,
+                base=vram_addr + row_start * self.mlen,
+                advance=self.stream_storage_atom,
+                count=count,
+                packet_elements=self.mlen,
+                storage_atom=self.stream_storage_atom,
+                packet_stride=self.mlen,
+                packetized=True,
+                extent_minor=self.mlen,
+                extent_major=count,
+                write=True,
+            )
+            self._append_stream_binding(
+                asm,
+                value_gp=gp_value,
+                slot=1,
+                target_register=1,
+                target_is_fp=True,
+                base=fpram_base,
+                advance=0,
+                count=count,
+                packet_elements=self.mlen,
+                storage_atom=self.stream_storage_atom,
+                packet_stride=fp_step,
+                packetized=True,
+                extent_minor=self.mlen,
+                extent_major=count,
+            )
+            asm.instr("C_LOOP_START", gp(gp_loop), count)
+            asm.instr("V_MUL_VF", gp(gp_data), gp(gp_data), fp(1), 0)
+            asm.instr("C_LOOP_END", gp(gp_loop))
+            self._append_stream_reset(asm, slot=0, target_register=gp_data, target_is_fp=False)
+            self._append_stream_reset(asm, slot=1, target_register=1, target_is_fp=True)
+            return self._emit(asm)
+        finally:
+            self._reg.free_gp([gp_data, gp_loop, gp_value])
+
+    def tile_multirow_fma_fp_sweep_asm(
+        self,
+        dst_addr: int,
+        src_addr: int,
+        fpram_base: int,
+        dst_rows: list[int],
+        src_rows: list[int],
+    ) -> str:
+        """Packetized ``dst += src * scalar`` for moving destinations.
+
+        A pinned destination is deliberately rejected: it is a cross-row
+        reduction, not independent lane arithmetic, and remains on the ordinary
+        row path.
+        """
+
+        if len(dst_rows) != len(src_rows):
+            raise ValueError("packet FMA source and destination row counts differ")
+        supported = self._packet_rows_supported(dst_rows)
+        src_progression = self._arith_progression(src_rows)
+        if supported is None or src_progression is None or src_progression[2] not in (0, 1):
+            return self.tile_row_fma_fp_sweep_asm(
+                dst_addr, src_addr, fpram_base, dst_rows, src_rows
+            )
+
+        dst_start, count = supported
+        src_start, src_count, src_step = src_progression
+        if src_count != count:
+            raise ValueError("packet FMA source and destination row counts differ")
+        gp_dst, gp_src, gp_loop, gp_value = self._reg.allocate_gp(4)
+        try:
+            asm = IsaBuilder().comment(
+                f"Packetized multi-row FMA: VRAM[{dst_addr}] += VRAM[{src_addr}] * FPRAM"
+            )
+            for slot, target, base, stride, write in (
+                (0, gp_dst, dst_addr + dst_start * self.mlen, self.mlen, True),
+                (1, gp_src, src_addr + src_start * self.mlen, src_step * self.mlen, False),
+            ):
+                self._append_stream_binding(
+                    asm,
+                    value_gp=gp_value,
+                    slot=slot,
+                    target_register=target,
+                    target_is_fp=False,
+                    base=base,
+                    advance=self.stream_storage_atom,
+                    count=count,
+                    packet_elements=self.mlen,
+                    storage_atom=self.stream_storage_atom,
+                    packet_stride=stride,
+                    packetized=True,
+                    extent_minor=self.mlen,
+                    extent_major=count,
+                    write=write,
+                )
+            self._append_stream_binding(
+                asm,
+                value_gp=gp_value,
+                slot=2,
+                target_register=1,
+                target_is_fp=True,
+                base=fpram_base,
+                advance=0,
+                count=count,
+                packet_elements=self.mlen,
+                storage_atom=self.stream_storage_atom,
+                packet_stride=1,
+                packetized=True,
+                extent_minor=self.mlen,
+                extent_major=count,
+            )
+            asm.instr("C_LOOP_START", gp(gp_loop), count)
+            asm.instr("V_FMA_VF", gp(gp_dst), gp(gp_src), fp(1), 0)
+            asm.instr("C_LOOP_END", gp(gp_loop))
+            self._append_stream_reset(asm, slot=0, target_register=gp_dst, target_is_fp=False)
+            self._append_stream_reset(asm, slot=1, target_register=gp_src, target_is_fp=False)
+            self._append_stream_reset(asm, slot=2, target_register=1, target_is_fp=True)
+            return self._emit(asm)
+        finally:
+            self._reg.free_gp([gp_dst, gp_src, gp_loop, gp_value])
 
     @staticmethod
     def _stream_is_profitable(

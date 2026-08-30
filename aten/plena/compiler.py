@@ -199,6 +199,7 @@ class PlenaCompiler(
         stream_affine_beta: int = 0,
         stream_affine_gamma: int = 0,
         stream_storage_atom: int = 4,
+        stream_packetized: bool = False,
     ):
         """
         Args:
@@ -227,6 +228,10 @@ class PlenaCompiler(
                           instructions auto-advance their operands. Existing C_LOOP
                           opcodes still own repetition; no model-specific operation is
                           introduced.
+            stream_packetized: Allow one existing Vector operation to consume a
+                          VLEN-wide packet assembled from storage atoms in several
+                          logical rows. This changes addressing only; arithmetic and
+                          loop opcodes remain unchanged.
         """
         if mram_tile_capacity is None:
             mram_tile_capacity = _derive_mram_tile_capacity(mlen) or 4
@@ -265,6 +270,7 @@ class PlenaCompiler(
         self.stream_affine_beta = stream_affine_beta
         self.stream_affine_gamma = stream_affine_gamma
         self.stream_storage_atom = stream_storage_atom
+        self.stream_packetized = stream_packetized
 
         # HBM address auto-allocation
         self._next_hbm_addr: int = 0

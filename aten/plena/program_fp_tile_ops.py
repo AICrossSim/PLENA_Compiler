@@ -406,6 +406,58 @@ class ProgramFPTileOpsMixin:
             dst.name, src.name, addr, list(dst_rows), list(src_rows)
         )
 
+    def tile_multirow_mul_fp(
+        self,
+        source: VRAMMatrixVar,
+        fpram_base: int | FPVar,
+        rows: Iterable[int],
+        *,
+        fpram_offset: int = 0,
+        fp_step: int,
+    ):
+        resolved_rows = list(rows)
+        base = self._resolve_fpram_addr(fpram_base, fpram_offset)
+        if isinstance(fpram_base, FPVar) and resolved_rows and fp_step:
+            end = fpram_offset + len(resolved_rows) - 1
+            if end >= fpram_base.size:
+                raise ValueError(
+                    f"FPRAM packet sweep reads slot {end}, past {fpram_base.name}'s "
+                    f"{fpram_base.size}"
+                )
+        super().tile_multirow_mul_fp(
+            source.name,
+            base,
+            resolved_rows,
+            fp_step=fp_step,
+        )
+
+    def tile_multirow_fma_fp_sweep(
+        self,
+        dst: VRAMMatrixVar,
+        src: VRAMMatrixVar,
+        fpram_base: int | FPVar,
+        dst_rows: Iterable[int],
+        src_rows: Iterable[int],
+        *,
+        fpram_offset: int = 0,
+    ):
+        dst_rows, src_rows = list(dst_rows), list(src_rows)
+        base = self._resolve_fpram_addr(fpram_base, fpram_offset)
+        if isinstance(fpram_base, FPVar) and dst_rows:
+            end = fpram_offset + len(dst_rows) - 1
+            if end >= fpram_base.size:
+                raise ValueError(
+                    f"FPRAM packet sweep reads slot {end}, past {fpram_base.name}'s "
+                    f"{fpram_base.size}"
+                )
+        super().tile_multirow_fma_fp_sweep(
+            dst.name,
+            src.name,
+            base,
+            dst_rows,
+            src_rows,
+        )
+
     # One FPRAM slot applied to EVERY listed row, as opposed to the
     # `tile_row_*_fp` family which walks a different slot per row.
     def tile_row_add_fp_broadcast(

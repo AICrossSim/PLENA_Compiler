@@ -16,7 +16,7 @@ from compiler.aten.plena.affine_layout import AffineLayout
 
 
 L_STREAM_CFG_OPCODE = 0x3C
-L_STREAM_CONTRACT_VERSION = 1
+L_STREAM_CONTRACT_VERSION = 2
 L_STREAM_MAX_SLOTS = 4
 
 
@@ -36,6 +36,7 @@ class StreamConfigField(IntEnum):
     PACKET_ELEMENTS = 12
     STORAGE_ATOM = 13
     PHYSICAL_BASE_ROW = 14
+    PACKET_STRIDE = 15
 
 
 class StreamFlags(IntFlag):
@@ -46,6 +47,7 @@ class StreamFlags(IntFlag):
     WRITE = 1 << 4
     LANE_RESTORE = 1 << 5
     STRICT_BOUNDS = 1 << 6
+    PACKETIZED = 1 << 7
 
 
 @dataclass(frozen=True)
@@ -57,9 +59,11 @@ class StreamBinding:
     advance: int
     packet_elements: int
     storage_atom: int
+    packet_stride: int | None = None
     auto_advance: bool = True
     write: bool = False
     lane_restore: bool = True
+    packetized: bool = False
 
     def validate(self) -> None:
         if not 0 <= self.slot < L_STREAM_MAX_SLOTS:
@@ -69,10 +73,18 @@ class StreamBinding:
             raise ValueError(
                 f"stream target register must be in [0, {target_limit}), got {self.target_register}"
             )
-        if self.base < 0 or self.advance < 0:
-            raise ValueError("stream base and advance must be non-negative")
+        if self.base < 0 or self.advance < 0 or (
+            self.packet_stride is not None and self.packet_stride < 0
+        ):
+            raise ValueError("stream base, advance, and packet stride must be non-negative")
         if self.packet_elements <= 0 or self.storage_atom <= 0:
             raise ValueError("stream packet and storage atom must be positive")
+        if self.packet_elements % self.storage_atom:
+            raise ValueError("stream packet must contain a whole number of storage atoms")
+
+    @property
+    def effective_packet_stride(self) -> int:
+        return self.storage_atom if self.packet_stride is None else self.packet_stride
 
 
 def encode_l_stream_cfg_word(
@@ -159,6 +171,7 @@ def emit_stream_configuration(
         (StreamConfigField.PACKET_ELEMENTS, binding.packet_elements),
         (StreamConfigField.STORAGE_ATOM, binding.storage_atom),
         (StreamConfigField.PHYSICAL_BASE_ROW, layout.bank_row_base),
+        (StreamConfigField.PACKET_STRIDE, binding.effective_packet_stride),
     ):
         defaults = {
             StreamConfigField.EXTENT_MINOR: 1,
@@ -173,6 +186,7 @@ def emit_stream_configuration(
             StreamConfigField.PACKET_ELEMENTS: 1,
             StreamConfigField.STORAGE_ATOM: 1,
             StreamConfigField.PHYSICAL_BASE_ROW: 0,
+            StreamConfigField.PACKET_STRIDE: binding.storage_atom,
         }
         if field == StreamConfigField.BASE or value != defaults[field]:
             write(field, value)
@@ -188,6 +202,8 @@ def emit_stream_configuration(
         flags |= StreamFlags.WRITE
     if binding.lane_restore:
         flags |= StreamFlags.LANE_RESTORE
+    if binding.packetized:
+        flags |= StreamFlags.PACKETIZED
     write(StreamConfigField.FLAGS, int(flags))
     return asm
 

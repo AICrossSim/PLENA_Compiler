@@ -191,8 +191,10 @@ class ProgramSSMRecurrentMixin:
             # loop: it needed a scratch row per step, and that row was the same
             # row every iteration, which broke the progression.
             state_rows = list(range(base, base + n_state))
-            self.tile_row_mul_fp_broadcast(state, da_fp, rows=state_rows, fpram_offset=h)
-            self.tile_row_fma_fp_sweep(
+            self.tile_multirow_mul_fp(
+                state, da_fp, rows=state_rows, fpram_offset=h, fp_step=0
+            )
+            self.tile_multirow_fma_fp_sweep(
                 state, scratch, b_fp,
                 dst_rows=state_rows, src_rows=[0] * n_state,
                 fpram_offset=group * n_state,

@@ -148,8 +148,8 @@ class AssemblyToBinary:
                 )
             if not 0 <= slot < 4:
                 raise ValueError(f"L_STREAM_CFG slot must be in [0, 4), got {slot}")
-            if not 0 <= field < 15:
-                raise ValueError(f"L_STREAM_CFG field must be in [0, 15), got {field}")
+            if not 0 <= field < 16:
+                raise ValueError(f"L_STREAM_CFG field must be in [0, 16), got {field}")
             binary_instruction = (
                 (field << (opw + 3 * ow))
                 + (slot << (opw + 2 * ow))

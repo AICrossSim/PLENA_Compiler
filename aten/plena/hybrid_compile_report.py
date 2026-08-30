@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -51,6 +52,7 @@ class AssemblyMetrics:
     unfoldable_self_advances: int
     scalar_loads: int
     opcode_census: dict[str, int]
+    packetized_opcode_census: dict[str, int]
     contains_l_stream_cfg: bool
     contains_model_specific_state_opcode: bool
 
@@ -67,16 +69,65 @@ class AssemblyMetrics:
             unfoldable_self_advances=unfoldable,
             scalar_loads=census.get("S_LD_FP", 0),
             opcode_census=dict(sorted(census.items())),
+            packetized_opcode_census=_packetized_opcode_census(assembly),
             contains_l_stream_cfg="L_STREAM_CFG" in census,
             contains_model_specific_state_opcode=bool(forbidden & set(census)),
         )
+
+
+def _packetized_opcode_census(assembly: str) -> dict[str, int]:
+    """Count arithmetic issued by explicitly marked multi-row packets.
+
+    Packet mode deliberately reuses existing Vector opcodes, so the ordinary
+    opcode census cannot distinguish a full-row ``V_FMA_VF`` from one fed by
+    sixteen four-element logical rows.  The emitters own a stable marker and a
+    single hardware loop for each packet sweep; count that loop here so the
+    Simulator can price physical bank service without guessing from shapes.
+    """
+
+    lines = [line.strip() for line in assembly.splitlines() if line.strip()]
+    counts: dict[str, int] = {}
+    for index, line in enumerate(lines):
+        if not line.startswith("; Packetized multi-row "):
+            continue
+        loop_index = next(
+            (
+                cursor
+                for cursor in range(index + 1, len(lines))
+                if lines[cursor].startswith("C_LOOP_START")
+            ),
+            None,
+        )
+        if loop_index is None:
+            raise ValueError("packetized sweep is missing its hardware loop")
+        trips = int(re.findall(r"(-?\d+)", lines[loop_index])[-1])
+        body = []
+        for cursor in range(loop_index + 1, len(lines)):
+            if lines[cursor].startswith("C_LOOP_END"):
+                break
+            if not lines[cursor].startswith(";"):
+                body.append(lines[cursor].split()[0].rstrip(","))
+        arithmetic = [opcode for opcode in body if opcode.startswith("V_")]
+        if len(arithmetic) != 1:
+            raise ValueError(
+                "packetized sweep must contain exactly one Vector arithmetic opcode"
+            )
+        opcode = arithmetic[0]
+        counts[opcode] = counts.get(opcode, 0) + trips
+    return dict(sorted(counts.items()))
 
 
 def _up(value: int, multiple: int) -> int:
     return math.ceil(value / multiple) * multiple
 
 
-def _compiler(*, stream: bool, affine: bool = False, mlen: int = 64) -> PlenaCompiler:
+def _compiler(
+    *,
+    stream: bool,
+    affine: bool = False,
+    packetized: bool = False,
+    mlen: int = 64,
+) -> PlenaCompiler:
     return PlenaCompiler(
         mlen=mlen,
         blen=4,
@@ -84,15 +135,20 @@ def _compiler(*, stream: bool, affine: bool = False, mlen: int = 64) -> PlenaCom
         stream_addressing=stream,
         stream_affine_alpha=int(affine),
         stream_storage_atom=4,
+        stream_packetized=packetized,
     )
 
 
-def kimi_k3_mixer_assembly(*, stream: bool, affine: bool = False) -> str:
+def kimi_k3_mixer_assembly(
+    *, stream: bool, affine: bool = False, packetized: bool = False
+) -> str:
     """Official Kimi K3 recurrent mixer geometry, excluding Matrix projections."""
 
     mlen = 64
     shape = KdaShape.kimi_k3()
-    program = _compiler(stream=stream, affine=affine, mlen=mlen)
+    program = _compiler(
+        stream=stream, affine=affine, packetized=packetized, mlen=mlen
+    )
     key_blocks = kda_key_blocks(shape, mlen)
 
     def alloc(name: str, rows: int):
@@ -135,7 +191,9 @@ def kimi_k3_mixer_assembly(*, stream: bool, affine: bool = False) -> str:
     return program.get_code()[start:]
 
 
-def nemotron3_mamba_decode_assembly(*, stream: bool, affine: bool = False) -> str:
+def nemotron3_mamba_decode_assembly(
+    *, stream: bool, affine: bool = False, packetized: bool = False
+) -> str:
     """Real Nemotron 3 recurrent geometry, after projection/conv scalar setup.
 
     B/C are shared by eight heads.  The fixed 1024-entry FPRAM cannot hold all
@@ -155,7 +213,9 @@ def nemotron3_mamba_decode_assembly(*, stream: bool, affine: bool = False) -> st
         chunk_size=128,
         seq_len=1,
     )
-    program = _compiler(stream=stream, affine=affine, mlen=mlen)
+    program = _compiler(
+        stream=stream, affine=affine, packetized=packetized, mlen=mlen
+    )
     b_fp = program.fp_var("b_group_window", size=group_shape.state_size)
     c_fp = program.fp_var("c_group_window", size=group_shape.state_size)
     da_fp = program.fp_var("da_group_window", size=group_shape.num_heads)
@@ -190,11 +250,15 @@ def nemotron3_mamba_decode_assembly(*, stream: bool, affine: bool = False) -> st
     return program.get_code()[start:]
 
 
-def generic_affine_saxpy_assembly(*, stream: bool, affine: bool = False) -> str:
+def generic_affine_saxpy_assembly(
+    *, stream: bool, affine: bool = False, packetized: bool = False
+) -> str:
     """A non-model-specific affine row sweep used as the ISA generality gate."""
 
     mlen = 64
-    program = _compiler(stream=stream, affine=affine, mlen=mlen)
+    program = _compiler(
+        stream=stream, affine=affine, packetized=packetized, mlen=mlen
+    )
     dst = program.alloc("generic_dst", 256, mlen)
     src = program.alloc("generic_src", 256, mlen)
     scalars = program.fp_var("generic_scalars", size=256)
@@ -215,9 +279,17 @@ def _pair(builder) -> dict[str, object]:
     # instruction reduction below is therefore measured with an identity
     # layout; affine banking is priced separately by the layout planner.
     stream = AssemblyMetrics.from_assembly(builder(stream=True, affine=False))
+    packet_row = AssemblyMetrics.from_assembly(
+        builder(stream=True, affine=False, packetized=True)
+    )
+    packet_affine = AssemblyMetrics.from_assembly(
+        builder(stream=True, affine=True, packetized=True)
+    )
     return {
         "baseline": asdict(baseline),
         "stream": asdict(stream),
+        "packet_row_major": asdict(packet_row),
+        "packet_affine": asdict(packet_affine),
         "dynamic_issue_reduction": (
             baseline.dynamic_issued_instructions
             / max(1, stream.dynamic_issued_instructions)

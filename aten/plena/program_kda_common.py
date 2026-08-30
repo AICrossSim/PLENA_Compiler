@@ -471,7 +471,15 @@ class ProgramKdaCommonMixin:
         single row therefore silently reads slot 0 -- which for the per-key
         scalars here means every row scaled by head 0's first key.
         """
-        if len(rows) == 1:
+        if getattr(self, "stream_packetized", False):
+            self.tile_multirow_mul_fp(
+                tile,
+                fp,
+                rows=rows,
+                fpram_offset=fpram_offset,
+                fp_step=1,
+            )
+        elif len(rows) == 1:
             self.tile_row_mul_fp(tile, fp, rows=rows, fpram_offset=fpram_offset)
         else:
             self.tile_row_mul_fp(tile, fp, rows=rows, fpram_base_offset=fpram_offset)
