@@ -58,10 +58,10 @@ def test_projection_affine_writeback_is_opt_in_and_brackets_matrix_writeout(tmp_
     baseline = _projection(affine=False)
     affine = _projection(affine=True)
 
-    assert "L_STREAM_CFG" not in baseline
-    assert "L_STREAM_CFG" in affine
+    assert "L_CFG" not in baseline
+    assert "L_CFG" in affine
     writeout = affine.index("M_MM_WO")
-    setup = affine.index("L_STREAM_CFG")
+    setup = affine.index("L_CFG")
     reset = affine.rindex(
         f", 3, {int(StreamConfigField.RESET)}"
     )
@@ -76,18 +76,18 @@ def test_projection_affine_writeback_is_opt_in_and_brackets_matrix_writeout(tmp_
     )
     words = assembler.generate_binary(str(asm_path), str(mem_path))
     assert words
-    assert sum(word & 0x3F == 0x3C for word in words) >= 2
+    assert sum(word & 0x3F == 0x3F for word in words) >= 2
 
 
 def test_projection_write_layout_does_not_replace_the_static_result_pointer():
     affine = _projection(affine=True)
-    # The producer stream has no AUTO_ADVANCE flag. Existing scalar address
-    # arithmetic remains authoritative; the stream changes only physical bank
+    # Matrix writeback owns slot 3 by convention. Existing scalar address
+    # arithmetic remains authoritative; the view changes only physical bank
     # placement at M_MM_WO.
     flags_cfg = [
         line
         for line in affine.splitlines()
-        if line.startswith("L_STREAM_CFG")
+        if line.startswith("L_CFG")
         and line.endswith(f", {int(StreamConfigField.FLAGS)}")
     ]
     assert len(flags_cfg) == 1
@@ -112,7 +112,7 @@ def test_wide_k_projection_applies_affine_layout_only_at_final_writeback():
     cfg_fields = [
         int(line.rsplit(",", 1)[1])
         for line in code.splitlines()
-        if line.startswith("L_STREAM_CFG")
+        if line.startswith("L_CFG")
     ]
     assert cfg_fields.count(int(StreamConfigField.RESET)) == 2
     assert cfg_fields.count(int(StreamConfigField.FLAGS)) == 1

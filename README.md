@@ -8,12 +8,19 @@ It does not add a Mamba/KDA coprocessor, private state cache, or `X_STATE`.
 The Compiler performs two independent optimizations:
 
 1. It replaces regular pointer/scalar traffic inside existing hardware loops
-   with `L_STREAM_CFG`. Existing Matrix/Vector opcodes still define the math,
-   and `C_LOOP_START/END` still define repetition.
+   with `L_CFG`. Existing Matrix/Vector opcodes still define the math, and
+   `C_LOOP_START/END` still define repetition. Each consuming Vector operation
+   explicitly encodes the configured slots it uses; configuration alone never
+   changes an unrelated instruction's address.
 2. It evaluates row-major, transpose, consumer-major, and affine-skewed
    placements at the Matrix-writeback-to-output-SRAM boundary. A layout is
    selected only after checking bijection, producer writes, consumer reads,
    bank stalls, and lane-restore cost.
+
+The ABI is conflict-free with the Shared Expert work: `0x39-0x3C` remain its
+routing opcodes, `L_CFG` is `0x3F`, and `V_FMA_VF` reuses `V_MUL_VF=0x12`
+with an operation-mode bit instead of claiming another opcode. Vector consumers
+select slots 0-2; slot 3 is the Matrix writeback view.
 
 For recurrent decay and rank-one updates, packet width is independent from the
 semantic state-row width. At the PLENA paper's `VLEN=2048` point, Nemotron

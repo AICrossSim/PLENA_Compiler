@@ -1,9 +1,9 @@
 """ISA contract for PLENA's model-independent affine stream configuration.
 
-``L_STREAM_CFG`` configures how an existing Matrix/Vector/scalar operand is
-addressed.  Existing opcodes still define all arithmetic and existing
-``C_LOOP_START/END`` still define repetition.  This avoids both an
-algorithm-specific step instruction and a second loop ISA.
+``L_CFG`` configures compiler-managed affine view slots. Existing opcodes still
+define all arithmetic and ``C_LOOP_START/END`` still define repetition. A
+consumer names every slot it uses in its encoded view mask; configuration alone
+never silently changes an unrelated instruction's addressing.
 """
 
 from __future__ import annotations
@@ -15,9 +15,11 @@ from compiler.aten.isa_builder import IsaBuilder, fp, gp
 from compiler.aten.plena.affine_layout import AffineLayout
 
 
-L_STREAM_CFG_OPCODE = 0x3C
-L_STREAM_CONTRACT_VERSION = 2
+L_CFG_OPCODE = 0x3F
+L_STREAM_CONTRACT_VERSION = 4
 L_STREAM_MAX_SLOTS = 4
+L_STREAM_CONSUMER_SLOTS = 3
+L_STREAM_PRODUCER_SLOT = 3
 
 
 class StreamConfigField(IntEnum):
@@ -41,13 +43,34 @@ class StreamConfigField(IntEnum):
 
 class StreamFlags(IntFlag):
     ENABLE = 1 << 0
-    AUTO_ADVANCE = 1 << 1
+    # Bit 1 was AUTO_ADVANCE in contract v2. In v3 advancement is explicit:
+    # the consuming instruction names the slot in its encoded view mask.
     AFFINE = 1 << 2
     TARGET_FP = 1 << 3
     WRITE = 1 << 4
     LANE_RESTORE = 1 << 5
     STRICT_BOUNDS = 1 << 6
     PACKETIZED = 1 << 7
+
+
+def stream_view_mask(*slots: int) -> int:
+    """Encode the explicitly consumed L_CFG slots for one arithmetic op."""
+
+    mask = 0
+    for slot in slots:
+        if not isinstance(slot, int) or isinstance(slot, bool):
+            raise TypeError(f"stream slot must be an int, got {slot!r}")
+        if not 0 <= slot < L_STREAM_CONSUMER_SLOTS:
+            raise ValueError(
+                "Vector consumer slot must be in "
+                f"[0, {L_STREAM_CONSUMER_SLOTS}); slot {L_STREAM_PRODUCER_SLOT} "
+                f"is reserved for Matrix writeback, got {slot}"
+            )
+        bit = 1 << slot
+        if mask & bit:
+            raise ValueError(f"stream slot {slot} is selected more than once")
+        mask |= bit
+    return mask
 
 
 @dataclass(frozen=True)
@@ -60,7 +83,6 @@ class StreamBinding:
     packet_elements: int
     storage_atom: int
     packet_stride: int | None = None
-    auto_advance: bool = True
     write: bool = False
     lane_restore: bool = True
     packetized: bool = False
@@ -90,13 +112,13 @@ class StreamBinding:
 def encode_l_stream_cfg_word(
     *, value_register: int, target_register: int, slot: int, field: StreamConfigField | int
 ) -> int:
-    """Encode the canonical register-register-immediate L_STREAM_CFG word."""
+    """Encode the canonical register-register-immediate L_CFG word."""
 
     field_value = int(field)
     try:
         StreamConfigField(field_value)
     except ValueError as error:
-        raise ValueError(f"reserved L_STREAM_CFG field {field_value}") from error
+        raise ValueError(f"reserved L_CFG field {field_value}") from error
     for name, value in (
         ("value_register", value_register),
         ("target_register", target_register),
@@ -108,7 +130,7 @@ def encode_l_stream_cfg_word(
     if slot >= L_STREAM_MAX_SLOTS:
         raise ValueError(f"slot {slot} exceeds the implemented {L_STREAM_MAX_SLOTS} slots")
     return (
-        L_STREAM_CFG_OPCODE
+        L_CFG_OPCODE
         | value_register << 6
         | target_register << 10
         | slot << 14
@@ -119,8 +141,8 @@ def encode_l_stream_cfg_word(
 def decode_l_stream_cfg_word(word: int) -> tuple[int, int, int, StreamConfigField]:
     if word < 0 or word > 0xFFFF_FFFF:
         raise ValueError("instruction word must be unsigned 32-bit")
-    if word & 0x3F != L_STREAM_CFG_OPCODE or word >> 22:
-        raise ValueError("word is not a canonical L_STREAM_CFG encoding")
+    if word & 0x3F != L_CFG_OPCODE or word >> 22:
+        raise ValueError("word is not a canonical L_CFG encoding")
     value_register = word >> 6 & 0xF
     target_register = word >> 10 & 0xF
     slot = word >> 14 & 0xF
@@ -129,7 +151,7 @@ def decode_l_stream_cfg_word(word: int) -> tuple[int, int, int, StreamConfigFiel
     try:
         field = StreamConfigField(word >> 18 & 0xF)
     except ValueError as error:
-        raise ValueError("reserved L_STREAM_CFG field") from error
+        raise ValueError("reserved L_CFG field") from error
     return value_register, target_register, slot, field
 
 
@@ -147,11 +169,11 @@ def emit_stream_configuration(
 
     def write(field: StreamConfigField, value: int) -> None:
         asm.instr("S_ADDI_INT", gp(value_gp), gp(0), value)
-        asm.instr("L_STREAM_CFG", gp(value_gp), target, binding.slot, int(field))
+        asm.instr("L_CFG", gp(value_gp), target, binding.slot, int(field))
 
     # RESET has no payload, so gp0 is canonical and costs one instruction.
     asm.instr(
-        "L_STREAM_CFG",
+        "L_CFG",
         gp(0),
         target,
         binding.slot,
@@ -192,8 +214,6 @@ def emit_stream_configuration(
             write(field, value)
 
     flags = StreamFlags.ENABLE | StreamFlags.STRICT_BOUNDS
-    if binding.auto_advance:
-        flags |= StreamFlags.AUTO_ADVANCE
     if layout.alpha or layout.beta or layout.gamma:
         flags |= StreamFlags.AFFINE
     if binding.target_is_fp:
@@ -209,13 +229,16 @@ def emit_stream_configuration(
 
 
 __all__ = [
-    "L_STREAM_CFG_OPCODE",
+    "L_CFG_OPCODE",
     "L_STREAM_CONTRACT_VERSION",
+    "L_STREAM_CONSUMER_SLOTS",
     "L_STREAM_MAX_SLOTS",
+    "L_STREAM_PRODUCER_SLOT",
     "StreamBinding",
     "StreamConfigField",
     "StreamFlags",
     "decode_l_stream_cfg_word",
     "emit_stream_configuration",
     "encode_l_stream_cfg_word",
+    "stream_view_mask",
 ]

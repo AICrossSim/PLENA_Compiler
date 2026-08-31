@@ -299,7 +299,9 @@ Similar to `V_ADD_VF`, but performs element-wise multiplication.
 
 **Operation:** `Vector[gp_reg<rd>] & gp_reg<rmask> = (Vector[gp_reg<rd>] + Vector[gp_reg<rs1>] * Broadcast(fp_reg<fp2>)) & gp_reg<rmask>`
 
-**Opcode:** `6'h3B`
+**Encoding:** assembly pseudo-op for `V_MUL_VF` (`6'h12`) with
+`funct1[3]=1`. `funct1[2:0]` remains the optional L-Compute consumer-view
+mask. The plain `V_MUL_VF` form requires `funct1[3]=0`.
 
 **Description:**
 
@@ -321,6 +323,10 @@ otherwise costs `copy + multiply + add` through a scratch row; the fused form
 removes both the copy and the scratch. Removing the scratch is the larger effect:
 without it a whole key sweep is a single arithmetic row progression, which the
 compiler turns into a hardware loop instead of unrolling.
+
+This is a function variant rather than a new opcode because it uses exactly the
+same operands and datapath family as `V_MUL_VF`; only the destination
+read-enable and accumulate control differ.
 
 ### V_MAX_VF
 
@@ -404,6 +410,8 @@ V_RECI_V gp2, gp1, 0   ; Vector[gp2] = 1.0 / Vector[gp1]
 ### V_SOFTPLUS_V
 
 **Format:** `V_SOFTPLUS_V rd, rs1, rmask`
+
+**Opcode:** `6'h3D`
 
 **Operation:** `Vector[gp_reg<rd>] = log(1 + exp(Vector[gp_reg<rs1>]))`
 
@@ -622,6 +630,8 @@ Copy a vector of length VLEN from FP_MEM to Vector SRAM.
 #### S_MAP_FP_V
 
 **Format:** `S_MAP_FP_V rd, rs1, imm`
+
+**Opcode:** `6'h3E`
 
 **Operation:** `FP_MEM[gp_reg<rd> + imm :+ VLEN] = Vector[gp_reg<rs1> :+ VLEN]`
 
@@ -849,6 +859,25 @@ S_ADDI_INT gp4, gp0, 16390         ; (64 << 8) | 6  -- DeepSeek-V2-Lite
 C_SET_TOPK_REG gp4                 ; TOPK_POLICY = 64 experts, top-6
 V_TOPK gp1, gp2, gp3, 15           ; route one token under that policy
 ```
+
+### L_CFG
+
+**Format:** `L_CFG value, target, slot, field`
+
+**Opcode:** `6'h3F`
+
+**Operation:** write `gp_reg<value>` into one field of affine view `slot` and
+bind that view to `target`.
+
+`slot=0..2` are explicitly selected by Vector instructions through
+`funct1[2:0]`. `slot=3` is reserved for Matrix projection writeback and cannot
+be selected as a Vector operand. Configuration is inert until an instruction
+selects the view; it never silently changes architectural register addressing.
+
+The 32-bit word is canonical: `value[9:6]`, `target[13:10]`, `slot[17:14]`,
+`field[21:18]`, and bits `[31:22]=0`. Fields define base, extents, affine bank
+coefficients, packet shape, and explicit advancement. See
+`doc/hybrid_lcompute.md` for the complete field contract.
 
 ### C_BREAK
 

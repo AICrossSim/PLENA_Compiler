@@ -53,7 +53,8 @@ class AssemblyMetrics:
     scalar_loads: int
     opcode_census: dict[str, int]
     packetized_opcode_census: dict[str, int]
-    contains_l_stream_cfg: bool
+    contains_l_cfg: bool
+    explicit_view_mask_census: dict[str, int]
     contains_model_specific_state_opcode: bool
 
     @classmethod
@@ -70,7 +71,8 @@ class AssemblyMetrics:
             scalar_loads=census.get("S_LD_FP", 0),
             opcode_census=dict(sorted(census.items())),
             packetized_opcode_census=_packetized_opcode_census(assembly),
-            contains_l_stream_cfg="L_STREAM_CFG" in census,
+            contains_l_cfg="L_CFG" in census,
+            explicit_view_mask_census=_explicit_view_mask_census(assembly),
             contains_model_specific_state_opcode=bool(forbidden & set(census)),
         )
 
@@ -114,6 +116,45 @@ def _packetized_opcode_census(assembly: str) -> dict[str, int]:
             )
         opcode = arithmetic[0]
         counts[opcode] = counts.get(opcode, 0) + trips
+    return dict(sorted(counts.items()))
+
+
+_LSTREAM_OPERAND_COUNTS = {
+    "V_ADD_VV": 5,
+    "V_ADD_VF": 5,
+    "V_SUB_VV": 5,
+    "V_MUL_VV": 5,
+    "V_MUL_VF": 5,
+    "V_FMA_VF": 5,
+    "V_MAX_VF": 5,
+    "V_MIN_VF": 5,
+    "V_EXP_V": 4,
+    "V_RECI_V": 4,
+    "V_RED_SUM": 4,
+    "V_RED_MAX": 4,
+    "V_SOFTPLUS_V": 4,
+}
+
+
+def _explicit_view_mask_census(assembly: str) -> dict[str, int]:
+    """Count existing Vector operations that explicitly select L_CFG slots."""
+
+    counts: dict[str, int] = {}
+    for raw_line in assembly.splitlines():
+        line = raw_line.split(";", 1)[0].strip()
+        if not line or " " not in line:
+            continue
+        opcode, raw_operands = line.split(maxsplit=1)
+        expected = _LSTREAM_OPERAND_COUNTS.get(opcode)
+        if expected is None:
+            continue
+        operands = [operand.strip() for operand in raw_operands.split(",")]
+        if len(operands) != expected:
+            continue
+        mask = int(operands[-1], 0)
+        if mask:
+            key = f"{opcode}@0x{mask:x}"
+            counts[key] = counts.get(key, 0) + 1
     return dict(sorted(counts.items()))
 
 
@@ -447,14 +488,14 @@ def build_report(
         ),
     }
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "claim_boundaries": {
             "weights": "symbolic addresses; no full checkpoint numeric execution",
             "dimensions": "official pinned model dimensions",
             "layout_cycles": "layout-buffer service only",
             "instruction_counts": "compiler issue stream; not PLENA hardware cycles",
             "storage_rows": (
-                "Mamba and KDA retain independently selected semantic rows; L_STREAM_CFG "
+                "Mamba and KDA retain independently selected semantic rows; L_CFG "
                 "may coalesce bank-word atoms from several rows into one wider packet"
             ),
         },
@@ -490,9 +531,21 @@ def build_report(
         },
         "layout_plans": layout_plans,
         "isa": {
-            "new_opcode": "L_STREAM_CFG",
+            "contract_version": 4,
+            "new_opcode": "L_CFG",
+            "l_cfg_opcode": "0x3F",
+            "fma_encoding": "V_MUL_VF with funct1[3]=1",
             "math_opcodes": "existing Matrix/Vector ISA",
             "loop_opcode": "existing C_LOOP_START/C_LOOP_END",
+            "view_selection": "explicit three-slot mask in funct1[2:0] on each consuming Vector instruction",
+            "configuration_alone_changes_addressing": False,
+            "matrix_writeback_producer_slot": 3,
+            "reserved_route_opcodes": {
+                "0x39": "C_ROUTE_BEGIN",
+                "0x3A": "C_ROUTE_LOOP_START",
+                "0x3B": "C_ROUTE_LOOP_END",
+                "0x3C": "V_ROUTE_MUL",
+            },
             "model_specific_opcode": False,
             "cache": False,
         },

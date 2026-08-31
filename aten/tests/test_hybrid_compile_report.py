@@ -19,7 +19,8 @@ def test_real_shape_report_uses_one_general_stream_isa_and_reduces_issue():
         "latent_moe": 92,
     }
     for name, pair in report["assembly"].items():
-        assert pair["stream"]["contains_l_stream_cfg"], name
+        assert pair["stream"]["contains_l_cfg"], name
+        assert pair["stream"]["explicit_view_mask_census"], name
         assert not pair["stream"]["contains_model_specific_state_opcode"], name
         assert pair["dynamic_issue_reduction"] > 1.0, name
         assert (
@@ -58,7 +59,7 @@ def test_paper_2048_report_records_the_wide_packet_without_changing_model_shapes
         kda_recurrent_row_elements=128,
     )
 
-    assert report["schema_version"] == 4
+    assert report["schema_version"] == 5
     assert report["execution_config"] == {
         "recurrent_storage_row_elements": {
             "nemotron3": 64,
@@ -72,6 +73,25 @@ def test_paper_2048_report_records_the_wide_packet_without_changing_model_shapes
     }
     assert report["workloads"]["nemotron3"]["layer_counts"]["mamba"] == 23
     assert report["workloads"]["kimi_k3"]["layer_counts"]["kda"] == 69
+    assert report["isa"] == {
+        "contract_version": 4,
+        "new_opcode": "L_CFG",
+        "l_cfg_opcode": "0x3F",
+        "fma_encoding": "V_MUL_VF with funct1[3]=1",
+        "math_opcodes": "existing Matrix/Vector ISA",
+        "loop_opcode": "existing C_LOOP_START/C_LOOP_END",
+        "view_selection": "explicit three-slot mask in funct1[2:0] on each consuming Vector instruction",
+        "configuration_alone_changes_addressing": False,
+        "matrix_writeback_producer_slot": 3,
+        "reserved_route_opcodes": {
+            "0x39": "C_ROUTE_BEGIN",
+            "0x3A": "C_ROUTE_LOOP_START",
+            "0x3B": "C_ROUTE_LOOP_END",
+            "0x3C": "V_ROUTE_MUL",
+        },
+        "model_specific_opcode": False,
+        "cache": False,
+    }
     assert report["assembly"]["nemotron_mamba_decode_recurrence"]["packet_affine"][
         "packetized_opcode_census"
     ] == {"V_FMA_VF": 256, "V_MUL_VF": 256}

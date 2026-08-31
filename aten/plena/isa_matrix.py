@@ -53,7 +53,6 @@ class IsaMatrixMixin:
             advance=0,
             packet_elements=self.mlen,
             storage_atom=self.blen,
-            auto_advance=False,
             write=True,
         )
         setup = emit_stream_configuration(
@@ -62,7 +61,7 @@ class IsaMatrixMixin:
             layout=bound_layout,
         ).render().splitlines()
         reset = (
-            f"L_STREAM_CFG gp0, gp{target_register}, {stream_slot}, "
+            f"L_CFG gp0, gp{target_register}, {stream_slot}, "
             f"{int(StreamConfigField.RESET)}"
         )
         return setup, reset

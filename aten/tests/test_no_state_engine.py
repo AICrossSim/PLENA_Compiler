@@ -6,10 +6,11 @@ something the compiler already decided, and a residency cache defers a decision
 the compiler is not allowed to defer. Neither belongs on this path, and this file
 fails if either reappears.
 
-What the recurrent kernels need instead is three ordinary arithmetic/data-move
-instructions -- `V_SOFTPLUS_V` (0x39), `S_MAP_FP_V` (0x3A) and `V_FMA_VF`
-(0x3B) -- plus one model-independent address configuration instruction,
-`L_STREAM_CFG` (0x3C). None fetches a state descriptor or names Mamba/KDA.
+What the recurrent kernels need instead is two ordinary arithmetic/data-move
+opcodes -- `V_SOFTPLUS_V` (0x3D) and `S_MAP_FP_V` (0x3E) -- plus one
+model-independent address configuration opcode, `L_CFG` (0x3F). `V_FMA_VF`
+is only a readable assembler alias for the existing `V_MUL_VF` opcode's
+funct1[3] accumulate mode. None fetches a state descriptor or names Mamba/KDA.
 
 There is nothing to delete: this branch was cut from `a4b3e7de` on main, which
 never had any of it. So this file is not a cleanup, it is the guard that keeps
@@ -120,60 +121,49 @@ def test_the_state_engine_directories_do_not_exist():
         assert not gone.exists(), f"{gone} exists; the static path does not need it"
 
 
-def test_the_descriptor_opcodes_are_still_free():
-    """0x3D and 0x3F stay undefined.
-
-    They are the slots a descriptor-driven state instruction and a
-    descriptor-driven scatter would take. The compiler's opcode table must not
-    define them and the emulator asserts 0x3F decodes to Invalid, so filling
-    either needs a written argument rather than a free slot.
-    """
+def test_extension_opcode_ownership_is_explicit_and_conflict_free():
+    """Shared Expert and static recurrent work occupy disjoint encodings."""
     root = _repo_root()
     svh = (_compiler_root(root) / "doc" / "operation.svh").read_text()
     defined = {
         int(m.group(2), 16): m.group(1)
         for m in re.finditer(r"(\w+)\s*=\s*6'h([0-9A-Fa-f]+)", svh)
     }
-    # 0x3D and 0x3F are the slots a descriptor-driven state instruction and a
-    # descriptor-driven scatter would naturally take. Held free deliberately:
-    # a free slot is not an argument for filling it.
-    for opcode in (0x3D, 0x3F):
-        assert opcode not in defined, (
-            f"0x{opcode:02X} is defined as {defined[opcode]}. This path carries no "
-            f"descriptor machinery; adding an opcode here needs an argument in "
-            f"docs/superpowers/plans/, not just a free slot"
-        )
-    for opcode, name in (
-        (0x39, "V_SOFTPLUS_V"),
-        (0x3A, "S_MAP_FP_V"),
-        (0x3B, "V_FMA_VF"),
-        (0x3C, "L_STREAM_CFG"),
-    ):
+    expected = {
+        0x39: "C_ROUTE_BEGIN",
+        0x3A: "C_ROUTE_LOOP_START",
+        0x3B: "C_ROUTE_LOOP_END",
+        0x3C: "V_ROUTE_MUL",
+        0x3D: "V_SOFTPLUS_V",
+        0x3E: "S_MAP_FP_V",
+        0x3F: "L_CFG",
+    }
+    for opcode, name in expected.items():
         assert defined.get(opcode) == name, (
-            f"{name} should hold 0x{opcode:02X}; the static path must keep its "
-            f"three ordinary operations and one general address mode stable"
+            f"{name} should hold 0x{opcode:02X}; Shared Expert and L-Compute "
+            "must not independently claim the same physical opcode"
         )
-    assert max(defined) == 0x3C, (
-        f"the highest opcode is 0x{max(defined):02X}; adding another needs an "
-        f"argument, not just a free slot"
-    )
+    assert max(defined) == 0x3F
+    assert "V_FMA_VF" not in defined.values(), "FMA must remain a V_MUL_VF mode"
 
 
 #: What `origin/main` stops at -- `C_SET_TOPK_REG`. Everything past it is this
 #: branch's, and there are four.
 MAIN_LAST_OPCODE = 0x38
 
-#: Three ordinary operations plus one model-independent address mode.
-OPCODES_ADDED_HERE = {0x39, 0x3A, 0x3B, 0x3C}
+#: Two ordinary operations plus one model-independent address mode. The routed
+#: MoE opcodes at 0x39..0x3C are owned by the Shared Expert work.
+OPCODES_ADDED_HERE = {0x3D, 0x3E, 0x3F}
 
 
-def test_exactly_four_opcodes_were_added():
+def test_static_recurrent_path_uses_exactly_three_physical_opcodes():
     """Pin the exact ISA delta and keep model-specific state machinery out.
 
-    `origin/main` stops at `C_SET_TOPK_REG` (0x38). This branch adds three
-    ordinary operations at 0x39..0x3B and one general address mode at 0x3C.
+    `origin/main` stops at `C_SET_TOPK_REG` (0x38). Shared Expert owns
+    0x39..0x3C. This work owns two ordinary operations at 0x3D..0x3E and one
+    general address mode at 0x3F; FMA is a mode of V_MUL_VF, not an opcode.
 
-    `L_STREAM_CFG` is an explicit fourth opcode. It configures a general affine
+    `L_CFG` is the only layout opcode. It configures a general affine
     operand stream; it does not fetch descriptors, hold a queue, or manage
     residency. The other tests guard that architectural boundary.
     """
@@ -182,10 +172,11 @@ def test_exactly_four_opcodes_were_added():
     codes = {
         int(m.group(1), 16) for m in re.finditer(r"\w+\s*=\s*6'h([0-9A-Fa-f]+)", svh)
     }
-    added_by_this_work = {c for c in codes if c > MAIN_LAST_OPCODE}
+    route_reserved = {0x39, 0x3A, 0x3B, 0x3C}
+    added_by_this_work = {c for c in codes if c > MAIN_LAST_OPCODE} - route_reserved
     assert added_by_this_work == OPCODES_ADDED_HERE, (
         f"opcodes past {hex(MAIN_LAST_OPCODE)}: "
         f"{sorted(hex(c) for c in added_by_this_work)}; this work adds exactly "
-        f"four -- V_SOFTPLUS_V 0x39, S_MAP_FP_V 0x3A, V_FMA_VF 0x3B, "
-        f"L_STREAM_CFG 0x3C"
+        "three -- V_SOFTPLUS_V 0x3D, S_MAP_FP_V 0x3E, and L_CFG 0x3F; "
+        "V_FMA_VF must not spend an opcode"
     )

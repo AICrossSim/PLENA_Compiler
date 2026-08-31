@@ -25,7 +25,6 @@ from compiler.aten.models.kda.shape import KdaShape  # noqa: E402
 from compiler.aten.plena import PlenaCompiler  # noqa: E402
 from compiler.aten.plena.program_kda_common import (  # noqa: E402
     kda_blocks,
-    kda_stage_marker,
     kda_state_row,
     kda_state_rows,
     kda_vector_row,
@@ -434,17 +433,16 @@ def test_the_two_halves_emit_the_same_program_as_the_whole_step():
 def test_emits_exactly_one_opcode_beyond_the_phase0_set():
     """This asserted `V_FMA_VF not in code` through Phase 0, when the point was
     that KDA needs no new opcode. That claim was demonstrated and now it is
-    spent: Task 8 converts the sweeps onto the one instruction Phase 1 adds.
+    spent: Task 8 converts the sweeps onto one additional assembly operation.
 
     What still has to hold is that it is exactly *one*. The interpreter raises
     on anything it does not model, so a lowering that reaches for a second new
     opcode fails here rather than being silently half-checked.
 
-    "One" is a statement about **this kernel**, not about the branch. The
-    branch adds three opcodes -- `V_SOFTPLUS_V` 0x39, `S_MAP_FP_V` 0x3A and
-    `V_FMA_VF` 0x3B -- and `test_no_state_engine.py` pins that count. The
-    decode step reaches for only the third of them; the other two belong to
-    Mamba's `dt` and to the FPRAM window fill.
+    "One" is a statement about the assembly vocabulary, not the physical opcode
+    table. `V_FMA_VF` is encoded as V_MUL_VF with funct1[3]=1, so this kernel
+    gains accumulate semantics without claiming another opcode. The two real
+    arithmetic/data-move extensions belong to Mamba's `dt` and FPRAM window fill.
     """
     shape, ref = _case(1, num_heads=2, key_dim=4)
     code = _Harness(shape).emit()
@@ -489,10 +487,16 @@ def test_the_sweeps_are_hardware_loops_not_unrolled():
 
 def test_records_the_phase0_instruction_count():
     """Baseline for Task 8. Not a budget -- the number this prints, against the
-    one Task 8 prints, is the measured case for spending opcode 0x3B."""
+    one Task 8 prints, is the measured case for adding the FMA mode."""
     shape, ref = _case(3, num_heads=1, key_dim=8)
     code = _Harness(shape).emit()
-    static = len([l for l in code.splitlines() if l.strip() and not l.strip().startswith(";")])
+    static = len(
+        [
+            line
+            for line in code.splitlines()
+            if line.strip() and not line.strip().startswith(";")
+        ]
+    )
     _, _, machine = _run(shape, ref)
     print(
         f"PHASE0_KDA_DECODE heads={shape.num_heads} key_dim={shape.key_dim} "

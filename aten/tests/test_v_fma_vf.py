@@ -1,10 +1,4 @@
-"""V_FMA_VF encodes into the same R-type slots as V_MUL_VF.
-
-The one opcode this work adds. It differs from V_MUL_VF in exactly one bit
-field -- the opcode -- because it must reach the same operand decode path in
-the RTL; the difference is entirely in execution, where `rd` is read as well
-as written.
-"""
+"""V_FMA_VF is the multiply-accumulate mode of the existing V_MUL_VF opcode."""
 
 import os
 import sys
@@ -37,18 +31,24 @@ def _assemble(text: str) -> list[int]:
 
 def test_v_fma_vf_opcode_and_operand_slots():
     (word,) = _assemble("V_FMA_VF gp3, gp4, f2, 0\n")
-    assert word & 0x3F == 0x3B
+    assert word & 0x3F == 0x12
     assert (word >> 6) & 0xF == 3    # rd
     assert (word >> 10) & 0xF == 4   # rs1
     assert (word >> 14) & 0xF == 2   # fp2
     assert (word >> 18) & 0xF == 0   # rmask
+    assert (word >> 22) & 0xF == 0x8  # FMA variant, no affine consumer slots
 
 
 def test_v_fma_vf_matches_v_mul_vf_layout():
     (fma,) = _assemble("V_FMA_VF gp5, gp6, f1, 0\n")
     (mul,) = _assemble("V_MUL_VF gp5, gp6, f1, 0\n")
-    assert fma >> 6 == mul >> 6, "only the opcode field may differ"
-    assert (fma ^ mul) & 0x3F == (0x3B ^ 0x12)
+    assert fma & 0x3F == mul & 0x3F == 0x12
+    assert fma ^ mul == 1 << 25, "only funct1[3] may select accumulate"
+
+
+def test_direct_v_mul_vf_cannot_smuggle_in_the_fma_mode():
+    with pytest.raises(ValueError, match=r"reserved funct1\[3\]"):
+        _assemble("V_MUL_VF gp5, gp6, f1, 0, 8\n")
 
 
 def test_v_fma_vf_carries_a_nonzero_mask():

@@ -184,16 +184,26 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_TOPK                 = 6'h37,
     C_SET_TOPK_REG         = 6'h38,
 
-    // Mamba / selective-SSM extensions
-    V_SOFTPLUS_V           = 6'h39,
-    S_MAP_FP_V             = 6'h3A,
-    // Vector[rd] += Vector[rs1] * fp_reg<rs2>. The only V-type op that reads
-    // rd as well as writing it.
-    V_FMA_VF               = 6'h3B,
+    // Routed-MoE extensions. These encodings are owned by the Shared Expert
+    // work and are reserved here so independently developed extensions cannot
+    // reuse them.
+    C_ROUTE_BEGIN          = 6'h39,
+    C_ROUTE_LOOP_START     = 6'h3A,
+    C_ROUTE_LOOP_END       = 6'h3B,
+    V_ROUTE_MUL            = 6'h3C,
 
-    // Generic affine stream configuration. Arithmetic remains in the existing
-    // Matrix/Vector opcodes and repetition remains in C_LOOP_START/END.
-    L_STREAM_CFG           = 6'h3C
+    // General arithmetic/data-movement extensions used by static recurrent
+    // lowering. V_FMA_VF is deliberately not assigned an opcode: it is the
+    // V_MUL_VF encoding with funct1[3]=1, while funct1[2:0] remains the affine
+    // consumer-view mask.
+    V_SOFTPLUS_V           = 6'h3D,
+    S_MAP_FP_V             = 6'h3E,
+
+    // Configure one compiler-managed affine view slot. Existing Vector
+    // instructions name consumer slots 0..2 in funct1[2:0]; slot 3 is reserved
+    // for Matrix projection writeback. No register is implicitly rebound merely
+    // because L_CFG executed.
+    L_CFG                  = 6'h3F
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {

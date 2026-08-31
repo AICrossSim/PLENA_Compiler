@@ -17,19 +17,37 @@ must earn its cost in Simulator DSE before any RTL work.
 
 ## ISA
 
-`L_STREAM_CFG value, target, slot, field` configures one of four affine operand
-streams. It contains no model name, head count, recurrence equation, or fused
+`L_CFG value, target, slot, field` configures one of four affine operand
+views. It contains no model name, head count, recurrence equation, or fused
 Mamba/KDA operation. Existing vector instructions execute the arithmetic and
 existing hardware-loop instructions execute repetition.
 
-A configured stream can supply a GP address or an FP-memory address, advance it
-after each consuming Matrix/Vector operation, and carry affine placement
-metadata. In packet mode, one existing Vector operation consumes several
-logical rows whose atoms are restored into one VLEN-wide operand. Unsupported,
-short, reverse, reduction, or unprofitable walks keep the original static
-lowering.
+A configured stream is inert until a consuming Vector instruction explicitly
+selects it with the three-bit consumer mask in `funct1[2:0]`. Selected slots
+0..2 can supply GP or FP-memory operands and advance exactly
+once after the operation completes; unselected slots and architectural GP
+registers do not change. Slot 3 is reserved for Matrix projection writeback.
+A zero mask is byte-for-byte the legacy encoding.
 
-This is the review justification for one opcode: the static baseline can
+```text
+L_CFG      value, target, slot, field
+V_MUL_VF   dst, src, scalar, rmask, lmask
+V_FMA_VF   dst, src, scalar, rmask, lmask
+```
+
+`V_FMA_VF` is not a physical opcode. The assembler emits `V_MUL_VF=0x12`
+with `funct1[3]=1`; plain multiply uses `funct1[3]=0`. This keeps the ISA
+delta to one model-independent layout opcode while preserving readable code.
+
+In packet mode, one existing Vector operation consumes several logical rows
+whose atoms are restored into one VLEN-wide operand. `V_SUB_VF` retains its
+pre-existing operand-order meaning in `funct1`, and unsupported, short,
+reverse, or unprofitable walks keep the original static lowering. Matrix final
+writeback has no spare mode bits in its current encoding, so the prototype
+uses a WRITE-qualified slot 3 as its compiler-owned producer convention; this
+is documented separately from the explicit Vector-consumer contract.
+
+This is the review justification for one layout opcode: the static baseline can
 already compute the formulas, but regular loops spend issue slots on pointer
 updates and scalar loads that are fully known at compile time. The same stream
 semantics is tested on Nemotron Mamba, Kimi KDA, and a model-independent SAXPY
@@ -37,9 +55,12 @@ sweep.
 
 Configuration is fail-closed. Reserved fields, unsupported flags, out-of-range
 slots/registers, zero extents, aliased bank rows, duplicate live targets,
-address overflow, and a packet outside its declared extent are rejected. A
-failed update is atomic: it cannot leave a partially changed live slot. The
-Compiler emits `ENABLE` last and emits `RESET` before a slot is reused.
+address overflow, an unconfigured selected slot, use of producer slot 3 as a
+Vector operand, a selected slot targeting a
+non-operand, and a packet outside its declared extent are rejected. Contract-v2
+`AUTO_ADVANCE` is reserved and rejected. A failed update is atomic: it cannot
+leave a partially changed live slot. The Compiler emits `ENABLE` last and emits
+`RESET` before a slot is reused.
 
 ## Layout planning
 
@@ -68,8 +89,10 @@ win.
 ## Current verified status
 
 - Official Nemotron and Kimi layer censuses and dimensions are checked.
-- `L_STREAM_CFG` has a canonical 32-bit encoding, golden-word test, bounds
+- `L_CFG` has a canonical 32-bit encoding, golden-word test, bounds
   checks, and assembler support.
+- Existing Vector machine words remain byte-stable at `lmask=0`; report
+  artifacts record the exact nonzero masks consumed by each packet operation.
 - Baseline output is byte-stable when stream addressing is disabled.
 - Stream lowering removes address/scalar issue from regular FMA, unary, binary,
   reduction, and map loops; short and reverse walks fall back.
@@ -80,6 +103,8 @@ win.
   mappings fail.
 - The Compiler report separately identifies ordinary stream operations and the
   exact `V_MUL_VF`/`V_FMA_VF` operations issued by recurrent packets.
+- A Compiler-to-Rust Matrix projection test executes affine final writeback and
+  explicit Vector lane restoration with zero BF16 error against PyTorch.
 
 At the official decode shapes and the PLENA paper's 2048-element packet point,
 dynamic issue counts are:

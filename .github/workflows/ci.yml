@@ -169,6 +169,7 @@ jobs:
             aten/tests/test_l_stream_cfg.py \
             aten/tests/test_layout_planner.py \
             aten/tests/test_lstream_lowering.py \
+            aten/tests/test_lstream_packet_lowering.py \
             aten/tests/test_projection_affine_writeback.py
       # Real published weights. Skips when the checkpoint is not cached, so it
       # never requires network -- fetch once with

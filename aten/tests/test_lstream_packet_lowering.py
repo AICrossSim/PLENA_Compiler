@@ -23,7 +23,7 @@ def _packet_flag_lines(assembly: str) -> list[str]:
     return [
         line
         for line in assembly.splitlines()
-        if line.startswith("L_STREAM_CFG") and line.endswith(marker)
+        if line.startswith("L_CFG") and line.endswith(marker)
     ]
 
 
@@ -44,7 +44,7 @@ def _small_config_immediate(
     indices = [
         index
         for index, line in enumerate(setup)
-        if line.startswith("L_STREAM_CFG") and line.endswith(f", {int(field)}")
+        if line.startswith("L_CFG") and line.endswith(f", {int(field)}")
     ]
     if not indices:
         assert default is not None
@@ -83,7 +83,7 @@ def test_packet_mode_is_a_stream_flag_not_a_model_specific_opcode() -> None:
         assembly = builder(stream=True, affine=False, packetized=True)
         assert "MAMBA_STEP" not in assembly
         assert "KDA_STEP" not in assembly
-        assert "L_STREAM_CFG" in assembly
+        assert "L_CFG" in assembly
 
 
 def test_affine_rotation_is_bound_only_to_the_physically_skewed_state() -> None:
@@ -95,7 +95,7 @@ def test_affine_rotation_is_bound_only_to_the_physically_skewed_state() -> None:
         alpha_writes = [
             line
             for line in setup
-            if line.startswith("L_STREAM_CFG")
+            if line.startswith("L_CFG")
             and line.endswith(f", {int(StreamConfigField.ALPHA)}")
         ]
         # The moving state is skewed. The pinned source and segmented FPRAM
@@ -175,7 +175,7 @@ def test_real_shape_packet_recurrence_assembles_to_machine_words(
     ).generate_binary(str(asm_path), str(mem_path))
 
     assert words
-    assert sum((word & 0x3F) == 0x3C for word in words) > 0
+    assert sum((word & 0x3F) == 0x3F for word in words) > 0
     assert mem_path.stat().st_size > 0
 
 
@@ -207,5 +207,5 @@ def test_paper_width_packet_recurrence_assembles_to_machine_words(
     ).generate_binary(str(asm_path), str(mem_path))
 
     assert words
-    assert sum((word & 0x3F) == 0x3C for word in words) > 0
+    assert sum((word & 0x3F) == 0x3F for word in words) > 0
     assert mem_path.stat().st_size > 0
