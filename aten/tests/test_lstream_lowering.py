@@ -3,6 +3,14 @@ from pathlib import Path
 from compiler.assembler.assembly_to_binary import AssemblyToBinary
 from compiler.aten.plena.compiler import PlenaCompiler
 from compiler.aten.plena.instruction_stream import dynamic_count
+from compiler.aten.plena.affine_layout import AffineLayout, LayoutKind
+from compiler.aten.plena.lstream import (
+    L_STREAM_CONTRACT_VERSION,
+    StreamBinding,
+    StreamConfigField,
+    StreamFlags,
+    emit_stream_configuration,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,3 +88,53 @@ def test_short_and_reverse_walks_fall_back_to_the_plain_static_path():
     assert "L_CFG" not in reverse
     assert any(line.startswith("S_ADDI_INT") for line in _loop_body(short))
     assert any(line.startswith("S_ADDI_INT") for line in _loop_body(reverse))
+
+
+def test_major_packed_is_an_explicit_layout_flag_not_a_packet_side_effect():
+    assert L_STREAM_CONTRACT_VERSION == 5
+    binding = StreamBinding(
+        slot=0,
+        target_register=1,
+        target_is_fp=False,
+        base=0,
+        advance=64,
+        packet_elements=2048,
+        storage_atom=64,
+        packet_stride=64,
+        write=True,
+        packetized=True,
+    )
+    regular = AffineLayout(LayoutKind.AFFINE_SKEW, 1, 1, 32, 64, alpha=1)
+    packed = AffineLayout(
+        LayoutKind.AFFINE_SKEW,
+        1,
+        1,
+        32,
+        64,
+        alpha=1,
+        major_packed=True,
+    )
+
+    regular_asm = emit_stream_configuration(
+        value_gp=15, binding=binding, layout=regular
+    ).render()
+    packed_asm = emit_stream_configuration(
+        value_gp=15, binding=binding, layout=packed
+    ).render()
+
+    def configured_flags(assembly: str) -> int:
+        lines = [line for line in assembly.splitlines() if line]
+        flags_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("L_CFG")
+            and line.endswith(f", {int(StreamConfigField.FLAGS)}")
+        )
+        return int(lines[flags_index - 1].rsplit(",", 1)[1])
+
+    regular_flags = StreamFlags(configured_flags(regular_asm))
+    packed_flags = StreamFlags(configured_flags(packed_asm))
+    assert regular_flags & StreamFlags.PACKETIZED
+    assert not regular_flags & StreamFlags.MAJOR_PACKED
+    assert packed_flags & StreamFlags.PACKETIZED
+    assert packed_flags & StreamFlags.MAJOR_PACKED

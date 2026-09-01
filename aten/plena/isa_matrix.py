@@ -460,6 +460,9 @@ class IsaMatrixMixin:
         output_layout: AffineLayout | None = None,
         output_layout_base: int | None = None,
         output_stream_slot: int = 3,
+        matrix_view_base: int | None = None,
+        matrix_view_logical_offset: int | None = None,
+        matrix_view_slot: int = 0,
     ) -> str:
         """Emit M_MM for one 4x4 microtile, optionally flushing with M_MM_WO.
 
@@ -524,20 +527,39 @@ class IsaMatrixMixin:
             lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
 
         if write_out:
-            setup, reset = self._projection_output_stream(
-                output_layout=output_layout,
-                output_layout_base=output_layout_base,
-                result_vram_addr=result_vram_addr,
-                target_register=gp_result,
-                value_register=gp_mat,
-                stream_slot=output_stream_slot,
-            )
-            if setup:
-                lines.extend(setup)
-            lines.extend(load_large_int(gp_result, result_addr))
-            lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
-            if reset:
-                lines.append(reset)
+            if matrix_view_base is not None:
+                if output_layout is not None:
+                    raise ValueError(
+                        "Matrix-view writeback and Vector affine writeback are mutually exclusive"
+                    )
+                if matrix_view_logical_offset is None:
+                    raise ValueError(
+                        "Matrix-view writeback requires a logical element offset"
+                    )
+                lines.extend(load_large_int(gp_result, matrix_view_base))
+                lines.append(
+                    f"M_MM_WO gp{gp_result}, gp0, "
+                    f"{matrix_view_logical_offset}, {matrix_view_slot}"
+                )
+            else:
+                if matrix_view_logical_offset is not None:
+                    raise ValueError(
+                        "Matrix-view logical offset was provided without a Matrix base"
+                    )
+                setup, reset = self._projection_output_stream(
+                    output_layout=output_layout,
+                    output_layout_base=output_layout_base,
+                    result_vram_addr=result_vram_addr,
+                    target_register=gp_result,
+                    value_register=gp_mat,
+                    stream_slot=output_stream_slot,
+                )
+                if setup:
+                    lines.extend(setup)
+                lines.extend(load_large_int(gp_result, result_addr))
+                lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
+                if reset:
+                    lines.append(reset)
 
         return "\n".join(lines) + "\n"
 
@@ -558,6 +580,9 @@ class IsaMatrixMixin:
         write_out: bool,
         output_layout: AffineLayout | None = None,
         gp_regs: list[int] | None = None,
+        matrix_view_base: int | None = None,
+        matrix_view_logical_offset: int | None = None,
+        matrix_view_slot: int = 0,
     ) -> str:
         result_vram_addr, target_base_addr, _target_rows = self._target_tile_addr(
             target_matrix, target_row_idx, target_col_idx
@@ -579,6 +604,9 @@ class IsaMatrixMixin:
                 gp_regs=gp_regs,
                 output_layout=output_layout,
                 output_layout_base=target_base_addr,
+                matrix_view_base=matrix_view_base,
+                matrix_view_logical_offset=matrix_view_logical_offset,
+                matrix_view_slot=matrix_view_slot,
             )
         finally:
             if owns_gp_regs:

@@ -136,7 +136,7 @@ def test_extension_opcode_ownership_is_explicit_and_conflict_free():
         0x3C: "V_ROUTE_MUL",
         0x3D: "V_SOFTPLUS_V",
         0x3E: "S_MAP_FP_V",
-        0x3F: "L_CFG",
+        0x3F: "L_MVIEW",
     }
     for opcode, name in expected.items():
         assert defined.get(opcode) == name, (

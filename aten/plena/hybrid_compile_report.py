@@ -37,6 +37,7 @@ from compiler.aten.plena.instruction_stream import (
     static_count,
 )
 from compiler.aten.plena.layout_planner import AffineLayoutPlanner
+from compiler.aten.plena.lstream import L_STREAM_CONTRACT_VERSION
 from compiler.aten.plena.program_kda_common import kda_state_rows, kda_vector_rows
 from compiler.aten.plena.program_kda_gates import kda_head_blocks, kda_key_blocks
 from compiler.aten.plena.program_kda_mixer import KdaMixerBuffers
@@ -531,7 +532,7 @@ def build_report(
         },
         "layout_plans": layout_plans,
         "isa": {
-            "contract_version": 4,
+            "contract_version": L_STREAM_CONTRACT_VERSION,
             "new_opcode": "L_CFG",
             "l_cfg_opcode": "0x3F",
             "fma_encoding": "V_MUL_VF with funct1[3]=1",
@@ -540,6 +541,10 @@ def build_report(
             "view_selection": "explicit three-slot mask in funct1[2:0] on each consuming Vector instruction",
             "configuration_alone_changes_addressing": False,
             "matrix_writeback_producer_slot": 3,
+            "major_packed_layout_flag": (
+                "explicit physical-layout property shared by Matrix writeback, "
+                "packet consumers and ordinary affine consumers"
+            ),
             "reserved_route_opcodes": {
                 "0x39": "C_ROUTE_BEGIN",
                 "0x3A": "C_ROUTE_LOOP_START",

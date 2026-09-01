@@ -4,6 +4,12 @@ from compiler.assembler.assembly_to_binary import AssemblyToBinary
 from compiler.aten.plena import PlenaCompiler
 from compiler.aten.plena.affine_layout import AffineLayout, LayoutKind
 from compiler.aten.plena.lstream import StreamConfigField
+from compiler.aten.plena.mview import (
+    MatrixViewDescriptor,
+    MatrixViewMap,
+    MatrixViewShape,
+    validate_matrix_view_dominance,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -116,3 +122,212 @@ def test_wide_k_projection_applies_affine_layout_only_at_final_writeback():
     ]
     assert cfg_fields.count(int(StreamConfigField.RESET)) == 2
     assert cfg_fields.count(int(StreamConfigField.FLAGS)) == 1
+
+
+def test_identity_relayout_records_the_same_major_packed_layout_for_consumers():
+    program = PlenaCompiler(mlen=64, blen=4, mram_tile_capacity=64)
+    source_hbm = program.input("source", shape=(16, 64), physical_shape=(16, 64))
+    source = program.load_batch(source_hbm, name="source_vram")
+    identity = program.input("identity", shape=(64, 64), physical_shape=(64, 64))
+    output = program.alloc(
+        "packed_output",
+        16,
+        64,
+        strict=False,
+        physical_shape=(16, 64),
+    )
+    layout = AffineLayout(
+        LayoutKind.AFFINE_SKEW,
+        1,
+        1,
+        16,
+        64,
+        alpha=1,
+        major_packed=True,
+    )
+
+    program.vram_identity_relayout_to(
+        source=source,
+        identity=identity,
+        out=output,
+        output_layout=layout,
+    )
+
+    assert output.physical_layout == layout
+    flags_lines = [
+        line
+        for line in program.get_code().splitlines()
+        if line.startswith("L_CFG")
+        and line.endswith(f", {int(StreamConfigField.FLAGS)}")
+    ]
+    assert len(flags_lines) == 1
+
+
+def test_projection_accumulator_directly_writes_a_configured_matrix_view(tmp_path):
+    program = PlenaCompiler(mlen=64, blen=4, mram_tile_capacity=64)
+    x_hbm = program.input(
+        "view_x",
+        shape=(1, 64),
+        physical_shape=(4, 64),
+        real_data_ratio=1.0,
+    )
+    x = program.load_batch(x_hbm, name="view_x_vram")
+    weight = program.input(
+        "view_weight",
+        shape=(64, 64),
+        physical_shape=(64, 64),
+        real_data_ratio=1.0,
+    )
+    output = program.alloc(
+        "view_output",
+        1,
+        64,
+        strict=False,
+        physical_shape=(4, 64),
+    )
+    descriptor = MatrixViewDescriptor(
+        shape=MatrixViewShape(rows=1, cols=8, tile_count=8),
+        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+    )
+
+    program.vram_sub_projection_stream_k_accum_to(
+        x,
+        0,
+        weight,
+        0,
+        output,
+        0,
+        0,
+        max_k_tiles=1,
+        matrix_view_descriptor=descriptor,
+        matrix_view_slot=2,
+    )
+    assembly = program.get_code()
+
+    validate_matrix_view_dominance(assembly)
+    assert assembly.count("L_MVIEW_FULL") == 1
+    assert assembly.count("M_MM_WO") == 1
+    assert "C_LOOP_START" in assembly
+    assert "S_ADDI_INT gp" in assembly
+    assert ", 4" in assembly
+    # All sixteen output micro-columns reuse the one resident weight tile.
+    assert assembly.count("H_PREFETCH_M") == 1
+    assert "L_MVIEW_LOAD" not in assembly
+    assert "L_MVIEW_WO" not in assembly
+
+    asm_path = tmp_path / "matrix_view_projection.asm"
+    mem_path = tmp_path / "matrix_view_projection.mem"
+    asm_path.write_text(assembly)
+    assembler = AssemblyToBinary(
+        str(ROOT / "doc/operation.svh"),
+        str(ROOT / "doc/configuration.svh"),
+    )
+    words = assembler.generate_binary(str(asm_path), str(mem_path))
+    assert sum(word & 0x3F == 0x3F for word in words) == 1
+    viewed_writebacks = [word for word in words if word & 0x3F == 0x06]
+    assert len(viewed_writebacks) == 1
+    assert all((word >> 31) & 1 for word in viewed_writebacks)
+
+
+def test_wide_projection_reserves_existing_matrix_scratch_and_streams_weights():
+    program = PlenaCompiler(mlen=64, blen=4, mram_tile_capacity=2)
+    x_hbm = program.input(
+        "wide_view_x",
+        shape=(1, 128),
+        physical_shape=(4, 128),
+        real_data_ratio=1.0,
+    )
+    x = program.load_batch(x_hbm, name="wide_view_x_vram")
+    weight = program.input(
+        "wide_view_weight",
+        shape=(128, 64),
+        physical_shape=(128, 64),
+        real_data_ratio=1.0,
+    )
+    descriptor = MatrixViewDescriptor(
+        shape=MatrixViewShape(rows=1, cols=8, tile_count=8),
+        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+    )
+
+    program.linear_projection_bf16(
+        x,
+        weight,
+        name="wide_view_output",
+        matrix_view_descriptor=descriptor,
+        matrix_view_slot=1,
+    )
+    assembly = program.get_code()
+
+    validate_matrix_view_dominance(assembly)
+    assert assembly.count("L_MVIEW_FULL") == 1
+    assert assembly.count("M_MM_WO") == 16
+    assert "L_MVIEW_LOAD" not in assembly
+    # One Matrix tile is statically reserved for the view. The remaining tile
+    # streams the two K chunks without aliasing that scratch address.
+    assert assembly.count("H_PREFETCH_M") == 32
+
+
+def test_direct_view_projection_reuses_a_fitting_wide_k_weight_set():
+    program = PlenaCompiler(mlen=64, blen=4, mram_tile_capacity=64)
+    x_hbm = program.input(
+        "fit_view_x",
+        shape=(1, 128),
+        physical_shape=(4, 128),
+        real_data_ratio=1.0,
+    )
+    x = program.load_batch(x_hbm, name="fit_view_x_vram")
+    weight = program.input(
+        "fit_view_weight",
+        shape=(128, 64),
+        physical_shape=(128, 64),
+        real_data_ratio=1.0,
+    )
+    descriptor = MatrixViewDescriptor(
+        shape=MatrixViewShape(rows=1, cols=8, tile_count=8),
+        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+    )
+
+    program.linear_projection_bf16(
+        x,
+        weight,
+        name="fit_view_output",
+        matrix_view_descriptor=descriptor,
+    )
+    assembly = program.get_code()
+
+    assert assembly.count("M_MM_WO") == 1
+    assert "C_LOOP_START" in assembly
+    assert assembly.count("H_PREFETCH_M") == 2
+
+
+def test_direct_view_projection_rejects_a_partial_consumer_packet():
+    program = PlenaCompiler(mlen=64, blen=4, mram_tile_capacity=64)
+    x_hbm = program.input(
+        "bad_view_x",
+        shape=(1, 64),
+        physical_shape=(4, 64),
+        real_data_ratio=1.0,
+    )
+    x = program.load_batch(x_hbm, name="bad_view_x_vram")
+    weight = program.input(
+        "bad_view_weight",
+        shape=(64, 64),
+        physical_shape=(64, 64),
+        real_data_ratio=1.0,
+    )
+    incomplete = MatrixViewDescriptor(
+        shape=MatrixViewShape(rows=1, cols=8, tile_count=4),
+        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+    )
+
+    try:
+        program.linear_projection_bf16(
+            x,
+            weight,
+            name="bad_view_output",
+            matrix_view_descriptor=incomplete,
+        )
+    except ValueError as error:
+        assert "complete MLEN-wide consumer packet" in str(error)
+    else:
+        raise AssertionError("partial Matrix consumer packet was accepted")

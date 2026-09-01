@@ -1,66 +1,74 @@
 # PLENA Compiler
 
-## Hybrid Mamba/KDA support
+## Matrix SRAM L-Compute
 
-This branch adds a static, model-independent path for Nemotron 3 and Kimi K3.
-It does not add a Mamba/KDA coprocessor, private state cache, or `X_STATE`.
+This branch has two independent optimizations for Nemotron 3 and Kimi K3:
 
-The Compiler performs two independent optimizations:
+1. Arlo's static lowering reduces pointer, scalar and loop instructions.
+2. Matrix L-Compute assigns a Compiler-selected affine skew to each Matrix
+   tensor view. Matrix writeback places values diagonally across physical banks;
+   row, column, cross-head and cross-field consumers read the same cells and
+   restore logical lane order.
 
-1. It replaces regular pointer/scalar traffic inside existing hardware loops
-   with `L_CFG`. Existing Matrix/Vector opcodes still define the math, and
-   `C_LOOP_START/END` still define repetition. Each consuming Vector operation
-   explicitly encodes the configured slots it uses; configuration alone never
-   changes an unrelated instruction's address.
-2. It evaluates row-major, transpose, consumer-major, and affine-skewed
-   placements at the Matrix-writeback-to-output-SRAM boundary. A layout is
-   selected only after checking bijection, producer writes, consumer reads,
-   bank stalls, and lane-restore cost.
+The second item is the architecture contribution. It is not the older
+Vector-SRAM `L_CFG` experiment and it does not add a state cache, private SRAM,
+`X_STATE`, MAC array, queue or runtime scheduler.
 
-The ABI is conflict-free with the Shared Expert work: `0x39-0x3C` remain its
-routing opcodes, `L_CFG` is `0x3F`, and `V_FMA_VF` reuses `V_MUL_VF=0x12`
-with an operation-mode bit instead of claiming another opcode. Vector consumers
-select slots 0-2; slot 3 is the Matrix writeback view.
+The implemented ISA uses one model-independent configuration opcode with two forms:
 
-For recurrent decay and rank-one updates, packet width is independent from the
-semantic state-row width. At the PLENA paper's `VLEN=2048` point, Nemotron
-retains 64-element Mamba rows and Kimi retains natural 128-element KDA rows;
-one existing Vector operation combines their 64-element bank-word atoms into
-a 2048-element segmented-scalar packet. Cross-row reductions stay on the
-ordinary fallback.
-
-Affine packets use a packet-aligned physical base. The Compiler therefore
-packs the 32 bank words of one packet into one physical SRAM row instead of
-leaving 32 mostly empty VLEN rows; unaligned compact packet bases are rejected
-rather than silently aliasing another tensor.
-
-This distinction keeps the comparison fair. Reusing the old 64-wide KDA
-lowering would split every natural KDA row in half and overstate the new path.
-With exact rows, one official-size Mamba recurrence compiles from 92,399
-baseline dynamic instructions to 19,049 affine-packet instructions; one KDA
-mixer compiles from 215,387 to 61,115. These are issue counts, not full-model
-cycles.
-
-The official manifests are pinned to 52 Nemotron layers (23 Mamba, 23 MoE,
-6 GQA) and 93 Kimi layers (69 KDA, 24 MLA). The checked report uses their real
-dimensions, but projection weights remain symbolic; this is a performance and
-code-generation result, not a real-checkpoint end-to-end numerical claim.
-
-Run the reproducible Compiler report:
-
-```bash
-PYTHONPATH=.. python -m compiler.aten.plena.hybrid_compile_report \
-  --model-lib doc/Model_Lib \
-  --packet-elements 2048 --storage-atom 64 \
-  --banks 32 --bank-width 64 --blen 32 \
-  --mamba-row-elements 64 --kda-row-elements 128 \
-  --json-out /tmp/hybrid-compiler-report.json
+```text
+L_MVIEW.FULL   slot, shape_reg, map_reg
+L_MVIEW.FIELD  slot, field, value_reg
+<Matrix op>    ..., view=slot
+<Vector op>.MV ..., operand_view_mask
 ```
 
-The report separates dynamic issue reduction from local SRAM service cycles.
-Neither number is presented as a layer or full-model speedup. See
-[`doc/hybrid_lcompute.md`](doc/hybrid_lcompute.md) for the ISA boundary,
-fallback policy, validated status, and remaining gates.
+The descriptor contains shape, physical-row pitch and `alpha`, the skew selected
+from the tensor's logical row width. It contains no model
+name, recurrence equation, head count, bank count or traversal. Existing
+`M_MM/M_TMM/M_MV` words explicitly name the view. Existing binary Vector
+operations use `.MV` as an addressing-mode suffix: mask bits select whether the
+destination, source 1 and source 2 use configured slots 0, 1 and 2. A
+single-pass dominance check rejects use before configuration.
+
+At `MLEN=2048`, one packet uses 32 Mamba heads x 64 values or 16 KDA heads x
+128 values. `D'` searches all 4096 global `(alpha,gamma)` wirings on physical
+rows taken from the emitted Compiler addresses. Against that strongest fixed
+control, per-view `alpha` gives no further local gain for Nemotron, while Kimi
+service falls from 6144 to 3072 cycles across the real decode lowering (2.0x)
+and bank-conflict stalls fall from 3072 to zero. The same numbered values are
+written, read and restored in every case; arithmetic and issue counts are held
+constant.
+
+The official manifests are pinned to 52 Nemotron layers (23 Mamba, 23 MoE,
+6 GQA) and 93 Kimi layers (69 KDA, 24 MLA). Dimensions and GPU calibration are
+real, but the full PLENA programs still use symbolic weights. A separate
+published `mamba2-130m-hf` gate validates 24 layers and carried recurrent state;
+its surrounding Matrix stages run in PyTorch and are not described as a full
+PLENA checkpoint execution.
+
+Official recurrent state remains explicit FP32 traffic: 2 MiB per Nemotron
+Mamba layer and 6 MiB per Kimi KDA layer. The BF16 Matrix SRAM cannot silently
+hold either format. Low-precision state results are reported separately with
+their accuracy error.
+
+There are no transfer-only `L_MVIEW` instructions. Matrix projection fragments
+use the existing `M_MM_WO` with a view-qualified destination and advance by one
+`BLEN` fragment until the real consumer shape is full: `32 x 64` for the
+Nemotron packet and `16 x 128` for Kimi at `MLEN=2048`. Existing Vector
+arithmetic reads those packets directly through `.MV`; no intermediate gather
+or copy is inserted. See [the ISA review](doc/matrix_lcompute_isa_review.md) for
+the encoding argument, physical data path and resource contract.
+
+KDA prefill has a separate layout boundary. The legacy Compiler emits an
+identity GEMM to convert `[value,key]` into decode's `[key,value]`. At Kimi's
+real 96-head, 69-layer shape this is 13.89 G logical MACs, while the current
+MLEN padding actually emits 56.90 T MACs. A BF16/MX8 Matrix-view candidate
+reads the same per-head cells by the column axis and explicitly streams them
+out in decode order: 0 transpose MACs and all 16,384 non-symmetric values
+checked per head. Decode's later 16-head packet is a separate compact view, not
+the same resident allocation. This result is reported on its own and is not
+credited to the official FP32 path.
 
 ## MoE code organization
 

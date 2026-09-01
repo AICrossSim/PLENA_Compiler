@@ -50,6 +50,7 @@ rather than the other way round.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Sequence
 
 from compiler.aten.models.kda.shape import KdaShape
@@ -61,7 +62,23 @@ from compiler.aten.plena.program_kda_common import (
 )
 from compiler.aten.plena.vars import FPVar, VRAMMatrixVar
 
-__all__ = ["ProgramKdaRecurrentMixin"]
+__all__ = ["KdaDecodeInvocation", "ProgramKdaRecurrentMixin"]
+
+
+@dataclass(frozen=True)
+class KdaDecodeInvocation:
+    """Ordinary storage used by one request's KDA decode recurrence."""
+
+    state: VRAMMatrixVar
+    q_fp: FPVar
+    k_fp: FPVar
+    decay_fp: FPVar
+    beta_fp: FPVar
+    v: VRAMMatrixVar
+    o: VRAMMatrixVar
+    pred: VRAMMatrixVar
+    err: VRAMMatrixVar
+    output_scale_fp: FPVar
 
 
 class ProgramKdaRecurrentMixin:
@@ -129,6 +146,48 @@ class ProgramKdaRecurrentMixin:
             head_rows=heads, fp_head_stride=stride,
         )
         return o
+
+    def kda_decode_batch_v0(
+        self,
+        *,
+        invocations: Sequence[KdaDecodeInvocation],
+        shape: KdaShape,
+    ) -> tuple[VRAMMatrixVar, ...]:
+        """Statically lower independent KDA requests in program order.
+
+        No runtime request table or state cache is introduced.  The caller
+        allocates request-private tensors and this method repeats the verified
+        single-request recurrence over them.  Cross-request packet sharing is a
+        separate optimization and is not assumed here.
+        """
+
+        items = tuple(invocations)
+        if not items:
+            raise ValueError("KDA decode batch must contain at least one request")
+        for field in ("state", "o", "pred", "err"):
+            names = [getattr(item, field).name for item in items]
+            if len(names) != len(set(names)):
+                raise ValueError(f"KDA batch {field} tensors must be request-private")
+
+        outputs = []
+        for batch_index, item in enumerate(items):
+            self.emit_comment(f"static KDA batch request={batch_index}")
+            outputs.append(
+                self.kda_decode_step_v0(
+                    state=item.state,
+                    q_fp=item.q_fp,
+                    k_fp=item.k_fp,
+                    decay_fp=item.decay_fp,
+                    beta_fp=item.beta_fp,
+                    v=item.v,
+                    o=item.o,
+                    pred=item.pred,
+                    err=item.err,
+                    shape=shape,
+                    output_scale_fp=item.output_scale_fp,
+                )
+            )
+        return tuple(outputs)
 
     def _kda_decode_setup(
         self, *, shape, tiles, state, pred, err, head_rows, fp_head_stride

@@ -1,4 +1,5 @@
 from utils.load_config import load_svh_settings
+from compiler.aten.plena.mview import validate_matrix_view_dominance
 
 from .parser import load_isa_definitions, parse_asm_file
 
@@ -23,6 +24,9 @@ _RMASK_VECTOR_OPS = frozenset(
         "V_MIN_VF",
         "V_TOPK",
         "V_SOFTPLUS_V",
+        "V_ADD_VV.MV",
+        "V_SUB_VV.MV",
+        "V_MUL_VV.MV",
     }
 )
 # These existing arithmetic mnemonics interpret funct1[2:0] as a three-slot
@@ -44,9 +48,20 @@ _LSTREAM_VIEW_OPS = frozenset(
         "V_MAX_VF",
         "V_MIN_VF",
         "V_SOFTPLUS_V",
+        "V_ADD_VV.MV",
+        "V_SUB_VV.MV",
+        "V_MUL_VV.MV",
     }
 )
-_PSEUDO_OPCODE_ALIASES = {"V_FMA_VF": "V_MUL_VF"}
+_PSEUDO_OPCODE_ALIASES = {
+    "V_FMA_VF": "V_MUL_VF",
+    "L_CFG": "L_MVIEW",
+    "L_MVIEW_FULL": "L_MVIEW",
+    "L_MVIEW_FIELD": "L_MVIEW",
+    "V_ADD_VV.MV": "V_ADD_VV",
+    "V_SUB_VV.MV": "V_SUB_VV",
+    "V_MUL_VV.MV": "V_MUL_VV",
+}
 _IMM_RS1_RD_OPS = frozenset(
     {
         "S_ADDI_INT",
@@ -162,7 +177,15 @@ class AssemblyToBinary:
         # injected only here, so spelling V_MUL_VF with a non-canonical mode bit
         # cannot silently change its arithmetic semantics.
         encoded_funct1 = funct1
-        if mnemonic == "V_FMA_VF":
+        if mnemonic.endswith(".MV"):
+            if funct1 == 0:
+                raise ValueError(f"{mnemonic}: Matrix-view operand mask cannot be zero")
+            # funct1[3] is an explicit Matrix-view addressing marker for the
+            # VV family. funct1[2:0] select dst/src1/src2 view slots. The
+            # physical arithmetic opcode is unchanged and legacy words retain
+            # funct1=0 byte-for-byte.
+            encoded_funct1 = funct1 | 0x8
+        elif mnemonic == "V_FMA_VF":
             encoded_funct1 = funct1 | 0x8
 
         # _RMASK_VECTOR_OPS MUST be tested before _IMM_RS1_RD_OPS / _RS1_RD_OPS.
@@ -173,7 +196,72 @@ class AssemblyToBinary:
         # With the old ordering a masked V_EXP_V silently executed on the whole
         # tile: no diagnostic, wrong answer. rmask == 0 encodes identically under
         # either ordering, so this is a no-op for every unmasked call site.
-        if mnemonic in _RMASK_VECTOR_OPS:
+        if mnemonic == "L_MVIEW_FULL":
+            # Text: L_MVIEW_FULL slot, gp_shape, gp_map.
+            slot = rd
+            shape_register = rs1
+            map_register = rs2
+            if slot is None or shape_register is None or map_register is None:
+                raise ValueError("L_MVIEW_FULL requires slot, shape register, and map register")
+            if not 0 <= slot < 4:
+                raise ValueError(f"L_MVIEW_FULL slot must be in [0, 4), got {slot}")
+            binary_instruction = (
+                opcode
+                + (shape_register << opw)
+                + (map_register << (opw + ow))
+                + (slot << (opw + 2 * ow))
+                + (1 << (opw + 4 * ow))
+            )
+        elif mnemonic == "L_MVIEW_FIELD":
+            # Text: L_MVIEW_FIELD slot, field, gp_value.
+            slot = rd
+            field = imm
+            value_register = rs2
+            if slot is None or field is None or value_register is None:
+                raise ValueError("L_MVIEW_FIELD requires slot, field, and value register")
+            if not 0 <= slot < 4:
+                raise ValueError(f"L_MVIEW_FIELD slot must be in [0, 4), got {slot}")
+            if not 0 <= field < 3:
+                raise ValueError(f"L_MVIEW_FIELD field must be in [0, 3), got {field}")
+            binary_instruction = (
+                opcode
+                + (value_register << opw)
+                + (field << (opw + ow))
+                + (slot << (opw + 2 * ow))
+                + (2 << (opw + 4 * ow))
+            )
+        elif mnemonic == "M_MM_WO" and rstride is not None:
+            # View-qualified existing writeback. The 18-bit immediate uses its
+            # top bit as an explicit view marker and the next two bits as the
+            # slot. Legacy three-operand words retain marker=0 byte-for-byte.
+            if rd is None or rs1 is None or imm is None:
+                raise ValueError("M_MM_WO requires base, stride register, and offset")
+            if not 0 <= rstride < 4:
+                raise ValueError(f"M_MM_WO Matrix view slot must be in [0, 4), got {rstride}")
+            if not 0 <= imm < (1 << 15):
+                raise ValueError(
+                    f"view-qualified M_MM_WO offset must fit 15 bits, got {imm}"
+                )
+            encoded_imm = (1 << 17) | (rstride << 15) | imm
+            binary_instruction = (
+                (encoded_imm << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+        elif mnemonic in _RS2_RS1_RD_OPS and mnemonic.startswith("M_") and rstride is not None:
+            # A fourth Matrix operand is an explicit view slot. funct1=0 keeps
+            # the legacy no-view word; codes 1..4 select slots 0..3.
+            if not 0 <= rstride < 4:
+                raise ValueError(f"{mnemonic}: Matrix view slot must be in [0, 4), got {rstride}")
+            binary_instruction = (
+                ((rstride + 1) << (opw + 4 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+        elif mnemonic in _RMASK_VECTOR_OPS or mnemonic.endswith(".MV"):
             # 2- and 3-operand forms leave rs1/rs2 unset; the hardware reads those
             # fields regardless, so encode them as 0 rather than crashing on None.
             binary_instruction = (
@@ -185,6 +273,11 @@ class AssemblyToBinary:
                 + opcode
             )
         elif mnemonic in _IMM_RS1_RD_OPS:
+            if mnemonic == "M_MM_WO" and not 0 <= imm < (1 << 17):
+                raise ValueError(
+                    "legacy M_MM_WO offset must fit 17 bits; bit 17 is the "
+                    f"Matrix-view marker, got {imm}"
+                )
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif mnemonic in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
@@ -249,6 +342,8 @@ class AssemblyToBinary:
         """
         Generate binary instructions from the assembled instructions.
         """
+        with open(asm_file) as source:
+            validate_matrix_view_dominance(source.read())
         instructions = parse_asm_file(asm_file)
         binary_instructions = []
         for instruction in instructions:

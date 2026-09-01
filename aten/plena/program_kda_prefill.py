@@ -78,6 +78,7 @@ is what :meth:`kda_chunk_check_range` really guarantees, and they are never read
 from __future__ import annotations
 
 from compiler.aten.models.kda.shape import KdaShape
+from compiler.aten.plena.affine_layout import AffineLayout
 from compiler.aten.plena.program_kda_chunk import kda_round_up
 from compiler.aten.plena.program_kda_common import kda_stage_marker
 from compiler.aten.plena.vars import FPVar, InputVar, VRAMMatrixVar
@@ -291,6 +292,7 @@ class ProgramKdaPrefillMixin:
         out: VRAMMatrixVar,
         shape: KdaShape,
         precision: dict,
+        output_layout: AffineLayout | None = None,
     ) -> VRAMMatrixVar:
         """Transpose the carried state from prefill's layout into decode's.
 
@@ -364,7 +366,15 @@ class ProgramKdaPrefillMixin:
         for ib in range(key_blocks):
             for jb in range(val_blocks):
                 self.vram_sub_projection_T_to(
-                    identity, ib, state_hbm, jb, out, ib, jb, **precision
+                    identity,
+                    ib,
+                    state_hbm,
+                    jb,
+                    out,
+                    ib,
+                    jb,
+                    output_layout=output_layout,
+                    **precision,
                 )
         return out
 

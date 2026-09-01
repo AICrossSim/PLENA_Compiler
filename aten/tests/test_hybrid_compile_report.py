@@ -74,7 +74,7 @@ def test_paper_2048_report_records_the_wide_packet_without_changing_model_shapes
     assert report["workloads"]["nemotron3"]["layer_counts"]["mamba"] == 23
     assert report["workloads"]["kimi_k3"]["layer_counts"]["kda"] == 69
     assert report["isa"] == {
-        "contract_version": 4,
+        "contract_version": 5,
         "new_opcode": "L_CFG",
         "l_cfg_opcode": "0x3F",
         "fma_encoding": "V_MUL_VF with funct1[3]=1",
@@ -83,6 +83,10 @@ def test_paper_2048_report_records_the_wide_packet_without_changing_model_shapes
         "view_selection": "explicit three-slot mask in funct1[2:0] on each consuming Vector instruction",
         "configuration_alone_changes_addressing": False,
         "matrix_writeback_producer_slot": 3,
+        "major_packed_layout_flag": (
+            "explicit physical-layout property shared by Matrix writeback, "
+            "packet consumers and ordinary affine consumers"
+        ),
         "reserved_route_opcodes": {
             "0x39": "C_ROUTE_BEGIN",
             "0x3A": "C_ROUTE_LOOP_START",

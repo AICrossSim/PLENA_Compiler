@@ -27,6 +27,7 @@ def test_official_kimi_k3_state_geometry() -> None:
     shape = KdaShape.kimi_k3()
     assert shape.projection_size == 12_288
     assert shape.state_elements == 1_572_864
+    assert shape.state_elements * 4 == 6 * 1024 * 1024
     assert shape.state_elements * 2 == 3 * 1024 * 1024
     assert shape.conv_state_elements * 2 == 288 * 1024
 

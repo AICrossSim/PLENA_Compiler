@@ -92,6 +92,7 @@ def dynamic_count(asm: str) -> int:
 #: loop control, and moving scalars between FPRAM and the register file.
 ARITHMETIC = frozenset({
     "V_FMA_VF", "V_MUL_VV", "V_ADD_VV", "V_SUB_VV", "V_MUL_VF", "V_ADD_VF",
+    "V_MUL_VV.MV", "V_ADD_VV.MV", "V_SUB_VV.MV",
     "V_SUB_VF", "V_MAX_VF", "V_EXP_V", "V_RECI_V", "V_SOFTPLUS_V", "V_RED_SUM",
     "V_RED_MAX", "V_MOV_VF", "V_SHIFT_V", "V_CLR_V",
     "M_MM", "M_TMM", "M_MM_WO", "M_BTMM",

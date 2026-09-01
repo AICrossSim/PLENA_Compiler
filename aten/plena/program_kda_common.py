@@ -308,12 +308,20 @@ class ProgramKdaCommonMixin:
         )
 
     def kda_load_state_v0(self, name: str, shape: KdaShape, hbm_addr: int) -> VRAMMatrixVar:
-        """Prefetch the pinned FP32 state tile into VRAM, transposed.
+        """Prefetch the pinned BF16 fallback state into VRAM, transposed.
 
         Returns a ``[num_heads * blocks * key_dim, mlen]`` tile. Use
         :func:`kda_state_row` to index it; head ``h``'s block ``c`` occupies
         ``key_dim`` consecutive rows starting at
         ``(h * blocks + c) * key_dim``.
+
+        This is deliberately not described as the official Kimi state format:
+        the profiled implementation carries recurrent state in FP32 (6 MiB per
+        KDA layer), while this executable PLENA fallback reserves and transfers
+        two bytes per element. A caller must pass
+        :meth:`kda_require_state_precision_v0` before lowering so those two
+        bytes are Plain BF16 rather than an MX payload with a different address
+        contract.
         """
         rows = kda_state_rows(shape, self.mlen)
         self.emit_comment(kda_stage_marker("kda_state_load", f"{name} [{rows},{self.mlen}]"))

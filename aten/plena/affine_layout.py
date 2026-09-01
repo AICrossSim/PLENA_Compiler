@@ -79,8 +79,11 @@ class AffineLayout:
 
     ``alpha``, ``beta`` and ``gamma`` rotate successive major rows, fields and
     groups across banks.  They change only placement, never logical value
-    order.  ``bank_row_pitch`` may reserve padding between logical major rows;
-    zero asks the contract to derive the smallest non-aliasing pitch.
+    order.  ``major_packed`` coalesces one bank word from consecutive major
+    rows into the same physical wide row; this is the generic short-row layout
+    used by multi-row packets. ``bank_row_pitch`` may reserve padding between
+    physical rows; zero asks the contract to derive the smallest non-aliasing
+    pitch.
     """
 
     kind: LayoutKind
@@ -91,6 +94,7 @@ class AffineLayout:
     alpha: int = 0
     beta: int = 0
     gamma: int = 0
+    major_packed: bool = False
     bank_row_base: int = 0
     bank_row_pitch: int = 0
 
@@ -102,6 +106,13 @@ class AffineLayout:
                 raise ValueError(f"{name} must be positive, got {value}")
         if self.bank_row_base < 0 or self.bank_row_pitch < 0:
             raise ValueError("bank row base and pitch must be non-negative")
+        if self.major_packed:
+            if self.kind == LayoutKind.TRANSPOSE:
+                raise ValueError("major-packed placement does not support TRANSPOSE")
+            if math.gcd(self.alpha % geometry.banks, geometry.banks) != 1:
+                raise ValueError(
+                    "major-packed alpha must permute every physical bank"
+                )
         if self.pitch(geometry) < self.minimum_pitch(geometry):
             raise ValueError(
                 f"bank_row_pitch {self.pitch(geometry)} is smaller than the "
@@ -109,6 +120,8 @@ class AffineLayout:
             )
 
     def minimum_pitch(self, geometry: BankGeometry) -> int:
+        if self.major_packed:
+            return 1
         inner = self.majors if self.kind == LayoutKind.TRANSPOSE else self.minors
         stripes = math.ceil(inner / geometry.bank_width)
         return math.ceil(stripes / geometry.banks)
@@ -150,8 +163,45 @@ class AffineLayout:
             + self.gamma * coord.group
         ) % geometry.banks
         bank = (stripe + phase) % geometry.banks
-        bank_row = self.bank_row_base + outer * self.pitch(geometry) + stripe // geometry.banks
+        if self.major_packed:
+            minor_steps = math.ceil(self.minors / geometry.bank_width)
+            major_blocks = math.ceil(self.majors / geometry.banks)
+            field_group = coord.group * self.fields + coord.field
+            packed_row = (
+                (field_group * major_blocks + coord.major // geometry.banks)
+                * minor_steps
+                + stripe
+            )
+            bank_row = self.bank_row_base + packed_row * self.pitch(geometry)
+        else:
+            bank_row = (
+                self.bank_row_base
+                + outer * self.pitch(geometry)
+                + stripe // geometry.banks
+            )
         return PhysicalCoord(bank=bank, bank_row=bank_row, sublane=sublane)
+
+    def major_start_row_offset(
+        self, major_start: int, geometry: BankGeometry
+    ) -> int:
+        """Physical-row offset for a tensor-relative major-aligned subview."""
+
+        if major_start < 0 or major_start >= self.majors:
+            raise ValueError(
+                f"major_start {major_start} is outside [0, {self.majors})"
+            )
+        if self.major_packed:
+            if major_start % geometry.banks:
+                raise ValueError(
+                    "major-packed subview must begin on a complete bank group"
+                )
+            minor_steps = math.ceil(self.minors / geometry.bank_width)
+            return (
+                major_start // geometry.banks
+                * minor_steps
+                * self.pitch(geometry)
+            )
+        return major_start * self.pitch(geometry)
 
     def assert_bijective(self, geometry: BankGeometry) -> None:
         occupied: dict[PhysicalCoord, LogicalCoord] = {}

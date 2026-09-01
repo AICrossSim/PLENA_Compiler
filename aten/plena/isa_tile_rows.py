@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from compiler.aten.isa_builder import IsaBuilder, fp, gp
-from compiler.aten.plena.affine_layout import AffineLayout, LayoutKind
+from compiler.aten.plena.affine_layout import AffineLayout, BankGeometry, LayoutKind
 from compiler.aten.plena.lstream import (
     StreamBinding,
     StreamConfigField,
@@ -318,6 +320,8 @@ class IsaTileRowMixin:
         dst_tile_col_idx: int = 0,
         src_tile_row_idx: int = 0,
         src_tile_col_idx: int = 0,
+        dst_layout: AffineLayout | None = None,
+        src_layout: AffineLayout | None = None,
     ) -> str:
         return self.tile_row_fma_fp_sweep_asm(
             self._tile_addr(dst_matrix, dst_tile_row_idx, dst_tile_col_idx),
@@ -325,6 +329,8 @@ class IsaTileRowMixin:
             fpram_base,
             dst_rows,
             src_rows,
+            dst_layout=dst_layout,
+            src_layout=src_layout,
         )
 
     def tile_row_fma_fp_broadcast(
@@ -356,12 +362,14 @@ class IsaTileRowMixin:
         fp_step: int,
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
+        physical_layout: AffineLayout | None = None,
     ) -> str:
         return self.tile_multirow_mul_fp_asm(
             self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
             fpram_base,
             rows,
             fp_step=fp_step,
+            physical_layout=physical_layout,
         )
 
     def tile_multirow_fma_fp_sweep(
@@ -375,6 +383,8 @@ class IsaTileRowMixin:
         dst_tile_col_idx: int = 0,
         src_tile_row_idx: int = 0,
         src_tile_col_idx: int = 0,
+        dst_layout: AffineLayout | None = None,
+        src_layout: AffineLayout | None = None,
     ) -> str:
         return self.tile_multirow_fma_fp_sweep_asm(
             self._tile_addr(dst_matrix, dst_tile_row_idx, dst_tile_col_idx),
@@ -382,6 +392,8 @@ class IsaTileRowMixin:
             fpram_base,
             dst_rows,
             src_rows,
+            dst_layout=dst_layout,
+            src_layout=src_layout,
         )
 
     def vram_fill_zero(
@@ -443,6 +455,8 @@ class IsaTileRowMixin:
         extent_major: int | None = None,
         write: bool = False,
         affine: bool = False,
+        physical_layout: AffineLayout | None = None,
+        layout_major_start: int = 0,
     ) -> None:
         if count <= 0:
             raise ValueError(f"stream trip count must be positive, got {count}")
@@ -468,36 +482,77 @@ class IsaTileRowMixin:
             span = (count - 1) * step_units + 1 if step_units else 1
             majors = span if extent_major is None else extent_major
             minors = packet_elements if extent_minor is None else extent_minor
-        use_affine = affine and not target_is_fp
+        use_affine = (affine or physical_layout is not None) and not target_is_fp
         if packetized and use_affine and base % packet_elements:
             raise ValueError(
                 "compact affine packet base must be aligned to packet_elements"
             )
-        layout = AffineLayout(
-            kind=(
-                LayoutKind.AFFINE_SKEW
-                if use_affine
-                and (
-                    self.stream_affine_alpha
-                    or self.stream_affine_beta
-                    or self.stream_affine_gamma
+        if physical_layout is not None:
+            if physical_layout.kind == LayoutKind.TRANSPOSE:
+                raise ValueError("Vector state streams do not support TRANSPOSE placement")
+            if physical_layout.groups != 1 or physical_layout.fields != 1:
+                raise ValueError("state stream subviews currently require one group and one field")
+            if physical_layout.minors != minors:
+                raise ValueError(
+                    f"physical layout minor extent {physical_layout.minors} does not "
+                    f"match stream extent {minors}"
                 )
-                else LayoutKind.ROW_MAJOR
-            ),
-            groups=1,
-            fields=1,
-            majors=majors,
-            minors=minors,
-            alpha=self.stream_affine_alpha if use_affine else 0,
-            beta=self.stream_affine_beta if use_affine else 0,
-            gamma=self.stream_affine_gamma if use_affine else 0,
-            bank_row_base=(
-                0
-                if target_is_fp
-                else base
-                // (packet_elements if packetized and use_affine else self.mlen)
-            ),
-        )
+            geometry = BankGeometry(
+                banks=self.mlen // storage_atom,
+                bank_width=storage_atom,
+                read_ports=1,
+                write_ports=1,
+            )
+            banks = geometry.banks
+            phase = physical_layout.alpha * layout_major_start % banks
+            if phase:
+                raise ValueError(
+                    "affine stream subview must begin on a bank-period boundary; "
+                    f"major {layout_major_start} has phase {phase}"
+                )
+            tensor_base_row = base // self.mlen - layout_major_start
+            physical_base_row = (
+                tensor_base_row
+                + physical_layout.bank_row_base
+                + physical_layout.major_start_row_offset(
+                    layout_major_start, geometry
+                )
+            )
+            layout = replace(
+                physical_layout,
+                groups=1,
+                fields=1,
+                majors=majors,
+                minors=minors,
+                bank_row_base=physical_base_row,
+            )
+        else:
+            layout = AffineLayout(
+                kind=(
+                    LayoutKind.AFFINE_SKEW
+                    if use_affine
+                    and (
+                        self.stream_affine_alpha
+                        or self.stream_affine_beta
+                        or self.stream_affine_gamma
+                    )
+                    else LayoutKind.ROW_MAJOR
+                ),
+                groups=1,
+                fields=1,
+                majors=majors,
+                minors=minors,
+                alpha=self.stream_affine_alpha if use_affine else 0,
+                beta=self.stream_affine_beta if use_affine else 0,
+                gamma=self.stream_affine_gamma if use_affine else 0,
+                major_packed=packetized and use_affine,
+                bank_row_base=(
+                    0
+                    if target_is_fp
+                    else base
+                    // (packet_elements if packetized and use_affine else self.mlen)
+                ),
+            )
         binding = StreamBinding(
             slot=slot,
             target_register=target_register,
@@ -542,6 +597,7 @@ class IsaTileRowMixin:
         rows: list[int],
         *,
         fp_step: int,
+        physical_layout: AffineLayout | None = None,
     ) -> str:
         """Multiply rows by a segmented scalar packet when the walk is regular.
 
@@ -586,6 +642,8 @@ class IsaTileRowMixin:
                 extent_major=count,
                 write=True,
                 affine=True,
+                physical_layout=physical_layout,
+                layout_major_start=row_start,
             )
             self._append_stream_binding(
                 asm,
@@ -628,6 +686,9 @@ class IsaTileRowMixin:
         fpram_base: int,
         dst_rows: list[int],
         src_rows: list[int],
+        *,
+        dst_layout: AffineLayout | None = None,
+        src_layout: AffineLayout | None = None,
     ) -> str:
         """Packetized ``dst += src * scalar`` for moving destinations.
 
@@ -646,7 +707,13 @@ class IsaTileRowMixin:
             or src_progression[2] not in (0, 1)
         ):
             return self.tile_row_fma_fp_sweep_asm(
-                dst_addr, src_addr, fpram_base, dst_rows, src_rows
+                dst_addr,
+                src_addr,
+                fpram_base,
+                dst_rows,
+                src_rows,
+                dst_layout=dst_layout,
+                src_layout=src_layout,
             )
 
         dst_start, count, packet_elements, packet_steps = supported
@@ -659,8 +726,17 @@ class IsaTileRowMixin:
                 f"Packetized multi-row FMA: VRAM[{dst_addr}] += VRAM[{src_addr}] * FPRAM, "
                 f"packet_elements={packet_elements}"
             )
-            for slot, target, base, stride, write, affine in (
-                (0, gp_dst, dst_addr + dst_start * self.mlen, self.mlen, True, True),
+            for slot, target, base, stride, write, affine, layout, major_start in (
+                (
+                    0,
+                    gp_dst,
+                    dst_addr + dst_start * self.mlen,
+                    self.mlen,
+                    True,
+                    True,
+                    dst_layout,
+                    dst_start,
+                ),
                 (
                     1,
                     gp_src,
@@ -668,6 +744,8 @@ class IsaTileRowMixin:
                     src_step * self.mlen,
                     False,
                     bool(src_step),
+                    src_layout,
+                    src_start,
                 ),
             ):
                 self._append_stream_binding(
@@ -687,6 +765,8 @@ class IsaTileRowMixin:
                     extent_major=count,
                     write=write,
                     affine=affine,
+                    physical_layout=layout,
+                    layout_major_start=major_start,
                 )
             self._append_stream_binding(
                 asm,
@@ -1054,6 +1134,9 @@ class IsaTileRowMixin:
         dst_addr: int,
         src_addr: int,
         row_map: list[tuple[int, int, int]],
+        *,
+        dst_layout: AffineLayout | None = None,
+        src_layout: AffineLayout | None = None,
     ) -> str:
         """``dst[d] += src[s] * FPRAM[f]`` for each ``(d, s, f)`` in ``row_map``.
 
@@ -1103,13 +1186,15 @@ class IsaTileRowMixin:
                 if use_stream:
                     gp_value = self._reg.allocate_gp(1)[0]
                     try:
-                        for slot, target, base, step, write in (
+                        for slot, target, base, step, write, layout, major_start in (
                             (
                                 0,
                                 gp_dst,
                                 dst_addr + dst_start * self.mlen,
                                 dst_step,
                                 True,
+                                dst_layout,
+                                dst_start,
                             ),
                             (
                                 1,
@@ -1117,6 +1202,8 @@ class IsaTileRowMixin:
                                 src_addr + src_start * self.mlen,
                                 src_step,
                                 False,
+                                src_layout,
+                                src_start,
                             ),
                         ):
                             self._append_stream_binding(
@@ -1131,6 +1218,8 @@ class IsaTileRowMixin:
                                 packet_elements=self.mlen,
                                 storage_atom=self.stream_storage_atom,
                                 write=write,
+                                physical_layout=layout,
+                                layout_major_start=major_start,
                             )
                         self._append_stream_binding(
                             asm,
@@ -1476,6 +1565,9 @@ class IsaTileRowMixin:
         fpram_base: int,
         dst_rows: list[int],
         src_rows: list[int],
+        *,
+        dst_layout: AffineLayout | None = None,
+        src_layout: AffineLayout | None = None,
     ) -> str:
         """Walk one FPRAM slot per row pair, starting at ``fpram_base``.
 
@@ -1491,7 +1583,13 @@ class IsaTileRowMixin:
         row_map = [
             (d, s, fpram_base + i) for i, (d, s) in enumerate(zip(dst_rows, src_rows))
         ]
-        return self._emit_tile_row_fma(dst_addr, src_addr, row_map)
+        return self._emit_tile_row_fma(
+            dst_addr,
+            src_addr,
+            row_map,
+            dst_layout=dst_layout,
+            src_layout=src_layout,
+        )
 
     def tile_row_fma_fp_broadcast_asm(
         self,

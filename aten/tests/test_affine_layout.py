@@ -81,3 +81,69 @@ def test_transpose_exchanges_row_and_column_service_costs():
     assert transpose.packet_service(logical_row, geometry).service_cycles == 8
     assert transpose.packet_service(logical_column, geometry).service_cycles == 1
     transpose.assert_bijective(geometry)
+
+
+def test_major_packed_layout_coalesces_one_short_row_per_bank():
+    geometry = BankGeometry(banks=32, bank_width=64)
+    row = AffineLayout(LayoutKind.ROW_MAJOR, 1, 1, 32, 64)
+    packed = AffineLayout(
+        LayoutKind.AFFINE_SKEW,
+        groups=1,
+        fields=1,
+        majors=32,
+        minors=64,
+        alpha=1,
+        major_packed=True,
+    )
+    packet = list(packed.iter_coords())
+
+    packed.assert_bijective(geometry)
+    assert len({row.place(coord, geometry).bank_row for coord in packet}) == 32
+    assert len({packed.place(coord, geometry).bank_row for coord in packet}) == 1
+    assert row.packet_service(packet, geometry).service_cycles == 32
+    assert packed.packet_service(packet, geometry).service_cycles == 1
+    assert packed.packet_service(packet, geometry).conflict_stall_cycles == 0
+
+
+def test_major_packed_kda_subviews_advance_by_complete_bank_groups():
+    geometry = BankGeometry(banks=32, bank_width=64)
+    layout = AffineLayout(
+        LayoutKind.AFFINE_SKEW,
+        groups=1,
+        fields=1,
+        majors=96,
+        minors=128,
+        alpha=1,
+        major_packed=True,
+    )
+
+    layout.assert_bijective(geometry)
+    assert layout.major_start_row_offset(0, geometry) == 0
+    assert layout.major_start_row_offset(32, geometry) == 2
+    assert layout.major_start_row_offset(64, geometry) == 4
+    try:
+        layout.major_start_row_offset(1, geometry)
+    except ValueError as error:
+        assert "complete bank group" in str(error)
+    else:
+        raise AssertionError("an unaligned major-packed subview must fail")
+
+
+def test_major_packed_layout_rejects_a_non_permuting_bank_rotation():
+    geometry = BankGeometry(banks=32, bank_width=64)
+    layout = AffineLayout(
+        LayoutKind.AFFINE_SKEW,
+        groups=1,
+        fields=1,
+        majors=32,
+        minors=64,
+        alpha=2,
+        major_packed=True,
+    )
+
+    try:
+        layout.assert_bijective(geometry)
+    except ValueError as error:
+        assert "must permute every physical bank" in str(error)
+    else:
+        raise AssertionError("a major-packed mapping that skips banks must fail")

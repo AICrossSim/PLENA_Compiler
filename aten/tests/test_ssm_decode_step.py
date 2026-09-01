@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import replace
 
 import pytest
 import torch
@@ -26,6 +27,7 @@ from compiler.aten.models.mamba2.reference import (  # noqa: E402
 )
 from compiler.aten.plena import PlenaCompiler  # noqa: E402
 from compiler.aten.plena.program_mamba_common import Mamba2Shape  # noqa: E402
+from compiler.aten.plena.program_ssm_recurrent import MambaDecodeInvocation  # noqa: E402
 from compiler.aten.tests.isa_interpreter import (  # noqa: E402
     Machine,
     UnsupportedInstruction,
@@ -186,3 +188,94 @@ def test_emits_nothing_the_oracle_cannot_model():
         Machine(vlen=MLEN).run(code)
     except UnsupportedInstruction as exc:  # pragma: no cover - failure path
         pytest.fail(f"decode step emitted an unmodelled instruction: {exc}")
+
+
+def test_static_batch_executes_private_state_for_every_request():
+    """Batched decode is explicit static repetition, not hidden batch-1 code."""
+
+    batch = 4
+    cases = [_case(100 + i, heads=2, state_size=4) for i in range(batch)]
+    shape = replace(cases[0][0], batch_size=batch)
+    p = PlenaCompiler(mlen=MLEN, blen=2)
+    items = []
+    for i in range(batch):
+        n = shape.state_size
+        items.append(
+            MambaDecodeInvocation(
+                state=p.alloc(f"state{i}", _rows_up(shape.num_heads * n), MLEN),
+                x=p.alloc(f"x{i}", _rows_up(shape.num_heads), MLEN),
+                b_fp=p.fp_var(f"b{i}", size=shape.n_groups * n),
+                c_fp=p.fp_var(f"c{i}", size=shape.n_groups * n),
+                da_fp=p.fp_var(f"da{i}", size=shape.num_heads),
+                dt_fp=p.fp_var(f"dt{i}", size=shape.num_heads),
+                d_fp=p.fp_var(f"d{i}", size=shape.num_heads),
+                y=p.alloc(f"y{i}", _rows_up(shape.num_heads), MLEN),
+                scratch=p.alloc(f"scratch{i}", MLEN, MLEN),
+            )
+        )
+    consts = p.mamba_fp_constants()
+    mark = len(p.get_code())
+    p.ssm_decode_batch_v0(invocations=items, shape=shape, consts=consts)
+    code = p.get_code()[mark:]
+    assert code.count("static Mamba batch request=") == batch
+
+    m = Machine(vlen=MLEN, vram_words=1 << 18, fpram_words=1 << 14)
+    base = lambda var: p.get_vram_layout(var.name).vram_base_addr  # noqa: E731
+    for item, (_, case) in zip(items, cases):
+        for h in range(shape.num_heads):
+            m.write_vram_row(base(item.x) + h * MLEN, case["x"][h].tolist())
+            m.write_vram_row(base(item.y) + h * MLEN, [7.5] * MLEN)
+            for n in range(shape.state_size):
+                m.write_vram_row(
+                    base(item.state) + (h * shape.state_size + n) * MLEN,
+                    case["state"][h, n].tolist(),
+                )
+        m.write_fpram(item.b_fp.address, case["b"].flatten().tolist())
+        m.write_fpram(item.c_fp.address, case["c"].flatten().tolist())
+        m.write_fpram(item.da_fp.address, case["da"].tolist())
+        m.write_fpram(item.dt_fp.address, case["dt"].tolist())
+        m.write_fpram(item.d_fp.address, case["d"].tolist())
+    m.write_fpram(consts.zero.address, p.mamba_fp_constant_values(shape))
+    m.run(code)
+
+    for item, (_, case) in zip(items, cases):
+        got_y = torch.tensor(
+            [m.read_vram_row(base(item.y) + h * MLEN, MLEN) for h in range(shape.num_heads)]
+        )
+        got_state = torch.tensor(
+            [
+                [
+                    m.read_vram_row(
+                        base(item.state) + (h * shape.state_size + n) * MLEN,
+                        MLEN,
+                    )
+                    for n in range(shape.state_size)
+                ]
+                for h in range(shape.num_heads)
+            ]
+        )
+        torch.testing.assert_close(got_y, case["y_ref"], rtol=5e-5, atol=5e-6)
+        torch.testing.assert_close(got_state, case["state_ref"], rtol=5e-5, atol=5e-6)
+
+
+def test_static_mamba_batch_rejects_shared_state_storage():
+    shape, _ = _case(200, heads=1, state_size=4)
+    p = PlenaCompiler(mlen=MLEN, blen=2)
+    item = MambaDecodeInvocation(
+        state=p.alloc("state", MLEN, MLEN),
+        x=p.alloc("x", MLEN, MLEN),
+        b_fp=p.fp_var("b", size=shape.state_size),
+        c_fp=p.fp_var("c", size=shape.state_size),
+        da_fp=p.fp_var("da", size=1),
+        dt_fp=p.fp_var("dt", size=1),
+        d_fp=p.fp_var("d", size=1),
+        y=p.alloc("y", MLEN, MLEN),
+        scratch=p.alloc("scratch", MLEN, MLEN),
+    )
+    consts = p.mamba_fp_constants()
+    with pytest.raises(ValueError, match="state tensors must be request-private"):
+        p.ssm_decode_batch_v0(
+            invocations=[item, item],
+            shape=replace(shape, batch_size=2),
+            consts=consts,
+        )

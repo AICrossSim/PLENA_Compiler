@@ -396,9 +396,39 @@ class MRAMAllocator(MemoryAllocatorBase):
         if total_size is None:
             total_size = self.tile_elems * tile_capacity
         super().__init__(total_size=total_size, alignment=self.tile_elems, mem_name="MRAM")
+        self._reserved: dict[str, MemoryBlock] = {}
 
     def allocate(self, name: str, size: int) -> int:
         return self._vmm.allocate(name, size)
+
+    def reserve(self, name: str, size: int) -> int:
+        """Reserve compiler-managed Matrix scratch across allocator resets.
+
+        This is an explicit static allocation, not a cache.  Its address is
+        fixed in the generated program and it has no tag, lookup, replacement,
+        or runtime ownership state.
+        """
+
+        if name in self._reserved:
+            block = self._reserved[name]
+            if self._vmm._align(size) != block.size:
+                raise ValueError(
+                    f"MRAM reservation {name!r} already has size {block.size}, "
+                    f"not {self._vmm._align(size)}"
+                )
+            return block.addr
+        addr = self._vmm.allocate(name, size)
+        block = next(block for block in self._vmm.used_stack if block.name == name)
+        self._reserved[name] = block
+        return addr
+
+    def reset(self):
+        """Release transient weight tiles while retaining static reservations."""
+
+        reserved = tuple(self._reserved.values())
+        self._vmm.reset()
+        for block in sorted(reserved, key=lambda item: item.addr):
+            self._vmm.mark_used(block.addr, block.size, block.name)
 
 
 class VRAMAllocator(MemoryAllocatorBase):

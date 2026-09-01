@@ -30,6 +30,7 @@ from compiler.aten.plena.program_kda_common import (  # noqa: E402
     kda_vector_row,
     kda_vector_rows,
 )
+from compiler.aten.plena.program_kda_recurrent import KdaDecodeInvocation  # noqa: E402
 from compiler.aten.tests.isa_interpreter import Machine, UnsupportedInstruction  # noqa: E402
 
 #: What the recurrence emitted before Task 8. Named rather than inlined so the
@@ -274,6 +275,120 @@ def test_decode_step_matches_the_reference(seed, heads, key_dim):
     out, new_state, _ = _run(shape, ref)
     torch.testing.assert_close(out, ref["out"], rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(new_state, ref["state_out_T"], rtol=1e-5, atol=1e-6)
+
+
+def test_static_batch_executes_private_kda_state_for_every_request():
+    """Four requests share code shape but never state or accumulator storage."""
+
+    batch = 4
+    cases = [_case(300 + i, num_heads=2, key_dim=4) for i in range(batch)]
+    shape = cases[0][0]
+    p = PlenaCompiler(mlen=MLEN, blen=2)
+    state_rows = _rows_up(kda_state_rows(shape, MLEN))
+    vector_rows = _rows_up(kda_vector_rows(shape, MLEN))
+    items = []
+    for i in range(batch):
+        n_key = shape.num_heads * shape.key_dim
+        items.append(
+            KdaDecodeInvocation(
+                state=p.alloc(f"state{i}", state_rows, MLEN),
+                q_fp=p.fp_var(f"q{i}", size=n_key),
+                k_fp=p.fp_var(f"k{i}", size=n_key),
+                decay_fp=p.fp_var(f"decay{i}", size=n_key),
+                beta_fp=p.fp_var(f"beta{i}", size=shape.num_heads),
+                v=p.alloc(f"v{i}", vector_rows, MLEN),
+                o=p.alloc(f"o{i}", vector_rows, MLEN),
+                pred=p.alloc(f"pred{i}", vector_rows, MLEN),
+                err=p.alloc(f"err{i}", vector_rows, MLEN),
+                output_scale_fp=p.fp_var(f"scale{i}", size=1),
+            )
+        )
+    mark = len(p.get_code())
+    p.kda_decode_batch_v0(invocations=items, shape=shape)
+    code = p.get_code()[mark:]
+    assert code.count("static KDA batch request=") == batch
+
+    m = Machine(vlen=MLEN, vram_words=1 << 18, fpram_words=1 << 15)
+    base = lambda var: p.get_vram_layout(var.name).vram_base_addr  # noqa: E731
+    blocks = kda_blocks(shape, MLEN)
+    for item, (_, ref) in zip(items, cases):
+        for h in range(shape.num_heads):
+            for block in range(blocks):
+                lanes = slice(block * MLEN, (block + 1) * MLEN)
+                vector_row = kda_vector_row(shape, MLEN, h, block)
+                m.write_vram_row(
+                    base(item.v) + vector_row * MLEN,
+                    ref["v"][h, lanes].tolist(),
+                )
+                m.write_vram_row(base(item.o) + vector_row * MLEN, [7.5] * MLEN)
+                m.write_vram_row(base(item.pred) + vector_row * MLEN, [7.5] * MLEN)
+                for key in range(shape.key_dim):
+                    m.write_vram_row(
+                        base(item.state)
+                        + kda_state_row(shape, MLEN, h, block, key) * MLEN,
+                        ref["state_T"][h, key, lanes].tolist(),
+                    )
+        m.write_fpram(item.q_fp.address, ref["q_hat"].reshape(-1).tolist())
+        m.write_fpram(item.k_fp.address, ref["k_hat"].reshape(-1).tolist())
+        m.write_fpram(item.decay_fp.address, ref["decay"].reshape(-1).tolist())
+        m.write_fpram(item.beta_fp.address, ref["beta"].tolist())
+        m.write_fpram(item.output_scale_fp.address, [ref["output_scale"]])
+    m.run(code)
+
+    for item, (_, ref) in zip(items, cases):
+        got_out = torch.tensor(
+            [
+                [
+                    value
+                    for block in range(blocks)
+                    for value in m.read_vram_row(
+                        base(item.o) + kda_vector_row(shape, MLEN, h, block) * MLEN,
+                        MLEN,
+                    )
+                ]
+                for h in range(shape.num_heads)
+            ]
+        )
+        got_state = torch.tensor(
+            [
+                [
+                    [
+                        value
+                        for block in range(blocks)
+                        for value in m.read_vram_row(
+                            base(item.state)
+                            + kda_state_row(shape, MLEN, h, block, key) * MLEN,
+                            MLEN,
+                        )
+                    ]
+                    for key in range(shape.key_dim)
+                ]
+                for h in range(shape.num_heads)
+            ]
+        )
+        torch.testing.assert_close(got_out, ref["out"], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(got_state, ref["state_out_T"], rtol=1e-5, atol=1e-6)
+
+
+def test_static_kda_batch_rejects_shared_state_storage():
+    shape, _ = _case(400, num_heads=1, key_dim=4)
+    p = PlenaCompiler(mlen=MLEN, blen=2)
+    state_rows = _rows_up(kda_state_rows(shape, MLEN))
+    vector_rows = _rows_up(kda_vector_rows(shape, MLEN))
+    item = KdaDecodeInvocation(
+        state=p.alloc("state", state_rows, MLEN),
+        q_fp=p.fp_var("q", size=shape.key_dim),
+        k_fp=p.fp_var("k", size=shape.key_dim),
+        decay_fp=p.fp_var("decay", size=shape.key_dim),
+        beta_fp=p.fp_var("beta", size=1),
+        v=p.alloc("v", vector_rows, MLEN),
+        o=p.alloc("o", vector_rows, MLEN),
+        pred=p.alloc("pred", vector_rows, MLEN),
+        err=p.alloc("err", vector_rows, MLEN),
+        output_scale_fp=p.fp_var("scale", size=1),
+    )
+    with pytest.raises(ValueError, match="state tensors must be request-private"):
+        p.kda_decode_batch_v0(invocations=[item, item], shape=shape)
 
 
 def test_read_out_uses_the_updated_state_not_the_decayed_one():

@@ -389,7 +389,15 @@ class ProgramFPTileOpsMixin:
                     f"{fpram_offset} reads slot {end}, past {fpram_base.name}'s "
                     f"{fpram_base.size}"
                 )
-        super().tile_row_fma_fp_sweep(dst.name, src.name, base, dst_rows, src_rows)
+        super().tile_row_fma_fp_sweep(
+            dst.name,
+            src.name,
+            base,
+            dst_rows,
+            src_rows,
+            dst_layout=dst.physical_layout,
+            src_layout=src.physical_layout,
+        )
 
     def tile_row_fma_fp_broadcast(
         self,
@@ -429,6 +437,7 @@ class ProgramFPTileOpsMixin:
             base,
             resolved_rows,
             fp_step=fp_step,
+            physical_layout=source.physical_layout,
         )
 
     def tile_multirow_fma_fp_sweep(
@@ -456,6 +465,8 @@ class ProgramFPTileOpsMixin:
             base,
             dst_rows,
             src_rows,
+            dst_layout=dst.physical_layout,
+            src_layout=src.physical_layout,
         )
 
     # One FPRAM slot applied to EVERY listed row, as opposed to the

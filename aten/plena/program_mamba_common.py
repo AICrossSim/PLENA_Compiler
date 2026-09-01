@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from compiler.aten.plena.vars import FPVar, VRAMMatrixVar
 
@@ -147,6 +147,16 @@ class Mamba2Shape:
     def num_chunks(self) -> int:
         return math.ceil(self.seq_len / self.chunk_size)
 
+    def single_sequence(self) -> Mamba2Shape:
+        """Return the per-request shape consumed by one recurrence body.
+
+        A batch is lowered as an explicit list of request-private state tensors.
+        Keeping the conversion on the shape contract prevents a batched shape
+        from being accepted by an emitter whose row indices are per request.
+        """
+
+        return replace(self, batch_size=1)
+
     @property
     def slice_offsets(self) -> dict[str, tuple[int, int]]:
         """Column offset and width of each slice within the fused in_proj output."""
@@ -214,13 +224,8 @@ class Mamba2Shape:
             raise ValueError(
                 f"time_step_limit is inverted: min={self.time_step_min} > max={self.time_step_max}"
             )
-        if self.batch_size != 1:
-            raise ValueError(
-                f"batch_size ({self.batch_size}) must be 1: this lowering emits one sequence "
-                "per program. No emitter scales a row range or a state block by it, so "
-                "accepting it would silently produce batch-1 code. Batch by invoking the "
-                "program once per sequence."
-            )
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
         # FPRAM is a hardware-fixed 1024 slots (FPRAMAllocator's default, never
         # overridden), and ssd_decay_mask_v0 needs chunk_size of them for one head's
         # cs row -- there is no column-block loop, so the whole row must fit at once.

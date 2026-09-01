@@ -152,7 +152,8 @@ jobs:
           PYTHONPATH=. python3 -m pytest -q aten/tests/test_spill_precision_guard.py
           PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_prefill_structure.py
           PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_layer.py
-      # The design's central claim: one new opcode, and no descriptor machinery.
+      # The design's central claim: one new opcode and no memory-resident
+      # descriptor, cache, state engine, queue, or runtime scheduler.
       - name: Run the static-path guard
         run: |
           PYTHONPATH=. python3 -m pytest -q aten/tests/test_no_state_engine.py
@@ -162,14 +163,21 @@ jobs:
       - name: Run the Hybrid L-Compute ISA and layout guards
         run: |
           PYTHONPATH=. python3 -m pytest -q \
+            assembler/tests/test_l_mview.py \
             aten/tests/test_affine_layout.py \
             aten/tests/test_hybrid_compile_report.py \
             aten/tests/test_hybrid_workloads.py \
+            aten/tests/test_kda_precision_campaign.py \
             aten/tests/test_kda_official_layer.py \
             aten/tests/test_l_stream_cfg.py \
             aten/tests/test_layout_planner.py \
             aten/tests/test_lstream_lowering.py \
             aten/tests/test_lstream_packet_lowering.py \
+            aten/tests/test_matrix_access_packets.py \
+            aten/tests/test_matrix_packet_report.py \
+            aten/tests/test_matrix_prefill_handoff.py \
+            aten/tests/test_matrix_recurrence_lowering.py \
+            aten/tests/test_mview_contract.py \
             aten/tests/test_projection_affine_writeback.py
       # Real published weights. Skips when the checkpoint is not cached, so it
       # never requires network -- fetch once with

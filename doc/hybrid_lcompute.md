@@ -1,5 +1,11 @@
 # Hybrid L-Compute Compiler Contract
 
+> **Historical Vector-SRAM experiment.** This document describes the earlier
+> `L_CFG` stream-addressing path. Its issue reductions and speedups are not
+> evidence for the Matrix-SRAM affine co-layout contribution. The current
+> Matrix ISA decision, fixed-map control and state-precision boundary are in
+> [`matrix_lcompute_isa_review.md`](matrix_lcompute_isa_review.md).
+
 ## Scope
 
 The implementation targets one static PLENA instruction stream for
@@ -105,6 +111,9 @@ win.
   exact `V_MUL_VF`/`V_FMA_VF` operations issued by recurrent packets.
 - A Compiler-to-Rust Matrix projection test executes affine final writeback and
   explicit Vector lane restoration with zero BF16 error against PyTorch.
+- A published 24-layer Mamba-2 checkpoint carries PLENA-interpreted recurrence
+  state through four decode tokens with top-1/top-5 agreement on every token;
+  the surrounding Matrix and PyTorch stages are explicitly outside that gate.
 
 At the official decode shapes and the PLENA paper's 2048-element packet point,
 dynamic issue counts are:

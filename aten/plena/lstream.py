@@ -16,7 +16,7 @@ from compiler.aten.plena.affine_layout import AffineLayout
 
 
 L_CFG_OPCODE = 0x3F
-L_STREAM_CONTRACT_VERSION = 4
+L_STREAM_CONTRACT_VERSION = 5
 L_STREAM_MAX_SLOTS = 4
 L_STREAM_CONSUMER_SLOTS = 3
 L_STREAM_PRODUCER_SLOT = 3
@@ -43,8 +43,10 @@ class StreamConfigField(IntEnum):
 
 class StreamFlags(IntFlag):
     ENABLE = 1 << 0
-    # Bit 1 was AUTO_ADVANCE in contract v2. In v3 advancement is explicit:
-    # the consuming instruction names the slot in its encoded view mask.
+    # Pack bank-word atoms from consecutive major rows into physical wide rows.
+    # This is a physical-layout property shared by Matrix producers and all
+    # consumers; packetization alone never selects a different layout.
+    MAJOR_PACKED = 1 << 1
     AFFINE = 1 << 2
     TARGET_FP = 1 << 3
     WRITE = 1 << 4
@@ -214,6 +216,8 @@ def emit_stream_configuration(
             write(field, value)
 
     flags = StreamFlags.ENABLE | StreamFlags.STRICT_BOUNDS
+    if layout.major_packed:
+        flags |= StreamFlags.MAJOR_PACKED
     if layout.alpha or layout.beta or layout.gamma:
         flags |= StreamFlags.AFFINE
     if binding.target_is_fp:

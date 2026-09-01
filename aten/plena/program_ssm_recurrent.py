@@ -44,6 +44,7 @@ result by a hardwired ``bmm_scale = 0.25`` that no opcode exposes.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from compiler.aten.plena.program_mamba_common import (
     Mamba2Shape,
@@ -51,6 +52,21 @@ from compiler.aten.plena.program_mamba_common import (
     mamba_stage_marker,
 )
 from compiler.aten.plena.vars import FPVar, InputVar, VRAMMatrixVar
+
+
+@dataclass(frozen=True)
+class MambaDecodeInvocation:
+    """Ordinary storage used by one request's Mamba decode recurrence."""
+
+    state: VRAMMatrixVar
+    x: VRAMMatrixVar
+    b_fp: FPVar
+    c_fp: FPVar
+    da_fp: FPVar
+    dt_fp: FPVar
+    d_fp: FPVar
+    y: VRAMMatrixVar
+    scratch: VRAMMatrixVar
 
 
 class ProgramSSMRecurrentMixin:
@@ -168,6 +184,11 @@ class ProgramSSMRecurrentMixin:
         in the module docstring; `x` is ``[num_heads, head_dim]``; `y` is
         ``[num_heads, head_dim]``.
         """
+        if shape.batch_size != 1:
+            raise ValueError(
+                "ssm_decode_step_v0 consumes one request; use "
+                "ssm_decode_batch_v0 for an explicit static batch"
+            )
         heads = list(range(shape.num_heads)) if head_rows is None else list(head_rows)
         n_state = shape.state_size
         self.emit_comment(
@@ -217,6 +238,54 @@ class ProgramSSMRecurrentMixin:
             )
 
         return y
+
+    def ssm_decode_batch_v0(
+        self,
+        *,
+        invocations: Sequence[MambaDecodeInvocation],
+        shape: Mamba2Shape,
+        consts: MambaFPConstants,
+    ) -> tuple[VRAMMatrixVar, ...]:
+        """Emit one deterministic recurrence body per request.
+
+        Matrix projections may share a batched weight fetch, but recurrent state
+        is private.  The Compiler therefore receives an explicit record for each
+        request and reuses the verified single-request arithmetic unchanged.
+        """
+
+        items = tuple(invocations)
+        if len(items) != shape.batch_size:
+            raise ValueError(
+                f"batch has {len(items)} invocation records, expected {shape.batch_size}"
+            )
+        if not items:
+            raise ValueError("Mamba decode batch must contain at least one request")
+
+        for field in ("state", "y", "scratch"):
+            names = [getattr(item, field).name for item in items]
+            if len(names) != len(set(names)):
+                raise ValueError(f"Mamba batch {field} tensors must be request-private")
+
+        unit_shape = shape.single_sequence()
+        outputs = []
+        for batch_index, item in enumerate(items):
+            self.emit_comment(f"static Mamba batch request={batch_index}")
+            outputs.append(
+                self.ssm_decode_step_v0(
+                    state=item.state,
+                    x=item.x,
+                    b_fp=item.b_fp,
+                    c_fp=item.c_fp,
+                    da_fp=item.da_fp,
+                    dt_fp=item.dt_fp,
+                    d_fp=item.d_fp,
+                    y=item.y,
+                    scratch=item.scratch,
+                    shape=unit_shape,
+                    consts=consts,
+                )
+            )
+        return tuple(outputs)
 
     def ssm_decode_scalars_to_fpram_v0(
         self,
@@ -271,4 +340,4 @@ class ProgramSSMRecurrentMixin:
         return conv_state
 
 
-__all__ = ["ProgramSSMRecurrentMixin"]
+__all__ = ["MambaDecodeInvocation", "ProgramSSMRecurrentMixin"]

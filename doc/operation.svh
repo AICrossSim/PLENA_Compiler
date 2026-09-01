@@ -199,11 +199,11 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_SOFTPLUS_V           = 6'h3D,
     S_MAP_FP_V             = 6'h3E,
 
-    // Configure one compiler-managed affine view slot. Existing Vector
-    // instructions name consumer slots 0..2 in funct1[2:0]; slot 3 is reserved
-    // for Matrix projection writeback. No register is implicitly rebound merely
-    // because L_CFG executed.
-    L_CFG                  = 6'h3F
+    // Compiler-programmable Matrix-SRAM view. FULL and FIELD share this opcode
+    // under funct1; Matrix consumers explicitly name a slot in their own
+    // encoding. funct1=0 remains a temporary legacy L_CFG source form while
+    // the pre-RTL branch migrates, but it is not part of the frozen ISA.
+    L_MVIEW                = 6'h3F
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {
