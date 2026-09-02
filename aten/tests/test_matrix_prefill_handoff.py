@@ -53,7 +53,7 @@ def test_matrix_view_handoff_checks_values_and_keeps_fp32_out_of_matrix_sram() -
         "cols": 128,
         "tile_count": 1,
     }
-    assert view["descriptor"]["mapping"]["alpha"] == 1
+    assert view["descriptor"]["mapping"]["fixed_wiring_alpha"] == 1
     assert view["direct_cross_head_residence_claimed"] is False
     assert view["value_evidence"]["values_checked"] == 16_384
     assert view["value_evidence"]["wrong_axis_rejected_before_execution"] is True

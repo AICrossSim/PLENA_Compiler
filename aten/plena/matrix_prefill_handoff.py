@@ -8,8 +8,9 @@ This module keeps three claims separate:
 * the official Kimi K3 FP32 state cannot use that Matrix-resident path and is
   therefore still explicit streamed traffic.
 
-The ISA stays model independent.  ``L_MVIEW`` only declares shape and affine
-placement; existing row/column Matrix operations select the access axis.
+The ISA stays model independent. ``L_MVIEW`` declares shape and physical-row
+pitch over PLENA's fixed diagonal placement; existing row/column Matrix
+operations select the access axis.
 """
 
 from __future__ import annotations
@@ -139,11 +140,10 @@ def _view_configuration_assembly(
         mapping=MatrixViewMap(
             tile_pitch_rows=shape.value_dim,
             # The whole per-head state is read by columns at this boundary.
-            # The prior-work diagonal skew reaches that column floor. Decode's
-            # later cross-head packet is a different compact view (alpha=4)
-            # built by the explicit streamed load; conflating the two would
-            # return correct-looking values with the wrong service claim.
-            alpha=1,
+            # The prior-work fixed diagonal wiring reaches that column floor.
+            # Decode's later cross-head packet uses a different tile pitch;
+            # conflating the two would return plausible values with the wrong
+            # service claim.
         ),
     )
     program = PlenaCompiler(
@@ -278,7 +278,7 @@ def build_prefill_handoff_report(
                 "shape": asdict(descriptor.shape),
                 "mapping": {
                     "tile_pitch_rows": descriptor.mapping.tile_pitch_rows,
-                    "alpha": descriptor.mapping.alpha,
+                    "fixed_wiring_alpha": 1,
                     "flags": int(descriptor.mapping.flags),
                 },
             },
@@ -292,7 +292,7 @@ def build_prefill_handoff_report(
             "same_physical_cells": True,
             "next_decode_packet_layout": (
                 "explicit streamed write/read in decode order; the later 16-head "
-                "compact packet uses a separate alpha=4 descriptor"
+                "packet uses a separate compiler-selected tile pitch"
             ),
             "direct_cross_head_residence_claimed": False,
             "value_evidence": _value_handoff(shape),

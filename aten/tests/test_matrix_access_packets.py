@@ -17,7 +17,7 @@ GEOMETRY = PacketGeometry(mlen=64, blen=4, hlen=16)
 
 def test_public_instruction_count_matches_multi_operand_extraction_boundary() -> None:
     shape = MatrixViewShape(rows=1, cols=4, tile_count=16).pack()
-    mapping = MatrixViewMap(tile_pitch_rows=1, alpha=1).pack()
+    mapping = MatrixViewMap(tile_pitch_rows=1).pack()
     assembly = f"""
 S_ADDI_INT gp1, gp0, {shape}
 S_ADDI_INT gp2, gp0, {mapping}
@@ -90,7 +90,7 @@ M_MM 0, gp7, gp8
 
 def test_optional_view_is_explicit_on_the_consumer() -> None:
     shape = MatrixViewShape(rows=1, cols=4, tile_count=16).pack()
-    mapping = MatrixViewMap(tile_pitch_rows=1, alpha=1).pack()
+    mapping = MatrixViewMap(tile_pitch_rows=1).pack()
     packet = extract_matrix_access_packets(
         f"""
 S_ADDI_INT gp7, gp0, {shape}
@@ -107,7 +107,7 @@ M_MM 0, gp1, gp2, 2
 
 def test_extracts_real_multi_tile_view_packets_and_direct_writeback() -> None:
     shape = MatrixViewShape(rows=1, cols=4, tile_count=16).pack()
-    mapping = MatrixViewMap(tile_pitch_rows=1, alpha=1).pack()
+    mapping = MatrixViewMap(tile_pitch_rows=1).pack()
     packets = extract_matrix_access_packets(
         f"""
 ; @stage=kda_projection @axis=cross_head

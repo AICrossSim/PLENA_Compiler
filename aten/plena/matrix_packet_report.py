@@ -45,8 +45,7 @@ def _consumer_descriptor(
             tile_count=mlen // consumer_row_elements,
         ),
         mapping=MatrixViewMap(
-            tile_pitch_rows=1,
-            alpha=consumer_row_elements // blen,
+            tile_pitch_rows=consumer_row_elements // blen,
         ),
     )
 
@@ -147,7 +146,7 @@ def _case(
                 "cols": descriptor.shape.cols,
                 "tile_count": descriptor.shape.tile_count,
                 "tile_pitch_rows": descriptor.mapping.tile_pitch_rows,
-                "alpha": descriptor.mapping.alpha,
+                "fixed_wiring_alpha": 1,
                 "packet_values": (
                     descriptor.shape.rows
                     * descriptor.shape.cols
@@ -186,12 +185,12 @@ def _recurrence_case(
     *,
     model: str,
     repeats_in_model: int,
-    affine: bool,
+    co_layout: bool,
 ) -> dict[str, object]:
     geometry = PacketGeometry(mlen=2048, blen=32, hlen=128)
     assembly = lower_matrix_recurrence(
         spec,
-        affine=affine,
+        co_layout=co_layout,
         mlen=geometry.mlen,
         blen=geometry.blen,
     )
@@ -204,7 +203,11 @@ def _recurrence_case(
         "stage": f"{spec.name}_matrix_recurrence",
         "real_shape": [spec.heads, spec.recurrence_rows, spec.row_elements],
         "repeats_in_model": repeats_in_model,
-        "lowering": "matrix_recurrence_affine" if affine else "matrix_recurrence_fixed",
+        "lowering": (
+            "matrix_recurrence_colayout"
+            if co_layout
+            else "matrix_recurrence_pitch1"
+        ),
         "geometry": {
             "mlen": geometry.mlen,
             "blen": geometry.blen,
@@ -381,25 +384,25 @@ def build_report() -> dict[str, object]:
             NEMOTRON_MAMBA,
             model="Nemotron-3 Nano 30B-A3B",
             repeats_in_model=23,
-            affine=False,
+            co_layout=False,
         ),
         _recurrence_case(
             NEMOTRON_MAMBA,
             model="Nemotron-3 Nano 30B-A3B",
             repeats_in_model=23,
-            affine=True,
+            co_layout=True,
         ),
         _recurrence_case(
             KIMI_KDA,
             model="Kimi K3",
             repeats_in_model=69,
-            affine=False,
+            co_layout=False,
         ),
         _recurrence_case(
             KIMI_KDA,
             model="Kimi K3",
             repeats_in_model=69,
-            affine=True,
+            co_layout=True,
         ),
     ]
     coissued_histograms = [

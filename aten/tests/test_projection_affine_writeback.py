@@ -187,7 +187,7 @@ def test_projection_accumulator_directly_writes_a_configured_matrix_view(tmp_pat
     )
     descriptor = MatrixViewDescriptor(
         shape=MatrixViewShape(rows=1, cols=8, tile_count=8),
-        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+        mapping=MatrixViewMap(tile_pitch_rows=2),
     )
 
     program.vram_sub_projection_stream_k_accum_to(
@@ -246,7 +246,7 @@ def test_wide_projection_reserves_existing_matrix_scratch_and_streams_weights():
     )
     descriptor = MatrixViewDescriptor(
         shape=MatrixViewShape(rows=1, cols=8, tile_count=8),
-        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+        mapping=MatrixViewMap(tile_pitch_rows=2),
     )
 
     program.linear_projection_bf16(
@@ -284,7 +284,7 @@ def test_direct_view_projection_reuses_a_fitting_wide_k_weight_set():
     )
     descriptor = MatrixViewDescriptor(
         shape=MatrixViewShape(rows=1, cols=8, tile_count=8),
-        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+        mapping=MatrixViewMap(tile_pitch_rows=2),
     )
 
     program.linear_projection_bf16(
@@ -317,7 +317,7 @@ def test_direct_view_projection_rejects_a_partial_consumer_packet():
     )
     incomplete = MatrixViewDescriptor(
         shape=MatrixViewShape(rows=1, cols=8, tile_count=4),
-        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=2),
+        mapping=MatrixViewMap(tile_pitch_rows=2),
     )
 
     try:

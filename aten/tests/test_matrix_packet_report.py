@@ -80,9 +80,10 @@ def test_recurrence_report_records_real_same_cycle_multi_operand_packets() -> No
     recurrence = [
         case
         for case in build_report()["cases"]
-        if case["lowering"] == "matrix_recurrence_affine"
+        if case["lowering"]
+        in {"matrix_recurrence_pitch1", "matrix_recurrence_colayout"}
     ]
-    assert len(recurrence) == 2
+    assert len(recurrence) == 4
     for case in recurrence:
         reads = [
             entry
@@ -91,15 +92,34 @@ def test_recurrence_report_records_real_same_cycle_multi_operand_packets() -> No
         ]
         assert reads
         assert any(entry["same_cycle_operands"] == 2 for entry in reads)
-        assert all(entry["per_tile_skew_can_help"] for entry in reads)
-        expected_stride = (
-            65_536
-            if case["stage"] == "nemotron3_mamba2_matrix_recurrence"
-            else 32_768
-        )
+        # Fixed diagonal wiring fills the compiler-selected pitch gaps while
+        # preserving the same 131072-element recurrence block stride.
+        expected_stride = 131_072
         for group in case["service_groups"]:
             for operand in group["operands"]:
                 assert operand["address_stride_elements"] == expected_stride
+
+    by_model_and_lowering = {
+        (case["model"], case["lowering"]): case for case in recurrence
+    }
+    for model, pitch in (
+        ("Nemotron-3 Nano 30B-A3B", 2),
+        ("Kimi K3", 4),
+    ):
+        pitch1 = by_model_and_lowering[(model, "matrix_recurrence_pitch1")]
+        colayout = by_model_and_lowering[(model, "matrix_recurrence_colayout")]
+        assert pitch1["opcode_census"] == colayout["opcode_census"]
+        assert pitch1["dynamic_packet_repeats"] == colayout["dynamic_packet_repeats"]
+        assert {
+            operand["tile_pitch_rows"]
+            for group in pitch1["service_groups"]
+            for operand in group["operands"]
+        } == {1}
+        assert {
+            operand["tile_pitch_rows"]
+            for group in colayout["service_groups"]
+            for operand in group["operands"]
+        } == {pitch}
 
 
 def test_projection_writeback_uses_the_real_consumer_head_shape() -> None:
@@ -108,16 +128,16 @@ def test_projection_writeback_uses_the_real_consumer_head_shape() -> None:
         "rows": 1,
         "cols": 64,
         "tile_count": 32,
-        "tile_pitch_rows": 1,
-        "alpha": 2,
+        "tile_pitch_rows": 2,
+        "fixed_wiring_alpha": 1,
         "packet_values": 2048,
     }
     assert by_stage["kda_q_projection_lcompute"]["consumer_descriptor"] == {
         "rows": 1,
         "cols": 128,
         "tile_count": 16,
-        "tile_pitch_rows": 1,
-        "alpha": 4,
+        "tile_pitch_rows": 4,
+        "fixed_wiring_alpha": 1,
         "packet_values": 2048,
     }
     for stage in ("mamba_in_projection_lcompute", "kda_q_projection_lcompute"):

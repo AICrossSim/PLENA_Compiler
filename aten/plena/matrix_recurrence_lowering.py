@@ -52,14 +52,14 @@ class MatrixRecurrenceSpec:
     def packet_values(self) -> int:
         return self.packet_heads * self.row_elements
 
-    def affine_alpha(self, *, bank_width: int) -> int:
-        """Return the physical-row skew for one machine geometry.
+    def packet_pitch_rows(self, *, bank_width: int) -> int:
+        """Return the interleaved tile pitch for one machine geometry.
 
         A logical head row occupies ``row_elements / bank_width`` bank words.
-        Rotating consecutive heads by exactly that many banks packs a
-        cross-head packet without overlap.  Keeping this derived from the
-        machine's bank width is important: the ISA carries a skew, not an
-        assumption that BLEN is always 32.
+        Consecutive head tiles are separated by exactly the number of bank
+        words in one logical head row.  PLENA's existing fixed diagonal wiring
+        then spreads the heads across banks.  The Compiler exposes only this
+        already-architectural pitch; it does not program a new skew coefficient.
         """
 
         if bank_width <= 0 or self.row_elements % bank_width:
@@ -76,9 +76,9 @@ class MatrixRecurrenceSpec:
             )
         if self.row_elements % blen:
             raise ValueError(f"{self.name}: one logical row must contain whole bank words")
-        if self.affine_alpha(bank_width=blen) * self.packet_heads != mlen // blen:
+        if self.packet_pitch_rows(bank_width=blen) * self.packet_heads != mlen // blen:
             raise ValueError(
-                f"{self.name}: affine skew does not cover every Matrix SRAM bank"
+                f"{self.name}: packet pitch does not cover every Matrix SRAM bank"
             )
 
 
@@ -161,7 +161,7 @@ def _packet_body(spec: MatrixRecurrenceSpec, pass_index: int) -> list[str]:
 def lower_matrix_recurrence(
     spec: MatrixRecurrenceSpec,
     *,
-    affine: bool,
+    co_layout: bool,
     mlen: int = 2048,
     blen: int = 32,
 ) -> str:
@@ -174,16 +174,26 @@ def lower_matrix_recurrence(
     """
 
     spec.validate(mlen=mlen, blen=blen)
-    alpha = spec.affine_alpha(bank_width=blen) if affine else 0
+    # Both variants use PLENA's fixed diagonal wiring. The baseline keeps
+    # pitch=1; co-layout lets the Compiler select the existing pitch field.
+    # A programmable per-view alpha was measured separately and adds no gain.
+    packet_words_per_head = spec.packet_pitch_rows(bank_width=blen)
+    tile_pitch_rows = packet_words_per_head if co_layout else 1
+    schedule_block_rows = packet_words_per_head
+    if spec.recurrence_rows % schedule_block_rows:
+        raise ValueError(
+            f"{spec.name}: {spec.recurrence_rows} rows do not divide into "
+            f"{schedule_block_rows}-row pitch blocks"
+        )
     descriptor = MatrixViewDescriptor(
         shape=MatrixViewShape(rows=1, cols=spec.row_elements, tile_count=spec.packet_heads),
-        mapping=MatrixViewMap(tile_pitch_rows=1, alpha=alpha),
+        mapping=MatrixViewMap(tile_pitch_rows=tile_pitch_rows),
     )
     descriptor.validate_for_machine(banks=mlen // blen, bank_width=blen)
 
     lines = [
         f"; @stage={spec.name}_matrix_recurrence",
-        f"; layout={'affine_per_tile' if affine else 'global_fixed'}",
+        f"; layout={'fixed_wiring_compiler_pitch' if co_layout else 'fixed_wiring_pitch1'}",
         *_configure_view(slot=0, descriptor=descriptor, shape_register=14, map_register=15),
         *_configure_view(slot=1, descriptor=descriptor, shape_register=14, map_register=15),
         *_configure_view(slot=2, descriptor=descriptor, shape_register=14, map_register=15),
@@ -208,12 +218,26 @@ def lower_matrix_recurrence(
                     field_set * spec.field_loads_per_row + field_index
                 ) * spec.recurrence_rows * packet_span
                 lines.extend(load_large_int(register, field_base))
-            lines.append(f"C_LOOP_START gp{loop_register}, {spec.recurrence_rows}")
-            lines.extend(_packet_body(spec, pass_index))
-            for register in (1, *field_registers):
-                lines.append(
-                    f"S_ADDI_INT gp{register}, gp{register}, {packet_span}"
-                )
+            lines.append(
+                f"C_LOOP_START gp{loop_register}, "
+                f"{spec.recurrence_rows // schedule_block_rows}"
+            )
+            for phase in range(schedule_block_rows):
+                lines.append(f"; recurrence_phase={phase}/{schedule_block_rows}")
+                lines.extend(_packet_body(spec, pass_index))
+                if not co_layout:
+                    advance = packet_span
+                elif phase + 1 < schedule_block_rows:
+                    advance = mlen
+                else:
+                    advance = (
+                        spec.packet_heads * tile_pitch_rows
+                        - (schedule_block_rows - 1)
+                    ) * mlen
+                for register in (1, *field_registers):
+                    lines.append(
+                        f"S_ADDI_INT gp{register}, gp{register}, {advance}"
+                    )
             lines.append(f"C_LOOP_END gp{loop_register}")
     return "\n".join(lines) + "\n"
 
@@ -239,24 +263,29 @@ def lowering_metrics(assembly: str) -> dict[str, object]:
 def build_matrix_recurrence_report() -> dict[str, object]:
     models: dict[str, object] = {}
     for spec in (NEMOTRON_MAMBA, KIMI_KDA):
-        fixed = lower_matrix_recurrence(spec, affine=False)
-        affine = lower_matrix_recurrence(spec, affine=True)
-        fixed_metrics = lowering_metrics(fixed)
-        affine_metrics = lowering_metrics(affine)
-        if fixed_metrics != affine_metrics:
+        baseline = lower_matrix_recurrence(spec, co_layout=False)
+        co_layout = lower_matrix_recurrence(spec, co_layout=True)
+        baseline_metrics = lowering_metrics(baseline)
+        co_layout_metrics = lowering_metrics(co_layout)
+        if baseline_metrics != co_layout_metrics:
             raise AssertionError(
-                f"{spec.name}: physical layout changed the issued operation stream"
+                f"{spec.name}: tile pitch changed the issued operation stream"
             )
         models[spec.name] = {
             "spec": asdict(spec),
             "packet_groups": spec.packet_groups,
             "packet_values": spec.packet_values,
-            "fixed_alpha": 0,
-            "affine_alpha": spec.affine_alpha(bank_width=32),
-            "metrics": fixed_metrics,
-            "assembly_fixed": fixed,
-            "assembly_affine": affine,
-            "only_mapping_word_differs": True,
+            "fixed_alpha": 1,
+            "compiler_tile_pitch_rows": spec.packet_pitch_rows(bank_width=32),
+            "counterfactual_programmable_alpha_upper_bound": spec.packet_pitch_rows(
+                bank_width=32
+            ),
+            "counterfactual_alpha_encoded_in_isa": False,
+            "metrics": co_layout_metrics,
+            "assembly_pitch1": baseline,
+            "assembly_compiler_pitch": co_layout,
+            "same_dynamic_operation_stream": True,
+            "address_schedule_fills_pitch_gaps": True,
         }
     return {
         "schema_version": 1,

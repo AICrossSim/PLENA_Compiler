@@ -18,13 +18,17 @@ from compiler.aten.plena.mview import (
 )
 
 
-def test_real_shapes_and_64_bank_skew_roundtrip() -> None:
+def test_real_shapes_and_fixed_wiring_mapping_roundtrip() -> None:
     shape = MatrixViewShape(rows=128, cols=128, tile_count=96)
-    mapping = MatrixViewMap(tile_pitch_rows=128, alpha=4)
+    mapping = MatrixViewMap(tile_pitch_rows=128)
 
     assert MatrixViewShape.unpack(shape.pack()) == shape
     assert MatrixViewMap.unpack(mapping.pack()) == mapping
-    assert mapping.alpha == 4
+
+
+def test_mapping_rejects_the_removed_programmable_alpha_bits() -> None:
+    with pytest.raises(ValueError, match=r"bits \[27:16\] are reserved"):
+        MatrixViewMap.unpack(MatrixViewMap(tile_pitch_rows=4).pack() | (4 << 16))
 
 
 def test_full_and_field_words_are_canonical_and_share_one_opcode() -> None:
@@ -46,23 +50,32 @@ def test_full_and_field_words_are_canonical_and_share_one_opcode() -> None:
 def test_descriptor_rejects_a_pitch_that_aliases_tiles() -> None:
     descriptor = MatrixViewDescriptor(
         MatrixViewShape(rows=128, cols=128, tile_count=16),
-        MatrixViewMap(tile_pitch_rows=127, alpha=1),
+        MatrixViewMap(tile_pitch_rows=127),
     )
     with pytest.raises(ValueError, match="aliases consecutive tiles"):
         descriptor.validate_for_machine(banks=64, bank_width=2)
 
 
-def test_descriptor_does_not_encode_machine_bank_geometry() -> None:
+@pytest.mark.parametrize(
+    ("banks", "bank_width"),
+    [
+        (8, 4),
+        (16, 4),
+        (32, 4),
+        (64, 32),
+    ],
+)
+def test_descriptor_does_not_encode_machine_bank_geometry(
+    banks: int, bank_width: int
+) -> None:
     descriptor = MatrixViewDescriptor(
         MatrixViewShape(rows=64, cols=2048, tile_count=32),
         MatrixViewMap(
-            tile_pitch_rows=64,
-            alpha=1,
+            tile_pitch_rows=4096,
             flags=MatrixViewFlags.STRICT_BOUNDS,
         ),
     )
-    descriptor.validate_for_machine(banks=64, bank_width=32)
-    descriptor.validate_for_machine(banks=32, bank_width=64)
+    descriptor.validate_for_machine(banks=banks, bank_width=bank_width)
 
 
 @pytest.mark.parametrize(
@@ -108,6 +121,50 @@ M_MV 0, gp1, gp2, 1
         )
 
 
+def test_loop_backedge_requires_the_view_on_every_iteration() -> None:
+    with pytest.raises(ValueError, match="before a dominating configuration"):
+        validate_matrix_view_dominance(
+            """
+L_MVIEW_FULL 1, gp7, gp9
+C_LOOP_START gp10, 2
+M_MV 0, gp1, gp2, 1
+L_MVIEW_FIELD 1, 0, gp0
+C_LOOP_END gp10
+"""
+        )
+
+    validate_matrix_view_dominance(
+        """
+C_LOOP_START gp10, 2
+L_MVIEW_FULL 1, gp7, gp9
+M_MV 0, gp1, gp2, 1
+L_MVIEW_FIELD 1, 0, gp0
+C_LOOP_END gp10
+"""
+    )
+
+
+def test_break_cannot_hide_an_unconfigured_reachable_consumer() -> None:
+    with pytest.raises(ValueError, match="before a dominating configuration"):
+        validate_matrix_view_dominance(
+            """
+C_BREAK
+M_MV 0, gp1, gp2, 1
+"""
+        )
+
+    with pytest.raises(ValueError, match="before a dominating configuration"):
+        validate_matrix_view_dominance(
+            """
+C_LOOP_START gp10, 2
+C_BREAK
+L_MVIEW_FULL 1, gp7, gp9
+C_LOOP_END gp10
+M_MV 0, gp1, gp2, 1
+"""
+        )
+
+
 def test_matrix_view_vector_operands_require_dominating_views() -> None:
     validate_matrix_view_dominance(
         "L_MVIEW_FULL 1, gp2, gp3\n"
@@ -130,7 +187,7 @@ def test_compiler_emits_one_generic_matrix_view_data_path() -> None:
     program = PlenaCompiler(mlen=64, blen=4, mram_tile_capacity=4)
     descriptor = MatrixViewDescriptor(
         MatrixViewShape(rows=1, cols=4, tile_count=16),
-        MatrixViewMap(tile_pitch_rows=1, alpha=1),
+        MatrixViewMap(tile_pitch_rows=1),
     )
     matrix_base = program.reserve_matrix_view_scratch_v0()
 

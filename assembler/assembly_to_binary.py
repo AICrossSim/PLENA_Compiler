@@ -1,5 +1,10 @@
 from utils.load_config import load_svh_settings
-from compiler.aten.plena.mview import validate_matrix_view_dominance
+from compiler.aten.plena.mview import (
+    MatrixViewField,
+    encode_l_mview_field,
+    encode_l_mview_full,
+    validate_matrix_view_dominance,
+)
 
 from .parser import load_isa_definitions, parse_asm_file
 
@@ -205,12 +210,10 @@ class AssemblyToBinary:
                 raise ValueError("L_MVIEW_FULL requires slot, shape register, and map register")
             if not 0 <= slot < 4:
                 raise ValueError(f"L_MVIEW_FULL slot must be in [0, 4), got {slot}")
-            binary_instruction = (
-                opcode
-                + (shape_register << opw)
-                + (map_register << (opw + ow))
-                + (slot << (opw + 2 * ow))
-                + (1 << (opw + 4 * ow))
+            binary_instruction = encode_l_mview_full(
+                slot=slot,
+                shape_register=shape_register,
+                map_register=map_register,
             )
         elif mnemonic == "L_MVIEW_FIELD":
             # Text: L_MVIEW_FIELD slot, field, gp_value.
@@ -221,14 +224,10 @@ class AssemblyToBinary:
                 raise ValueError("L_MVIEW_FIELD requires slot, field, and value register")
             if not 0 <= slot < 4:
                 raise ValueError(f"L_MVIEW_FIELD slot must be in [0, 4), got {slot}")
-            if not 0 <= field < 3:
-                raise ValueError(f"L_MVIEW_FIELD field must be in [0, 3), got {field}")
-            binary_instruction = (
-                opcode
-                + (value_register << opw)
-                + (field << (opw + ow))
-                + (slot << (opw + 2 * ow))
-                + (2 << (opw + 4 * ow))
+            binary_instruction = encode_l_mview_field(
+                slot=slot,
+                field=MatrixViewField(field),
+                value_register=value_register,
             )
         elif mnemonic == "M_MM_WO" and rstride is not None:
             # View-qualified existing writeback. The 18-bit immediate uses its

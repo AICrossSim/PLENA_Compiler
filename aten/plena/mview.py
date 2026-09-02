@@ -11,7 +11,7 @@ Two GP values are sufficient for the hot form:
     tile_count_minus_one[31:24]``
 
 ``mapping``
-    ``tile_pitch_rows[15:0] | alpha[21:16] | reserved_zero[27:22] |
+    ``tile_pitch_rows[15:0] | reserved_zero[27:16] |
     flags[31:28]``
 
 ``tile_pitch_rows`` is measured in full physical Matrix-SRAM rows (one bank
@@ -21,6 +21,7 @@ without putting the machine's bank count or bank width in the ISA.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 
@@ -35,8 +36,7 @@ _TILE_COUNT_BITS = 8
 _TILE_COUNT_MASK = (1 << _TILE_COUNT_BITS) - 1
 _PITCH_BITS = 16
 _PITCH_MASK = (1 << _PITCH_BITS) - 1
-_ALPHA_BITS = 6
-_ALPHA_MASK = (1 << _ALPHA_BITS) - 1
+_RESERVED_MAPPING_MASK = ((1 << 12) - 1) << 16
 
 
 class MatrixViewForm(IntEnum):
@@ -95,15 +95,14 @@ class MatrixViewShape:
 
 @dataclass(frozen=True)
 class MatrixViewMap:
-    """Compiler-selected skew and physical pitch for one Matrix tensor view.
+    """Compiler-selected physical pitch for one Matrix tensor view.
 
-    ``alpha`` multiplies the *physical* row address.  Bits [27:22] remain
-    reserved until a real compiler-emitted co-access proves that another affine
-    term is needed; a synthetic per-tile offset is not part of this contract.
+    The Matrix SRAM keeps PLENA's fixed diagonal bank wiring. An exhaustive
+    fair control showed that per-view skew adds no service benefit once this
+    existing pitch is selected per view, so mapping bits [27:16] are reserved.
     """
 
     tile_pitch_rows: int
-    alpha: int = 1
     flags: MatrixViewFlags = MatrixViewFlags.STRICT_BOUNDS
 
     def validate(self) -> None:
@@ -111,8 +110,6 @@ class MatrixViewMap:
             raise ValueError(
                 f"tile_pitch_rows must be in [1, {_PITCH_MASK}], got {self.tile_pitch_rows}"
             )
-        if not 0 <= self.alpha <= _ALPHA_MASK:
-            raise ValueError(f"alpha must fit {_ALPHA_BITS} bits, got {self.alpha}")
         unknown = int(self.flags) & ~int(MatrixViewFlags.STRICT_BOUNDS)
         if unknown:
             raise ValueError(f"unknown Matrix-view flags 0x{unknown:x}")
@@ -121,7 +118,6 @@ class MatrixViewMap:
         self.validate()
         return (
             self.tile_pitch_rows
-            | self.alpha << _PITCH_BITS
             | int(self.flags) << 28
         )
 
@@ -130,11 +126,10 @@ class MatrixViewMap:
         _require_u32(word, "mapping word")
         mapping = cls(
             tile_pitch_rows=word & _PITCH_MASK,
-            alpha=(word >> _PITCH_BITS) & _ALPHA_MASK,
             flags=MatrixViewFlags((word >> 28) & 0xF),
         )
-        if word & (_ALPHA_MASK << (_PITCH_BITS + _ALPHA_BITS)):
-            raise ValueError("mapping bits [27:22] are reserved and must be zero")
+        if word & _RESERVED_MAPPING_MASK:
+            raise ValueError("mapping bits [27:16] are reserved and must be zero")
         mapping.validate()
         return mapping
 
@@ -161,11 +156,6 @@ class MatrixViewDescriptor:
             raise ValueError(
                 "tile_pitch_rows aliases consecutive tiles: "
                 f"need at least {required_pitch}, got {self.mapping.tile_pitch_rows}"
-            )
-        if self.mapping.alpha >= banks:
-            raise ValueError(
-                f"alpha must be below the machine's {banks} banks, got "
-                f"{self.mapping.alpha}"
             )
 
 
@@ -231,13 +221,16 @@ def decode_l_mview_word(word: int) -> tuple[MatrixViewForm, int, int, int]:
 def validate_matrix_view_dominance(assembly: str) -> None:
     """Reject a Matrix consumer whose explicit view is not configured first.
 
-    This is deliberately a syntactic, single-pass property. There is no
-    implicit SELECT state. A SHAPE+MAPPING field pair is the cold equivalent of
-    one atomic FULL; RESET removes the slot.
+    This is a syntactic must-dataflow property over the static loop control-flow
+    graph.  There is no implicit SELECT state. A SHAPE+MAPPING field pair is the
+    cold equivalent of one atomic FULL; RESET removes the slot.  Intersections
+    at loop back-edges prevent a first-iteration-only configuration from being
+    accepted as dominating every dynamic use. Inside a loop, C_BREAK has both a
+    fallthrough edge and an edge to the instruction after the matching loop end.
+    Intersecting those paths is conservative for both the public debug-exception
+    wording and the transactional emulator's loop-break behavior.
     """
 
-    configured: set[int] = set()
-    partial: dict[int, set[MatrixViewField]] = {}
     consumers = {
         "M_MM",
         "M_TMM",
@@ -248,6 +241,7 @@ def validate_matrix_view_dominance(assembly: str) -> None:
         "M_BMV",
         "M_BTMV",
     }
+    instructions: list[tuple[int, str, list[str]]] = []
     for line_number, raw in enumerate(assembly.splitlines(), start=1):
         line = raw.split(";", 1)[0].split("//", 1)[0].strip()
         if not line:
@@ -255,33 +249,113 @@ def validate_matrix_view_dominance(assembly: str) -> None:
         parts = line.split(maxsplit=1)
         opcode = parts[0]
         operands = [] if len(parts) == 1 else [part.strip() for part in parts[1].split(",")]
+        instructions.append((line_number, opcode, operands))
+
+    loop_stack: list[int] = []
+    end_to_start: dict[int, int] = {}
+    start_to_end: dict[int, int] = {}
+    break_to_start: dict[int, int] = {}
+    for index, (line_number, opcode, operands) in enumerate(instructions):
+        if opcode in {"L_MVIEW_FULL", "L_MVIEW_FIELD"}:
+            if len(operands) != 3:
+                raise ValueError(f"line {line_number}: malformed {opcode}")
+            _require_slot(int(operands[0], 0))
+            if opcode == "L_MVIEW_FIELD":
+                MatrixViewField(int(operands[1], 0))
+        if opcode == "C_LOOP_START":
+            loop_stack.append(index)
+        elif opcode == "C_BREAK" and loop_stack:
+            break_to_start[index] = loop_stack[-1]
+        elif opcode == "C_LOOP_END":
+            if not loop_stack:
+                raise ValueError(f"line {line_number}: C_LOOP_END without C_LOOP_START")
+            start = loop_stack.pop()
+            end_to_start[index] = start
+            start_to_end[start] = index
+    if loop_stack:
+        line_number = instructions[loop_stack[-1]][0]
+        raise ValueError(f"line {line_number}: C_LOOP_START without C_LOOP_END")
+
+    def successors(index: int) -> tuple[int, ...]:
+        _, opcode, _ = instructions[index]
+        fallthrough = index + 1
+        if opcode == "C_LOOP_END":
+            start = end_to_start[index]
+            result = [start + 1]
+            if fallthrough < len(instructions):
+                result.append(fallthrough)
+            return tuple(result)
+        if opcode == "C_BREAK" and index in break_to_start:
+            result = []
+            if fallthrough < len(instructions):
+                result.append(fallthrough)
+            after_loop = start_to_end[break_to_start[index]] + 1
+            if after_loop < len(instructions):
+                result.append(after_loop)
+            return tuple(dict.fromkeys(result))
+        return (fallthrough,) if fallthrough < len(instructions) else ()
+
+    # Tokens include the configured descriptor and the two cold-form words.
+    # Keeping all three makes FULL and subsequent FIELD updates match the Rust
+    # table: FULL seeds both words, while RESET kills the complete descriptor.
+    State = frozenset[tuple[str, int]]
+
+    def transfer(state: State, opcode: str, operands: list[str]) -> State:
+        result = set(state)
+        if opcode == "L_MVIEW_FULL":
+            slot = int(operands[0], 0)
+            result.difference_update({token for token in result if token[1] == slot})
+            result.update({("shape", slot), ("mapping", slot), ("configured", slot)})
+        elif opcode == "L_MVIEW_FIELD":
+            slot = int(operands[0], 0)
+            field = MatrixViewField(int(operands[1], 0))
+            if field is MatrixViewField.RESET:
+                result.difference_update({token for token in result if token[1] == slot})
+            else:
+                name = "shape" if field is MatrixViewField.SHAPE else "mapping"
+                result.add((name, slot))
+                if {("shape", slot), ("mapping", slot)} <= result:
+                    result.add(("configured", slot))
+        return frozenset(result)
+
+    if not instructions:
+        return
+    in_states: list[State | None] = [None] * len(instructions)
+    in_states[0] = frozenset()
+    work = deque([0])
+    while work:
+        index = work.popleft()
+        state = in_states[index]
+        assert state is not None
+        _, opcode, operands = instructions[index]
+        output = transfer(state, opcode, operands)
+        for target in successors(index):
+            previous = in_states[target]
+            merged = output if previous is None else previous & output
+            if merged != previous:
+                in_states[target] = merged
+                work.append(target)
+
+    for (line_number, opcode, operands), state in zip(instructions, in_states, strict=True):
+        if state is None:
+            continue
         if opcode == "L_MVIEW_FULL":
             if len(operands) != 3:
                 raise ValueError(f"line {line_number}: malformed L_MVIEW_FULL")
             slot = int(operands[0], 0)
             _require_slot(slot)
-            configured.add(slot)
-            partial.pop(slot, None)
             continue
         if opcode == "L_MVIEW_FIELD":
             if len(operands) != 3:
                 raise ValueError(f"line {line_number}: malformed L_MVIEW_FIELD")
             slot = int(operands[0], 0)
             _require_slot(slot)
-            field = MatrixViewField(int(operands[1], 0))
-            if field is MatrixViewField.RESET:
-                configured.discard(slot)
-                partial.pop(slot, None)
-            else:
-                fields = partial.setdefault(slot, set())
-                fields.add(field)
-                if fields >= {MatrixViewField.SHAPE, MatrixViewField.MAPPING}:
-                    configured.add(slot)
+            MatrixViewField(int(operands[1], 0))
             continue
         if opcode == "M_MM_WO" and len(operands) == 4:
             slot = int(operands[3], 0)
             _require_slot(slot)
-            if slot not in configured:
+            if ("configured", slot) not in state:
                 raise ValueError(
                     f"line {line_number}: M_MM_WO consumes Matrix view {slot} "
                     "before a dominating configuration"
@@ -296,7 +370,7 @@ def validate_matrix_view_dominance(assembly: str) -> None:
                     f"line {line_number}: Matrix-view operand mask must be in [1, 7]"
                 )
             for slot in range(3):
-                if mask & (1 << slot) and slot not in configured:
+                if mask & (1 << slot) and ("configured", slot) not in state:
                     raise ValueError(
                         f"line {line_number}: {opcode} consumes Matrix view {slot} "
                         "before a dominating configuration"
@@ -305,7 +379,7 @@ def validate_matrix_view_dominance(assembly: str) -> None:
         if opcode in consumers and len(operands) == 4:
             slot = int(operands[3], 0)
             _require_slot(slot)
-            if slot not in configured:
+            if ("configured", slot) not in state:
                 raise ValueError(
                     f"line {line_number}: {opcode} consumes Matrix view {slot} "
                     "before a dominating configuration"

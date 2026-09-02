@@ -473,7 +473,8 @@ def _matrix_read_packet(
         tile_pitch_rows=(
             descriptor.mapping.tile_pitch_rows if descriptor is not None else None
         ),
-        view_alpha=descriptor.mapping.alpha if descriptor is not None else None,
+        # PLENA's physical Matrix SRAM keeps the fixed diagonal alpha=1.
+        view_alpha=1 if descriptor is not None else None,
         address_stride_elements=_operand_loop_stride(matrix_operand, loop_strides),
     )
 
@@ -643,7 +644,7 @@ def _matrix_view_operand_packet(
         view_rows=shape.rows,
         view_cols=shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
-        view_alpha=descriptor.mapping.alpha,
+        view_alpha=1,
         address_stride_elements=address_stride_elements,
     )
 
@@ -706,7 +707,7 @@ def _matrix_view_writeback_packet(
         view_rows=shape.rows,
         view_cols=shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
-        view_alpha=descriptor.mapping.alpha,
+        view_alpha=1,
         address_stride_elements=_operand_loop_stride(operands[0], loop_strides),
     )
 
