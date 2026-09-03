@@ -64,6 +64,10 @@ class InputVar(TensorVar):
     If ``prestaged_vram_addr`` is not None the tensor is assumed to be already
     present in VRAM at that byte address.  ``load_batch`` will register it at
     that address without emitting any HBM→VRAM prefetch instructions.
+
+    ``hbm_element_bytes`` records the physical element width used by the HBM
+    image.  Keeping it on the value ensures later loads use the same byte
+    stride that was used when the tensor was allocated.
     """
 
     def __init__(
@@ -76,11 +80,13 @@ class InputVar(TensorVar):
         display_name: str | None = None,
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
+        hbm_element_bytes: int = 1,
     ):
         super().__init__(program, name, "input", shape, display_name=display_name, physical_shape=physical_shape)
         self.hbm_addr = hbm_addr
         self.hbm_size = hbm_size
         self.prestaged_vram_addr = prestaged_vram_addr
+        self.hbm_element_bytes = hbm_element_bytes
 
 
 class FPVar:

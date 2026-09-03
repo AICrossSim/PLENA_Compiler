@@ -58,6 +58,7 @@ class ProgramTensorMixin:
             hbm_size,
             prestaged_vram_addr=prestaged_vram_addr,
             physical_shape=physical_shape,
+            hbm_element_bytes=1 if hbm_element_bytes is None else hbm_element_bytes,
         )
         self._inputs[name] = var
         super().add_hbm_object(
@@ -77,7 +78,7 @@ class ProgramTensorMixin:
         self,
         input_var: InputVar,
         name: str | None = None,
-        storage_precision: int = 1,
+        storage_precision: int | None = None,
         precision: int = 0,
     ) -> VRAMMatrixVar:
         """
@@ -97,6 +98,9 @@ class ProgramTensorMixin:
         """
         if not isinstance(input_var, InputVar):
             raise TypeError(f"Expected InputVar, got {type(input_var)}")
+
+        if storage_precision is None:
+            storage_precision = input_var.hbm_element_bytes
 
         display_name = name if name is not None else input_var.display_name
         internal_name = self._scoped_name(display_name)
@@ -191,6 +195,7 @@ class ProgramTensorMixin:
             hbm_size,
             display_name=display_name,
             physical_shape=tensor_var.physical_shape,
+            hbm_element_bytes=hbm_element_bytes,
         )
         self._inputs[internal_name] = var
         return var

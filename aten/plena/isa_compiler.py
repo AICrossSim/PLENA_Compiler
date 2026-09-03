@@ -215,7 +215,10 @@ class IsaCompiler(
                 tensor_info.hbm_addr = hbm_addr
                 # HBM stores element + scale rows, each row-aligned (see hbm_tensor_size).
                 size = batch_size * hidden_size
-                tensor_info.hbm_size = self.hbm_tensor_size(size)
+                tensor_info.hbm_size = self.hbm_tensor_size(
+                    size,
+                    hbm_element_bytes=hbm_element_bytes,
+                )
         finally:
             self.register_allocator.free_gp(gp_regs)
             if need_free_addr:

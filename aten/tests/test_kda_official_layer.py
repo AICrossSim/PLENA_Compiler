@@ -257,7 +257,8 @@ def test_plain_bf16_batch_load_programs_a_byte_stride():
         hbm_element_bytes=2,
     )
 
-    p.load_batch(source, storage_precision=2, precision=1)
+    assert source.hbm_element_bytes == 2
+    p.load_batch(source, precision=1)
     code = p.compile()
 
     assert "S_ADDI_INT gp3, gp0, 32" in code
@@ -275,8 +276,36 @@ def test_plain_bf16_single_batch_load_advances_hbm_offsets_in_bytes():
         hbm_element_bytes=2,
     )
 
-    p.load_batch(source, storage_precision=2, precision=1)
+    assert source.hbm_element_bytes == 2
+    p.load_batch(source, precision=1)
     code = p.compile()
 
     # One H_PREFETCH_V moves 4 * MLEN = 32 BF16 values, hence 64 HBM bytes.
     assert "S_ADDI_INT gp2, gp2, 64" in code
+
+
+def test_bf16_store_preserves_the_element_width_for_a_later_reload():
+    p = PlenaCompiler(mlen=MLEN, blen=2, real_data_ratio=2.0)
+    source = p.input(
+        "plain_bf16_source",
+        (1, 64),
+        physical_shape=(1, 64),
+        real_data_ratio=2.0,
+        hbm_element_bytes=2,
+    )
+    value = p.load_batch(source, precision=1)
+    stored = p.store(
+        value,
+        name="plain_bf16_stored",
+        precision=1,
+        hbm_element_bytes=2,
+        real_data_ratio=1.0,
+    )
+
+    assert stored.hbm_element_bytes == 2
+    assert stored.hbm_size >= 1 * 64 * 2
+    prefix = p.compile()
+    p.load_batch(stored, name="plain_bf16_reloaded", precision=1)
+    reload_code = p.compile()[len(prefix) :]
+
+    assert "S_ADDI_INT gp2, gp2, 64" in reload_code
