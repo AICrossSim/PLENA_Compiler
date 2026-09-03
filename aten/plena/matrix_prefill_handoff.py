@@ -3,10 +3,10 @@
 This module keeps three claims separate:
 
 * the current Compiler really emits an identity GEMM at the boundary;
-* the same logical BF16/MX8 state can instead remain in one Matrix-SRAM
-  allocation and be consumed through the opposite axis;
-* the official Kimi K3 FP32 state cannot use that Matrix-resident path and is
-  therefore still explicit streamed traffic.
+* the PLENA BF16 state can remain in one Matrix-SRAM allocation and be consumed
+  through the opposite axis;
+* the official Kimi K3 GPU implementation's FP32 state is retained only as a
+  capacity and accuracy baseline, not as the active PLENA transfer format.
 
 The ISA stays model independent. ``L_MVIEW`` declares shape and physical-row
 pitch over PLENA's fixed diagonal placement; existing row/column Matrix
@@ -106,7 +106,13 @@ def _legacy_identity_transpose_assembly(
     # the published 256-row point, where one complete MLEN-square tile cannot
     # reside. One structural slot is enough to expose the emitted work; the
     # report separately states that the physical point cannot hold that tile.
-    program = PlenaCompiler(mlen=mlen, blen=blen, mram_tile_capacity=1)
+    program = PlenaCompiler(
+        mlen=mlen,
+        blen=blen,
+        mram_tile_capacity=1,
+        hbm_v_prefetch_amount=16,
+        hbm_v_writeback_amount=16,
+    )
     program._bf16_kv_checked = True
     kda_shape = KdaShape(
         hidden_size=shape.hidden_size,
@@ -237,6 +243,7 @@ def build_prefill_handoff_report(
     )
     bf16_state_bytes_per_head = shape.key_dim * shape.value_dim * 2
     fp32_state_bytes_per_layer = shape.heads * shape.key_dim * shape.value_dim * 4
+    bf16_state_bytes_per_layer = shape.heads * shape.key_dim * shape.value_dim * 2
     matrix_sram_bytes = mlen * matrix_sram_rows * 2
     bf16_heads_per_resident_window = matrix_sram_bytes // bf16_state_bytes_per_head
 
@@ -299,19 +306,21 @@ def build_prefill_handoff_report(
         },
         "precision_and_capacity_boundary": {
             "official_state_dtype": "FP32",
+            "plena_state_dtype": "BF16",
             "matrix_sram_dtype": "BF16",
             "official_fp32_state_bytes_per_layer": fp32_state_bytes_per_layer,
             "matrix_sram_bytes": matrix_sram_bytes,
             "official_fp32_state_matrix_resident": False,
-            "bf16_state_bytes_per_layer": fp32_state_bytes_per_layer // 2,
+            "plena_bf16_state_matrix_streamed": True,
+            "bf16_state_bytes_per_layer": bf16_state_bytes_per_layer,
             "bf16_heads_per_resident_window": bf16_heads_per_resident_window,
             "bf16_windows_per_layer": (
                 shape.heads + bf16_heads_per_resident_window - 1
             )
             // bf16_heads_per_resident_window,
             "interpretation": (
-                "The zero-MAC view handoff is a BF16/MX8 candidate. Official FP32 "
-                "state remains explicitly streamed and receives no Matrix-residency credit."
+                "The evaluated zero-MAC view handoff uses PLENA BF16 state. "
+                "Official GPU FP32 state is reported only as baseline metadata."
             ),
         },
     }

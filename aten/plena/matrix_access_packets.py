@@ -16,8 +16,9 @@ from dataclasses import asdict, dataclass
 from typing import Iterable
 
 from compiler.aten.plena.mview import (
+    LTilePrimitive,
+    MatrixViewAxis,
     MatrixViewDescriptor,
-    MatrixViewField,
     MatrixViewMap,
     MatrixViewShape,
 )
@@ -28,6 +29,7 @@ _MATRIX_READ_OPS = frozenset(
 )
 _MATRIX_WRITE_OPS = frozenset({"H_PREFETCH_M"})
 _MATRIX_VIEW_VECTOR_OPS = frozenset({"V_ADD_VV.MV", "V_SUB_VV.MV", "V_MUL_VV.MV"})
+_MATRIX_VIEW_DMA_OPS = frozenset({"H_PREFETCH_V.MV", "H_STORE_V.MV"})
 _STAGE = re.compile(r"@stage=([A-Za-z0-9_\-]+)")
 _AXIS = re.compile(r"@axis=([A-Za-z0-9_\-]+)")
 _GP = re.compile(r"^gp(\d+)$")
@@ -62,6 +64,13 @@ class MatrixAccessPacket:
     view_cols: int | None = None
     tile_pitch_rows: int | None = None
     view_alpha: int | None = None
+    view_tile_skew: int | None = None
+    view_affine: bool | None = None
+    view_tile_start: int | None = None
+    view_line_axis: str | None = None
+    view_line_period: int | None = None
+    view_broadcast_tile: bool | None = None
+    l_tile_primitive: str | None = None
     # Compile-time address delta between successive executions of the
     # innermost hardware loop containing this instruction.  ``None`` means the
     # scalar update was not affine and therefore cannot be replayed exactly.
@@ -75,6 +84,22 @@ class MatrixAccessPacket:
         result = asdict(self)
         result["values_per_packet"] = self.values_per_packet
         return result
+
+
+def _view_mapping_metadata(
+    descriptor: MatrixViewDescriptor | None,
+) -> tuple[int | None, int | None, bool | None]:
+    """Return the physical coefficients selected by one configured view."""
+
+    if descriptor is None:
+        return None, None, None
+    mapping = descriptor.mapping
+    affine = mapping.affine_enabled
+    return (
+        mapping.row_skew if affine else 1,
+        mapping.tile_skew if affine else 0,
+        affine,
+    )
 
 
 @dataclass(frozen=True)
@@ -107,7 +132,6 @@ def extract_matrix_access_packets(
     stage = "unattributed"
     packet_axis: str | None = None
     views: dict[int, MatrixViewDescriptor] = {}
-    partial_views: dict[int, dict[MatrixViewField, int]] = {}
     loop_trips: list[int] = []
     packets: list[MatrixAccessPacket] = []
     covered_matrix_instructions = 0
@@ -144,13 +168,11 @@ def extract_matrix_access_packets(
         _update_gp_state(line, registers)
         opcode, operands = _split_instruction(line)
         multiplier = _product(loop_trips)
-        if opcode in {"L_MVIEW_FULL", "L_MVIEW_FIELD"}:
+        if opcode == "L_TILE_CFG":
             _update_matrix_views(
-                opcode,
                 operands,
                 registers,
                 views,
-                partial_views,
             )
         elif opcode in _MATRIX_READ_OPS:
             packets.append(
@@ -206,6 +228,34 @@ def extract_matrix_access_packets(
                     packet_axis,
                     multiplier,
                     registers,
+                    views,
+                    loop_address_strides.get(instruction_index, {}),
+                )
+            )
+            covered_matrix_instructions += 1
+        elif opcode in _MATRIX_VIEW_DMA_OPS:
+            packets.append(
+                _matrix_view_dma_packet(
+                    instruction_index,
+                    opcode,
+                    operands,
+                    stage,
+                    multiplier,
+                    registers,
+                    views,
+                    loop_address_strides.get(instruction_index, {}),
+                )
+            )
+            covered_matrix_instructions += 1
+        elif opcode == "L_TILE_EXEC":
+            packets.extend(
+                _l_tile_exec_packets(
+                    instruction_index,
+                    operands,
+                    stage,
+                    multiplier,
+                    registers,
+                    geometry,
                     views,
                     loop_address_strides.get(instruction_index, {}),
                 )
@@ -272,11 +322,11 @@ def coissued_packet_histogram(
     the later destination write remains a separate service group.
     """
 
-    groups: dict[tuple[int, str], list[MatrixAccessPacket]] = {}
+    groups: dict[tuple[int, str, str], list[MatrixAccessPacket]] = {}
     for packet in packets:
-        groups.setdefault((packet.instruction_index, packet.direction), []).append(
-            packet
-        )
+        groups.setdefault(
+            (packet.instruction_index, packet.direction, packet.axis), []
+        ).append(packet)
 
     static: Counter[tuple[str, str, str, str, tuple[tuple[str, int, int], ...]]] = (
         Counter()
@@ -354,20 +404,22 @@ def coissued_packet_groups(
     omitting the potentially large cell list.
     """
 
-    groups: dict[tuple[int, str], list[MatrixAccessPacket]] = {}
+    groups: dict[tuple[int, str, str], list[MatrixAccessPacket]] = {}
     for packet in packets:
-        groups.setdefault((packet.instruction_index, packet.direction), []).append(
-            packet
-        )
+        groups.setdefault(
+            (packet.instruction_index, packet.direction, packet.axis), []
+        ).append(packet)
 
     result: list[dict[str, object]] = []
-    for (instruction_index, direction), group in sorted(groups.items()):
+    for (instruction_index, direction, _phase), group in sorted(groups.items()):
         repeats = {packet.repeats for packet in group}
         stages = {packet.stage for packet in group}
         axes = {packet.axis for packet in group}
         opcodes = {packet.opcode for packet in group}
         if len(repeats) != 1 or len(stages) != 1 or len(axes) != 1 or len(opcodes) != 1:
-            raise ValueError("co-issued Matrix operands disagree on instruction metadata")
+            raise ValueError(
+                "co-issued Matrix operands disagree on instruction metadata"
+            )
         result.append(
             {
                 "instruction_index": instruction_index,
@@ -387,6 +439,13 @@ def coissued_packet_groups(
                         "view_cols": packet.view_cols,
                         "tile_pitch_rows": packet.tile_pitch_rows,
                         "view_alpha": packet.view_alpha,
+                        "view_tile_skew": packet.view_tile_skew,
+                        "view_affine": packet.view_affine,
+                        "view_tile_start": packet.view_tile_start,
+                        "view_line_axis": packet.view_line_axis,
+                        "view_line_period": packet.view_line_period,
+                        "view_broadcast_tile": packet.view_broadcast_tile,
+                        "l_tile_primitive": packet.l_tile_primitive,
                         "address_stride_elements": packet.address_stride_elements,
                     }
                     for packet in group
@@ -456,6 +515,7 @@ def _matrix_read_packet(
         axis = "row"
         elements_per_tile = width
         cells = tuple(LogicalCell(tile, "cycle", col) for col in range(width))
+    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
     return MatrixAccessPacket(
         instruction_index=instruction_index,
         opcode=opcode,
@@ -473,8 +533,9 @@ def _matrix_read_packet(
         tile_pitch_rows=(
             descriptor.mapping.tile_pitch_rows if descriptor is not None else None
         ),
-        # PLENA's physical Matrix SRAM keeps the fixed diagonal alpha=1.
-        view_alpha=1 if descriptor is not None else None,
+        view_alpha=view_alpha,
+        view_tile_skew=view_tile_skew,
+        view_affine=view_affine,
         address_stride_elements=_operand_loop_stride(matrix_operand, loop_strides),
     )
 
@@ -515,46 +576,24 @@ def _matrix_dma_packet(
 
 
 def _update_matrix_views(
-    opcode: str,
     operands: list[str],
     registers: list[int | None],
     views: dict[int, MatrixViewDescriptor],
-    partial_views: dict[int, dict[MatrixViewField, int]],
 ) -> None:
     if len(operands) != 3:
-        raise ValueError(f"{opcode} requires three operands, got {operands}")
+        raise ValueError(f"L_TILE_CFG requires three operands, got {operands}")
     slot = int(operands[0], 0)
     if not 0 <= slot < 4:
         raise ValueError(f"Matrix-view slot must be in [0, 4), got {slot}")
-    if opcode == "L_MVIEW_FULL":
-        shape_word = _require_resolved(operands[1], registers, "Matrix-view shape")
-        map_word = _require_resolved(operands[2], registers, "Matrix-view mapping")
-        descriptor = MatrixViewDescriptor(
-            MatrixViewShape.unpack(shape_word),
-            MatrixViewMap.unpack(map_word),
-        )
-        descriptor.shape.validate()
-        descriptor.mapping.validate()
-        views[slot] = descriptor
-        partial_views.pop(slot, None)
-        return
-
-    field = MatrixViewField(int(operands[1], 0))
-    value = _require_resolved(operands[2], registers, "Matrix-view field")
-    if field is MatrixViewField.RESET:
-        views.pop(slot, None)
-        partial_views.pop(slot, None)
-        return
-    fields = partial_views.setdefault(slot, {})
-    fields[field] = value
-    if {MatrixViewField.SHAPE, MatrixViewField.MAPPING} <= fields.keys():
-        descriptor = MatrixViewDescriptor(
-            MatrixViewShape.unpack(fields[MatrixViewField.SHAPE]),
-            MatrixViewMap.unpack(fields[MatrixViewField.MAPPING]),
-        )
-        descriptor.shape.validate()
-        descriptor.mapping.validate()
-        views[slot] = descriptor
+    shape_word = _require_resolved(operands[1], registers, "Matrix-view shape")
+    map_word = _require_resolved(operands[2], registers, "Matrix-view mapping")
+    descriptor = MatrixViewDescriptor(
+        MatrixViewShape.unpack(shape_word),
+        MatrixViewMap.unpack(map_word),
+    )
+    descriptor.shape.validate()
+    descriptor.mapping.validate()
+    views[slot] = descriptor
 
 
 def _matrix_view_vector_packets(
@@ -601,6 +640,378 @@ def _matrix_view_vector_packets(
     return tuple(result)
 
 
+def _matrix_view_dma_packet(
+    instruction_index: int,
+    opcode: str,
+    operands: list[str],
+    stage: str,
+    multiplier: int,
+    registers: list[int | None],
+    views: dict[int, MatrixViewDescriptor],
+    loop_strides: dict[int, int | None],
+) -> MatrixAccessPacket:
+    """Describe an ordinary Vector DMA redirected through a Matrix view."""
+
+    if len(operands) != 6:
+        raise ValueError(
+            f"{opcode} requires destination, source, address register, offset, "
+            "precision, and Matrix-view slot"
+        )
+    slot = int(operands[5], 0)
+    try:
+        descriptor = views[slot]
+    except KeyError as error:
+        raise ValueError(
+            f"{opcode} uses unconfigured Matrix-view slot {slot}"
+        ) from error
+    matrix_operand = operands[0]
+    shape = descriptor.shape
+    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
+    sample = tuple(
+        LogicalCell(tile, row, col)
+        for tile in range(shape.tile_count)
+        for row in range(shape.rows)
+        for col in range(shape.cols)
+    )[:32]
+    return MatrixAccessPacket(
+        instruction_index=instruction_index,
+        opcode=opcode,
+        stage=stage,
+        direction="write" if opcode == "H_PREFETCH_V.MV" else "read",
+        axis="view_dma",
+        matrix_address=_resolve_operand(matrix_operand, registers),
+        tile_count=shape.tile_count,
+        elements_per_tile=shape.rows * shape.cols,
+        repeats=multiplier,
+        sample_cells=sample,
+        view_slot=slot,
+        operand="dma_destination" if opcode == "H_PREFETCH_V.MV" else "dma_source",
+        view_rows=shape.rows,
+        view_cols=shape.cols,
+        tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
+        view_alpha=view_alpha,
+        view_tile_skew=view_tile_skew,
+        view_affine=view_affine,
+        address_stride_elements=_operand_loop_stride(matrix_operand, loop_strides),
+    )
+
+
+def _axis_extent(
+    descriptor: MatrixViewDescriptor, axis: MatrixViewAxis
+) -> tuple[int, int]:
+    """Return (logical lines, values per line) for one view axis."""
+
+    if axis is MatrixViewAxis.ROW:
+        return descriptor.shape.rows, descriptor.shape.cols
+    return descriptor.shape.cols, descriptor.shape.rows
+
+
+def _line_cells(
+    *,
+    descriptor: MatrixViewDescriptor,
+    axis: MatrixViewAxis,
+    tile_start: int,
+    tile_count: int,
+    line: int,
+    broadcast_tile: bool = False,
+) -> tuple[LogicalCell, ...]:
+    cells: list[LogicalCell] = []
+    for packet_tile in range(tile_start, tile_start + tile_count):
+        tile = 0 if broadcast_tile else packet_tile
+        if axis is MatrixViewAxis.ROW:
+            cells.extend(
+                LogicalCell(tile, line, col) for col in range(descriptor.shape.cols)
+            )
+        else:
+            cells.extend(
+                LogicalCell(tile, row, line) for row in range(descriptor.shape.rows)
+            )
+    return tuple(cells)
+
+
+def _l_tile_packet(
+    *,
+    instruction_index: int,
+    stage: str,
+    direction: str,
+    phase: str,
+    matrix_address: int | str,
+    address_stride_elements: int | None,
+    repeats: int,
+    slot: int,
+    operand: str,
+    descriptor: MatrixViewDescriptor,
+    axis: MatrixViewAxis,
+    tile_start: int,
+    tile_count: int,
+    line: int,
+    line_period: int,
+    primitive: LTilePrimitive,
+    broadcast_tile: bool = False,
+) -> MatrixAccessPacket:
+    _, line_width = _axis_extent(descriptor, axis)
+    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
+    return MatrixAccessPacket(
+        instruction_index=instruction_index,
+        opcode="L_TILE_EXEC",
+        stage=stage,
+        direction=direction,
+        axis=phase,
+        matrix_address=matrix_address,
+        tile_count=tile_count,
+        elements_per_tile=line_width,
+        repeats=repeats,
+        sample_cells=_line_cells(
+            descriptor=descriptor,
+            axis=axis,
+            tile_start=tile_start,
+            tile_count=tile_count,
+            line=line,
+            broadcast_tile=broadcast_tile,
+        ),
+        view_slot=slot,
+        operand=operand,
+        view_rows=descriptor.shape.rows,
+        view_cols=descriptor.shape.cols,
+        tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
+        view_alpha=view_alpha,
+        view_tile_skew=view_tile_skew,
+        view_affine=view_affine,
+        view_tile_start=tile_start,
+        view_line_axis=axis.name.lower(),
+        view_line_period=line_period,
+        view_broadcast_tile=broadcast_tile,
+        l_tile_primitive=primitive.name,
+        address_stride_elements=address_stride_elements,
+    )
+
+
+def _l_tile_exec_packets(
+    instruction_index: int,
+    operands: list[str],
+    stage: str,
+    multiplier: int,
+    registers: list[int | None],
+    geometry: PacketGeometry,
+    views: dict[int, MatrixViewDescriptor],
+    loop_strides: dict[int, int | None],
+) -> tuple[MatrixAccessPacket, ...]:
+    """Expand one deterministic L_TILE macro into physical SRAM phases.
+
+    The expansion mirrors ``Accelerator::execute_l_tile``.  Destination,
+    source, and compact scalar packets use the existing one-read-port Matrix
+    SRAM sequentially; they are deliberately assigned distinct ``axis`` phase
+    names so a report cannot mislabel them as same-cycle operands.
+    """
+
+    if len(operands) not in (4, 5):
+        raise ValueError(
+            "L_TILE_EXEC requires destination/source/scale bases, primitive, "
+            "and an optional axis mask"
+        )
+    try:
+        descriptors = [views[slot] for slot in range(3)]
+    except KeyError as error:
+        raise ValueError(
+            f"L_TILE_EXEC uses unconfigured Matrix-view slot {error.args[0]}"
+        ) from error
+    dst, source, scales = descriptors
+    primitive = LTilePrimitive(int(operands[3], 0))
+    axis_mask = int(operands[4], 0) if len(operands) == 5 else 0
+    if not 0 <= axis_mask <= 3:
+        raise ValueError("L_TILE_EXEC axis mask must be in [0, 3]")
+    source_axis = MatrixViewAxis(axis_mask & 1)
+    scale_axis = MatrixViewAxis((axis_mask >> 1) & 1)
+    bases = [_resolve_operand(operand, registers) for operand in operands[:3]]
+    strides = [_operand_loop_stride(operand, loop_strides) for operand in operands[:3]]
+    result: list[MatrixAccessPacket] = []
+
+    if primitive in {LTilePrimitive.SCALE_ACCUM, LTilePrimitive.OUTER_UPDATE}:
+        source_lines, source_width = _axis_extent(source, source_axis)
+        scale_lines, _ = _axis_extent(scales, scale_axis)
+        if source_width != dst.shape.cols:
+            raise ValueError("row-wise L_TILE source/destination widths differ")
+        if source_lines not in {1, dst.shape.rows}:
+            raise ValueError(
+                "row-wise L_TILE source rows must be one or match destination"
+            )
+        if scale_lines < dst.shape.rows:
+            raise ValueError(
+                "L_TILE scale view has fewer logical lines than destination"
+            )
+        tiles_per_packet = max(1, geometry.mlen // dst.shape.cols)
+        for tile_start in range(0, dst.shape.tile_count, tiles_per_packet):
+            tile_count = min(tiles_per_packet, dst.shape.tile_count - tile_start)
+            row_repeats = multiplier * dst.shape.rows
+            for (
+                direction,
+                phase,
+                slot,
+                operand,
+                descriptor,
+                axis,
+                line_period,
+                base,
+                stride,
+            ) in (
+                (
+                    "read",
+                    "l_tile_dst_read",
+                    0,
+                    "destination",
+                    dst,
+                    MatrixViewAxis.ROW,
+                    dst.shape.rows,
+                    bases[0],
+                    strides[0],
+                ),
+                (
+                    "read",
+                    "l_tile_source_read",
+                    1,
+                    "source",
+                    source,
+                    source_axis,
+                    source_lines,
+                    bases[1],
+                    strides[1],
+                ),
+                (
+                    "write",
+                    "l_tile_dst_write",
+                    0,
+                    "destination",
+                    dst,
+                    MatrixViewAxis.ROW,
+                    dst.shape.rows,
+                    bases[0],
+                    strides[0],
+                ),
+            ):
+                result.append(
+                    _l_tile_packet(
+                        instruction_index=instruction_index,
+                        stage=stage,
+                        direction=direction,
+                        phase=phase,
+                        matrix_address=base,
+                        address_stride_elements=stride,
+                        repeats=row_repeats,
+                        slot=slot,
+                        operand=operand,
+                        descriptor=descriptor,
+                        axis=axis,
+                        tile_start=tile_start,
+                        tile_count=tile_count,
+                        line=0,
+                        line_period=line_period,
+                        primitive=primitive,
+                        broadcast_tile=(descriptor.shape.tile_count == 1),
+                    )
+                )
+            scale_tile_count = 1 if scales.shape.tile_count == 1 else tile_count
+            result.append(
+                _l_tile_packet(
+                    instruction_index=instruction_index,
+                    stage=stage,
+                    direction="read",
+                    phase="l_tile_scale_read",
+                    matrix_address=bases[2],
+                    address_stride_elements=strides[2],
+                    repeats=row_repeats,
+                    slot=2,
+                    operand="scale",
+                    descriptor=scales,
+                    axis=scale_axis,
+                    tile_start=0 if scales.shape.tile_count == 1 else tile_start,
+                    tile_count=scale_tile_count,
+                    line=0,
+                    line_period=scale_lines,
+                    primitive=primitive,
+                    broadcast_tile=False,
+                )
+            )
+    else:
+        source_lines, source_width = _axis_extent(source, source_axis)
+        scale_lines, _ = _axis_extent(scales, scale_axis)
+        if dst.shape.rows != 1 or dst.shape.cols != source_width:
+            raise ValueError("DOT_REDUCE destination must be one row per source tile")
+        if dst.shape.tile_count != source.shape.tile_count:
+            raise ValueError("DOT_REDUCE destination/source tile counts differ")
+        if scale_lines < source_lines:
+            raise ValueError("DOT_REDUCE scale view has fewer lines than reduction rows")
+        tiles_per_packet = max(1, geometry.mlen // source_width)
+        for tile_start in range(0, source.shape.tile_count, tiles_per_packet):
+            tile_count = min(tiles_per_packet, source.shape.tile_count - tile_start)
+            packet_repeats = multiplier
+            for direction, phase in (
+                ("read", "l_tile_dst_read"),
+                ("write", "l_tile_dst_write"),
+            ):
+                result.append(
+                    _l_tile_packet(
+                        instruction_index=instruction_index,
+                        stage=stage,
+                        direction=direction,
+                        phase=phase,
+                        matrix_address=bases[0],
+                        address_stride_elements=strides[0],
+                        repeats=packet_repeats,
+                        slot=0,
+                        operand="destination",
+                        descriptor=dst,
+                        axis=MatrixViewAxis.ROW,
+                        tile_start=tile_start,
+                        tile_count=tile_count,
+                        line=0,
+                        line_period=1,
+                        primitive=primitive,
+                    )
+                )
+            result.append(
+                _l_tile_packet(
+                    instruction_index=instruction_index,
+                    stage=stage,
+                    direction="read",
+                    phase="l_tile_source_read",
+                    matrix_address=bases[1],
+                    address_stride_elements=strides[1],
+                    repeats=packet_repeats * source_lines,
+                    slot=1,
+                    operand="source",
+                    descriptor=source,
+                    axis=source_axis,
+                    tile_start=tile_start,
+                    tile_count=tile_count,
+                    line=0,
+                    line_period=source_lines,
+                    primitive=primitive,
+                )
+            )
+            scale_tile_count = 1 if scales.shape.tile_count == 1 else tile_count
+            result.append(
+                _l_tile_packet(
+                    instruction_index=instruction_index,
+                    stage=stage,
+                    direction="read",
+                    phase="l_tile_scale_read",
+                    matrix_address=bases[2],
+                    address_stride_elements=strides[2],
+                    repeats=packet_repeats * source_lines,
+                    slot=2,
+                    operand="scale",
+                    descriptor=scales,
+                    axis=scale_axis,
+                    tile_start=0 if scales.shape.tile_count == 1 else tile_start,
+                    tile_count=scale_tile_count,
+                    line=0,
+                    line_period=scale_lines,
+                    primitive=primitive,
+                )
+            )
+    return tuple(result)
+
+
 def _matrix_view_operand_packet(
     *,
     instruction_index: int,
@@ -622,6 +1033,7 @@ def _matrix_view_operand_packet(
             f"{opcode} uses unconfigured Matrix-view slot {slot}"
         ) from error
     shape = descriptor.shape
+    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
     cells = tuple(
         LogicalCell(tile, row, col)
         for tile in range(shape.tile_count)
@@ -644,7 +1056,9 @@ def _matrix_view_operand_packet(
         view_rows=shape.rows,
         view_cols=shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
-        view_alpha=1,
+        view_alpha=view_alpha,
+        view_tile_skew=view_tile_skew,
+        view_affine=view_affine,
         address_stride_elements=address_stride_elements,
     )
 
@@ -671,6 +1085,7 @@ def _matrix_view_writeback_packet(
         operands[2], registers, "Matrix accumulator logical offset"
     )
     shape = descriptor.shape
+    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
     values_per_tile = shape.rows * shape.cols
     if logical_offset % geometry.blen:
         raise ValueError("M_MM_WO logical offset must select one BLEN-wide fragment")
@@ -707,7 +1122,9 @@ def _matrix_view_writeback_packet(
         view_rows=shape.rows,
         view_cols=shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
-        view_alpha=1,
+        view_alpha=view_alpha,
+        view_tile_skew=view_tile_skew,
+        view_affine=view_affine,
         address_stride_elements=_operand_loop_stride(operands[0], loop_strides),
     )
 
@@ -721,6 +1138,8 @@ def _is_matrix_access_instruction(raw: str) -> bool:
         opcode in _MATRIX_READ_OPS
         or opcode in _MATRIX_WRITE_OPS
         or opcode in _MATRIX_VIEW_VECTOR_OPS
+        or opcode in _MATRIX_VIEW_DMA_OPS
+        or opcode == "L_TILE_EXEC"
         or (opcode == "M_MM_WO" and len(operands) == 4)
     )
 
@@ -791,7 +1210,9 @@ def _loop_address_strides(assembly: str) -> dict[int, dict[int, int | None]]:
     result: dict[int, dict[int, int | None]] = {}
     # Outer loops are installed first; an inner loop then overrides them for
     # instructions in its body, which is the required per-issue address delta.
-    for start, end, strides in sorted(loops, key=lambda loop: loop[1] - loop[0], reverse=True):
+    for start, end, strides in sorted(
+        loops, key=lambda loop: loop[1] - loop[0], reverse=True
+    ):
         for index in range(start + 1, end):
             result[index] = strides
     return result

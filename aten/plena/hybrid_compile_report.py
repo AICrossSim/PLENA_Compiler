@@ -248,6 +248,76 @@ def kimi_k3_mixer_assembly(
     return program.get_code()[start:]
 
 
+def kimi_k3_recurrence_assembly(
+    *,
+    stream: bool,
+    affine: bool = False,
+    packetized: bool = False,
+    packet_elements: int = 64,
+    storage_atom: int = 4,
+    blen: int = 4,
+    recurrent_row_elements: int = 64,
+) -> str:
+    """Official Kimi K3 delta recurrence, excluding preparation and gating.
+
+    This is the like-for-like baseline for ``L_TILE``.  Q/K normalisation,
+    decay/beta generation, and output gated RMSNorm remain ordinary Vector
+    stages in both paths; only decay, prediction, error, rank-1 update and
+    readout are replaced by the Matrix-SRAM recurrence lowering.
+    """
+
+    mlen = recurrent_row_elements
+    shape = KdaShape.kimi_k3()
+    program = _compiler(
+        stream=stream,
+        affine=affine,
+        packetized=packetized,
+        mlen=mlen,
+        blen=blen,
+        packet_elements=packet_elements,
+        storage_atom=storage_atom,
+    )
+
+    def alloc(name: str, rows: int):
+        return program.alloc(name, _up(rows, mlen), mlen, strict=False)
+
+    state = alloc("state", kda_state_rows(shape, mlen))
+    value_rows = kda_vector_rows(shape, mlen)
+    value = alloc("value", value_rows)
+    output = alloc("output", value_rows)
+    prediction = alloc("prediction", value_rows)
+    error = alloc("error", value_rows)
+    query = program.fp_var("query", size=shape.key_dim)
+    key = program.fp_var("key", size=shape.key_dim)
+    decay = program.fp_var("decay", size=shape.key_dim)
+    beta = program.fp_var(
+        "beta", size=max(shape.num_heads, kda_head_blocks(shape, mlen) * mlen)
+    )
+    output_scale = program.fp_var("output_scale", size=1)
+
+    start = len(program.get_code())
+    for head in range(shape.num_heads):
+        # The official implementation reuses one key-dimension scalar window
+        # per head.  Lower one head at a time so the emitted baseline observes
+        # the same finite FPRAM contract as the complete mixer.
+        program.kda_decode_step_v0(
+            state=state,
+            q_fp=query,
+            k_fp=key,
+            decay_fp=decay,
+            beta_fp=beta,
+            v=value,
+            o=output,
+            pred=prediction,
+            err=error,
+            shape=shape,
+            output_scale_fp=output_scale,
+            head_rows=[head],
+            fp_head_stride=0,
+        )
+    return program.get_code()[start:]
+
+
 def nemotron3_mamba_decode_assembly(
     *,
     stream: bool,
@@ -525,6 +595,12 @@ def build_report(
             "kimi_k3_decode_recurrent_mixer": _pair(
                 configured(
                     kimi_k3_mixer_assembly,
+                    recurrent_row_elements=kda_recurrent_row_elements,
+                )
+            ),
+            "kimi_k3_decode_recurrence": _pair(
+                configured(
+                    kimi_k3_recurrence_assembly,
                     recurrent_row_elements=kda_recurrent_row_elements,
                 )
             ),

@@ -166,6 +166,7 @@ jobs:
             assembler/tests/test_l_mview.py \
             aten/tests/test_affine_layout.py \
             aten/tests/test_hybrid_compile_report.py \
+            aten/tests/test_hybrid_l_tile_schedule.py \
             aten/tests/test_hybrid_workloads.py \
             aten/tests/test_kda_precision_campaign.py \
             aten/tests/test_kda_official_layer.py \

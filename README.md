@@ -2,83 +2,130 @@
 
 ## Matrix SRAM L-Compute
 
-This branch keeps two independent optimizations for Nemotron 3 and Kimi K3:
-
-1. Arlo's static lowering reduces pointer, scalar and loop instructions.
-2. Matrix L-Compute uses PLENA's fixed diagonal Matrix-SRAM bank wiring and a
-   Compiler-selected physical-row pitch. Matrix writeback and its consumers use
-   the same view, so row, column and multi-row packets read the same cells with
-   logical lane order restored.
-
-The second item is the architecture mechanism evaluated here. It is not the
-older Vector-SRAM `L_CFG` experiment and it adds no state cache, private SRAM,
-`X_STATE`, MAC array, queue or runtime scheduler.
-
-The implemented ISA uses one model-independent configuration opcode with two forms:
+This branch evaluates linear recurrences on PLENA's existing Matrix SRAM. The
+Compiler explicitly loads prepared fields and recurrent state, configures a
+logical Matrix view, executes bank-parallel packets, and stores state and output
+back to HBM. The evaluated PLENA path is uniformly BF16. The official GPU
+implementations' FP32 state is retained only as profiling and accuracy metadata.
 
 ```text
-L_MVIEW.FULL   slot, shape_reg, map_reg
-L_MVIEW.FIELD  slot, field, value_reg
-<Matrix op>    ..., view=slot
-<Vector op>.MV ..., operand_view_mask
+prepared fields + BF16 HBM state
+                 |
+                 v
+       existing Matrix SRAM
+    fixed-diagonal or affine view
+                 |
+      bank packet + lane restore
+                 |
+                 v
+   existing Vector mul/add/reduce
+                 |
+                 v
+        BF16 state/output in HBM
 ```
 
-The descriptor contains shape, physical-row pitch and bounds flags. Mapping
-bits `[27:16]` are reserved and must be zero: a fair search found that
-per-view programmable skew provides no benefit once the control may also choose
-pitch. It contains no model name, recurrence equation, head count, bank count
-or traversal. Existing `M_MM/M_TMM/M_MV` words explicitly name the view.
-Existing binary Vector operations use `.MV` as an addressing-mode suffix: mask
-bits select whether destination, source 1 and source 2 use slots 0, 1 and 2. A
-must-dataflow check over loop back-edges rejects use before configuration.
+There is no state cache, private state SRAM, `X_STATE`, command queue, runtime
+scheduler or new MAC array. Matrix SRAM is an explicitly addressed scratchpad:
+the Compiler owns every address, transfer and lifetime.
 
-At `MLEN=2048`, one packet uses 32 Mamba heads x 64 values or 16 KDA heads x
-128 values. The pitch-1 control and implemented co-layout have exactly the same
-dynamic operation stream. Compiler pitches 2 (Mamba) and 4 (KDA) reduce local
-packet service from 2 to 1 cycles and 4 to 1 cycles, respectively, with zero
-bank-conflict stalls. An exhaustive counterfactual search over programmable
-skew cannot improve either result. All recurrence rows fill the apparent pitch
-gaps: 262,144 values per model were placed and read back with zero alias and
-zero capacity overhead.
+### ISA
 
-The corresponding official-shape, B1 decode serial analytic timelines are:
+One opcode (`0x3f`) carries two model-independent forms (and preserves the
+older `L_CFG` encoding at `funct1=0`):
 
-| Model | Pitch-1 | Implemented co-layout | Whole-model gain | Programmable-skew upper bound |
-|---|---:|---:|---:|---:|
-| Nemotron 3 (52 layers) | 3,160,138 | 3,142,474 | 1.00562x | 1.00000x over implemented |
-| Kimi K3 (93 layers) | 98,804,544 | 98,168,640 | 1.00648x | 1.00000x over implemented |
+```text
+L_TILE_CFG     slot, shape_reg, map_reg
+L_TILE_EXEC    dst, src, scale, primitive[, axis_mask]
+```
 
-The local bank result comes from numbered physical-cell replay of real Compiler
-addresses. The full-model result is a formula-based serial analytic timeline
-with official dimensions, GPU calibration and symbolic PLENA weights; it is not
-a first-to-last transactional checkpoint execution.
+The view descriptor contains tensor shape, row pitch, row skew, tile skew,
+precision and bounds flags. `L_TILE_EXEC` accepts only three algebraic
+primitives: scale-accumulate, dot-reduce and outer-update. The decoder walks a
+statically known view and reuses PLENA's existing Vector arithmetic. Neither
+the encoding nor decoder contains `Mamba`, `KDA`, a model-specific head count,
+or a cache policy. Configuration is atomic; there is no partial-update form. A
+loop-aware dominance check rejects use of an unconfigured
+view.
 
-The official manifests are pinned to 52 Nemotron layers (23 Mamba, 23 MoE,
-6 GQA) and 93 Kimi layers (69 KDA, 24 MLA). Dimensions and GPU calibration are
-real, but the full PLENA programs still use symbolic weights. A separate
-published `mamba2-130m-hf` gate validates 24 layers and carried recurrent state;
-its surrounding Matrix stages run in PyTorch and are not described as a full
-PLENA checkpoint execution.
+Matrix-view DMA reuses `H_PREFETCH_V` and `H_STORE_V`: bit 31 marks the viewed
+form and bits 30:29 select the view slot. Legacy DMA words are unchanged;
+legacy nonzero precision selectors still mean KV. The viewed form adds an
+explicit BF16 state selector.
 
-Official recurrent state remains explicit FP32 traffic: 2 MiB per Nemotron
-Mamba layer and 6 MiB per Kimi KDA layer. The BF16 Matrix SRAM cannot silently
-hold either format. Low-precision state results are reported separately with
-their accuracy error.
+Mamba-2 composes scale-accumulate and dot-reduce. KDA composes all three
+primitives. Attention/MLA/MoE keep their existing PLENA instructions. Arlo's
+row-by-row static lowering remains the software fallback and the `B` ablation.
+It is separate from L-Compute: Arlo reduces address/loop issue; `L_TILE` walks a
+configured multi-row view. Coefficient generation (`softplus`/`exp`) remains an
+upstream Vector stage and is not silently credited to `L_TILE`.
 
-There are no transfer-only `L_MVIEW` instructions. Matrix projection fragments
-use the existing `M_MM_WO` with a view-qualified destination and advance by one
-`BLEN` fragment until the real consumer shape is full: `32 x 64` for the
-Nemotron packet and `16 x 128` for Kimi at `MLEN=2048`. Existing Vector
-arithmetic reads those packets directly through `.MV`; no intermediate gather
-or copy is inserted. See [the ISA review](doc/matrix_lcompute_isa_review.md) for
-the encoding argument, physical data path and resource contract.
+### What is wired into the Compiler
 
-KDA prefill is a separate boundary. The legacy Compiler emits an identity GEMM
-to convert `[value,key]` into decode's `[key,value]`; a BF16/MX8 Matrix view
-instead reads 16,384 numbered values through the column axis with zero
-transpose MACs. The old `3.387x/1.713x` prefill claims are withdrawn because
-the two complete paths were not measured under the same timeline. Official
-FP32 state receives no Matrix-residency or prefill speedup credit.
+- Nemotron 3: all 23 Mamba layers in the official 52-layer order emit the
+  prepared-coefficient recurrence core through `L_TILE`.
+- Kimi K3: all 69 KDA layers in the official 93-layer order emit the
+  prepared-coefficient recurrence core through `L_TILE`.
+- Recurrent state is BF16: 1 MiB per Nemotron Mamba layer and 3 MiB per Kimi
+  KDA layer at batch 1.
+- Each layer owns disjoint, 64-byte-aligned HBM ranges. The 1 MiB Matrix SRAM is
+  reused sequentially and never treated as a cache.
+- Every head group's output has a distinct HBM destination and is checked after
+  Rust execution; a later group cannot overwrite an earlier result.
+
+The matching storage study reports BF16 output relative-L2 error of 0.000312
+for Nemotron at 32K tokens and 0.017061 for Kimi at 2K tokens versus FP32 state.
+These are synthetic recurrence errors, not checkpoint-level quality results.
+
+The affine schedules assemble to legal 32-bit words. Their ordinary
+Attention/MLA/MoE entries are schedule markers linked to the existing analytic
+paths, not a claim that checkpoint weights have run numerically from the first
+to final layer in Rust.
+
+### Current pre-RTL result
+
+At `MLEN=2048`, `BLEN=32`, 64 banks, a 1 MiB BF16 Matrix SRAM and 1560 HBM
+bytes/cycle, the fresh formula-based B1 decode timeline is:
+
+| Model | Original A | Arlo B | Fixed single-base C | Affine D | D/A | D/B |
+|---|---:|---:|---:|---:|---:|---:|
+| Nemotron 3 | 4,055,091 | 3,110,067 | 2,210,882 | 2,014,554 | 2.0129x | 1.5438x |
+| Kimi K3 | 103,816,704 | 97,013,856 | 93,286,200 | 91,178,043 | 1.1386x | 1.0640x |
+
+`A` and `B` are one-cycle-per-issued-instruction proxies for the original and
+Arlo static streams; they are not Rust cycle measurements. `C` and `D` add
+explicit service, arithmetic and HBM terms, so `D/A` and `D/B` primarily
+measure multi-row utilization plus issue compression, not programmable-skew
+speedup.
+
+KDA decay/beta preparation remains visible upstream: the B1 timeline charges
+the same 5,107,104 ordinary elementwise operations and 1,702,368 exponentials,
+or 4,485 Vector cycles, to every variant. The preparation follows the official
+decay and beta formulas before `L_TILE` consumes those coefficients.
+
+`C` is an executable descriptor constrained to one base phase; it is not the
+fair bank-only control. The fair `D'` control gives the original fixed diagonal
+wiring an ordinary per-tile base phase. It maps the same physical cells as `D`,
+has zero bank stalls, and gives `D/D' = 1.00x` on both official BF16 state
+packets. Therefore this branch does **not** claim a programmable-skew bank
+speedup. `C -> D` includes descriptor compactness, fewer chunks/instructions,
+lower ideal service, and KDA spill removal.
+
+The connected test is stronger than the analytic replay: Compiler assembly is
+assembled into canonical 32-bit words and executed by Rust for four consecutive
+tokens at official recurrence geometry. It compares 524,288 Nemotron and
+1,572,864 Kimi state values plus every head-group output. All four fixed/affine
+cases pass; the largest relative-L2 error is 0.0071 under uniform BF16.
+
+Whole-model cycles use official dimensions, pinned GPU calibration, measured
+Nemotron routing where available, and symbolic PLENA weights. Only the 23/69
+recurrent layers are executable in this schedule; ordinary layers are analytic
+markers. This is not silicon measurement or first-to-last real-checkpoint Rust
+execution. Prefill receives no L-Compute speedup; previous prefill speedup
+claims remain withdrawn. There is no overlap credit at the 1 MiB point.
+
+See [the ISA review](doc/matrix_lcompute_isa_review.md) and the Simulator's
+machine-readable `matrix_lcompute_e2e_v5` campaign for the complete fairness,
+capacity, bandwidth, port-width and evidence boundaries.
 
 ## MoE code organization
 

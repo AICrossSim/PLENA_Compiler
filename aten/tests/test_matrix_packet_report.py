@@ -76,50 +76,73 @@ def test_report_does_not_hide_the_legacy_square_tile_capacity_mismatch() -> None
     assert "do not claim" in contract["legacy_projection_limit"]
 
 
-def test_recurrence_report_records_real_same_cycle_multi_operand_packets() -> None:
+def test_recurrence_report_records_every_physical_l_tile_service_phase() -> None:
     recurrence = [
         case
         for case in build_report()["cases"]
         if case["lowering"]
-        in {"matrix_recurrence_pitch1", "matrix_recurrence_colayout"}
+        in {"matrix_recurrence_fixed", "matrix_recurrence_affine"}
     ]
     assert len(recurrence) == 4
     for case in recurrence:
-        reads = [
+        l_tile_groups = [
             entry
             for entry in case["coissued_histogram"]
-            if entry["direction"] == "read"
+            if entry["opcode"] == "L_TILE_EXEC"
         ]
-        assert reads
-        assert any(entry["same_cycle_operands"] == 2 for entry in reads)
-        # Fixed diagonal wiring fills the compiler-selected pitch gaps while
-        # preserving the same 131072-element recurrence block stride.
-        expected_stride = 131_072
+        assert {
+            (entry["direction"], entry["axis"])
+            for entry in l_tile_groups
+        } == {
+            ("read", "l_tile_dst_read"),
+            ("read", "l_tile_source_read"),
+            ("read", "l_tile_scale_read"),
+            ("write", "l_tile_dst_write"),
+        }
+        # The paper point has one Matrix-SRAM read port per bank.  Destination,
+        # source, and per-segment scales are therefore consecutive physical
+        # service phases inside L_TILE, not fictitious same-cycle operands.
+        assert all(entry["same_cycle_operands"] == 1 for entry in l_tile_groups)
+        assert all(entry["dynamic_service_groups"] > 0 for entry in l_tile_groups)
+
+        dma_groups = [
+            entry
+            for entry in case["coissued_histogram"]
+            if entry["axis"] == "view_dma"
+        ]
+        assert {entry["direction"] for entry in dma_groups} == {"read", "write"}
+
+        # L_TILE performs the internal row walk itself.  No surrounding hardware
+        # loop mutates its Matrix bases, so the executable packet extractor must
+        # report invariant base addresses rather than inventing an outer stride.
         for group in case["service_groups"]:
             for operand in group["operands"]:
-                assert operand["address_stride_elements"] == expected_stride
+                assert operand["address_stride_elements"] == 0
 
     by_model_and_lowering = {
         (case["model"], case["lowering"]): case for case in recurrence
     }
-    for model, pitch in (
-        ("Nemotron-3 Nano 30B-A3B", 2),
-        ("Kimi K3", 4),
-    ):
-        pitch1 = by_model_and_lowering[(model, "matrix_recurrence_pitch1")]
-        colayout = by_model_and_lowering[(model, "matrix_recurrence_colayout")]
-        assert pitch1["opcode_census"] == colayout["opcode_census"]
-        assert pitch1["dynamic_packet_repeats"] == colayout["dynamic_packet_repeats"]
-        assert {
-            operand["tile_pitch_rows"]
-            for group in pitch1["service_groups"]
-            for operand in group["operands"]
-        } == {1}
-        assert {
-            operand["tile_pitch_rows"]
-            for group in colayout["service_groups"]
-            for operand in group["operands"]
-        } == {pitch}
+    for model in ("Nemotron-3 Nano 30B-A3B", "Kimi K3"):
+        fixed = by_model_and_lowering[(model, "matrix_recurrence_fixed")]
+        affine = by_model_and_lowering[(model, "matrix_recurrence_affine")]
+        assert fixed["working_set"]["layout"] == "fixed"
+        assert affine["working_set"]["layout"] == "affine"
+        assert fixed["working_set"]["capacity_bytes"] == 1024 * 1024
+        assert affine["working_set"]["capacity_bytes"] == 1024 * 1024
+        assert fixed["lowering_metrics"]["contains_l_tile"] is True
+        assert affine["lowering_metrics"]["contains_l_tile"] is True
+        # Both variants execute the same official recurrence, but affine packing
+        # may retain a larger head/state chunk and therefore remove fixed-layout
+        # reloads.  That difference is a measured mechanism benefit, not a hidden
+        # capacity increase.
+        assert (
+            affine["working_set"]["group_heads"]
+            >= fixed["working_set"]["group_heads"]
+        )
+        assert (
+            affine["lowering_metrics"]["state_transfer_values"]
+            <= fixed["lowering_metrics"]["state_transfer_values"]
+        )
 
 
 def test_projection_writeback_uses_the_real_consumer_head_shape() -> None:

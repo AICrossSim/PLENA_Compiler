@@ -89,6 +89,53 @@ class ProgramKdaRecurrentMixin:
     ``ProgramFPTileOpsMixin`` (``tile_row_mul_fp``, ``vram_fill_zero``).
     """
 
+    def kda_decode_step_l_tile_v0(
+        self,
+        *,
+        shape: KdaShape,
+        layout: str,
+        matrix_sram_bytes: int = 1024 * 1024,
+    ) -> str:
+        """Emit the complete five-step KDA recurrence through Matrix SRAM.
+
+        The ordinary row-wise implementation remains available as the
+        correctness/fallback baseline.  This method emits the actual generic
+        ``L_TILE`` instructions consumed by the Matrix-SRAM architecture path;
+        no KDA opcode, state cache, private SRAM, or runtime queue is created.
+        """
+
+        from compiler.aten.plena.matrix_recurrence_lowering import (
+            KIMI_KDA,
+            LoweringRegisters,
+            MatrixSramPoint,
+            lower_matrix_recurrence,
+        )
+
+        actual = (
+            shape.num_heads,
+            shape.key_dim,
+            shape.value_dim,
+        )
+        expected = (
+            KIMI_KDA.heads,
+            KIMI_KDA.recurrence_rows,
+            KIMI_KDA.row_elements,
+        )
+        if actual != expected:
+            raise ValueError(f"L_TILE KDA decode expects {expected}, got {actual}")
+        allocated = self.register_allocator.allocate_gp(5)
+        try:
+            registers = LoweringRegisters(*allocated)
+            assembly = lower_matrix_recurrence(
+                KIMI_KDA,
+                layout=layout,
+                point=MatrixSramPoint(capacity_bytes=matrix_sram_bytes),
+                registers=registers,
+            )
+            return self._emit(assembly)
+        finally:
+            self.register_allocator.free_gp(allocated)
+
     def kda_decode_step_v0(
         self,
         *,

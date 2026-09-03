@@ -11,12 +11,14 @@ Two GP values are sufficient for the hot form:
     tile_count_minus_one[31:24]``
 
 ``mapping``
-    ``tile_pitch_rows[15:0] | reserved_zero[27:16] |
+    ``tile_pitch_rows[15:0] | row_skew[21:16] | tile_skew[27:22] |
     flags[31:28]``
 
 ``tile_pitch_rows`` is measured in full physical Matrix-SRAM rows (one bank
-word from every bank), not elements.  This keeps a 2048x2048 tile representable
-without putting the machine's bank count or bank width in the ISA.
+word from every bank), not elements.  A zero pitch is legal only when the
+affine tile phase keeps every logical bank word distinct.  That compact form
+is what places several logical head rows in the same physical row but in
+different banks.  The injectivity check below rejects an unsafe zero pitch.
 """
 
 from __future__ import annotations
@@ -28,7 +30,10 @@ from enum import IntEnum, IntFlag
 
 L_MVIEW_OPCODE = 0x3F
 L_MVIEW_MAX_SLOTS = 4
-L_MVIEW_CONTRACT_VERSION = 1
+L_MVIEW_CONTRACT_VERSION = 2
+MATRIX_VIEW_DMA_MARKER = 1 << 31
+MATRIX_VIEW_DMA_SLOT_SHIFT = 29
+MATRIX_VIEW_DMA_HIGH_RESERVED_MASK = 0b111 << 26
 
 _DIM_BITS = 12
 _DIM_MASK = (1 << _DIM_BITS) - 1
@@ -36,28 +41,60 @@ _TILE_COUNT_BITS = 8
 _TILE_COUNT_MASK = (1 << _TILE_COUNT_BITS) - 1
 _PITCH_BITS = 16
 _PITCH_MASK = (1 << _PITCH_BITS) - 1
-_RESERVED_MAPPING_MASK = ((1 << 12) - 1) << 16
+_SKEW_BITS = 6
+_SKEW_MASK = (1 << _SKEW_BITS) - 1
 
 
 class MatrixViewForm(IntEnum):
-    """Function selector carried by the shared ``L_MVIEW`` opcode."""
+    """Function selector carried by the shared ``L_TILE`` opcode."""
 
-    FULL = 1
-    FIELD = 2
+    CONFIG = 1
+    EXEC = 3
 
 
-class MatrixViewField(IntEnum):
-    """Fields that the cold partial-update form may replace."""
+class LTilePrimitive(IntEnum):
+    """Model-independent tensor primitives executed over Matrix-SRAM views.
 
-    RESET = 0
-    SHAPE = 1
-    MAPPING = 2
+    Shapes, broadcasting and reduction axes come from the three configured
+    views.  No primitive names a model or owns persistent state.
+    """
+
+    # dst[row, :] = scale[row, 0] * dst[row, :]
+    #             + scale[row, 1] * src[row_or_broadcast, :]
+    # The decoder walks logical rows; the scale view is segment-broadcast.
+    SCALE_ACCUM = 0
+
+    # dst[0, col] = sum_row(src[row, col] * scale[row, 0]).  The source is
+    # consumed as a group of logical columns, so this form exercises the
+    # transposable/diagonal Matrix-SRAM path rather than materialising a
+    # transpose or reducing one row at a time.
+    DOT_REDUCE = 1
+
+    # dst[row, :] += vector[row_or_broadcast, :] * scale[row, 0].  This is the
+    # generic outer/rank-1 update used by linear recurrences.
+    OUTER_UPDATE = 2
+
+
+class MatrixViewAxis(IntEnum):
+    """Logical line direction selected by an ``L_TILE.EXEC`` operand.
+
+    Placement remains a property of the configured view.  Axis is a use-site
+    property: the same physical cells may be consumed as logical rows during
+    decode or logical columns at a transpose boundary without creating a
+    second copy.
+    """
+
+    ROW = 0
+    COLUMN = 1
 
 
 class MatrixViewFlags(IntFlag):
-    """Placement properties; ``STRICT_BOUNDS`` is the canonical hot path."""
+    """Placement and element properties for one explicit scratchpad view."""
 
     STRICT_BOUNDS = 1 << 0
+    AFFINE = 1 << 1
+    FP32 = 1 << 2
+    BROADCAST_MINOR = 1 << 3
 
 
 @dataclass(frozen=True)
@@ -95,30 +132,56 @@ class MatrixViewShape:
 
 @dataclass(frozen=True)
 class MatrixViewMap:
-    """Compiler-selected physical pitch for one Matrix tensor view.
+    """Compiler-selected physical placement for one Matrix tensor view.
 
-    The Matrix SRAM keeps PLENA's fixed diagonal bank wiring. An exhaustive
-    fair control showed that per-view skew adds no service benefit once this
-    existing pitch is selected per view, so mapping bits [27:16] are reserved.
+    ``row_skew`` and ``tile_skew`` are six-bit affine coefficients because the
+    architectural Matrix SRAM has at most 64 banks.  A zero-coefficient mapping
+    without ``AFFINE`` selects PLENA's fixed diagonal wiring; setting either
+    coefficient makes the mapping explicit and sets ``AFFINE`` in the packed
+    word.  A tensor's allocation base supplies the constant bank phase, so no
+    separate model-specific field or group identifier is needed.
     """
 
     tile_pitch_rows: int
+    row_skew: int = 0
+    tile_skew: int = 0
     flags: MatrixViewFlags = MatrixViewFlags.STRICT_BOUNDS
 
+    @property
+    def affine_enabled(self) -> bool:
+        """Whether the packed descriptor selects its explicit affine map."""
+
+        return bool(
+            self.flags & MatrixViewFlags.AFFINE or self.row_skew or self.tile_skew
+        )
+
     def validate(self) -> None:
-        if not 1 <= self.tile_pitch_rows <= _PITCH_MASK:
+        if not 0 <= self.tile_pitch_rows <= _PITCH_MASK:
             raise ValueError(
-                f"tile_pitch_rows must be in [1, {_PITCH_MASK}], got {self.tile_pitch_rows}"
+                f"tile_pitch_rows must be in [0, {_PITCH_MASK}], got {self.tile_pitch_rows}"
             )
-        unknown = int(self.flags) & ~int(MatrixViewFlags.STRICT_BOUNDS)
+        for name, value in (("row_skew", self.row_skew), ("tile_skew", self.tile_skew)):
+            if not 0 <= value <= _SKEW_MASK:
+                raise ValueError(f"{name} must fit {_SKEW_BITS} bits, got {value}")
+        unknown = int(self.flags) & ~int(
+            MatrixViewFlags.STRICT_BOUNDS
+            | MatrixViewFlags.AFFINE
+            | MatrixViewFlags.FP32
+            | MatrixViewFlags.BROADCAST_MINOR
+        )
         if unknown:
             raise ValueError(f"unknown Matrix-view flags 0x{unknown:x}")
 
     def pack(self) -> int:
         self.validate()
+        flags = self.flags
+        if self.row_skew or self.tile_skew:
+            flags |= MatrixViewFlags.AFFINE
         return (
             self.tile_pitch_rows
-            | int(self.flags) << 28
+            | self.row_skew << 16
+            | self.tile_skew << 22
+            | int(flags) << 28
         )
 
     @classmethod
@@ -126,10 +189,14 @@ class MatrixViewMap:
         _require_u32(word, "mapping word")
         mapping = cls(
             tile_pitch_rows=word & _PITCH_MASK,
+            row_skew=(word >> 16) & _SKEW_MASK,
+            tile_skew=(word >> 22) & _SKEW_MASK,
             flags=MatrixViewFlags((word >> 28) & 0xF),
         )
-        if word & _RESERVED_MAPPING_MASK:
-            raise ValueError("mapping bits [27:16] are reserved and must be zero")
+        if not mapping.flags & MatrixViewFlags.AFFINE and (
+            mapping.row_skew or mapping.tile_skew
+        ):
+            raise ValueError("non-zero Matrix-view skew requires the AFFINE flag")
         mapping.validate()
         return mapping
 
@@ -150,17 +217,119 @@ class MatrixViewDescriptor:
             raise ValueError(
                 f"cols {self.shape.cols} must contain whole {bank_width}-element bank words"
             )
-        words_per_row = (self.shape.cols // bank_width + banks - 1) // banks
-        required_pitch = self.shape.rows * words_per_row
-        if self.mapping.tile_pitch_rows < required_pitch:
+        words_per_row = self.shape.cols // bank_width
+        row_groups = (words_per_row + banks - 1) // banks
+        affine = self.mapping.affine_enabled
+        alpha = self.mapping.row_skew if affine else 1
+        tile_skew = self.mapping.tile_skew if affine else 0
+        occupied: dict[tuple[int, int], tuple[int, int, int]] = {}
+        for tile in range(self.shape.tile_count):
+            for row in range(self.shape.rows):
+                for word in range(words_per_row):
+                    bank_row = (
+                        tile * self.mapping.tile_pitch_rows
+                        + row * row_groups
+                        + word // banks
+                    )
+                    bank = (alpha * bank_row + tile_skew * tile + word) % banks
+                    key = (bank, bank_row)
+                    previous = occupied.setdefault(key, (tile, row, word))
+                    if previous != (tile, row, word):
+                        raise ValueError(
+                            "Matrix view aliases logical bank words: "
+                            f"{previous} and {(tile, row, word)} both map to "
+                            f"bank={bank}, row={bank_row}"
+                        )
+
+
+@dataclass(frozen=True)
+class MatrixViewAllocation:
+    """One compiler-owned tensor view placed at an explicit Matrix-SRAM base."""
+
+    name: str
+    base: int
+    descriptor: MatrixViewDescriptor
+
+
+def validate_disjoint_matrix_views(
+    allocations: list[MatrixViewAllocation] | tuple[MatrixViewAllocation, ...],
+    *,
+    mlen: int,
+    banks: int,
+    bank_width: int,
+    depth_rows: int,
+    fixed_alpha: int = 1,
+    fixed_gamma: int = 0,
+) -> dict[str, int]:
+    """Prove that all simultaneously-live views occupy distinct bank words.
+
+    This is a static scratchpad allocation check, not a cache simulation.  It
+    uses the same coordinate equation as the Rust Matrix SRAM and returns a few
+    capacity facts for reports.  A bad placement fails during compilation.
+    """
+
+    if mlen != banks * bank_width:
+        raise ValueError("mlen must equal banks * bank_width")
+    if depth_rows <= 0:
+        raise ValueError("depth_rows must be positive")
+    if not 0 <= fixed_alpha < banks or not 0 <= fixed_gamma < banks:
+        raise ValueError("fixed Matrix-SRAM coefficients must fit the bank count")
+
+    occupied: dict[tuple[int, int], tuple[str, int, int, int]] = {}
+    max_row = 0
+    for allocation in allocations:
+        descriptor = allocation.descriptor
+        descriptor.validate_for_machine(banks=banks, bank_width=bank_width)
+        if allocation.base < 0 or allocation.base % bank_width:
             raise ValueError(
-                "tile_pitch_rows aliases consecutive tiles: "
-                f"need at least {required_pitch}, got {self.mapping.tile_pitch_rows}"
+                f"{allocation.name}: base {allocation.base} is not bank-word aligned"
             )
+        base_row, base_offset = divmod(allocation.base, mlen)
+        base_bank = base_offset // bank_width
+        words_per_row = descriptor.shape.cols // bank_width
+        row_groups = (words_per_row + banks - 1) // banks
+        affine = descriptor.mapping.affine_enabled
+        alpha = descriptor.mapping.row_skew if affine else fixed_alpha
+        tile_skew = descriptor.mapping.tile_skew if affine else 0
+        for tile in range(descriptor.shape.tile_count):
+            for row in range(descriptor.shape.rows):
+                for word in range(words_per_row):
+                    bank_row = (
+                        base_row
+                        + tile * descriptor.mapping.tile_pitch_rows
+                        + row * row_groups
+                        + word // banks
+                    )
+                    if bank_row >= depth_rows:
+                        raise ValueError(
+                            f"{allocation.name}: bank row {bank_row} exceeds "
+                            f"Matrix-SRAM depth {depth_rows}"
+                        )
+                    bank = (
+                        base_bank
+                        + alpha * bank_row
+                        + tile_skew * tile
+                        + fixed_gamma * (bank_row // banks)
+                        + word
+                    ) % banks
+                    key = (bank, bank_row)
+                    current = (allocation.name, tile, row, word)
+                    previous = occupied.setdefault(key, current)
+                    if previous != current:
+                        raise ValueError(
+                            "Matrix views alias physical bank word "
+                            f"bank={bank}, row={bank_row}: {previous} and {current}"
+                        )
+                    max_row = max(max_row, bank_row + 1)
+    return {
+        "bank_words": len(occupied),
+        "capacity_bank_words": banks * depth_rows,
+        "max_bank_row": max_row,
+    }
 
 
-def encode_l_mview_full(*, slot: int, shape_register: int, map_register: int) -> int:
-    """Encode ``L_MVIEW.FULL slot, shape_reg, map_reg`` canonically."""
+def encode_l_tile_cfg(*, slot: int, shape_register: int, map_register: int) -> int:
+    """Encode ``L_TILE_CFG slot, shape_reg, map_reg`` canonically."""
 
     _require_slot(slot)
     _require_register(shape_register, "shape_register")
@@ -170,28 +339,105 @@ def encode_l_mview_full(*, slot: int, shape_register: int, map_register: int) ->
         | shape_register << 6
         | map_register << 10
         | slot << 14
-        | int(MatrixViewForm.FULL) << 22
+        | int(MatrixViewForm.CONFIG) << 22
     )
 
 
-def encode_l_mview_field(
-    *, slot: int, field: MatrixViewField | int, value_register: int
+def encode_l_tile_exec(
+    *,
+    dst_register: int,
+    src1_register: int,
+    src2_register: int,
+    primitive: LTilePrimitive | int,
+    source_axis: MatrixViewAxis | int = MatrixViewAxis.ROW,
+    scale_axis: MatrixViewAxis | int = MatrixViewAxis.ROW,
 ) -> int:
-    """Encode ``L_MVIEW.FIELD slot, field, value_reg`` canonically."""
+    """Encode ``L_TILE_EXEC dst, src1, src2, primitive`` canonically.
 
-    _require_slot(slot)
-    _require_register(value_register, "value_register")
+    Slots 0/1/2 are the destination/source-1/source-2 descriptors.  Keeping the
+    slot assignment positional leaves all operand bases explicit in the
+    instruction and avoids an implicit SELECT state.
+    """
+
+    for name, register in (
+        ("dst_register", dst_register),
+        ("src1_register", src1_register),
+        ("src2_register", src2_register),
+    ):
+        _require_register(register, name)
     try:
-        selected = MatrixViewField(int(field))
+        selected = LTilePrimitive(int(primitive))
     except ValueError as error:
-        raise ValueError(f"reserved Matrix-view field {field}") from error
+        raise ValueError(f"reserved L_TILE primitive {primitive}") from error
+    try:
+        selected_source_axis = MatrixViewAxis(int(source_axis))
+        selected_scale_axis = MatrixViewAxis(int(scale_axis))
+    except ValueError as error:
+        raise ValueError("reserved L_TILE operand axis") from error
     return (
         L_MVIEW_OPCODE
-        | value_register << 6
-        | int(selected) << 10
-        | slot << 14
-        | int(MatrixViewForm.FIELD) << 22
+        | dst_register << 6
+        | src1_register << 10
+        | src2_register << 14
+        | int(selected) << 18
+        | int(MatrixViewForm.EXEC) << 22
+        | int(selected_source_axis) << 26
+        | int(selected_scale_axis) << 27
     )
+
+
+def decode_l_tile_exec_word(
+    word: int,
+) -> tuple[int, int, int, LTilePrimitive, MatrixViewAxis, MatrixViewAxis]:
+    """Decode one canonical ``L_TILE_EXEC`` word."""
+
+    _require_u32(word, "instruction word")
+    if word & 0x3F != L_MVIEW_OPCODE or ((word >> 22) & 0xF) != MatrixViewForm.EXEC:
+        raise ValueError("word is not an L_TILE_EXEC encoding")
+    if word >> 28:
+        raise ValueError("reserved L_TILE_EXEC bits [31:28] must be zero")
+    try:
+        primitive = LTilePrimitive((word >> 18) & 0xF)
+    except ValueError as error:
+        raise ValueError("reserved L_TILE primitive") from error
+    return (
+        (word >> 6) & 0xF,
+        (word >> 10) & 0xF,
+        (word >> 14) & 0xF,
+        primitive,
+        MatrixViewAxis((word >> 26) & 0x1),
+        MatrixViewAxis((word >> 27) & 0x1),
+    )
+
+
+def encode_matrix_view_dma_word(legacy_word: int, *, slot: int) -> int:
+    """Qualify an existing vector DMA word with an explicit Matrix view.
+
+    The physical opcode and every legacy operand field remain unchanged. Bit
+    31 marks the addressing form, bits 30:29 name a configured view, and bits
+    28:26 remain canonical zero. This is not a new transfer operation.
+    """
+
+    _require_u32(legacy_word, "legacy DMA word")
+    _require_slot(slot)
+    if legacy_word >> 26:
+        raise ValueError("legacy DMA word uses reserved bits [31:26]")
+    if legacy_word & 0x3F not in {0x29, 0x2A}:
+        raise ValueError("Matrix-view DMA requires H_PREFETCH_V or H_STORE_V")
+    return legacy_word | MATRIX_VIEW_DMA_MARKER | (slot << MATRIX_VIEW_DMA_SLOT_SHIFT)
+
+
+def decode_matrix_view_dma_slot(word: int) -> int | None:
+    """Return the explicit Matrix-view slot, or ``None`` for a legacy DMA."""
+
+    _require_u32(word, "DMA word")
+    if word >> 26 == 0:
+        return None
+    if not word & MATRIX_VIEW_DMA_MARKER or word & MATRIX_VIEW_DMA_HIGH_RESERVED_MASK:
+        raise ValueError("non-canonical Matrix-view DMA bits [31:26]")
+    slot = (word >> MATRIX_VIEW_DMA_SLOT_SHIFT) & 0b11
+    _require_slot(slot)
+    return slot
 
 
 def decode_l_mview_word(word: int) -> tuple[MatrixViewForm, int, int, int]:
@@ -210,11 +456,8 @@ def decode_l_mview_word(word: int) -> tuple[MatrixViewForm, int, int, int]:
     operand_b = (word >> 10) & 0xF
     if (word >> 18) & 0xF:
         raise ValueError("reserved L_MVIEW bits [21:18] must be zero")
-    if form is MatrixViewForm.FIELD:
-        try:
-            MatrixViewField(operand_b)
-        except ValueError as error:
-            raise ValueError("reserved Matrix-view field") from error
+    if form is MatrixViewForm.EXEC:
+        raise ValueError("use decode_l_tile_exec_word for EXEC form")
     return form, slot, operand_a, operand_b
 
 
@@ -222,9 +465,8 @@ def validate_matrix_view_dominance(assembly: str) -> None:
     """Reject a Matrix consumer whose explicit view is not configured first.
 
     This is a syntactic must-dataflow property over the static loop control-flow
-    graph.  There is no implicit SELECT state. A SHAPE+MAPPING field pair is the
-    cold equivalent of one atomic FULL; RESET removes the slot.  Intersections
-    at loop back-edges prevent a first-iteration-only configuration from being
+    graph.  There is no implicit SELECT state. Intersections at loop back-edges
+    prevent a first-iteration-only configuration from being
     accepted as dominating every dynamic use. Inside a loop, C_BREAK has both a
     fallthrough edge and an edge to the instruction after the matching loop end.
     Intersecting those paths is conservative for both the public debug-exception
@@ -256,12 +498,10 @@ def validate_matrix_view_dominance(assembly: str) -> None:
     start_to_end: dict[int, int] = {}
     break_to_start: dict[int, int] = {}
     for index, (line_number, opcode, operands) in enumerate(instructions):
-        if opcode in {"L_MVIEW_FULL", "L_MVIEW_FIELD"}:
+        if opcode == "L_TILE_CFG":
             if len(operands) != 3:
                 raise ValueError(f"line {line_number}: malformed {opcode}")
             _require_slot(int(operands[0], 0))
-            if opcode == "L_MVIEW_FIELD":
-                MatrixViewField(int(operands[1], 0))
         if opcode == "C_LOOP_START":
             loop_stack.append(index)
         elif opcode == "C_BREAK" and loop_stack:
@@ -295,27 +535,14 @@ def validate_matrix_view_dominance(assembly: str) -> None:
             return tuple(dict.fromkeys(result))
         return (fallthrough,) if fallthrough < len(instructions) else ()
 
-    # Tokens include the configured descriptor and the two cold-form words.
-    # Keeping all three makes FULL and subsequent FIELD updates match the Rust
-    # table: FULL seeds both words, while RESET kills the complete descriptor.
     State = frozenset[tuple[str, int]]
 
     def transfer(state: State, opcode: str, operands: list[str]) -> State:
         result = set(state)
-        if opcode == "L_MVIEW_FULL":
+        if opcode == "L_TILE_CFG":
             slot = int(operands[0], 0)
             result.difference_update({token for token in result if token[1] == slot})
             result.update({("shape", slot), ("mapping", slot), ("configured", slot)})
-        elif opcode == "L_MVIEW_FIELD":
-            slot = int(operands[0], 0)
-            field = MatrixViewField(int(operands[1], 0))
-            if field is MatrixViewField.RESET:
-                result.difference_update({token for token in result if token[1] == slot})
-            else:
-                name = "shape" if field is MatrixViewField.SHAPE else "mapping"
-                result.add((name, slot))
-                if {("shape", slot), ("mapping", slot)} <= result:
-                    result.add(("configured", slot))
         return frozenset(result)
 
     if not instructions:
@@ -339,18 +566,28 @@ def validate_matrix_view_dominance(assembly: str) -> None:
     for (line_number, opcode, operands), state in zip(instructions, in_states, strict=True):
         if state is None:
             continue
-        if opcode == "L_MVIEW_FULL":
+        if opcode == "L_TILE_CFG":
             if len(operands) != 3:
-                raise ValueError(f"line {line_number}: malformed L_MVIEW_FULL")
+                raise ValueError(f"line {line_number}: malformed L_TILE_CFG")
             slot = int(operands[0], 0)
             _require_slot(slot)
             continue
-        if opcode == "L_MVIEW_FIELD":
-            if len(operands) != 3:
-                raise ValueError(f"line {line_number}: malformed L_MVIEW_FIELD")
-            slot = int(operands[0], 0)
-            _require_slot(slot)
-            MatrixViewField(int(operands[1], 0))
+        if opcode == "L_TILE_EXEC":
+            if len(operands) not in {4, 5}:
+                raise ValueError(f"line {line_number}: malformed L_TILE_EXEC")
+            LTilePrimitive(int(operands[3], 0))
+            if len(operands) == 5:
+                axis_mask = int(operands[4], 0)
+                if not 0 <= axis_mask <= 0b11:
+                    raise ValueError(
+                        f"line {line_number}: L_TILE_EXEC axis mask must be in [0, 3]"
+                    )
+            for slot in range(3):
+                if ("configured", slot) not in state:
+                    raise ValueError(
+                        f"line {line_number}: L_TILE_EXEC consumes Matrix view {slot} "
+                        "before a dominating configuration"
+                    )
             continue
         if opcode == "M_MM_WO" and len(operands) == 4:
             slot = int(operands[3], 0)
@@ -358,6 +595,17 @@ def validate_matrix_view_dominance(assembly: str) -> None:
             if ("configured", slot) not in state:
                 raise ValueError(
                     f"line {line_number}: M_MM_WO consumes Matrix view {slot} "
+                    "before a dominating configuration"
+                )
+            continue
+        if opcode in {"H_PREFETCH_V.MV", "H_STORE_V.MV"}:
+            if len(operands) != 6:
+                raise ValueError(f"line {line_number}: malformed {opcode}")
+            slot = int(operands[5], 0)
+            _require_slot(slot)
+            if ("configured", slot) not in state:
+                raise ValueError(
+                    f"line {line_number}: {opcode} consumes Matrix view {slot} "
                     "before a dominating configuration"
                 )
             continue
@@ -402,17 +650,26 @@ def _require_u32(word: int, name: str) -> None:
 
 
 __all__ = [
+    "LTilePrimitive",
     "L_MVIEW_CONTRACT_VERSION",
     "L_MVIEW_MAX_SLOTS",
     "L_MVIEW_OPCODE",
+    "MATRIX_VIEW_DMA_HIGH_RESERVED_MASK",
+    "MATRIX_VIEW_DMA_MARKER",
+    "MATRIX_VIEW_DMA_SLOT_SHIFT",
     "MatrixViewDescriptor",
-    "MatrixViewField",
+    "MatrixViewAllocation",
+    "MatrixViewAxis",
     "MatrixViewFlags",
     "MatrixViewForm",
     "MatrixViewMap",
     "MatrixViewShape",
+    "decode_l_tile_exec_word",
+    "decode_matrix_view_dma_slot",
     "decode_l_mview_word",
-    "encode_l_mview_field",
-    "encode_l_mview_full",
+    "encode_l_tile_exec",
+    "encode_matrix_view_dma_word",
+    "encode_l_tile_cfg",
     "validate_matrix_view_dominance",
+    "validate_disjoint_matrix_views",
 ]

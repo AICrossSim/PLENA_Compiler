@@ -7,7 +7,11 @@ from compiler.aten.plena.matrix_access_packets import (
     matrix_access_instruction_count,
     packet_histogram,
 )
-from compiler.aten.plena.mview import MatrixViewMap, MatrixViewShape
+from compiler.aten.plena.mview import (
+    MatrixViewFlags,
+    MatrixViewMap,
+    MatrixViewShape,
+)
 
 import pytest
 
@@ -21,9 +25,9 @@ def test_public_instruction_count_matches_multi_operand_extraction_boundary() ->
     assembly = f"""
 S_ADDI_INT gp1, gp0, {shape}
 S_ADDI_INT gp2, gp0, {mapping}
-L_MVIEW_FULL 0, gp1, gp2
-L_MVIEW_FULL 1, gp1, gp2
-L_MVIEW_FULL 2, gp1, gp2
+L_TILE_CFG 0, gp1, gp2
+L_TILE_CFG 1, gp1, gp2
+L_TILE_CFG 2, gp1, gp2
 V_ADD_VV.MV gp3, gp4, gp5, 0, 7
 M_MM_WO gp3, gp0, 0, 0
 """
@@ -95,7 +99,7 @@ def test_optional_view_is_explicit_on_the_consumer() -> None:
         f"""
 S_ADDI_INT gp7, gp0, {shape}
 S_ADDI_INT gp8, gp0, {mapping}
-L_MVIEW_FULL 2, gp7, gp8
+L_TILE_CFG 2, gp7, gp8
 M_MM 0, gp1, gp2, 2
 """,
         GEOMETRY,
@@ -103,6 +107,29 @@ M_MM 0, gp1, gp2, 2
     assert packet.view_slot == 2
     assert packet.tile_count == 16
     assert packet.elements_per_tile == 4
+
+
+def test_packet_preserves_the_complete_physical_affine_mapping() -> None:
+    shape = MatrixViewShape(rows=2, cols=4, tile_count=8).pack()
+    mapping = MatrixViewMap(
+        tile_pitch_rows=2,
+        row_skew=0,
+        tile_skew=5,
+        flags=MatrixViewFlags.STRICT_BOUNDS | MatrixViewFlags.AFFINE,
+    ).pack()
+    packet = extract_matrix_access_packets(
+        f"""
+S_ADDI_INT gp7, gp0, {shape}
+S_ADDI_INT gp8, gp0, {mapping}
+L_TILE_CFG 2, gp7, gp8
+M_MM 0, gp1, gp2, 2
+""",
+        GEOMETRY,
+    )[0]
+
+    assert packet.view_alpha == 0
+    assert packet.view_tile_skew == 5
+    assert packet.view_affine is True
 
 
 def test_extracts_real_multi_tile_view_packets_and_direct_writeback() -> None:
@@ -113,9 +140,9 @@ def test_extracts_real_multi_tile_view_packets_and_direct_writeback() -> None:
 ; @stage=kda_projection @axis=cross_head
 S_ADDI_INT gp1, gp0, {shape}
 S_ADDI_INT gp2, gp0, {mapping}
-L_MVIEW_FULL 0, gp1, gp2
-L_MVIEW_FULL 1, gp1, gp2
-L_MVIEW_FULL 2, gp1, gp2
+L_TILE_CFG 0, gp1, gp2
+L_TILE_CFG 1, gp1, gp2
+L_TILE_CFG 2, gp1, gp2
 S_ADDI_INT gp3, gp0, 4096
 S_ADDI_INT gp4, gp0, 8192
 S_ADDI_INT gp5, gp0, 12288

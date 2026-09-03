@@ -30,13 +30,15 @@ from compiler.aten.plena.program_kda_common import (  # noqa: E402
     kda_vector_row,
     kda_vector_rows,
 )
+from compiler.aten.plena.state_precision import (  # noqa: E402
+    STATE_ELEMENT_BYTES,
+    STATE_PRECISION_SELECTOR,
+)
 
 MLEN = 8
 
-#: HBM bytes per element for recurrent state. BF16, because the state travels
-#: through the keyvalue precision class and Plain BF16 is the widest that class
-#: offers; see program_kda_common's module docstring.
-STATE_BYTES_PER_ELEMENT = 2
+#: PLENA stores KDA recurrent state as BF16 in its own HBM precision class.
+STATE_BYTES_PER_ELEMENT = STATE_ELEMENT_BYTES
 
 
 def _vram_base(prog, var) -> int:
@@ -228,6 +230,9 @@ def test_state_loads_in_the_transposed_layout(blocks):
     addr = prog.kda_pin_state_v0("kda_state", shape)
     state = prog.kda_load_state_v0("kda_state", shape, addr)
     assert state.shape == (kda_state_rows(shape, MLEN), MLEN)
+    assert prog._inputs["kda_state"].hbm_size == (
+        shape.num_heads * shape.key_dim * shape.value_dim * STATE_BYTES_PER_ELEMENT
+    )
 
 
 def _scale_reg_immediates(code: str) -> list[int]:
@@ -261,11 +266,45 @@ def test_state_store_mirrors_the_load_precision(blocks):
     assert _scale_reg_immediates(load_code) == [expected]
     assert _scale_reg_immediates(store_code) == [expected]
 
-    # The precision-class operand of the transfer itself: 1 == KeyValue on both.
-    (prefetch,) = [l for l in _body(load_code) if l.startswith("H_PREFETCH_V")]
-    (store_v,) = [l for l in _body(store_code) if l.startswith("H_STORE_V")]
-    assert prefetch.replace(",", " ").split()[-1] == "1"
-    assert store_v.replace(",", " ").split()[-1] == "1"
+    # The precision-class operand of the transfer itself: 2 == recurrent State.
+    (prefetch,) = [
+        line for line in _body(load_code) if line.startswith("H_PREFETCH_V")
+    ]
+    (store_v,) = [
+        line for line in _body(store_code) if line.startswith("H_STORE_V")
+    ]
+    assert prefetch.replace(",", " ").split()[-1] == str(STATE_PRECISION_SELECTOR)
+    assert store_v.replace(",", " ").split()[-1] == str(STATE_PRECISION_SELECTOR)
+
+
+def test_plena_state_precision_guard_accepts_only_plain_bf16():
+    prog = _prog()
+    bf16 = {
+        "HBM_STATE_TYPE": {
+            "format": "Plain",
+            "DATA_TYPE": {
+                "type": "Fp",
+                "sign": True,
+                "exponent": 8,
+                "mantissa": 7,
+            },
+        }
+    }
+    prog.kda_require_state_precision_v0(bf16)
+    with pytest.raises(ValueError, match="Plain BF16"):
+        prog.kda_require_state_precision_v0(
+            {
+                "HBM_STATE_TYPE": {
+                    "format": "Plain",
+                    "DATA_TYPE": {
+                        "type": "Fp",
+                        "sign": True,
+                        "exponent": 8,
+                        "mantissa": 23,
+                    },
+                }
+            }
+        )
 
 
 @pytest.mark.parametrize("blocks", [1, 2, 3])
@@ -355,7 +394,7 @@ def test_conv_roll_rejects_an_undersized_history():
 def test_l2_normalize_uses_the_scalar_sqrt_path():
     """There is no vector square root -- S_FP_OP carries SQRT_FP, V_ELEMENT_OP
     does not -- so the reciprocal norm must come out of the scalar unit."""
-    prog, shape = _prog(), _shape()
+    prog = _prog()
     vec = prog.alloc("qk", MLEN, MLEN)
     scratch = prog.alloc("sq", MLEN, MLEN)
     consts = prog.kda_fp_constants()

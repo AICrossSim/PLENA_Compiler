@@ -205,7 +205,7 @@ def test_projection_accumulator_directly_writes_a_configured_matrix_view(tmp_pat
     assembly = program.get_code()
 
     validate_matrix_view_dominance(assembly)
-    assert assembly.count("L_MVIEW_FULL") == 1
+    assert assembly.count("L_TILE_CFG") == 1
     assert assembly.count("M_MM_WO") == 1
     assert "C_LOOP_START" in assembly
     assert "S_ADDI_INT gp" in assembly
@@ -259,7 +259,7 @@ def test_wide_projection_reserves_existing_matrix_scratch_and_streams_weights():
     assembly = program.get_code()
 
     validate_matrix_view_dominance(assembly)
-    assert assembly.count("L_MVIEW_FULL") == 1
+    assert assembly.count("L_TILE_CFG") == 1
     assert assembly.count("M_MM_WO") == 16
     assert "L_MVIEW_LOAD" not in assembly
     # One Matrix tile is statically reserved for the view. The remaining tile

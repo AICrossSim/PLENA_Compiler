@@ -51,6 +51,10 @@ from compiler.aten.plena.program_mamba_common import (
     MambaFPConstants,
     mamba_stage_marker,
 )
+from compiler.aten.plena.state_precision import (
+    STATE_ELEMENT_BYTES,
+    STATE_PRECISION_SELECTOR,
+)
 from compiler.aten.plena.vars import FPVar, InputVar, VRAMMatrixVar
 
 
@@ -76,7 +80,12 @@ class ProgramSSMRecurrentMixin:
     # Cross-token persistent state
     # ========================================================================
 
-    def pin_hbm_region(self, name: str, size: int, hbm_element_bytes: int = 2) -> int:
+    def pin_hbm_region(
+        self,
+        name: str,
+        size: int,
+        hbm_element_bytes: int = STATE_ELEMENT_BYTES,
+    ) -> int:
         """Reserve an HBM range that ``_allocate_hbm`` will never hand out.
 
         This is the first persistent-state mechanism in the compiler: attention
@@ -91,10 +100,8 @@ class ProgramSSMRecurrentMixin:
         past the region rather than by adding a second allocator, so a later
         ``input()``/``store()`` with no explicit address cannot collide with it.
 
-        `hbm_element_bytes` defaults to 2 because that is what
-        :meth:`ssm_store_state_v0` writes; sizing the region with the MX layout
-        instead would under-reserve it by ~78% and the write-back would land on the
-        next tensor.
+        The default is PLENA's two-byte BF16 recurrent-state width.  The
+        explicit argument remains available for precision DSE variants.
         """
         if size <= 0:
             raise ValueError(f"pinned HBM region {name!r} must have positive size, got {size}")
@@ -120,7 +127,10 @@ class ProgramSSMRecurrentMixin:
     ) -> VRAMMatrixVar:
         """Prefetch a pinned state region from HBM into VRAM.
 
-        Declared with ``real_data_ratio=1.0`` and loaded through the BF16 path:
+        Declared with ``real_data_ratio=1.0`` and loaded through the independent
+        BF16 recurrent-state precision class.  The profiled GPU reference uses
+        FP32; numerical error from this deliberate narrowing is measured
+        separately:
         the SSM state is a multiplicative accumulator carried across the whole
         sequence, and MX-FP8's 3 mantissa bits would compound. Quantisation error
         in a decaying accumulator is amplified by ``1 / sqrt(1 - lambda^2)`` where
@@ -130,14 +140,19 @@ class ProgramSSMRecurrentMixin:
         such amplification because it is written once and never read-modify-written.
         """
         self.emit_comment(mamba_stage_marker("mamba_state_load", f"{name} [{rows},{cols}]"))
-        var = self.input(name, (rows, cols), hbm_addr=hbm_addr, real_data_ratio=1.0)
-        # Must mirror ssm_store_state_v0 exactly: same precision class (KeyValue)
-        # and same bytes per element (2). Until load_batch took these, it emitted
-        # Activation/1-byte with half the row stride and a different scale-section
-        # base, so the state read back was not the state written -- and the failure
-        # mode is a wrong answer, not an error.
+        var = self.input(
+            name,
+            (rows, cols),
+            hbm_addr=hbm_addr,
+            real_data_ratio=1.0,
+            hbm_element_bytes=STATE_ELEMENT_BYTES,
+        )
+        # Load/store/pinned allocation must agree on both selector and width.
         return self.load_batch(
-            var, name=f"{name}_vram", storage_precision=2, precision=1
+            var,
+            name=f"{name}_vram",
+            storage_precision=STATE_ELEMENT_BYTES,
+            precision=STATE_PRECISION_SELECTOR,
         )
 
     def ssm_store_state_v0(self, state: VRAMMatrixVar, name: str, hbm_addr: int) -> InputVar:
@@ -147,14 +162,59 @@ class ProgramSSMRecurrentMixin:
             state,
             name=name,
             hbm_addr=hbm_addr,
-            precision=1,
-            hbm_element_bytes=2,
+            precision=STATE_PRECISION_SELECTOR,
+            hbm_element_bytes=STATE_ELEMENT_BYTES,
             real_data_ratio=1.0,
         )
 
     # ========================================================================
     # Decode step
     # ========================================================================
+
+    def ssm_decode_step_l_tile_v0(
+        self,
+        *,
+        shape: Mamba2Shape,
+        layout: str,
+        matrix_sram_bytes: int = 1024 * 1024,
+    ) -> str:
+        """Emit the complete Mamba recurrence through Matrix-SRAM views.
+
+        This is the architecture path, not a cycle annotation around
+        :meth:`ssm_decode_step_v0`.  The latter remains the ordinary Vector
+        fallback and Arlo baseline.  The emitted ``L_TILE`` sequence contains
+        all four algebraic steps and uses caller-owned GP registers so it can
+        be embedded safely in a complete model program.
+        """
+
+        from compiler.aten.plena.matrix_recurrence_lowering import (
+            NEMOTRON_MAMBA,
+            LoweringRegisters,
+            MatrixSramPoint,
+            lower_matrix_recurrence,
+        )
+
+        actual = (shape.num_heads, shape.head_dim, shape.state_size, shape.seq_len)
+        expected = (
+            NEMOTRON_MAMBA.heads,
+            NEMOTRON_MAMBA.row_elements,
+            NEMOTRON_MAMBA.recurrence_rows,
+            1,
+        )
+        if actual != expected:
+            raise ValueError(f"L_TILE Mamba decode expects {expected}, got {actual}")
+        allocated = self.register_allocator.allocate_gp(5)
+        try:
+            registers = LoweringRegisters(*allocated)
+            assembly = lower_matrix_recurrence(
+                NEMOTRON_MAMBA,
+                layout=layout,
+                point=MatrixSramPoint(capacity_bytes=matrix_sram_bytes),
+                registers=registers,
+            )
+            return self._emit(assembly)
+        finally:
+            self.register_allocator.free_gp(allocated)
 
     def ssm_decode_step_v0(
         self,

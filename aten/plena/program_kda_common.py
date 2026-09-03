@@ -63,42 +63,23 @@ takes the other route for the same problem -- it *rejects* shapes wider than
 helper fix as "deliberately not done yet". Folding the block into the row gets
 the same safety without touching emitters that Mamba and attention are using.
 
-Precision -- and what this module can and cannot promise
---------------------------------------------------------
-State travels through the ``keyvalue`` precision class (``precision=1``), the
-same one ``ssm_load_state_v0`` uses. **That class selects a name, not a width.**
-The width comes from the active ``[<MODE>.PRECISION]`` table, and the shipped
-one declares ``HBM_V_KV_TYPE`` as ``format = "Mx"`` with e4m3 elements --
-1 byte plus a scale stream, not 2 and not 4. ``storage_precision`` only feeds
-the compiler's own address arithmetic; it cannot change what the DMA decodes.
-
-So this module **requires** Plain BF16 KV types rather than asserting them.
-Call :meth:`kda_require_state_precision_v0` with the parsed precision table
-before lowering a layer. Under an MX KV type the state decodes as e4m3 while
-the address stride assumes 2 bytes: garbage, silently, with no runtime error.
-``f5eb36a`` found and fixed exactly this for the Mamba SSD path
-(``require_bf16_kv_precision``); KDA reuses that guard rather than repeating
-the mistake.
-
-Why BF16 and not something narrower: the state is a multiplicative accumulator
-carried across the whole sequence, so quantisation error is amplified by
-``1 / sqrt(1 - lambda^2)``. KDA's decay is per-key and driven toward 1 by
-``gate_lower_bound`` -- exactly the long-memory regime where the amplification
-is worst. e4m3's 3 mantissa bits compound badly there. FP32 would be better
-still, but there is no FP32 path through the KV precision class, so BF16 is
-the widest this ISA offers and the numerical claim is scoped to it.
-
-Load and store must agree on both ``storage_precision`` and
-``hbm_element_bytes``: a mismatch changes the row stride and the scale-section
-base, so the state read back is not the state written -- again a wrong answer
-rather than an error. Both are 2 here, and
-:meth:`kda_pin_state_v0` reserves at the same width so the write-back cannot
-overrun onto the next tensor.
+Precision
+---------
+The profiled Kimi K3 GPU implementation carries recurrent state in FP32.  This
+PLENA design point intentionally stores it as BF16 and uses the independent
+``HBM_STATE_TYPE`` precision class (selector 2), not the attention KV class.
+Pin/load/store all use two bytes per element, so HBM ranges and row strides
+agree.  Accuracy relative to the FP32 reference is reported separately.
 """
 
 from __future__ import annotations
 
 from compiler.aten.models.kda.shape import KdaShape
+from compiler.aten.plena.state_precision import (
+    STATE_ELEMENT_BYTES,
+    STATE_PRECISION_SELECTOR,
+    require_bf16_state,
+)
 from compiler.aten.plena.vars import FPVar, InputVar, VRAMMatrixVar
 
 __all__ = [
@@ -285,14 +266,9 @@ class ProgramKdaCommonMixin:
     # -- residency ---------------------------------------------------------
 
     def kda_require_state_precision_v0(self, settings: dict | None = None) -> None:
-        """Fail unless this build configures the KV precision classes as Plain BF16.
+        """Fail unless PLENA's KDA state class is configured as BF16."""
 
-        Delegates to ``require_bf16_kv_precision``; see the module docstring for
-        why a check and not an assertion. Passing ``settings=None`` raises rather
-        than passing, because a check that could not run must not look like a
-        check that passed.
-        """
-        self.require_bf16_kv_precision(settings)
+        require_bf16_state(settings)
 
     def kda_pin_state_v0(self, name: str, shape: KdaShape) -> int:
         """Reserve the pinned HBM range for one head-group's recurrent state.
@@ -304,24 +280,20 @@ class ProgramKdaCommonMixin:
         return self.pin_hbm_region(
             name,
             kda_state_rows(shape, self.mlen) * self.mlen,
-            hbm_element_bytes=2,
+            hbm_element_bytes=STATE_ELEMENT_BYTES,
         )
 
     def kda_load_state_v0(self, name: str, shape: KdaShape, hbm_addr: int) -> VRAMMatrixVar:
-        """Prefetch the pinned BF16 fallback state into VRAM, transposed.
+        """Prefetch the PLENA BF16 state into VRAM, transposed.
 
         Returns a ``[num_heads * blocks * key_dim, mlen]`` tile. Use
         :func:`kda_state_row` to index it; head ``h``'s block ``c`` occupies
         ``key_dim`` consecutive rows starting at
         ``(h * blocks + c) * key_dim``.
 
-        This is deliberately not described as the official Kimi state format:
-        the profiled implementation carries recurrent state in FP32 (6 MiB per
-        KDA layer), while this executable PLENA fallback reserves and transfers
-        two bytes per element. A caller must pass
-        :meth:`kda_require_state_precision_v0` before lowering so those two
-        bytes are Plain BF16 rather than an MX payload with a different address
-        contract.
+        The profiled GPU implementation carries 6 MiB FP32 per KDA layer; this
+        BF16 design carries 3 MiB.  The transfer selects HBM_STATE_TYPE
+        explicitly; it never inherits the KV-cache type.
         """
         rows = kda_state_rows(shape, self.mlen)
         self.emit_comment(kda_stage_marker("kda_state_load", f"{name} [{rows},{self.mlen}]"))
@@ -330,9 +302,13 @@ class ProgramKdaCommonMixin:
             (rows, self.mlen),
             hbm_addr=hbm_addr,
             real_data_ratio=1.0,
+            hbm_element_bytes=STATE_ELEMENT_BYTES,
         )
         return self.load_batch(
-            var, name=f"{name}_vram", storage_precision=2, precision=1
+            var,
+            name=f"{name}_vram",
+            storage_precision=STATE_ELEMENT_BYTES,
+            precision=STATE_PRECISION_SELECTOR,
         )
 
     def kda_store_state_v0(
@@ -348,8 +324,8 @@ class ProgramKdaCommonMixin:
             state,
             name=name,
             hbm_addr=hbm_addr,
-            precision=1,
-            hbm_element_bytes=2,
+            precision=STATE_PRECISION_SELECTOR,
+            hbm_element_bytes=STATE_ELEMENT_BYTES,
             real_data_ratio=1.0,
         )
 

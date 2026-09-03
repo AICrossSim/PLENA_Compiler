@@ -22,7 +22,10 @@ from compiler.aten.plena.matrix_recurrence_lowering import (
     KIMI_KDA,
     NEMOTRON_MAMBA,
     MatrixRecurrenceSpec,
+    RecurrenceLayout,
+    build_recurrence_working_set,
     lower_matrix_recurrence,
+    lowering_metrics,
 )
 from compiler.aten.plena.mview import (
     MatrixViewDescriptor,
@@ -188,9 +191,11 @@ def _recurrence_case(
     co_layout: bool,
 ) -> dict[str, object]:
     geometry = PacketGeometry(mlen=2048, blen=32, hlen=128)
+    layout = RecurrenceLayout.AFFINE if co_layout else RecurrenceLayout.FIXED
+    working_set = build_recurrence_working_set(spec, layout=layout)
     assembly = lower_matrix_recurrence(
         spec,
-        co_layout=co_layout,
+        layout=layout,
         mlen=geometry.mlen,
         blen=geometry.blen,
     )
@@ -203,11 +208,7 @@ def _recurrence_case(
         "stage": f"{spec.name}_matrix_recurrence",
         "real_shape": [spec.heads, spec.recurrence_rows, spec.row_elements],
         "repeats_in_model": repeats_in_model,
-        "lowering": (
-            "matrix_recurrence_colayout"
-            if co_layout
-            else "matrix_recurrence_pitch1"
-        ),
+        "lowering": f"matrix_recurrence_{layout}",
         "geometry": {
             "mlen": geometry.mlen,
             "blen": geometry.blen,
@@ -219,6 +220,8 @@ def _recurrence_case(
         "static_matrix_operand_packets": len(packets),
         "dynamic_packet_repeats": sum(packet.repeats for packet in packets),
         "opcode_census": dict(sorted(opcodes.items())),
+        "working_set": working_set.to_dict(),
+        "lowering_metrics": lowering_metrics(assembly),
         "histogram": packet_histogram(packets),
         "coissued_histogram": coissued_packet_histogram(packets),
         "service_groups": coissued_packet_groups(packets),
@@ -226,7 +229,7 @@ def _recurrence_case(
         "packets_truncated": max(0, len(packets) - 32),
         "source": "official-shape Matrix recurrence packet-contract lowering",
         "evidence_level": (
-            "structural same-cycle packet and operation-count contract only; "
+            "executable one-read-port Matrix-SRAM phase and operation-count contract; "
             "complete recurrence arithmetic is validated separately by Rust numerical tests"
         ),
     }

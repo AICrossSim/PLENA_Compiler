@@ -165,6 +165,15 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     H_PREFETCH_M           = 6'h28,
     H_PREFETCH_V           = 6'h29,
     H_STORE_V              = 6'h2A,
+    // Matrix-view addressing forms reuse 0x29/0x2A. Bit 31 marks the form,
+    // bits [30:29] select L_MVIEW slot 0..3, and bits [28:26] are zero.
+    // They transfer directly between HBM and the configured Matrix-SRAM view.
+    // In the legacy form funct1=0 means Activation and any non-zero value means
+    // KeyValue. In the new bit-31 form funct1 is canonical: 0=Activation,
+    // 1=KeyValue, 2=State; 3..15 are reserved. The evaluated L-Compute path
+    // uses only Activation and State, both configured as BF16. Legacy
+    // KeyValue keeps PLENA's existing independent format and is not silently
+    // reinterpreted by this extension.
 
     // CSR Setting
     C_SET_ADDR_REG         = 6'h2B,
@@ -199,10 +208,26 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_SOFTPLUS_V           = 6'h3D,
     S_MAP_FP_V             = 6'h3E,
 
-    // Compiler-programmable Matrix-SRAM view. FULL and FIELD share this opcode
-    // under funct1; Matrix consumers explicitly name a slot in their own
-    // encoding. funct1=0 remains a temporary legacy L_CFG source form while
-    // the pre-RTL branch migrates, but it is not part of the frozen ISA.
+    // Compiler-programmable Matrix-SRAM tile family. CFG atomically configures
+    // model-independent affine views and EXEC applies SCALE_ACCUM, DOT_REDUCE,
+    // or OUTER_UPDATE through slots 0/1/2. The decoder expands EXEC deterministically;
+    // there is no cache, queue, runtime scheduler or model-specific state step.
+    //
+    // L_TILE_CFG encoding (funct1=1):
+    //   [9:6] shape-word GP, [13:10] mapping-word GP, [17:14] slot (0..3),
+    //   [21:18]=0, [25:22]=1, [31:26]=0.
+    // Shape word: rows-1[11:0], cols-1[23:12], tiles-1[31:24].
+    // Mapping word: tile_pitch_rows[15:0], row_skew[21:16],
+    // tile_skew[27:22], flags[31:28]. Flags are strict-bounds, affine,
+    // FP32-capable-view and broadcast-minor. The evaluated PLENA path leaves
+    // FP32 clear and stores Matrix values, fields and recurrent state as BF16.
+    //
+    // L_TILE_EXEC encoding (funct1=3):
+    //   [9:6] dst-base GP, [13:10] src-base GP, [17:14] scale-base GP,
+    //   [21:18] primitive, [25:22]=3, [26] src-axis, [27] scale-axis,
+    //   [31:28]=0. Axis 0=row and 1=column. Primitive 0=SCALE_ACCUM,
+    //   1=DOT_REDUCE, 2=OUTER_UPDATE; all other values are reserved.
+    // funct1=0 remains a temporary legacy L_CFG compatibility form.
     L_MVIEW                = 6'h3F
 } CUSTOM_ISA_OPCODE;
 

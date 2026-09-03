@@ -6,7 +6,7 @@ import math
 
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.affine_layout import AffineLayout
-from compiler.aten.plena.mview import MatrixViewDescriptor
+from compiler.aten.plena.mview import LTilePrimitive, MatrixViewDescriptor
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -99,7 +99,7 @@ class ProgramMatrixOpsMixin:
                 "; Configure compiler-managed Matrix SRAM affine view",
                 *load_large_int(shape_register, descriptor.shape.pack()),
                 *load_large_int(map_register, descriptor.mapping.pack()),
-                f"L_MVIEW_FULL {slot}, gp{shape_register}, gp{map_register}",
+                f"L_TILE_CFG {slot}, gp{shape_register}, gp{map_register}",
             ]
             return self._emit("\n".join(lines) + "\n")
         finally:
@@ -120,6 +120,39 @@ class ProgramMatrixOpsMixin:
             lines = [
                 *load_large_int(matrix_register, matrix_base),
                 f"M_MM_WO gp{matrix_register}, gp0, {logical_offset}, {slot}",
+            ]
+            return self._emit("\n".join(lines) + "\n")
+        finally:
+            self.register_allocator.free_gp(registers)
+
+    def matrix_tile_execute_v0(
+        self,
+        *,
+        destination_base: int,
+        source_base: int,
+        scale_base: int,
+        primitive: LTilePrimitive,
+    ) -> str:
+        """Execute one deterministic recurrence primitive over views 0/1/2.
+
+        The three views must already dominate this call.  All tensor bases are
+        explicit architectural operands; the instruction has no hidden model
+        state, cache lookup, queue, or runtime-selected loop bounds.
+        """
+
+        if not isinstance(primitive, LTilePrimitive):
+            raise TypeError("primitive must be an LTilePrimitive")
+        registers = self.register_allocator.allocate_gp(3)
+        try:
+            destination, source, scale = registers
+            lines = [
+                *load_large_int(destination, destination_base),
+                *load_large_int(source, source_base),
+                *load_large_int(scale, scale_base),
+                (
+                    f"L_TILE_EXEC gp{destination}, gp{source}, gp{scale}, "
+                    f"{int(primitive)}"
+                ),
             ]
             return self._emit("\n".join(lines) + "\n")
         finally:

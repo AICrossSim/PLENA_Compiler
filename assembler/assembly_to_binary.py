@@ -1,8 +1,10 @@
 from utils.load_config import load_svh_settings
 from compiler.aten.plena.mview import (
-    MatrixViewField,
-    encode_l_mview_field,
-    encode_l_mview_full,
+    LTilePrimitive,
+    MatrixViewAxis,
+    encode_matrix_view_dma_word,
+    encode_l_tile_exec,
+    encode_l_tile_cfg,
     validate_matrix_view_dominance,
 )
 
@@ -61,11 +63,13 @@ _LSTREAM_VIEW_OPS = frozenset(
 _PSEUDO_OPCODE_ALIASES = {
     "V_FMA_VF": "V_MUL_VF",
     "L_CFG": "L_MVIEW",
-    "L_MVIEW_FULL": "L_MVIEW",
-    "L_MVIEW_FIELD": "L_MVIEW",
+    "L_TILE_CFG": "L_MVIEW",
+    "L_TILE_EXEC": "L_MVIEW",
     "V_ADD_VV.MV": "V_ADD_VV",
     "V_SUB_VV.MV": "V_SUB_VV",
     "V_MUL_VV.MV": "V_MUL_VV",
+    "H_PREFETCH_V.MV": "H_PREFETCH_V",
+    "H_STORE_V.MV": "H_STORE_V",
 }
 _IMM_RS1_RD_OPS = frozenset(
     {
@@ -182,7 +186,7 @@ class AssemblyToBinary:
         # injected only here, so spelling V_MUL_VF with a non-canonical mode bit
         # cannot silently change its arithmetic semantics.
         encoded_funct1 = funct1
-        if mnemonic.endswith(".MV"):
+        if mnemonic in {"V_ADD_VV.MV", "V_SUB_VV.MV", "V_MUL_VV.MV"}:
             if funct1 == 0:
                 raise ValueError(f"{mnemonic}: Matrix-view operand mask cannot be zero")
             # funct1[3] is an explicit Matrix-view addressing marker for the
@@ -201,34 +205,62 @@ class AssemblyToBinary:
         # With the old ordering a masked V_EXP_V silently executed on the whole
         # tile: no diagnostic, wrong answer. rmask == 0 encodes identically under
         # either ordering, so this is a no-op for every unmasked call site.
-        if mnemonic == "L_MVIEW_FULL":
-            # Text: L_MVIEW_FULL slot, gp_shape, gp_map.
+        if mnemonic == "L_TILE_CFG":
+            # Text: L_TILE_CFG slot, gp_shape, gp_map.
             slot = rd
             shape_register = rs1
             map_register = rs2
             if slot is None or shape_register is None or map_register is None:
-                raise ValueError("L_MVIEW_FULL requires slot, shape register, and map register")
+                raise ValueError("L_TILE_CFG requires slot, shape register, and map register")
             if not 0 <= slot < 4:
-                raise ValueError(f"L_MVIEW_FULL slot must be in [0, 4), got {slot}")
-            binary_instruction = encode_l_mview_full(
+                raise ValueError(f"L_TILE_CFG slot must be in [0, 4), got {slot}")
+            binary_instruction = encode_l_tile_cfg(
                 slot=slot,
                 shape_register=shape_register,
                 map_register=map_register,
             )
-        elif mnemonic == "L_MVIEW_FIELD":
-            # Text: L_MVIEW_FIELD slot, field, gp_value.
-            slot = rd
-            field = imm
-            value_register = rs2
-            if slot is None or field is None or value_register is None:
-                raise ValueError("L_MVIEW_FIELD requires slot, field, and value register")
-            if not 0 <= slot < 4:
-                raise ValueError(f"L_MVIEW_FIELD slot must be in [0, 4), got {slot}")
-            binary_instruction = encode_l_mview_field(
-                slot=slot,
-                field=MatrixViewField(field),
-                value_register=value_register,
+        elif mnemonic == "L_TILE_EXEC":
+            # Text: L_TILE_EXEC gp_dst, gp_src1, gp_scale, primitive[, axis_mask].
+            # axis_mask[0] selects source columns and axis_mask[1] selects scale
+            # columns.  Omission is the byte-compatible row/row form.
+            if rd is None or rs1 is None or rs2 is None or rstride is None:
+                raise ValueError(
+                    "L_TILE_EXEC requires destination/source base registers and primitive"
+                )
+            try:
+                primitive = LTilePrimitive(rstride)
+            except ValueError as error:
+                raise ValueError(f"reserved L_TILE primitive {rstride}") from error
+            axis_mask = 0 if funct1 is None else funct1
+            if not isinstance(axis_mask, int) or not 0 <= axis_mask <= 0b11:
+                raise ValueError("L_TILE_EXEC axis mask must be in [0, 3]")
+            binary_instruction = encode_l_tile_exec(
+                dst_register=rd,
+                src1_register=rs1,
+                src2_register=rs2,
+                primitive=primitive,
+                source_axis=MatrixViewAxis((axis_mask >> 0) & 1),
+                scale_axis=MatrixViewAxis((axis_mask >> 1) & 1),
             )
+        elif mnemonic in {"H_PREFETCH_V.MV", "H_STORE_V.MV"}:
+            # Existing vector DMA with an explicit Matrix-view destination or
+            # source: rd, rs1, rs2, rstride, precision, view_slot.
+            if None in (rd, rs1, rs2, rstride, funct1, instruction.funct2):
+                raise ValueError(f"{mnemonic} requires all six operands")
+            if not isinstance(funct1, int) or not 0 <= funct1 <= 2:
+                raise ValueError(f"{mnemonic}: precision must be in [0, 2]")
+            slot = instruction.funct2
+            if not isinstance(slot, int) or not 0 <= slot < 4:
+                raise ValueError(f"{mnemonic}: Matrix view slot must be in [0, 4)")
+            legacy_word = (
+                (funct1 << (opw + 4 * ow))
+                + (rstride << (opw + 3 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+            binary_instruction = encode_matrix_view_dma_word(legacy_word, slot=slot)
         elif mnemonic == "M_MM_WO" and rstride is not None:
             # View-qualified existing writeback. The 18-bit immediate uses its
             # top bit as an explicit view marker and the next two bits as the

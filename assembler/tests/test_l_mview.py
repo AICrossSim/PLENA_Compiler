@@ -4,6 +4,7 @@ import pytest
 
 from assembler.assembly_to_binary import AssemblyToBinary
 from assembler.parser import Instruction
+from compiler.aten.plena.mview import LTilePrimitive
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,17 +17,47 @@ def _assembler() -> AssemblyToBinary:
     )
 
 
-def test_full_and_field_share_0x3f_and_use_distinct_functs() -> None:
-    assembler = _assembler()
-    full = assembler._convert_to_binary(
-        Instruction("L_MVIEW_FULL", 2, 7, 9, None, None, None)
+def test_config_uses_0x3f_and_the_config_funct() -> None:
+    word = _assembler()._convert_to_binary(
+        Instruction("L_TILE_CFG", 2, 7, 9, None, None, None)
     )
-    field = assembler._convert_to_binary(
-        Instruction("L_MVIEW_FIELD", 2, None, 9, None, None, None, imm=2)
+    assert word & 0x3F == 0x3F
+    assert (word >> 22) & 0xF == 1
+
+
+@pytest.mark.parametrize("primitive", list(LTilePrimitive))
+def test_exec_uses_0x3f_and_a_distinct_funct(
+    primitive: LTilePrimitive,
+) -> None:
+    word = _assembler()._convert_to_binary(
+        Instruction("L_TILE_EXEC", 4, 5, 6, int(primitive), None, None)
     )
-    assert full & 0x3F == field & 0x3F == 0x3F
-    assert (full >> 22) & 0xF == 1
-    assert (field >> 22) & 0xF == 2
+    assert word & 0x3F == 0x3F
+    assert (word >> 22) & 0xF == 3
+    assert (word >> 18) & 0xF == int(primitive)
+
+
+def test_exec_rejects_a_reserved_primitive() -> None:
+    with pytest.raises(ValueError, match="reserved L_TILE primitive"):
+        _assembler()._convert_to_binary(
+            Instruction("L_TILE_EXEC", 4, 5, 6, 3, None, None)
+        )
+
+
+def test_exec_encodes_optional_operand_axes_without_spending_an_opcode() -> None:
+    word = _assembler()._convert_to_binary(
+        Instruction("L_TILE_EXEC", 4, 5, 6, 1, 0b10, None)
+    )
+    assert word & 0x3F == 0x3F
+    assert (word >> 22) & 0xF == 3
+    assert (word >> 26) & 0b11 == 0b10
+
+
+def test_exec_rejects_reserved_operand_axes() -> None:
+    with pytest.raises(ValueError, match="axis mask"):
+        _assembler()._convert_to_binary(
+            Instruction("L_TILE_EXEC", 4, 5, 6, 1, 4, None)
+        )
 
 
 def test_matrix_fourth_operand_is_an_explicit_view_slot() -> None:
@@ -78,6 +109,43 @@ def test_accumulator_writeback_uses_existing_m_mm_wo_with_explicit_view() -> Non
     viewed_imm = viewed >> 14
     assert legacy_imm == 5
     assert viewed_imm == (1 << 17) | (2 << 15) | 5
+
+
+@pytest.mark.parametrize(
+    ("mnemonic", "opcode"),
+    [("H_PREFETCH_V.MV", 0x29), ("H_STORE_V.MV", 0x2A)],
+)
+def test_vector_dma_matrix_view_form_reuses_opcode_and_names_slot(
+    mnemonic: str, opcode: int
+) -> None:
+    word = _assembler()._convert_to_binary(
+        Instruction(mnemonic, 1, 2, 3, 1, 2, 3)
+    )
+    assert word & 0x3F == opcode
+    assert word >> 31 == 1
+    assert (word >> 29) & 0b11 == 3
+    assert (word >> 26) & 0b111 == 0
+    assert (word >> 22) & 0xF == 2
+    assert word & ((1 << 26) - 1) == (
+        opcode | (1 << 6) | (2 << 10) | (3 << 14) | (1 << 18) | (2 << 22)
+    )
+
+
+@pytest.mark.parametrize("precision", [0, 1, 2])
+def test_vector_dma_matrix_view_accepts_all_canonical_precisions(
+    precision: int,
+) -> None:
+    word = _assembler()._convert_to_binary(
+        Instruction("H_PREFETCH_V.MV", 1, 2, 3, 1, precision, 0)
+    )
+    assert (word >> 22) & 0xF == precision
+
+
+def test_vector_dma_matrix_view_form_rejects_reserved_slot() -> None:
+    with pytest.raises(ValueError, match="view slot"):
+        _assembler()._convert_to_binary(
+            Instruction("H_PREFETCH_V.MV", 1, 2, 3, 1, 2, 4)
+        )
 
 
 def test_legacy_m_mm_wo_cannot_alias_the_view_marker() -> None:

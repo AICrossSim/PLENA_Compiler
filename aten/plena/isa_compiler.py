@@ -73,13 +73,10 @@ class IsaCompiler(
         data (no scale), so VRAM size = logical size.
 
         `storage_precision` is HBM bytes per element and `precision` is the
-        H_PREFETCH_V precision-class selector (0 = Activation, 1 = KeyValue). Both
-        default to the MX-FP8 activation path, which is what every existing caller
-        wants. They exist because `store_to_hbm` already takes the matching pair,
-        and a load that cannot express what the store wrote is not an inverse: the
-        cross-token SSM state is written KeyValue/2-byte and would otherwise be read
-        back as Activation/1-byte, at half the row stride and against a different
-        scale-section base -- garbage, silently.
+        H_PREFETCH_V precision-class selector (0 = Activation, 1 = KeyValue,
+        2 = recurrent State). The PLENA Nemotron/Kimi path uses selector 2 and
+        two-byte BF16 elements.  The profiled GPU path's FP32 state is an
+        external accuracy baseline, not this ISA transfer format.
 
         Order (matters): allocate VRAM → register in symbol table → emit ISA.
         """
@@ -143,7 +140,7 @@ class IsaCompiler(
         hbm_object_name: str | None = None,
         hbm_addr_reg: int | None = None,
         vlen: int = 64,
-        precision: int = 0,  # 0 = Activation, 1 = KeyValue
+        precision: int = 0,  # 0 = Activation, 1 = KeyValue, 2 = recurrent State
         store_amount: int | None = None,  # HBM_V_Writeback_Amount
         hbm_element_bytes: int = 1,
         hbm_real_data_ratio: float | None = None,
