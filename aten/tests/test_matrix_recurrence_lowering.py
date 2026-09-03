@@ -10,7 +10,9 @@ from compiler.aten.plena.matrix_recurrence_lowering import (
     KIMI_KDA,
     NEMOTRON_MAMBA,
     ONE_MIB,
+    MatrixRecurrenceSpec,
     MatrixSramPoint,
+    RecurrenceKind,
     RecurrenceLayout,
     build_matrix_recurrence_report,
     build_recurrence_field_manifest,
@@ -33,6 +35,35 @@ def test_official_shapes_and_plena_bf16_state_sizes_are_explicit() -> None:
     assert NEMOTRON_MAMBA.recurrence_rows == KIMI_KDA.recurrence_rows == 128
     assert NEMOTRON_MAMBA.state_bytes_per_layer == ONE_MIB
     assert KIMI_KDA.state_bytes_per_layer == 3 * ONE_MIB
+
+
+def test_mamba_field_contract_is_reusable_by_a_real_checkpoint_shape() -> None:
+    checkpoint = MatrixRecurrenceSpec(
+        name="mamba2_130m",
+        kind=RecurrenceKind.MAMBA,
+        heads=24,
+        row_elements=64,
+        recurrence_rows=128,
+        primitives=NEMOTRON_MAMBA.primitives,
+    )
+    point = MatrixSramPoint()
+    working_set = build_recurrence_working_set(
+        checkpoint,
+        layout=RecurrenceLayout.AFFINE,
+        point=point,
+    )
+    assembly = lower_matrix_recurrence(
+        checkpoint,
+        layout=RecurrenceLayout.AFFINE,
+        point=point,
+    )
+
+    assert working_set.group_heads == 24
+    assert working_set.groups == 1
+    assert checkpoint.state_bytes_per_layer == 24 * 128 * 64 * BF16_BYTES
+    assert "@stage=mamba2_130m_matrix_recurrence" in assembly
+    assert lowering_metrics(assembly)["l_tile_exec_count"] == 4
+    validate_matrix_view_dominance(assembly)
 
 
 @pytest.mark.parametrize(

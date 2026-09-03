@@ -78,6 +78,13 @@ class RecurrenceLayout(StrEnum):
     AFFINE = "affine"
 
 
+class RecurrenceKind(StrEnum):
+    """Algorithm-independent field contract selected by one recurrence."""
+
+    MAMBA = "mamba"
+    KDA = "kda"
+
+
 @dataclass(frozen=True)
 class LoweringRegisters:
     """Five caller-owned GP registers used while emitting ``L_TILE``."""
@@ -134,6 +141,7 @@ class MatrixSramPoint:
 @dataclass(frozen=True)
 class MatrixRecurrenceSpec:
     name: str
+    kind: RecurrenceKind
     heads: int
     row_elements: int
     recurrence_rows: int
@@ -170,6 +178,7 @@ class MatrixRecurrenceSpec:
 
 NEMOTRON_MAMBA = MatrixRecurrenceSpec(
     name="nemotron3_mamba2",
+    kind=RecurrenceKind.MAMBA,
     heads=64,
     row_elements=64,
     recurrence_rows=128,
@@ -183,6 +192,7 @@ NEMOTRON_MAMBA = MatrixRecurrenceSpec(
 
 KIMI_KDA = MatrixRecurrenceSpec(
     name="kimi_k3_kda",
+    kind=RecurrenceKind.KDA,
     heads=96,
     row_elements=128,
     recurrence_rows=128,
@@ -416,7 +426,7 @@ def build_recurrence_working_set(
         # phase 64.  Both are compiler-owned scratchpad allocations.
         fields_base_row = state_rows if occupied_state_banks == point.banks else 0
         fields_first_bank = 0 if fields_base_row else occupied_state_banks
-        if spec is KIMI_KDA:
+        if spec.kind is RecurrenceKind.KDA:
             head_pair = _descriptor(
                 rows=2,
                 cols=state_rows,
@@ -531,7 +541,7 @@ def build_recurrence_working_set(
             pitch=state_rows,
             affine=False,
         )
-        if spec is KIMI_KDA:
+        if spec.kind is RecurrenceKind.KDA:
             padded_key_cols = max(point.bank_width, state_rows)
             head_pair = _descriptor(
                 rows=2,
@@ -677,7 +687,7 @@ def build_recurrence_field_manifest(
         cursor += transfer_values * BF16_BYTES
 
     for group in range(working_set.groups):
-        if working_set.spec is NEMOTRON_MAMBA:
+        if working_set.spec.kind is RecurrenceKind.MAMBA:
             for field, target in (
                 ("x", "x"),
                 ("scratch_zero", "scratch"),
@@ -690,7 +700,7 @@ def build_recurrence_field_manifest(
                 add("update", "update", group, chunk)
                 add("c", "c", group, chunk)
             add("output_result", "output", group)
-        elif working_set.spec is KIMI_KDA:
+        elif working_set.spec.kind is RecurrenceKind.KDA:
             for field, target in (
                 ("prediction_zero", "prediction"),
                 ("value", "error"),
@@ -1339,7 +1349,7 @@ def lower_matrix_recurrence(
             state_hbm_base=state_hbm_base,
             hbm_address_register=hbm_address_register,
         )
-        if spec is NEMOTRON_MAMBA
+        if spec.kind is RecurrenceKind.MAMBA
         else _lower_kda(
             working_set,
             field_manifest,
@@ -1584,6 +1594,7 @@ def build_matrix_recurrence_report() -> dict[str, object]:
         models[spec.name] = {
             "spec": {
                 "name": spec.name,
+                "kind": spec.kind,
                 "heads": spec.heads,
                 "row_elements": spec.row_elements,
                 "recurrence_rows": spec.recurrence_rows,
@@ -1622,6 +1633,7 @@ __all__ = [
     "MatrixRecurrenceSpec",
     "MatrixSramPoint",
     "RecurrenceLayout",
+    "RecurrenceKind",
     "RecurrenceFieldManifest",
     "RecurrenceFieldPacket",
     "RecurrenceWorkingSet",
