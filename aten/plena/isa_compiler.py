@@ -386,6 +386,7 @@ class IsaCompiler(
         shape: tuple[int, int],
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
+        storage_order: str = "row_major",
     ):
         """Register an HBM object and build its HBM layout.
 
@@ -400,6 +401,7 @@ class IsaCompiler(
             physical_shape=physical_shape,
             hbm_addr=hbm_addr,
             real_data_ratio=real_data_ratio,
+            storage_order=storage_order,
         )
 
     def free_hbm_object(self, name: str, strict: bool = False):

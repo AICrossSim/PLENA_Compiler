@@ -55,7 +55,12 @@ class IsaMatrixMixin:
         if set_scale:
             asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), rows * cols)
             asm.instr("C_SET_SCALE_REG", gp(gp_scale))
-        asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), cols * hbm_element_bytes)
+        asm.instr(
+            "S_ADDI_INT",
+            gp(gp_stride),
+            gp(0),
+            layout.hbm_row_stride_elements * hbm_element_bytes,
+        )
         asm.instr("C_SET_STRIDE_REG", gp(gp_stride))
 
     def _emit_hbm_subblock_prefetch(
@@ -308,6 +313,7 @@ class IsaMatrixMixin:
         k_block_start: int = 0,
         k_block_count: int | None = None,
         unroll: bool | None = None,
+        resident_mram_start_addr: int | None = None,
     ) -> str:
         """Emit VRAM[row][:] @ MRAM[:][col] projection."""
         gp_regs = self._default_projection_gp_regs(gp_regs)
@@ -327,10 +333,12 @@ class IsaMatrixMixin:
         valid_rows = vram_row_blocks[k_block_start].valid_shape[0] if vram_row_blocks[k_block_start].valid_shape else self.mlen
         row_loop_count = max(1, math.ceil(valid_rows / self.blen))
         vram_row_start_addr = vram_row_blocks[k_block_start].vram_addr
-        mram_col_start_addr = self._loaded_mram_start(
-            mram_col_blocks,
-            lambda block: f"{mram_mat_name}[{block.row_idx}][{mram_col_idx}]",
-        )
+        mram_col_start_addr = resident_mram_start_addr
+        if mram_col_start_addr is None:
+            mram_col_start_addr = self._loaded_mram_start(
+                mram_col_blocks,
+                lambda block: f"{mram_mat_name}[{block.row_idx}][{mram_col_idx}]",
+            )
 
         header_lines = [
             f"; VRAM Sub Projection: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[:][{mram_col_idx}]",
@@ -1115,6 +1123,7 @@ class IsaMatrixMixin:
         target_col_idx: int,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        resident_mram_start_addr: int | None = None,
     ) -> str:
         result_vram_addr, target_base_addr, target_rows = self._target_tile_addr(
             target_matrix, target_row_idx, target_col_idx
@@ -1122,6 +1131,8 @@ class IsaMatrixMixin:
         gp_regs = self.register_allocator.allocate_gp(9)
 
         if transposed:
+            if resident_mram_start_addr is not None:
+                raise ValueError("resident MRAM override is only supported for non-transposed projections")
             isa_code = f"; VRAM Sub Projection T To: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[{mram_idx}][:]^T -> {target_matrix}[{target_row_idx}][{target_col_idx}]\n"
             asm = self.vram_sub_projection_T_asm(
                 vram_mat_name=vram_mat_name,
@@ -1142,6 +1153,7 @@ class IsaMatrixMixin:
                 gp_regs=gp_regs,
                 k_block_start=k_block_start,
                 k_block_count=k_block_count,
+                resident_mram_start_addr=resident_mram_start_addr,
             )
         isa_code += f"; Target VRAM addr: {result_vram_addr} (base={target_base_addr}, offset=col*{target_rows}*{self.mlen} + row*{self.mlen}*{self.mlen})\n"
         isa_code += asm
@@ -1160,6 +1172,7 @@ class IsaMatrixMixin:
         target_col_idx: int,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        resident_mram_start_addr: int | None = None,
     ) -> str:
         """
         Sub-block multiplication:
@@ -1177,6 +1190,7 @@ class IsaMatrixMixin:
             target_col_idx=target_col_idx,
             k_block_start=k_block_start,
             k_block_count=k_block_count,
+            resident_mram_start_addr=resident_mram_start_addr,
         )
 
     def vram_sub_projection_T_to(

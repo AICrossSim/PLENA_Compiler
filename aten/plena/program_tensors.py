@@ -19,6 +19,7 @@ class ProgramTensorMixin:
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float | None = None,
+        hbm_storage_order: str = "row_major",
     ) -> InputVar:
         """
         Declare an input tensor (in HBM).
@@ -62,6 +63,7 @@ class ProgramTensorMixin:
             shape=shape,
             physical_shape=physical_shape,
             real_data_ratio=real_data_ratio,
+            storage_order=hbm_storage_order,
         )
         return var
 
