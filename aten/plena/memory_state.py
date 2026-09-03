@@ -129,6 +129,7 @@ class MemoryStateMixin:
         kind: str = "HBMObject",
         real_data_ratio: float = 1.125,
         strict: bool = False,
+        storage_order: str = "row_major",
     ) -> MemoryObjectInfo:
         del dtype, kind
         self.register_matrix(
@@ -138,6 +139,7 @@ class MemoryStateMixin:
             hbm_base_addr=hbm_addr,
             real_data_ratio=real_data_ratio,
             strict=strict,
+            storage_order=storage_order,
         )
         return self[name]
 
@@ -239,6 +241,7 @@ class MemoryStateMixin:
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float = 1.125,
         strict: bool = True,
+        storage_order: str = "row_major",
     ) -> MatrixBlockLayout:
         """Register an HBM matrix and derive its mlen block layout."""
         del real_data_ratio  # HBM size is now row-aligned (see hbm_tensor_size)
@@ -261,6 +264,7 @@ class MemoryStateMixin:
             block_size=self.mlen,
             hbm_base_addr=hbm_base_addr,
             hbm_size=hbm_size,
+            storage_order=storage_order,
         )
 
         self.hbm_matrices[name] = layout
