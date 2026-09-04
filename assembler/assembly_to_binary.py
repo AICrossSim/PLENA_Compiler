@@ -62,9 +62,9 @@ _LSTREAM_VIEW_OPS = frozenset(
 )
 _PSEUDO_OPCODE_ALIASES = {
     "V_FMA_VF": "V_MUL_VF",
-    "L_CFG": "L_MVIEW",
-    "L_TILE_CFG": "L_MVIEW",
-    "L_TILE_EXEC": "L_MVIEW",
+    "L_CFG": "L_TILE",
+    "L_TILE_CFG": "L_TILE",
+    "L_TILE_EXEC": "L_TILE",
     "V_ADD_VV.MV": "V_ADD_VV",
     "V_SUB_VV.MV": "V_SUB_VV",
     "V_MUL_VV.MV": "V_MUL_VV",

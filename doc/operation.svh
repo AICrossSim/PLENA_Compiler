@@ -166,7 +166,7 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     H_PREFETCH_V           = 6'h29,
     H_STORE_V              = 6'h2A,
     // Matrix-view addressing forms reuse 0x29/0x2A. Bit 31 marks the form,
-    // bits [30:29] select L_MVIEW slot 0..3, and bits [28:26] are zero.
+    // bits [30:29] select L_TILE slot 0..3, and bits [28:26] are zero.
     // They transfer directly between HBM and the configured Matrix-SRAM view.
     // In the legacy form funct1=0 means Activation and any non-zero value means
     // KeyValue. In the new bit-31 form funct1 is canonical: 0=Activation,
@@ -217,18 +217,23 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     //   [9:6] shape-word GP, [13:10] mapping-word GP, [17:14] slot (0..3),
     //   [21:18]=0, [25:22]=1, [31:26]=0.
     // Shape word: rows-1[11:0], cols-1[23:12], tiles-1[31:24].
-    // Mapping word: tile_pitch_rows[15:0], row_skew[21:16],
-    // tile_skew[27:22], flags[31:28]. Flags are strict-bounds, affine,
-    // FP32-capable-view and broadcast-minor. The evaluated PLENA path leaves
-    // FP32 clear and stores Matrix values, fields and recurrent state as BF16.
+    // Mapping word: tile_pitch_rows[15:0], reserved-zero[21:16],
+    // tile_phase_stride[27:22], flags[31:28]. PLENA's published diagonal row
+    // coefficient is fixed at one and is not encoded. A zero phase selects the
+    // ordinary fixed form; a non-zero phase compactly expresses per-tile base
+    // phases. Flag bits [2:0] are reserved zero and bit 3 selects
+    // broadcast-minor. Bounds are always strict. Matrix values, fields and
+    // recurrent state are BF16.
     //
     // L_TILE_EXEC encoding (funct1=3):
     //   [9:6] dst-base GP, [13:10] src-base GP, [17:14] scale-base GP,
     //   [21:18] primitive, [25:22]=3, [26] src-axis, [27] scale-axis,
     //   [31:28]=0. Axis 0=row and 1=column. Primitive 0=SCALE_ACCUM,
     //   1=DOT_REDUCE, 2=OUTER_UPDATE; all other values are reserved.
-    // funct1=0 remains a temporary legacy L_CFG compatibility form.
-    L_MVIEW                = 6'h3F
+    // funct1=0 retains the historical L_CFG research baseline, but it is not
+    // part of the frozen Matrix-SRAM RTL candidate. All production recurrent
+    // schedules use the CFG/EXEC forms above.
+    L_TILE                 = 6'h3F
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {

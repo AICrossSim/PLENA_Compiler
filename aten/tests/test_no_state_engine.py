@@ -8,7 +8,7 @@ fails if either reappears.
 
 What the recurrent kernels need instead is two ordinary arithmetic/data-move
 opcodes -- `V_SOFTPLUS_V` (0x3D) and `S_MAP_FP_V` (0x3E) -- plus one
-model-independent address configuration opcode, `L_CFG` (0x3F). `V_FMA_VF`
+model-independent Matrix-tile opcode family, `L_TILE` (0x3F). `V_FMA_VF`
 is only a readable assembler alias for the existing `V_MUL_VF` opcode's
 funct1[3] accumulate mode. None fetches a state descriptor or names Mamba/KDA.
 
@@ -136,7 +136,7 @@ def test_extension_opcode_ownership_is_explicit_and_conflict_free():
         0x3C: "V_ROUTE_MUL",
         0x3D: "V_SOFTPLUS_V",
         0x3E: "S_MAP_FP_V",
-        0x3F: "L_MVIEW",
+        0x3F: "L_TILE",
     }
     for opcode, name in expected.items():
         assert defined.get(opcode) == name, (
@@ -163,9 +163,10 @@ def test_static_recurrent_path_uses_exactly_three_physical_opcodes():
     0x39..0x3C. This work owns two ordinary operations at 0x3D..0x3E and one
     general address mode at 0x3F; FMA is a mode of V_MUL_VF, not an opcode.
 
-    `L_CFG` is the only layout opcode. It configures a general affine
-    operand stream; it does not fetch descriptors, hold a queue, or manage
-    residency. The other tests guard that architectural boundary.
+    `L_TILE` is the only physical layout opcode. Its CFG/EXEC forms configure
+    and walk a compiler-owned Matrix view; they do not fetch descriptors, hold
+    a queue, or manage residency. The historical `L_CFG` research form shares
+    this opcode but is excluded from the frozen Matrix-SRAM RTL candidate.
     """
     root = _repo_root()
     svh = (_compiler_root(root) / "doc" / "operation.svh").read_text()
@@ -177,6 +178,6 @@ def test_static_recurrent_path_uses_exactly_three_physical_opcodes():
     assert added_by_this_work == OPCODES_ADDED_HERE, (
         f"opcodes past {hex(MAIN_LAST_OPCODE)}: "
         f"{sorted(hex(c) for c in added_by_this_work)}; this work adds exactly "
-        "three -- V_SOFTPLUS_V 0x3D, S_MAP_FP_V 0x3E, and L_CFG 0x3F; "
+        "three -- V_SOFTPLUS_V 0x3D, S_MAP_FP_V 0x3E, and L_TILE 0x3F; "
         "V_FMA_VF must not spend an opcode"
     )

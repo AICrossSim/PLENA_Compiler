@@ -64,8 +64,8 @@ class MatrixAccessPacket:
     view_cols: int | None = None
     tile_pitch_rows: int | None = None
     view_alpha: int | None = None
-    view_tile_skew: int | None = None
-    view_affine: bool | None = None
+    view_tile_phase_stride: int | None = None
+    view_phased: bool | None = None
     view_tile_start: int | None = None
     view_line_axis: str | None = None
     view_line_period: int | None = None
@@ -94,12 +94,8 @@ def _view_mapping_metadata(
     if descriptor is None:
         return None, None, None
     mapping = descriptor.mapping
-    affine = mapping.affine_enabled
-    return (
-        mapping.row_skew if affine else 1,
-        mapping.tile_skew if affine else 0,
-        affine,
-    )
+    phased = mapping.phased_enabled
+    return (1, mapping.tile_phase_stride, phased)
 
 
 @dataclass(frozen=True)
@@ -305,7 +301,7 @@ def packet_histogram(packets: Iterable[MatrixAccessPacket]) -> list[dict[str, ob
             "static_packets": counts[(stage, axis, tiles, elements)],
             "dynamic_packets": dynamic[(stage, axis, tiles, elements)],
             "values_per_packet": tiles * elements,
-            "per_tile_skew_can_help": tiles > 1,
+            "per_tile_phase_can_help": tiles > 1,
         }
         for stage, axis, tiles, elements in sorted(counts)
     ]
@@ -387,7 +383,7 @@ def coissued_packet_histogram(
                 "values_per_service": sum(item["values"] for item in operands),
                 "static_service_groups": static[key],
                 "dynamic_service_groups": dynamic[key],
-                "per_tile_skew_can_help": any(item["tiles"] > 1 for item in operands),
+                "per_tile_phase_can_help": any(item["tiles"] > 1 for item in operands),
             }
         )
     return result
@@ -439,8 +435,8 @@ def coissued_packet_groups(
                         "view_cols": packet.view_cols,
                         "tile_pitch_rows": packet.tile_pitch_rows,
                         "view_alpha": packet.view_alpha,
-                        "view_tile_skew": packet.view_tile_skew,
-                        "view_affine": packet.view_affine,
+                        "view_tile_phase_stride": packet.view_tile_phase_stride,
+                        "view_phased": packet.view_phased,
                         "view_tile_start": packet.view_tile_start,
                         "view_line_axis": packet.view_line_axis,
                         "view_line_period": packet.view_line_period,
@@ -515,7 +511,7 @@ def _matrix_read_packet(
         axis = "row"
         elements_per_tile = width
         cells = tuple(LogicalCell(tile, "cycle", col) for col in range(width))
-    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
+    view_alpha, view_tile_phase_stride, view_phased = _view_mapping_metadata(descriptor)
     return MatrixAccessPacket(
         instruction_index=instruction_index,
         opcode=opcode,
@@ -534,8 +530,8 @@ def _matrix_read_packet(
             descriptor.mapping.tile_pitch_rows if descriptor is not None else None
         ),
         view_alpha=view_alpha,
-        view_tile_skew=view_tile_skew,
-        view_affine=view_affine,
+        view_tile_phase_stride=view_tile_phase_stride,
+        view_phased=view_phased,
         address_stride_elements=_operand_loop_stride(matrix_operand, loop_strides),
     )
 
@@ -666,7 +662,7 @@ def _matrix_view_dma_packet(
         ) from error
     matrix_operand = operands[0]
     shape = descriptor.shape
-    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
+    view_alpha, view_tile_phase_stride, view_phased = _view_mapping_metadata(descriptor)
     sample = tuple(
         LogicalCell(tile, row, col)
         for tile in range(shape.tile_count)
@@ -690,8 +686,8 @@ def _matrix_view_dma_packet(
         view_cols=shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
         view_alpha=view_alpha,
-        view_tile_skew=view_tile_skew,
-        view_affine=view_affine,
+        view_tile_phase_stride=view_tile_phase_stride,
+        view_phased=view_phased,
         address_stride_elements=_operand_loop_stride(matrix_operand, loop_strides),
     )
 
@@ -750,7 +746,7 @@ def _l_tile_packet(
     broadcast_tile: bool = False,
 ) -> MatrixAccessPacket:
     _, line_width = _axis_extent(descriptor, axis)
-    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
+    view_alpha, view_tile_phase_stride, view_phased = _view_mapping_metadata(descriptor)
     return MatrixAccessPacket(
         instruction_index=instruction_index,
         opcode="L_TILE_EXEC",
@@ -775,8 +771,8 @@ def _l_tile_packet(
         view_cols=descriptor.shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
         view_alpha=view_alpha,
-        view_tile_skew=view_tile_skew,
-        view_affine=view_affine,
+        view_tile_phase_stride=view_tile_phase_stride,
+        view_phased=view_phased,
         view_tile_start=tile_start,
         view_line_axis=axis.name.lower(),
         view_line_period=line_period,
@@ -1033,7 +1029,7 @@ def _matrix_view_operand_packet(
             f"{opcode} uses unconfigured Matrix-view slot {slot}"
         ) from error
     shape = descriptor.shape
-    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
+    view_alpha, view_tile_phase_stride, view_phased = _view_mapping_metadata(descriptor)
     cells = tuple(
         LogicalCell(tile, row, col)
         for tile in range(shape.tile_count)
@@ -1057,8 +1053,8 @@ def _matrix_view_operand_packet(
         view_cols=shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
         view_alpha=view_alpha,
-        view_tile_skew=view_tile_skew,
-        view_affine=view_affine,
+        view_tile_phase_stride=view_tile_phase_stride,
+        view_phased=view_phased,
         address_stride_elements=address_stride_elements,
     )
 
@@ -1085,7 +1081,7 @@ def _matrix_view_writeback_packet(
         operands[2], registers, "Matrix accumulator logical offset"
     )
     shape = descriptor.shape
-    view_alpha, view_tile_skew, view_affine = _view_mapping_metadata(descriptor)
+    view_alpha, view_tile_phase_stride, view_phased = _view_mapping_metadata(descriptor)
     values_per_tile = shape.rows * shape.cols
     if logical_offset % geometry.blen:
         raise ValueError("M_MM_WO logical offset must select one BLEN-wide fragment")
@@ -1123,8 +1119,8 @@ def _matrix_view_writeback_packet(
         view_cols=shape.cols,
         tile_pitch_rows=descriptor.mapping.tile_pitch_rows,
         view_alpha=view_alpha,
-        view_tile_skew=view_tile_skew,
-        view_affine=view_affine,
+        view_tile_phase_stride=view_tile_phase_stride,
+        view_phased=view_phased,
         address_stride_elements=_operand_loop_stride(operands[0], loop_strides),
     )
 

@@ -22,15 +22,17 @@ Three physical controls are emitted from the same formulas:
 ``fixed-phased D'`` (evaluation control, not another executable layout enum)
     Existing fixed-diagonal wiring with one ordinary compiler-selected column
     base per logical head tile.  It reaches the same conflict-free physical
-    bank coordinates as ``affine`` without programmable row/tile skew, but
+    bank coordinates as the compact phased form without a programmable row
+    coefficient, but
     needs many base/view bindings instead of one compact descriptor.  D' is the
     fair control for pure bank-conflict claims; ``fixed`` remains the executable
     control for descriptor/chunk/issue comparisons.
 
-``affine``
-    The compiler additionally chooses row/tile skew.  Several logical head
-    rows then share a physical SRAM row while occupying disjoint banks.  Lane
-    order is restored by the Matrix-SRAM view on read.
+``affine`` (legacy enum spelling for the frozen phased form)
+    The row term remains PLENA's fixed diagonal mapping. The compiler chooses
+    one inter-tile bank phase stride, allowing several logical head rows to
+    share a physical SRAM row while occupying disjoint banks. Lane order is
+    restored by the Matrix-SRAM view on read.
 
 The default point preserves the paper's approximately 1 MiB Matrix-SRAM bit
 budget with a uniform BF16 data path.  It contains 256 MLEN-wide rows and uses
@@ -253,8 +255,9 @@ class RecurrenceWorkingSet:
                     "shape": asdict(allocation.descriptor.shape),
                     "mapping": {
                         "tile_pitch_rows": allocation.descriptor.mapping.tile_pitch_rows,
-                        "row_skew": allocation.descriptor.mapping.row_skew,
-                        "tile_skew": allocation.descriptor.mapping.tile_skew,
+                        "tile_phase_stride": (
+                            allocation.descriptor.mapping.tile_phase_stride
+                        ),
                         "flags": int(allocation.descriptor.mapping.flags),
                     },
                 }
@@ -337,21 +340,17 @@ def _descriptor(
     tiles: int,
     pitch: int,
     affine: bool,
-    row_skew: int = 0,
-    tile_skew: int = 0,
+    tile_phase_stride: int = 0,
     broadcast: bool = False,
 ) -> MatrixViewDescriptor:
-    flags = MatrixViewFlags.STRICT_BOUNDS
-    if affine:
-        flags |= MatrixViewFlags.AFFINE
+    flags = MatrixViewFlags(0)
     if broadcast:
         flags |= MatrixViewFlags.BROADCAST_MINOR
     return MatrixViewDescriptor(
         MatrixViewShape(rows=rows, cols=cols, tile_count=tiles),
         MatrixViewMap(
             tile_pitch_rows=pitch,
-            row_skew=row_skew,
-            tile_skew=tile_skew,
+            tile_phase_stride=tile_phase_stride if affine else 0,
             flags=flags,
         ),
     )
@@ -393,8 +392,7 @@ def build_recurrence_working_set(
             tiles=group_heads,
             pitch=0,
             affine=True,
-            row_skew=1,
-            tile_skew=words_per_row,
+            tile_phase_stride=words_per_row,
         )
         scalar = _descriptor(
             rows=state_rows,
@@ -402,8 +400,7 @@ def build_recurrence_working_set(
             tiles=1,
             pitch=state_rows,
             affine=True,
-            row_skew=1,
-            tile_skew=1,
+            tile_phase_stride=1,
             broadcast=True,
         )
         vector = _descriptor(
@@ -416,7 +413,6 @@ def build_recurrence_working_set(
             # overlap adjacent heads by all but one bank word (2--4x service).
             pitch=words_per_row,
             affine=True,
-            row_skew=1,
         )
         occupied_state_banks = group_heads * words_per_row
         # At the 1 MiB point the head-group state occupies half of every
@@ -438,8 +434,7 @@ def build_recurrence_working_set(
                 # conflict-free for the BF16 16-head group.
                 pitch=2 * words_per_row,
                 affine=True,
-                row_skew=1,
-                tile_skew=words_per_row,
+                tile_phase_stride=words_per_row,
                 broadcast=True,
             )
             head_scalar = _descriptor(
@@ -451,7 +446,6 @@ def build_recurrence_working_set(
                 # four-bank slices in a full viewed DMA.
                 pitch=words_per_row,
                 affine=True,
-                row_skew=1,
                 broadcast=True,
             )
             phases = {

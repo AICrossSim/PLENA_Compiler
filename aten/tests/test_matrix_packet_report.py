@@ -42,7 +42,7 @@ def test_attention_cases_extract_the_real_column_read() -> None:
                 "static_packets": 1,
                 "dynamic_packets": 131_072,
                 "values_per_packet": 32,
-                "per_tile_skew_can_help": False,
+                "per_tile_phase_can_help": False,
             }
         ]
 
@@ -50,7 +50,7 @@ def test_attention_cases_extract_the_real_column_read() -> None:
 def test_report_separates_the_one_tile_baseline_from_executable_lcompute() -> None:
     finding = build_report()["current_isa_finding"]
     assert finding["baseline_packets_name_one_tile"]
-    assert finding["per_tile_skew_has_current_consumer"]
+    assert finding["per_tile_phase_has_current_consumer"]
 
 
 def test_every_report_case_proves_complete_matrix_access_coverage() -> None:
@@ -182,6 +182,6 @@ def test_projection_writeback_uses_the_real_consumer_head_shape() -> None:
                 "static_packets": 384,
                 "dynamic_packets": 384,
                 "values_per_packet": 32,
-                "per_tile_skew_can_help": False,
+                "per_tile_phase_can_help": False,
             }
         ]

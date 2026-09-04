@@ -8,7 +8,7 @@ This module keeps three claims separate:
 * the official Kimi K3 GPU implementation's FP32 state is retained only as a
   capacity and accuracy baseline, not as the active PLENA transfer format.
 
-The ISA stays model independent. ``L_MVIEW`` declares shape and physical-row
+The ISA stays model independent. ``L_TILE_CFG`` declares shape and physical-row
 pitch over PLENA's fixed diagonal placement; existing row/column Matrix
 operations select the access axis.
 """

@@ -145,12 +145,11 @@ def test_fixed_control_has_every_freedom_except_programmable_skew() -> None:
         assert affine.chunks == 1
         for control in (diagnostic, fixed):
             assert all(
-                allocation.descriptor.mapping.row_skew == 0
-                and allocation.descriptor.mapping.tile_skew == 0
+                allocation.descriptor.mapping.tile_phase_stride == 0
                 for allocation in control.allocations
             )
         assert any(
-            allocation.descriptor.mapping.tile_skew != 0
+            allocation.descriptor.mapping.tile_phase_stride != 0
             for allocation in affine.allocations
         )
 
@@ -167,7 +166,8 @@ def test_every_active_recurrence_view_uses_uniform_bf16() -> None:
             working_set = build_recurrence_working_set(spec, layout=layout)
             assert working_set.point.element_bytes == BF16_BYTES
             assert all(
-                not allocation.descriptor.mapping.flags & MatrixViewFlags.FP32
+                not allocation.descriptor.mapping.flags
+                & ~MatrixViewFlags.BROADCAST_MINOR
                 for allocation in working_set.allocations
             )
 

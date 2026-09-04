@@ -439,7 +439,7 @@ def build_report() -> dict[str, object]:
                 "The current projection allocator schedules MLEN-square tiles. The "
                 "official-shape projection cases therefore use the minimum two-slot "
                 "structural fixture and do not claim that an MLEN-square tile resides "
-                "in the published 256-row SRAM. Compact L_MVIEW operands do fit."
+                "in the published 256-row SRAM. Compact L_TILE operands do fit."
             ),
         },
         "scope_boundary": (
@@ -455,13 +455,13 @@ def build_report() -> dict[str, object]:
                 if case["lowering"] == "baseline"
                 for entry in case["histogram"]
             ),
-            "per_tile_skew_has_current_consumer": any(
-                entry["per_tile_skew_can_help"] for entry in coissued_histograms
+            "per_tile_phase_has_current_consumer": any(
+                entry["per_tile_phase_can_help"] for entry in coissued_histograms
             ),
             "interpretation": (
                 "Arlo's M_* lowering remains the one-tile baseline. The executable "
-                "L_MVIEW path adds a compiler-emitted multi-tile packet after direct "
-                "Matrix-accumulator affine writeback."
+                "L_TILE path adds a compiler-emitted multi-tile packet after direct "
+                "Matrix-accumulator phased writeback."
             ),
         },
     }

@@ -7,11 +7,7 @@ from compiler.aten.plena.matrix_access_packets import (
     matrix_access_instruction_count,
     packet_histogram,
 )
-from compiler.aten.plena.mview import (
-    MatrixViewFlags,
-    MatrixViewMap,
-    MatrixViewShape,
-)
+from compiler.aten.plena.mview import MatrixViewMap, MatrixViewShape
 
 import pytest
 
@@ -89,7 +85,7 @@ M_MM 0, gp7, gp8
     histogram = packet_histogram(packets)
 
     assert all(entry["tiles"] == 1 for entry in histogram)
-    assert not any(entry["per_tile_skew_can_help"] for entry in histogram)
+    assert not any(entry["per_tile_phase_can_help"] for entry in histogram)
 
 
 def test_optional_view_is_explicit_on_the_consumer() -> None:
@@ -109,13 +105,11 @@ M_MM 0, gp1, gp2, 2
     assert packet.elements_per_tile == 4
 
 
-def test_packet_preserves_the_complete_physical_affine_mapping() -> None:
+def test_packet_preserves_the_complete_physical_phased_mapping() -> None:
     shape = MatrixViewShape(rows=2, cols=4, tile_count=8).pack()
     mapping = MatrixViewMap(
         tile_pitch_rows=2,
-        row_skew=0,
-        tile_skew=5,
-        flags=MatrixViewFlags.STRICT_BOUNDS | MatrixViewFlags.AFFINE,
+        tile_phase_stride=5,
     ).pack()
     packet = extract_matrix_access_packets(
         f"""
@@ -127,9 +121,9 @@ M_MM 0, gp1, gp2, 2
         GEOMETRY,
     )[0]
 
-    assert packet.view_alpha == 0
-    assert packet.view_tile_skew == 5
-    assert packet.view_affine is True
+    assert packet.view_alpha == 1
+    assert packet.view_tile_phase_stride == 5
+    assert packet.view_phased is True
 
 
 def test_extracts_real_multi_tile_view_packets_and_direct_writeback() -> None:
@@ -171,7 +165,7 @@ M_MM_WO gp3, gp0, 0, 0
     assert writeback.direction == "write"
     assert writeback.tile_count == 1
     assert writeback.elements_per_tile == 4
-    assert packet_histogram((source1,))[0]["per_tile_skew_can_help"]
+    assert packet_histogram((source1,))[0]["per_tile_phase_can_help"]
 
     coissued = coissued_packet_histogram(packets)
     read_group = next(entry for entry in coissued if entry["direction"] == "read")

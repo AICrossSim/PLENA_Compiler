@@ -4,6 +4,7 @@ import pytest
 
 from compiler.aten.plena import PlenaCompiler
 from compiler.aten.plena.mview import (
+    L_MVIEW_CONTRACT_VERSION,
     LTilePrimitive,
     L_MVIEW_OPCODE,
     MatrixViewAllocation,
@@ -24,6 +25,23 @@ from compiler.aten.plena.mview import (
 )
 
 
+def test_matrix_view_v3_golden_mapping_words() -> None:
+    assert L_MVIEW_CONTRACT_VERSION == 3
+    assert MatrixViewMap(tile_pitch_rows=64).pack() == 0x00000040
+    assert (
+        MatrixViewMap(tile_pitch_rows=0, tile_phase_stride=4).pack()
+        == 0x01000000
+    )
+    assert (
+        MatrixViewMap(
+            tile_pitch_rows=0,
+            tile_phase_stride=4,
+            flags=MatrixViewFlags.BROADCAST_MINOR,
+        ).pack()
+        == 0x81000000
+    )
+
+
 def test_real_shapes_and_fixed_wiring_mapping_roundtrip() -> None:
     shape = MatrixViewShape(rows=128, cols=128, tile_count=96)
     mapping = MatrixViewMap(tile_pitch_rows=128)
@@ -32,19 +50,26 @@ def test_real_shapes_and_fixed_wiring_mapping_roundtrip() -> None:
     assert MatrixViewMap.unpack(mapping.pack()) == mapping
 
 
-def test_affine_mapping_roundtrips_without_model_specific_fields() -> None:
-    mapping = MatrixViewMap(tile_pitch_rows=128, row_skew=3, tile_skew=11)
+def test_phased_mapping_roundtrips_without_model_specific_fields() -> None:
+    mapping = MatrixViewMap(tile_pitch_rows=128, tile_phase_stride=11)
     restored = MatrixViewMap.unpack(mapping.pack())
     assert restored.tile_pitch_rows == 128
-    assert restored.row_skew == 3
-    assert restored.tile_skew == 11
-    assert restored.flags & MatrixViewFlags.AFFINE
+    assert restored.tile_phase_stride == 11
+
+
+def test_programmable_row_coefficient_is_rejected_before_rtl() -> None:
+    word = 128 | (3 << 16) | (11 << 22)
+    with pytest.raises(ValueError, match=r"bits \[21:16\] are reserved"):
+        MatrixViewMap.unpack(word)
 
 
 def test_zero_pitch_compacts_tiles_into_distinct_banks() -> None:
     descriptor = MatrixViewDescriptor(
         MatrixViewShape(rows=128, cols=128, tile_count=8),
-        MatrixViewMap(tile_pitch_rows=0, row_skew=1, tile_skew=4),
+        MatrixViewMap(
+            tile_pitch_rows=0,
+            tile_phase_stride=4,
+        ),
     )
     descriptor.validate_for_machine(banks=64, bank_width=32)
     assert MatrixViewMap.unpack(descriptor.mapping.pack()).tile_pitch_rows == 0
@@ -59,9 +84,10 @@ def test_zero_pitch_without_a_tile_phase_is_rejected_as_aliasing() -> None:
         descriptor.validate_for_machine(banks=64, bank_width=32)
 
 
-def test_nonzero_skew_without_affine_flag_is_rejected() -> None:
-    word = 4 | (3 << 16) | (1 << 28)
-    with pytest.raises(ValueError, match="requires the AFFINE flag"):
+@pytest.mark.parametrize("reserved_flag", [1 << 0, 1 << 1, 1 << 2])
+def test_unused_mapping_flag_bits_are_reserved(reserved_flag: int) -> None:
+    word = 4 | (reserved_flag << 28)
+    with pytest.raises(ValueError, match="unknown Matrix-view flags"):
         MatrixViewMap.unpack(word)
 
 
@@ -163,7 +189,7 @@ def test_descriptor_does_not_encode_machine_bank_geometry(
         MatrixViewShape(rows=64, cols=2048, tile_count=32),
         MatrixViewMap(
             tile_pitch_rows=4096,
-            flags=MatrixViewFlags.STRICT_BOUNDS,
+            flags=MatrixViewFlags(0),
         ),
     )
     descriptor.validate_for_machine(banks=banks, bank_width=bank_width)
@@ -327,15 +353,24 @@ def _paper_addr(row: int, bank_phase: int) -> int:
 def test_compiler_proves_official_kda_chunk_and_fields_are_disjoint() -> None:
     state = MatrixViewDescriptor(
         MatrixViewShape(rows=16, cols=128, tile_count=16),
-        MatrixViewMap(tile_pitch_rows=8, row_skew=1, tile_skew=4),
+        MatrixViewMap(
+            tile_pitch_rows=8,
+            tile_phase_stride=4,
+        ),
     )
     scalar = MatrixViewDescriptor(
         MatrixViewShape(rows=16, cols=32, tile_count=16),
-        MatrixViewMap(tile_pitch_rows=1, row_skew=1, tile_skew=3),
+        MatrixViewMap(
+            tile_pitch_rows=1,
+            tile_phase_stride=3,
+        ),
     )
     vector = MatrixViewDescriptor(
         MatrixViewShape(rows=1, cols=128, tile_count=16),
-        MatrixViewMap(tile_pitch_rows=1, row_skew=1, tile_skew=3),
+        MatrixViewMap(
+            tile_pitch_rows=1,
+            tile_phase_stride=3,
+        ),
     )
     allocations = [
         MatrixViewAllocation("state", _paper_addr(0, 0), state),
@@ -355,15 +390,24 @@ def test_compiler_proves_official_kda_chunk_and_fields_are_disjoint() -> None:
 def test_compiler_proves_official_mamba_chunk_and_fields_are_disjoint() -> None:
     state = MatrixViewDescriptor(
         MatrixViewShape(rows=16, cols=64, tile_count=32),
-        MatrixViewMap(tile_pitch_rows=4, row_skew=1, tile_skew=2),
+        MatrixViewMap(
+            tile_pitch_rows=4,
+            tile_phase_stride=2,
+        ),
     )
     scalar = MatrixViewDescriptor(
         MatrixViewShape(rows=16, cols=32, tile_count=32),
-        MatrixViewMap(tile_pitch_rows=1, row_skew=1, tile_skew=1),
+        MatrixViewMap(
+            tile_pitch_rows=1,
+            tile_phase_stride=1,
+        ),
     )
     vector = MatrixViewDescriptor(
         MatrixViewShape(rows=1, cols=64, tile_count=32),
-        MatrixViewMap(tile_pitch_rows=1, row_skew=1, tile_skew=1),
+        MatrixViewMap(
+            tile_pitch_rows=1,
+            tile_phase_stride=1,
+        ),
     )
     allocations = [
         MatrixViewAllocation("state", _paper_addr(0, 0), state),

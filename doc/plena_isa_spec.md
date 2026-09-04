@@ -860,11 +860,15 @@ C_SET_TOPK_REG gp4                 ; TOPK_POLICY = 64 experts, top-6
 V_TOPK gp1, gp2, gp3, 15           ; route one token under that policy
 ```
 
-### L_CFG
+### L_CFG (Historical Evaluation Form)
 
 **Format:** `L_CFG value, target, slot, field`
 
 **Opcode:** `6'h3F`
+
+**Status:** Retained to reproduce the earlier Vector-stream experiment. It is
+not required by the frozen Matrix-SRAM L-Compute RTL candidate. New recurrent
+programs use `L_TILE_CFG` and `L_TILE_EXEC` below.
 
 **Operation:** write `gp_reg<value>` into one field of affine view `slot` and
 bind that view to `target`.
@@ -878,6 +882,73 @@ The 32-bit word is canonical: `value[9:6]`, `target[13:10]`, `slot[17:14]`,
 `field[21:18]`, and bits `[31:22]=0`. Fields define base, extents, affine bank
 coefficients, packet shape, and explicit advancement. See
 `doc/hybrid_lcompute.md` for the complete field contract.
+
+### L_TILE_CFG
+
+**Format:** `L_TILE_CFG slot, shape_reg, map_reg`
+
+**Physical opcode:** `L_TILE = 6'h3F`, `funct1=1`
+
+**Operation:** Atomically install one compiler-owned Matrix-SRAM view in
+`slot=0..3`. `gp_reg<shape_reg>` contains:
+
+```text
+rows_minus_one[11:0] | cols_minus_one[23:12] |
+tile_count_minus_one[31:24]
+```
+
+`gp_reg<map_reg>` contains:
+
+```text
+tile_pitch_rows[15:0] | reserved_zero[21:16] |
+tile_phase_stride[27:22] | flags[31:28]
+```
+
+Bits `[21:16]` must be zero. The effective row coefficient is always one,
+matching PLENA's fixed diagonal Matrix SRAM, and is therefore not carried in
+the descriptor. `tile_phase_stride=0` selects the ordinary fixed form; a
+non-zero value compactly expresses the compiler-selected base phase between
+logical tiles. Flag bits 0 through 2 are reserved; bit 3 is
+`BROADCAST_MINOR`. Bounds are always strict and Matrix-view storage is uniformly
+BF16; multiply and reduction accumulation may remain FP32 inside the arithmetic
+unit.
+
+The configuration is architectural placement metadata, not a cache entry. It
+has no tag, replacement, hit/miss, implicit transfer, or hidden model state.
+Use before configuration and non-injective/out-of-capacity mappings trap.
+
+### L_TILE_EXEC
+
+**Format:** `L_TILE_EXEC dst, src, scale, primitive[, axis_mask]`
+
+**Physical opcode:** `L_TILE = 6'h3F`, `funct1=3`
+
+**Operation:** Walk the statically configured destination, source and scale
+views in slots 0, 1 and 2. The GP operands name their explicit Matrix-SRAM base
+addresses. `axis_mask[0]` selects row/column access for `src` and
+`axis_mask[1]` selects row/column access for `scale`; omission selects rows.
+
+The closed primitive set is:
+
+| Value | Primitive | Semantics |
+|---:|---|---|
+| 0 | `SCALE_ACCUM` | `dst = a * dst + b * src` with one scalar pair per segment |
+| 1 | `DOT_REDUCE` | segmented multiply and dot reduction |
+| 2 | `OUTER_UPDATE` | rank-1 update of the destination tile |
+| 3..15 | reserved | trap |
+
+The decoder/sequencer expands the descriptor into deterministic bank reads,
+cyclic lane restoration, existing Vector arithmetic and Matrix-SRAM writes.
+It performs no dynamic scheduling and adds no model-specific arithmetic. Mamba
+and KDA are different compiler compositions of the same primitives.
+
+### Matrix-View Vector Transfer
+
+`H_PREFETCH_V.MV` and `H_STORE_V.MV` reuse physical opcodes `0x29` and `0x2A`.
+Bit 31 marks the Matrix-view form, bits `[30:29]` select a configured slot and
+bits `[28:26]` must be zero. The legacy encoding is unchanged. In the viewed
+form the precision selector is canonical: 0=Activation, 1=KeyValue, 2=State,
+3..15=reserved. The frozen L-Compute design stores Activation and State as BF16.
 
 ### C_BREAK
 

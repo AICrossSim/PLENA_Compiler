@@ -11,12 +11,12 @@ Two GP values are sufficient for the hot form:
     tile_count_minus_one[31:24]``
 
 ``mapping``
-    ``tile_pitch_rows[15:0] | row_skew[21:16] | tile_skew[27:22] |
-    flags[31:28]``
+    ``tile_pitch_rows[15:0] | reserved[21:16] |
+    tile_phase_stride[27:22] | flags[31:28]``
 
 ``tile_pitch_rows`` is measured in full physical Matrix-SRAM rows (one bank
 word from every bank), not elements.  A zero pitch is legal only when the
-affine tile phase keeps every logical bank word distinct.  That compact form
+inter-tile phase keeps every logical bank word distinct.  That compact form
 is what places several logical head rows in the same physical row but in
 different banks.  The injectivity check below rejects an unsafe zero pitch.
 """
@@ -30,7 +30,9 @@ from enum import IntEnum, IntFlag
 
 L_MVIEW_OPCODE = 0x3F
 L_MVIEW_MAX_SLOTS = 4
-L_MVIEW_CONTRACT_VERSION = 2
+# Version 3 removes the programmable row coefficient and optional storage
+# precision. Bits [21:16] and flag bits [2:0] are now reserved and must trap.
+L_MVIEW_CONTRACT_VERSION = 3
 MATRIX_VIEW_DMA_MARKER = 1 << 31
 MATRIX_VIEW_DMA_SLOT_SHIFT = 29
 MATRIX_VIEW_DMA_HIGH_RESERVED_MASK = 0b111 << 26
@@ -41,8 +43,8 @@ _TILE_COUNT_BITS = 8
 _TILE_COUNT_MASK = (1 << _TILE_COUNT_BITS) - 1
 _PITCH_BITS = 16
 _PITCH_MASK = (1 << _PITCH_BITS) - 1
-_SKEW_BITS = 6
-_SKEW_MASK = (1 << _SKEW_BITS) - 1
+_PHASE_BITS = 6
+_PHASE_MASK = (1 << _PHASE_BITS) - 1
 
 
 class MatrixViewForm(IntEnum):
@@ -91,9 +93,7 @@ class MatrixViewAxis(IntEnum):
 class MatrixViewFlags(IntFlag):
     """Placement and element properties for one explicit scratchpad view."""
 
-    STRICT_BOUNDS = 1 << 0
-    AFFINE = 1 << 1
-    FP32 = 1 << 2
+    # Bits 0..2 are reserved. Bounds are always strict and storage is BF16.
     BROADCAST_MINOR = 1 << 3
 
 
@@ -134,69 +134,59 @@ class MatrixViewShape:
 class MatrixViewMap:
     """Compiler-selected physical placement for one Matrix tensor view.
 
-    ``row_skew`` and ``tile_skew`` are six-bit affine coefficients because the
-    architectural Matrix SRAM has at most 64 banks.  A zero-coefficient mapping
-    without ``AFFINE`` selects PLENA's fixed diagonal wiring; setting either
-    coefficient makes the mapping explicit and sets ``AFFINE`` in the packed
-    word.  A tensor's allocation base supplies the constant bank phase, so no
-    separate model-specific field or group identifier is needed.
+    PLENA's published diagonal row mapping remains fixed. The only programmable
+    map term is ``tile_phase_stride``: a six-bit phase applied between logical
+    tiles. A tensor's allocation base supplies the constant bank phase, so no
+    model-specific field or group identifier is needed.
+
+    This restriction follows the fair D' control: a programmable row
+    coefficient provided no bank-service gain for either official workload.
+    Freezing it to the existing diagonal value removes a bank-wide multiplier
+    or adder candidate before RTL while retaining compact multi-tile placement.
     """
 
     tile_pitch_rows: int
-    row_skew: int = 0
-    tile_skew: int = 0
-    flags: MatrixViewFlags = MatrixViewFlags.STRICT_BOUNDS
+    tile_phase_stride: int = 0
+    flags: MatrixViewFlags = MatrixViewFlags(0)
 
     @property
-    def affine_enabled(self) -> bool:
-        """Whether the packed descriptor selects its explicit affine map."""
+    def phased_enabled(self) -> bool:
+        """Whether the descriptor applies an inter-tile bank phase."""
 
-        return bool(
-            self.flags & MatrixViewFlags.AFFINE or self.row_skew or self.tile_skew
-        )
+        return self.tile_phase_stride != 0
 
     def validate(self) -> None:
         if not 0 <= self.tile_pitch_rows <= _PITCH_MASK:
             raise ValueError(
                 f"tile_pitch_rows must be in [0, {_PITCH_MASK}], got {self.tile_pitch_rows}"
             )
-        for name, value in (("row_skew", self.row_skew), ("tile_skew", self.tile_skew)):
-            if not 0 <= value <= _SKEW_MASK:
-                raise ValueError(f"{name} must fit {_SKEW_BITS} bits, got {value}")
-        unknown = int(self.flags) & ~int(
-            MatrixViewFlags.STRICT_BOUNDS
-            | MatrixViewFlags.AFFINE
-            | MatrixViewFlags.FP32
-            | MatrixViewFlags.BROADCAST_MINOR
-        )
+        if not 0 <= self.tile_phase_stride <= _PHASE_MASK:
+            raise ValueError(
+                "tile_phase_stride must fit "
+                f"{_PHASE_BITS} bits, got {self.tile_phase_stride}"
+            )
+        unknown = int(self.flags) & ~int(MatrixViewFlags.BROADCAST_MINOR)
         if unknown:
             raise ValueError(f"unknown Matrix-view flags 0x{unknown:x}")
 
     def pack(self) -> int:
         self.validate()
-        flags = self.flags
-        if self.row_skew or self.tile_skew:
-            flags |= MatrixViewFlags.AFFINE
         return (
             self.tile_pitch_rows
-            | self.row_skew << 16
-            | self.tile_skew << 22
-            | int(flags) << 28
+            | self.tile_phase_stride << 22
+            | int(self.flags) << 28
         )
 
     @classmethod
     def unpack(cls, word: int) -> "MatrixViewMap":
         _require_u32(word, "mapping word")
+        if (word >> 16) & _PHASE_MASK:
+            raise ValueError("Matrix-view mapping bits [21:16] are reserved")
         mapping = cls(
             tile_pitch_rows=word & _PITCH_MASK,
-            row_skew=(word >> 16) & _SKEW_MASK,
-            tile_skew=(word >> 22) & _SKEW_MASK,
+            tile_phase_stride=(word >> 22) & _PHASE_MASK,
             flags=MatrixViewFlags((word >> 28) & 0xF),
         )
-        if not mapping.flags & MatrixViewFlags.AFFINE and (
-            mapping.row_skew or mapping.tile_skew
-        ):
-            raise ValueError("non-zero Matrix-view skew requires the AFFINE flag")
         mapping.validate()
         return mapping
 
@@ -219,9 +209,8 @@ class MatrixViewDescriptor:
             )
         words_per_row = self.shape.cols // bank_width
         row_groups = (words_per_row + banks - 1) // banks
-        affine = self.mapping.affine_enabled
-        alpha = self.mapping.row_skew if affine else 1
-        tile_skew = self.mapping.tile_skew if affine else 0
+        alpha = 1
+        tile_phase_stride = self.mapping.tile_phase_stride
         occupied: dict[tuple[int, int], tuple[int, int, int]] = {}
         for tile in range(self.shape.tile_count):
             for row in range(self.shape.rows):
@@ -231,7 +220,9 @@ class MatrixViewDescriptor:
                         + row * row_groups
                         + word // banks
                     )
-                    bank = (alpha * bank_row + tile_skew * tile + word) % banks
+                    bank = (
+                        alpha * bank_row + tile_phase_stride * tile + word
+                    ) % banks
                     key = (bank, bank_row)
                     previous = occupied.setdefault(key, (tile, row, word))
                     if previous != (tile, row, word):
@@ -288,9 +279,8 @@ def validate_disjoint_matrix_views(
         base_bank = base_offset // bank_width
         words_per_row = descriptor.shape.cols // bank_width
         row_groups = (words_per_row + banks - 1) // banks
-        affine = descriptor.mapping.affine_enabled
-        alpha = descriptor.mapping.row_skew if affine else fixed_alpha
-        tile_skew = descriptor.mapping.tile_skew if affine else 0
+        alpha = fixed_alpha
+        tile_phase_stride = descriptor.mapping.tile_phase_stride
         for tile in range(descriptor.shape.tile_count):
             for row in range(descriptor.shape.rows):
                 for word in range(words_per_row):
@@ -308,7 +298,7 @@ def validate_disjoint_matrix_views(
                     bank = (
                         base_bank
                         + alpha * bank_row
-                        + tile_skew * tile
+                        + tile_phase_stride * tile
                         + fixed_gamma * (bank_row // banks)
                         + word
                     ) % banks

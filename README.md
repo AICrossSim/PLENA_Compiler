@@ -13,7 +13,7 @@ prepared fields + BF16 HBM state
                  |
                  v
        existing Matrix SRAM
-    fixed-diagonal or affine view
+ fixed diagonal + compiler tile phase
                  |
       bank packet + lane restore
                  |
@@ -30,16 +30,21 @@ the Compiler owns every address, transfer and lifetime.
 
 ### ISA
 
-One opcode (`0x3f`) carries two model-independent forms (and preserves the
-older `L_CFG` encoding at `funct1=0`):
+One physical opcode (`0x3f`, named `L_TILE`) carries two model-independent
+Matrix-SRAM forms. The older `L_CFG` encoding at `funct1=0` remains only so the
+historical software baseline can be reproduced; it is not part of the frozen
+Matrix-SRAM RTL candidate:
 
 ```text
 L_TILE_CFG     slot, shape_reg, map_reg
 L_TILE_EXEC    dst, src, scale, primitive[, axis_mask]
 ```
 
-The view descriptor contains tensor shape, row pitch, row skew, tile skew,
-precision and bounds flags. `L_TILE_EXEC` accepts only three algebraic
+The view descriptor contains tensor shape, row pitch, a compiler-selected
+inter-tile bank phase, and one broadcast flag; bounds checking is always
+strict. The row term is fixed to PLENA's published diagonal mapping; arbitrary
+programmable row skew is rejected.
+`L_TILE_EXEC` accepts only three algebraic
 primitives: scale-accumulate, dot-reduce and outer-update. The decoder walks a
 statically known view and reuses PLENA's existing Vector arithmetic. Neither
 the encoding nor decoder contains `Mamba`, `KDA`, a model-specific head count,
@@ -76,7 +81,7 @@ The matching storage study reports BF16 output relative-L2 error of 0.000312
 for Nemotron at 32K tokens and 0.017061 for Kimi at 2K tokens versus FP32 state.
 These are synthetic recurrence errors, not checkpoint-level quality results.
 
-The affine schedules assemble to legal 32-bit words. Their ordinary
+The compact phased schedules assemble to legal 32-bit words. Their ordinary
 Attention/MLA/MoE entries are schedule markers linked to the existing analytic
 paths, not a claim that checkpoint weights have run numerically from the first
 to final layer in Rust.
@@ -86,10 +91,10 @@ to final layer in Rust.
 At `MLEN=2048`, `BLEN=32`, 64 banks, a 1 MiB BF16 Matrix SRAM and 1560 HBM
 bytes/cycle, the fresh formula-based B1 decode timeline is:
 
-| Model | Original A | Arlo B | Fixed single-base C | Affine D | D/A | D/B |
+| Model | Original A | Arlo B | Fixed single-base C | Compact phased D | D/A | D/B |
 |---|---:|---:|---:|---:|---:|---:|
-| Nemotron 3 | 4,055,091 | 3,110,067 | 2,210,882 | 2,014,554 | 2.0129x | 1.5438x |
-| Kimi K3 | 103,816,704 | 97,013,856 | 93,286,200 | 91,178,043 | 1.1386x | 1.0640x |
+| Nemotron 3 | 4,055,091 | 3,110,067 | 2,192,850 | 2,014,094 | 2.0134x | 1.5442x |
+| Kimi K3 | 103,816,704 | 97,013,856 | 93,124,740 | 91,173,903 | 1.1387x | 1.0641x |
 
 `A` and `B` are one-cycle-per-issued-instruction proxies for the original and
 Arlo static streams; they are not Rust cycle measurements. `C` and `D` add
@@ -113,7 +118,7 @@ lower ideal service, and KDA spill removal.
 The connected test is stronger than the analytic replay: Compiler assembly is
 assembled into canonical 32-bit words and executed by Rust for four consecutive
 tokens at official recurrence geometry. It compares 524,288 Nemotron and
-1,572,864 Kimi state values plus every head-group output. All four fixed/affine
+1,572,864 Kimi state values plus every head-group output. All four fixed/phased
 cases pass; the largest relative-L2 error is 0.0071 under uniform BF16.
 
 Whole-model cycles use official dimensions, pinned GPU calibration, measured
@@ -126,6 +131,9 @@ claims remain withdrawn. There is no overlap credit at the 1 MiB point.
 See [the ISA review](doc/matrix_lcompute_isa_review.md) and the Simulator's
 machine-readable `matrix_lcompute_e2e_v5` campaign for the complete fairness,
 capacity, bandwidth, port-width and evidence boundaries.
+
+The handoff boundary for the next phase is frozen in
+[the pre-RTL contract](doc/matrix_lcompute_pre_rtl_freeze.md).
 
 ## MoE code organization
 

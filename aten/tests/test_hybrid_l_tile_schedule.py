@@ -49,6 +49,12 @@ def test_every_official_recurrent_layer_emits_l_tile(
     assert report["l_tile_exec_count"] == sum(
         record.l_tile_exec_count for record in schedule.records
     )
+    # The frozen Matrix-SRAM path must not depend on the historical Vector
+    # stream experiment that shares opcode 0x3f at funct1=0.
+    assert all(
+        not line.strip().startswith("L_CFG ")
+        for line in schedule.assembly.splitlines()
+    )
     for layer in range(1, layers + 1):
         assert f"@hybrid_layer_begin layer={layer} " in schedule.assembly
         assert f"@hybrid_layer_end layer={layer}" in schedule.assembly
