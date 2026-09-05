@@ -13,6 +13,7 @@ that test_generator_e2e._build_hbm_from_hf_weights writes.
 See docs/COMPILATION_PIPELINES.md for the full architecture overview.
 """
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,14 @@ from asm_templates import (
     preload_addr_reg_asm,
     projection_asm,
     rms_norm_asm,
+    silu_asm,
 )
+from asm_templates._imm import load_large_int as _load_large_int
+
+# Imported from the module rather than the package: adding Mamba-2 to
+# asm_templates/__init__.py is out of scope for this change, and a direct module
+# import is equivalent for the caller.
+from asm_templates.mamba_conv1d_asm import mamba_conv1d_asm, mamba_ssd_scan_asm
 
 
 def _load_template(template_name: str) -> str:
@@ -602,6 +610,431 @@ def _generate_vision_projection_code(
     return code.strip()
 
 
+# ---------------------------------------------------------------------------
+# Mamba-2 (selective state-space) lowering
+# ---------------------------------------------------------------------------
+
+#: HBM address registers the Mamba-2 path reuses.  A Mamba-2 program has no
+#: attention and no gated FFN, so the q/k/v and ffn_* registers assigned by
+#: generator/scheduler/reg_assignment_lib.json are dead for it.  Rather than
+#: invent register indices (only a0-a7 exist), the Mamba weights and the two SSD
+#: operand-spill areas are mapped onto those free slots.  The names below say
+#: what each one actually holds in a Mamba-2 program.
+_MAMBA_ADDR_REG_ROLES = {
+    "token_table": "token_table_offset",
+    "in_proj": "q_weight_offset",
+    "conv1d": "k_weight_offset",
+    "out_proj": "v_weight_offset",
+    "ssd_act_spill": "ffn_gate_offset",
+    "ssd_wt_spill": "ffn_up_offset",
+}
+
+
+def _mamba_shape_from_graph(symbolic_graph: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the Mamba-2 shape carried by a graph, or None for other families.
+
+    The parser stamps it on the graph *and* on every mixer node, so a graph
+    assembled by hand (as tests do) still resolves.
+    """
+    shape = symbolic_graph.get("mamba_shape")
+    if shape:
+        return shape
+    for node in symbolic_graph.get("nodes", []):
+        candidate = node.get("dimensions", {}).get("mamba_shape")
+        if candidate:
+            return candidate
+    return None
+
+
+def _mamba_vram_regions(shape: dict[str, Any], vlen: int) -> dict[str, int]:
+    """Bump-allocate one layer's VRAM regions as VLEN-aligned element addresses.
+
+    Every emitter for a given layer derives its addresses from this one function,
+    so the conv output the SSD reads is by construction the conv output the conv
+    wrote.  Regions are laid out with the sequence on the row axis (see
+    ``asm_templates/mamba_conv1d_asm``'s layout contract).
+
+    ``x``/``B``/``C``/``dt``/``z`` are column slices of the fused ``in_proj``
+    output and get their own regions here.  That is not a copy the ISA would have
+    to make: ``projection_asm`` writes its result one BLEN-wide output column
+    block at a time via ``M_MM_WO``, so retargeting the destination per slice
+    lands them in separate regions for free.  The generator does not model that
+    retargeting, which is the one place the addresses below diverge from a
+    numerically executable program.
+
+    KNOWN LIMIT: this keeps the whole sequence resident, so ``_end`` exceeds the
+    physical Vector SRAM (``VECTOR_SRAM_DEPTH * VLEN`` = 64 Ki elements) for any
+    realistic seq_len.  The generator's other paths address VRAM the same
+    unbounded way, and the ASM still assembles because these are element
+    addresses rather than encoded immediates -- but a lowering meant to *run*
+    would have to tile the sequence, which is exactly what ``chunk_size`` exists
+    to enable and what this structural model does not yet do.
+    """
+    tokens = shape["batch_size"] * shape["seq_len"]
+    hidden = shape["hidden_size"]
+    d_inner = shape["d_inner"]
+    conv_dim = shape["conv_dim"]
+    in_proj_out = shape["in_proj_out"]
+    state = shape["state_size"]
+    heads = shape["num_heads"]
+    head_dim = shape["head_dim"]
+    groups = shape["n_groups"]
+    chunk = shape["chunk_size"]
+    conv_kernel = shape["conv_kernel"]
+
+    regions: dict[str, int] = {}
+    cursor = 0
+
+    def alloc(name: str, size: int) -> None:
+        nonlocal cursor
+        regions[name] = cursor
+        padded = max(size, vlen)
+        cursor += ((padded + vlen - 1) // vlen) * vlen
+
+    alloc("residual", tokens * hidden)  # layer input, also the residual operand
+    alloc("in_proj", tokens * in_proj_out)  # fused [z, x, B, C, dt]
+    alloc("conv_w", (conv_kernel + 1) * conv_dim)  # conv_kernel tap rows + bias row
+    alloc("conv_in", tokens * conv_dim)  # the [x, B, C] slices of in_proj
+    alloc("conv_out", tokens * conv_dim)
+    alloc("z", tokens * d_inner)  # gate, consumed by the gated RMSNorm
+    alloc("x", tokens * d_inner)
+    alloc("B", tokens * groups * state)
+    alloc("C", tokens * groups * state)
+    alloc("dt", tokens * heads)
+    alloc("decay", tokens * heads)
+    alloc("score", heads * chunk * chunk)
+    alloc("state", heads * state * head_dim)  # carried across chunks
+    alloc("y", tokens * d_inner)
+    alloc(
+        "scratch",
+        max(tokens * conv_dim, tokens * d_inner, heads * chunk * chunk, heads * state * head_dim),
+    )
+    # Single-row temporaries.  Every VRAM-destination operand needs a live
+    # address register pointing at a real row; giving the one-row temporaries
+    # their own regions keeps them from aliasing the multi-row "scratch" buffer
+    # that the SSD GEMMs write.
+    alloc("row0", vlen)
+    alloc("row1", vlen)
+    alloc("out", tokens * hidden)
+    regions["_end"] = cursor
+    return regions
+
+
+def _mamba_fp_slots(scheduler: dict[str, Any]) -> dict[str, int]:
+    """FP_MEM slot indices for the Mamba-2 scalar constants.
+
+    ``generator/scheduler/mem_layout_lib.json`` has no Mamba entries, so these
+    are allocated immediately after the highest named slot rather than
+    hardcoded -- adding a slot to the JSON later shifts these instead of
+    colliding with them.  The host must seed them the same way it seeds
+    ``attn_scale`` / ``eps``.
+    """
+    fp_sram = scheduler.get("memory_layout", {}).get("fp_sram", {})
+    named = [v for v in fp_sram.values() if isinstance(v, int)]
+    base = (max(named) + 1) if named else 6
+    return {
+        "dt_min": base,
+        "dt_max": base + 1,
+        "a_decay": base + 2,
+        "d_skip": base + 3,
+        "one": fp_sram.get("silu_one", fp_sram.get("silu_e", 3)),
+        "eps": fp_sram.get("eps", 1),
+        "reci_group": fp_sram.get("hid_reciprocal", 2),
+    }
+
+
+def _mamba_addr_reg(scheduler: dict[str, Any], role: str, default: int) -> int:
+    """Resolve the HBM address register a Mamba-2 tensor is addressed through."""
+    hbm_addr_reg = scheduler.get("register_assignment", {}).get("hbm_addr_reg", {})
+    return hbm_addr_reg.get(_MAMBA_ADDR_REG_ROLES[role], default)
+
+
+def _prefetch_vram_asm(
+    *,
+    vram_base: int,
+    elements: int,
+    hbm_addr_reg: int,
+    regs: list[int],
+    vlen: int,
+    prefetch_amount: int,
+    label: str,
+) -> str:
+    """H_PREFETCH_V loop bringing ``elements`` elements from HBM into VRAM."""
+    per_issue = max(1, prefetch_amount) * vlen
+    issues = math.ceil(elements / per_issue) if elements > 0 else 0
+    if issues == 0:
+        return ""
+    dst, off, loop = regs[0], regs[1], regs[2]
+    lines = [f"; load {label}: {elements} elements from HBM[a{hbm_addr_reg}] ({issues} x H_PREFETCH_V)"]
+    lines.extend(_load_large_int(dst, vram_base))
+    lines.append(f"S_ADDI_INT gp{off}, gp0, 0")
+    lines.append(f"C_LOOP_START gp{loop}, {issues}")
+    lines.append(f"H_PREFETCH_V gp{dst}, gp{off}, a{hbm_addr_reg}, 1, 0")
+    lines.append(f"S_ADDI_INT gp{dst}, gp{dst}, {per_issue}")
+    lines.append(f"S_ADDI_INT gp{off}, gp{off}, {per_issue}")
+    lines.append(f"C_LOOP_END gp{loop}")
+    return "\n".join(lines) + "\n"
+
+
+def _mamba_rowwise_asm(
+    *,
+    body: list[str],
+    ptr_regs: list[int],
+    rows: int,
+    loop_reg: int,
+    vlen: int,
+    comment: str,
+) -> str:
+    """Row loop helper for the code_gen-side Mamba vector stages."""
+    if rows <= 0:
+        return ""
+    lines = [f"; {comment} ({rows} rows)", f"C_LOOP_START gp{loop_reg}, {rows}"]
+    lines.extend(body)
+    for reg in ptr_regs:
+        lines.append(f"S_ADDI_INT gp{reg}, gp{reg}, {vlen}")
+    lines.append(f"C_LOOP_END gp{loop_reg}")
+    return "\n".join(lines) + "\n"
+
+
+def _generate_projection_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly for a plain linear layer (Mamba-2 in_proj / out_proj).
+
+    Reuses ``projection_asm`` unchanged: in_proj and out_proj are ordinary dense
+    GEMMs against a static weight, which is exactly what that template emits.
+    The GEMM's batch axis is the token axis (``batch_size * seq_len``), not the
+    model batch -- a Mamba-2 prefill projects every token in one pass.
+    """
+    dims = node["dimensions"]
+    in_features = dims["in_features"]
+    out_features = dims["out_features"]
+    role = dims.get("role", "projection")
+
+    mlen = hardware_config.get("MLEN", 64)
+    blen = hardware_config.get("BLEN", 4)
+    vlen = hardware_config.get("VLEN", 64)
+    vsram = scheduler["memory_layout"].get("vector_sram_addr", {})
+
+    shape = dims.get("mamba_shape")
+    if shape is not None:
+        regions = _mamba_vram_regions(shape, vlen)
+        batch = shape["batch_size"] * shape["seq_len"]
+        if role == "mamba_out_proj":
+            activation_base = regions["y"]
+            result_base = regions["out"]
+            w_reg = _mamba_addr_reg(scheduler, "out_proj", 4)
+        else:
+            activation_base = regions["residual"]
+            result_base = regions["in_proj"]
+            w_reg = _mamba_addr_reg(scheduler, "in_proj", 2)
+        scratch_base = regions["scratch"]
+    else:
+        regions = None
+        batch = model_info.get("batch", 1)
+        activation_base = vsram.get("block1", 0)
+        result_base = vsram.get("block2", 0)
+        scratch_base = vsram.get("k_split_scratch", vsram.get("block4", 0))
+        w_reg = scheduler["register_assignment"].get("hbm_addr_reg", {}).get("q_weight_offset", 2)
+
+    code = f"""
+; Linear projection ({role}): ({batch}, {in_features}) @ ({in_features}, {out_features})
+"""
+    if out_features % blen:
+        code += (
+            f"; NOTE: out_features={out_features} is not a multiple of BLEN={blen}; "
+            f"projection_asm emits whole BLEN column blocks, so the final "
+            f"{out_features % blen} column(s) are not covered.\n"
+        )
+    code += projection_asm(
+        mlen=mlen,
+        blen=blen,
+        batch=batch,
+        hidden_size=in_features,
+        alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+        w_base_hbm_offset_reg=w_reg,
+        activation_base_address=activation_base,
+        result_base_address=result_base,
+        rope_enabled=False,
+        out_features=out_features,
+        matrix_sram_size=hardware_config.get("MATRIX_SRAM_SIZE", 1024),
+        scratch_base_address=scratch_base,
+        vlen=vlen,
+    )
+    return code.strip()
+
+
+def _generate_conv1d_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly for the Mamba-2 causal depthwise conv1d + its SiLU.
+
+    Deliberately not routed through ``im2col_asm``/``_no_shift``: those hardcode a
+    square KxK patch, have no padding (so they cannot express the causal left
+    pad), and would build a dense ``(M, C_in*K*K)`` GEMM against a block-diagonal
+    weight.  ``mamba_conv1d_asm`` instead exploits the sequence-on-rows layout,
+    where the causal shift is a row-address offset and each tap is a VLEN-wide
+    ``V_MUL_VV`` operand.
+    """
+    dims = node["dimensions"]
+    shape = dims["mamba_shape"]
+    vlen = hardware_config.get("VLEN", 64)
+    regions = _mamba_vram_regions(shape, vlen)
+    conv_dim = dims["conv_dim"]
+    conv_kernel = dims["kernel_size"]
+    tokens = shape["batch_size"] * shape["seq_len"]
+    use_bias = dims.get("use_conv_bias", True)
+    fp_slots = _mamba_fp_slots(scheduler)
+
+    code = f"""
+; === Mamba-2 depthwise causal conv1d ===
+; channels={conv_dim} (groups={dims["groups"]}), kernel={conv_kernel}, padding={dims["padding"]} (causal)
+; Operates on the [x, B, C] slices of in_proj only; z and dt bypass the conv.
+"""
+    # The conv weight is a static per-layer parameter: taps then (optionally) bias.
+    code += _prefetch_vram_asm(
+        vram_base=regions["conv_w"],
+        elements=(conv_kernel + (1 if use_bias else 0)) * conv_dim,
+        hbm_addr_reg=_mamba_addr_reg(scheduler, "conv1d", 3),
+        regs=[1, 2, 3],
+        vlen=vlen,
+        prefetch_amount=hardware_config.get("HBM_V_Prefetch_Amount", 16),
+        label="conv1d taps + bias",
+    )
+    code += mamba_conv1d_asm(
+        vlen=vlen,
+        seq_len=tokens,
+        conv_dim=conv_dim,
+        conv_kernel=conv_kernel,
+        alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+        input_base_address=regions["conv_in"],
+        output_base_address=regions["conv_out"],
+        weight_base_address=regions["conv_w"],
+        scratch_base_address=regions["row0"],
+        bias_base_address=(regions["conv_w"] + conv_kernel * conv_dim) if use_bias else None,
+    )
+
+    activation = dims.get("activation", "silu")
+    if activation == "silu":
+        code += f"\n; -- {activation} on the conv output (fused: Mamba-2 never separates them) --\n"
+        code += silu_asm(
+            const_one_fp_address=fp_slots["one"],
+            alive_registers=[1, 2, 3],
+            activation_base_address=regions["conv_out"],
+            # silu_asm holds its sigmoid in a single reused row, so one row is enough.
+            scratchpad_base_address=regions["row1"],
+            vlen=vlen,
+            batch_size=tokens,
+            hidden_dim=conv_dim,
+        )
+    else:
+        code += f"\n; -- {activation} activation (unrecognized; no ASM emitted) --\n"
+    return code.strip()
+
+
+def _generate_ssd_scan_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly for the chunked state-space-duality scan."""
+    dims = node["dimensions"]
+    shape = dims["mamba_shape"]
+    vlen = hardware_config.get("VLEN", 64)
+    regions = _mamba_vram_regions(shape, vlen)
+    fp_slots = _mamba_fp_slots(scheduler)
+
+    code = f"""
+; === Mamba-2 SSD scan ===
+; chunk_size={dims["chunk_size"]} -> {dims["num_chunks"]} chunk(s) over seq_len={dims["seq_len"]}
+; time_step_limit=({dims["time_step_min"]}, {dims["time_step_max"]})
+; The x / B / C / dt operands are the corresponding column slices of the conv
+; output; they are addressed as separate VRAM regions here (see
+; _mamba_vram_regions for why that costs nothing on real hardware).
+"""
+    code += mamba_ssd_scan_asm(
+        mlen=hardware_config.get("MLEN", 64),
+        vlen=vlen,
+        blen=hardware_config.get("BLEN", 4),
+        seq_len=shape["batch_size"] * shape["seq_len"],
+        chunk_size=dims["chunk_size"],
+        num_heads=dims["num_heads"],
+        head_dim=dims["head_dim"],
+        state_size=dims["state_size"],
+        n_groups=dims["n_groups"],
+        alive_registers=[1, 2, 3, 4, 5, 6, 7, 8],
+        vram=regions,
+        act_spill_addr_reg=_mamba_addr_reg(scheduler, "ssd_act_spill", 6),
+        wt_spill_addr_reg=_mamba_addr_reg(scheduler, "ssd_wt_spill", 7),
+        writeback_amount=hardware_config.get("HBM_V_Writeback_Amount", 4),
+        dt_min_fp_address=fp_slots["dt_min"],
+        dt_max_fp_address=fp_slots["dt_max"],
+        a_decay_fp_address=fp_slots["a_decay"],
+        d_skip_fp_address=fp_slots["d_skip"],
+    )
+    return code.strip()
+
+
+def _generate_gated_rmsnorm_code(
+    node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
+) -> str:
+    """Generate assembly for Mamba-2's gated RMSNorm: ``y = RMSNorm(y) * silu(z)``.
+
+    Cannot reuse ``_generate_normalization_code``: Mamba-2 normalises over
+    ``d_inner / n_groups``, not over ``hidden_size``, and the gate multiply has no
+    counterpart in the plain norm node.  The RMSNorm body itself is
+    ``rms_norm_asm`` with the group width as its ``hidden_dim`` and one "batch"
+    row per (token, group).
+    """
+    dims = node["dimensions"]
+    shape = dims["mamba_shape"]
+    vlen = hardware_config.get("VLEN", 64)
+    regions = _mamba_vram_regions(shape, vlen)
+    fp_slots = _mamba_fp_slots(scheduler)
+
+    group_size = dims["group_size"]
+    n_groups = dims["n_groups"]
+    d_inner = dims["normalized_shape"]
+    tokens = shape["batch_size"] * shape["seq_len"]
+
+    code = f"""
+; === Mamba-2 gated RMSNorm ===
+; normalize over {group_size} (= d_inner {d_inner} / n_groups {n_groups}), then
+; multiply by {dims["gate_activation"]}(z).  1/group_size must be seeded into the
+; FP_MEM slot below -- the plain-norm path seeds 1/hidden_size there instead.
+"""
+    code += rms_norm_asm(
+        _eps_offset=fp_slots["eps"],
+        reci_hid_offset=fp_slots["reci_group"],
+        alive_registers=[1, 2, 3],
+        activation_base_address=regions["y"],
+        scratchpad_base_address=regions["row0"],
+        vlen=vlen,
+        batch_size=tokens * n_groups,
+        hidden_dim=group_size,
+    )
+    code += f"\n; -- gate = {dims['gate_activation']}(z), computed in place on the z slice --\n"
+    code += silu_asm(
+        const_one_fp_address=fp_slots["one"],
+        alive_registers=[1, 2, 3],
+        activation_base_address=regions["z"],
+        scratchpad_base_address=regions["row1"],
+        vlen=vlen,
+        batch_size=tokens,
+        hidden_dim=d_inner,
+    )
+    code += "\n; -- y *= gate --\n"
+    code += "".join(line + "\n" for line in _load_large_int(1, regions["y"]))
+    code += "".join(line + "\n" for line in _load_large_int(2, regions["z"]))
+    code += _mamba_rowwise_asm(
+        body=["V_MUL_VV gp1, gp1, gp2, 0"],
+        ptr_regs=[1, 2],
+        rows=max(1, (tokens * d_inner) // vlen),
+        loop_reg=3,
+        vlen=vlen,
+        comment="gate multiply",
+    )
+    return code.strip()
+
+
 def _generate_elementwise_add_code(
     node: dict[str, Any], model_info: dict[str, Any], hardware_config: dict[str, Any], scheduler: dict[str, Any]
 ) -> str:
@@ -679,6 +1112,14 @@ def _generate_node_code(
         return header + _generate_conv2d_code(node, model_info, hardware_config, scheduler)
     elif operation_type == "vision_projection":
         return header + _generate_vision_projection_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "projection":
+        return header + _generate_projection_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "conv1d":
+        return header + _generate_conv1d_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "ssd_scan":
+        return header + _generate_ssd_scan_code(node, model_info, hardware_config, scheduler)
+    elif operation_type == "gated_rmsnorm":
+        return header + _generate_gated_rmsnorm_code(node, model_info, hardware_config, scheduler)
     else:
         raise ValueError(f"Unknown operation type: {operation_type}")
 
@@ -716,16 +1157,74 @@ def _weight_hbm_bytes(rows: int, cols: int, hardware_config: dict) -> int:
     return rows * (cols // block_dim) * ((wt_block_width // 8) + (scale_width // 8))
 
 
+def _mamba_addr_reg_layout(
+    model_info: dict[str, Any],
+    shape: dict[str, Any],
+    hardware_config: dict[str, Any],
+) -> list[tuple[str, int, int, str | None]]:
+    """HBM weight layout for a Mamba-2 program, as (name, rows, cols, reg_key).
+
+    Mamba-2 has no q/k/v and no gated FFN, so the register keys those names map
+    to in reg_assignment_lib.json are reused here for the tensors a Mamba-2
+    program actually needs (see ``_MAMBA_ADDR_REG_ROLES``).  The last two entries
+    are not weights at all but the two SSD operand-spill areas -- their size is
+    the largest single operand any of the four per-chunk GEMMs spills.
+    """
+    block_dim = hardware_config.get("block_dim", 4)
+
+    def pad(cols: int) -> int:
+        # _weight_hbm_bytes requires whole MX blocks; a Mamba width that is not a
+        # multiple of block_dim (e.g. in_proj_out with num_heads % block_dim != 0)
+        # is rounded up rather than tripping its assert.
+        return ((cols + block_dim - 1) // block_dim) * block_dim
+
+    vocab_size = model_info.get("vocab_size", 1024)
+    hidden = shape["hidden_size"]
+    d_inner = shape["d_inner"]
+    conv_dim = shape["conv_dim"]
+    in_proj_out = shape["in_proj_out"]
+    chunk = shape["chunk_size"]
+    state = shape["state_size"]
+    heads = shape["num_heads"]
+    head_dim = shape["head_dim"]
+    groups = shape["n_groups"]
+
+    spill_elements = max(
+        groups * chunk * state,
+        heads * chunk * chunk,
+        heads * chunk * head_dim,
+        heads * chunk * state,
+        heads * state * head_dim,
+    )
+    spill_rows = max(1, math.ceil(spill_elements / pad(max(head_dim, block_dim))))
+
+    return [
+        ("token_table", vocab_size, pad(hidden), _MAMBA_ADDR_REG_ROLES["token_table"]),
+        ("in_proj_weight", hidden, pad(in_proj_out), _MAMBA_ADDR_REG_ROLES["in_proj"]),
+        # conv_kernel tap rows + one bias row, conv_dim wide.
+        ("conv1d_weight", shape["conv_kernel"] + 1, pad(conv_dim), _MAMBA_ADDR_REG_ROLES["conv1d"]),
+        ("out_proj_weight", d_inner, pad(hidden), _MAMBA_ADDR_REG_ROLES["out_proj"]),
+        ("ssd_act_spill", spill_rows, pad(max(head_dim, block_dim)), _MAMBA_ADDR_REG_ROLES["ssd_act_spill"]),
+        ("ssd_wt_spill", spill_rows, pad(max(head_dim, block_dim)), _MAMBA_ADDR_REG_ROLES["ssd_wt_spill"]),
+    ]
+
+
 def _generate_addr_reg_init(
     model_info: dict[str, Any],
     hardware_config: dict[str, Any],
     scheduler: dict[str, Any],
+    mamba_shape: dict[str, Any] | None = None,
 ) -> str:
     """Emit C_SET_ADDR_REG instructions for all weight HBM address registers.
 
     Computes cumulative MXFP8 byte offsets matching the HBM layout that
     _build_hbm_from_hf_weights writes.  Must be emitted before any node
     that references HBM weights.
+
+    When ``mamba_shape`` is supplied the Mamba-2 layout is used instead of the
+    attention + FFN one; emitting the latter for a Mamba-2 program would reserve
+    HBM for q/k/v/ffn tensors that do not exist and leave the registers the
+    Mamba nodes actually read pointing into the wrong regions.
     """
     hidden_size = model_info.get("hidden_size", 64)
     intermediate_size = model_info.get("intermediate_size", 256)
@@ -735,6 +1234,10 @@ def _generate_addr_reg_init(
     head_dim = model_info.get("head_dim", hidden_size // num_heads)
 
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
+
+    if mamba_shape is not None:
+        layout = _mamba_addr_reg_layout(model_info, mamba_shape, hardware_config)
+        return _emit_addr_reg_init(layout, hardware_config, scheduler)
 
     # Weight layout: ordered list of (name, rows, cols, addr_reg_key).
     # addr_reg_key is None for weights without a dedicated register.
@@ -748,6 +1251,21 @@ def _generate_addr_reg_init(
         ("ffn_up", hidden_size, intermediate_size, "ffn_up_offset"),
         ("ffn_down", intermediate_size, hidden_size, "ffn_down_offset"),
     ]
+    _ = hbm_addr_reg  # resolved inside _emit_addr_reg_init
+    return _emit_addr_reg_init(layout, hardware_config, scheduler)
+
+
+def _emit_addr_reg_init(
+    layout: list[tuple[str, int, int, str | None]],
+    hardware_config: dict[str, Any],
+    scheduler: dict[str, Any],
+) -> str:
+    """Turn an ordered HBM tensor layout into C_SET_ADDR_REG initialisation.
+
+    Shared by the attention and Mamba-2 layouts so the two cannot drift in how
+    they compute cumulative MXFP8 byte offsets.
+    """
+    hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
 
     # Compute cumulative offsets
     offset = 0
@@ -795,8 +1313,11 @@ def code_gen_pass(
     # Generate program header
     asm_code = [_generate_program_header(model_info)]
 
-    # Initialize HBM address registers with weight byte offsets
-    addr_reg_init = _generate_addr_reg_init(model_info, hardware_config, scheduler)
+    # Initialize HBM address registers with weight byte offsets.  A Mamba-2 graph
+    # needs a different HBM layout (no q/k/v, no FFN), detected from the graph
+    # itself rather than from model_info so callers need no new contract.
+    mamba_shape = _mamba_shape_from_graph(symbolic_graph)
+    addr_reg_init = _generate_addr_reg_init(model_info, hardware_config, scheduler, mamba_shape=mamba_shape)
     if addr_reg_init:
         asm_code.append(addr_reg_init)
 

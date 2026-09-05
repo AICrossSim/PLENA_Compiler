@@ -240,11 +240,17 @@ Fetch an (MLEN, 1) vector from the Vector SRAM using the address provided by `rs
 
 **Format:** `V_SUB_VV rd, rs1, rs2, rmask`
 
-**Operation:** `Vector[gp_reg<rd>] & gp_rmask = (Vector[gp_reg<rs2>] & gp_reg<rmask>) - (Vector[gp_reg<rs1>] & gp_reg<rmask>)`
+**Operation:** `Vector[gp_reg<rd>] & gp_rmask = (Vector[gp_reg<rs1>] & gp_reg<rmask>) - (Vector[gp_reg<rs2>] & gp_reg<rmask>)`
 
 **Description:**
 
 Similar to `V_ADD_VV`, but performs element-wise subtraction.
+
+**Note:** this line previously read `rs2 - rs1`. The hardware computes
+`rs1 - rs2` -- `vector_machine.rs`'s `sub(vd, vs1, vs2)` returns
+`read(vs1) - read(vs2)`, and `dispatch.rs` passes `(rd, rs1, rs2)` in that
+order. Subtraction does not commute, so the old wording inverted the sign of
+anything written against the spec rather than against the emulator.
 
 ### V_SUB_VF
 
@@ -286,6 +292,41 @@ Similar to `V_ADD_VV`, but performs element-wise multiplication.
 **Description:**
 
 Similar to `V_ADD_VF`, but performs element-wise multiplication.
+
+### V_FMA_VF
+
+**Format:** `V_FMA_VF rd, rs1, fp2, rmask`
+
+**Operation:** `Vector[gp_reg<rd>] & gp_reg<rmask> = (Vector[gp_reg<rd>] + Vector[gp_reg<rs1>] * Broadcast(fp_reg<fp2>)) & gp_reg<rmask>`
+
+**Encoding:** assembly pseudo-op for `V_MUL_VF` (`6'h12`) with
+`funct1[3]=1`. `funct1[2:0]` remains the optional L-Compute consumer-view
+mask. The plain `V_MUL_VF` form requires `funct1[3]=0`.
+
+**Description:**
+
+Fused broadcast multiply-add. **`rd` is read as well as written** -- the only
+V-type instruction for which that is true, so a register allocator must treat it
+as a read-modify-write and not as a pure destination.
+
+The multiply and the add are fused: the result is quantised **once**, on the sum.
+That is a numerical difference from the `V_MUL_VF` + `V_ADD_VV` pair it replaces,
+not just a shorter encoding.
+
+Lanes masked off by `rmask` keep the destination's existing value. Note this is
+the opposite base from `V_MUL_VF`, where a masked-off lane keeps the *source*'s
+value -- there the source is what the result is built from, here it is the
+destination.
+
+Its purpose is the state recurrences. A rank-1 update or a state contraction
+otherwise costs `copy + multiply + add` through a scratch row; the fused form
+removes both the copy and the scratch. Removing the scratch is the larger effect:
+without it a whole key sweep is a single arithmetic row progression, which the
+compiler turns into a hardware loop instead of unrolling.
+
+This is a function variant rather than a new opcode because it uses exactly the
+same operands and datapath family as `V_MUL_VF`; only the destination
+read-enable and accumulate control differ.
 
 ### V_MAX_VF
 
@@ -364,6 +405,41 @@ Fetch a (VLEN, 1) vector from the Vector SRAM using the address provided by `rs1
 **Example:**
 ```asm
 V_RECI_V gp2, gp1, 0   ; Vector[gp2] = 1.0 / Vector[gp1]
+```
+
+### V_SOFTPLUS_V
+
+**Format:** `V_SOFTPLUS_V rd, rs1, rmask`
+
+**Opcode:** `6'h3D`
+
+**Operation:** `Vector[gp_reg<rd>] = log(1 + exp(Vector[gp_reg<rs1>]))`
+
+**Description:**
+
+Element-wise softplus over a (VLEN, 1) vector.
+
+Exists because the ISA has **no logarithm** anywhere -- `S_FP_OP` is
+{ADD, SUB, MAX, MUL, EXP, RECI, SQRT, LD, ST, MV, MAP} and `V_ELEMENT_OP` is
+{ADD, SUB, MUL, EXP, RECI, HADAMARD, PREFIX_SCAN, SHIFT} -- so `log(1+exp(x))`
+has no exact software lowering. A lookup table is architecturally impossible too:
+there is no float-to-int conversion instruction, so FP_MEM cannot be indexed by a
+data-dependent value.
+
+Mamba / Mamba-2 needs `dt = softplus(dt_raw + dt_bias)` on the critical path of a
+multiplicative recurrence, where an approximation's error compounds across the
+sequence rather than being normalised away the way attention's softmax normalises
+`exp` error.
+
+**Implementation note:** evaluate as `relu(x) + log1p(exp(-|x|))`, not as the
+naive `log1p(exp(x))`. The two are algebraically identical, but the first never
+feeds `exp` a positive argument and therefore cannot overflow for any finite
+input -- no clamp is needed, and none should be applied, since `dt` feeds
+`exp(A*dt)` and a clamp would silently flatten the decay for large `dt`.
+
+**Example:**
+```asm
+V_SOFTPLUS_V gp2, gp1, 0   ; Vector[gp2] = softplus(Vector[gp1])
 ```
 
 ### V_RED_SUM
@@ -550,6 +626,41 @@ Load upper immediate value into the integer register.
 **Description:**
 
 Copy a vector of length VLEN from FP_MEM to Vector SRAM.
+
+#### S_MAP_FP_V
+
+**Format:** `S_MAP_FP_V rd, rs1, imm`
+
+**Opcode:** `6'h3E`
+
+**Operation:** `FP_MEM[gp_reg<rd> + imm :+ VLEN] = Vector[gp_reg<rs1> :+ VLEN]`
+
+**Description:**
+
+The exact inverse of `S_MAP_V_FP`: copy one VLEN-wide Vector SRAM row into VLEN
+consecutive FP_MEM slots. Note the operand roles mirror rather than repeat --
+`rd` is the FP_MEM base and `rs1` the VRAM row, so that in both instructions `rd`
+names the *destination* memory.
+
+Before this existed the only VRAM-to-scalar path was `V_RED_SUM` / `V_RED_MAX`,
+which collapse the whole row, so extracting a single lane cost a one-hot
+`V_MUL_VV` + `V_RED_SUM` + `S_ST_FP` triple -- 3 instructions per *scalar*
+against 1 per *row* here.
+
+That mattered because `V_MUL_VF` can only broadcast from an FP register, while
+every value a kernel wants to broadcast is computed on chip and lands in a VRAM
+row. Mamba-2's chunked scan needs one such scalar per row (`cs_i` for the
+segment-sum matrix, `exp(cs_C - cs_t)` for the decay-scaled X, `exp(cs_i)` for
+the inter-chunk term), which made the extraction, not the matmuls, the dominant
+instruction cost of the kernel.
+
+**Cost:** VLEN cycles, the same as `S_MAP_V_FP`.
+
+**Example:**
+```asm
+S_MAP_FP_V gp3, gp1, 0   ; FP_MEM[gp3 :+ VLEN] = Vector[gp1 :+ VLEN]
+S_LD_FP    f1,  gp3, 5   ; then broadcast lane 5 with V_MUL_VF
+```
 
 ---
 
@@ -748,6 +859,96 @@ S_ADDI_INT gp4, gp0, 16390         ; (64 << 8) | 6  -- DeepSeek-V2-Lite
 C_SET_TOPK_REG gp4                 ; TOPK_POLICY = 64 experts, top-6
 V_TOPK gp1, gp2, gp3, 15           ; route one token under that policy
 ```
+
+### L_CFG (Historical Evaluation Form)
+
+**Format:** `L_CFG value, target, slot, field`
+
+**Opcode:** `6'h3F`
+
+**Status:** Retained to reproduce the earlier Vector-stream experiment. It is
+not required by the frozen Matrix-SRAM L-Compute RTL candidate. New recurrent
+programs use `L_TILE_CFG` and `L_TILE_EXEC` below.
+
+**Operation:** write `gp_reg<value>` into one field of affine view `slot` and
+bind that view to `target`.
+
+`slot=0..2` are explicitly selected by Vector instructions through
+`funct1[2:0]`. `slot=3` is reserved for Matrix projection writeback and cannot
+be selected as a Vector operand. Configuration is inert until an instruction
+selects the view; it never silently changes architectural register addressing.
+
+The 32-bit word is canonical: `value[9:6]`, `target[13:10]`, `slot[17:14]`,
+`field[21:18]`, and bits `[31:22]=0`. Fields define base, extents, affine bank
+coefficients, packet shape, and explicit advancement. See
+`doc/hybrid_lcompute.md` for the complete field contract.
+
+### L_TILE_CFG
+
+**Format:** `L_TILE_CFG slot, shape_reg, map_reg`
+
+**Physical opcode:** `L_TILE = 6'h3F`, `funct1=1`
+
+**Operation:** Atomically install one compiler-owned Matrix-SRAM view in
+`slot=0..3`. `gp_reg<shape_reg>` contains:
+
+```text
+rows_minus_one[11:0] | cols_minus_one[23:12] |
+tile_count_minus_one[31:24]
+```
+
+`gp_reg<map_reg>` contains:
+
+```text
+tile_pitch_rows[15:0] | reserved_zero[21:16] |
+tile_phase_stride[27:22] | flags[31:28]
+```
+
+Bits `[21:16]` must be zero. The effective row coefficient is always one,
+matching PLENA's fixed diagonal Matrix SRAM, and is therefore not carried in
+the descriptor. `tile_phase_stride=0` selects the ordinary fixed form; a
+non-zero value compactly expresses the compiler-selected base phase between
+logical tiles. Flag bits 0 through 2 are reserved; bit 3 is
+`BROADCAST_MINOR`. Bounds are always strict and Matrix-view storage is uniformly
+BF16; multiply and reduction accumulation may remain FP32 inside the arithmetic
+unit.
+
+The configuration is architectural placement metadata, not a cache entry. It
+has no tag, replacement, hit/miss, implicit transfer, or hidden model state.
+Use before configuration and non-injective/out-of-capacity mappings trap.
+
+### L_TILE_EXEC
+
+**Format:** `L_TILE_EXEC dst, src, scale, primitive[, axis_mask]`
+
+**Physical opcode:** `L_TILE = 6'h3F`, `funct1=3`
+
+**Operation:** Walk the statically configured destination, source and scale
+views in slots 0, 1 and 2. The GP operands name their explicit Matrix-SRAM base
+addresses. `axis_mask[0]` selects row/column access for `src` and
+`axis_mask[1]` selects row/column access for `scale`; omission selects rows.
+
+The closed primitive set is:
+
+| Value | Primitive | Semantics |
+|---:|---|---|
+| 0 | `SCALE_ACCUM` | `dst = a * dst + b * src` with one scalar pair per segment |
+| 1 | `DOT_REDUCE` | segmented multiply and dot reduction |
+| 2 | `OUTER_UPDATE` | rank-1 update of the destination tile |
+| 3..15 | reserved | trap |
+
+The decoder/sequencer expands the descriptor into deterministic bank reads,
+cyclic lane restoration, existing Vector arithmetic and Matrix-SRAM writes.
+It performs no dynamic scheduling and adds no model-specific arithmetic. Mamba
+and KDA are different compiler compositions of the same primitives.
+
+### Matrix-View Vector Transfer
+
+`H_PREFETCH_V.MV` and `H_STORE_V.MV` reuse physical opcodes `0x29` and `0x2A`.
+Bit 31 marks the Matrix-view form, bits `[30:29]` select a configured slot and
+bits `[28:26]` must be zero. The legacy encoding is unchanged. In the viewed
+form the precision selector is canonical: 0=Activation, 1=KeyValue, 2=State,
+3..15=reserved. The frozen L-Compute design stores Activation and State as BF16.
 
 ### C_BREAK
 

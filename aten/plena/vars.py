@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from compiler.aten.plena.compiler import PlenaCompiler
+    from compiler.aten.plena.affine_layout import AffineLayout
 
 
 class TensorVar:
@@ -26,6 +27,7 @@ class TensorVar:
         shape: tuple[int, int],
         display_name: str | None = None,
         physical_shape: tuple[int, int] | None = None,
+        physical_layout: AffineLayout | None = None,
     ):
         self._program = program
         self.internal_name = internal_name  # System internal name (with scope prefix), used by symbol table
@@ -33,6 +35,11 @@ class TensorVar:
         self.kind = kind  # "input", "batch", "matrix", "vram_matrix"
         self.shape = shape
         self.physical_shape = physical_shape or shape
+        # Tensor-relative placement in the banked Vector SRAM.  ``None`` is the
+        # conventional row-major layout.  Keeping this on the value prevents a
+        # consumer from accidentally interpreting row-major bytes as affine
+        # data (or vice versa).
+        self.physical_layout = physical_layout
 
     @property
     def name(self) -> str:
@@ -57,6 +64,10 @@ class InputVar(TensorVar):
     If ``prestaged_vram_addr`` is not None the tensor is assumed to be already
     present in VRAM at that byte address.  ``load_batch`` will register it at
     that address without emitting any HBM→VRAM prefetch instructions.
+
+    ``hbm_element_bytes`` records the physical element width used by the HBM
+    image.  Keeping it on the value ensures later loads use the same byte
+    stride that was used when the tensor was allocated.
     """
 
     def __init__(
@@ -69,11 +80,13 @@ class InputVar(TensorVar):
         display_name: str | None = None,
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
+        hbm_element_bytes: int = 1,
     ):
         super().__init__(program, name, "input", shape, display_name=display_name, physical_shape=physical_shape)
         self.hbm_addr = hbm_addr
         self.hbm_size = hbm_size
         self.prestaged_vram_addr = prestaged_vram_addr
+        self.hbm_element_bytes = hbm_element_bytes
 
 
 class FPVar:
@@ -130,6 +143,7 @@ class VRAMMatrixVar(TensorVar):
         shape: tuple[int, int],
         display_name: str | None = None,
         physical_shape: tuple[int, int] | None = None,
+        physical_layout: AffineLayout | None = None,
     ):
         super().__init__(
             program,
@@ -138,4 +152,5 @@ class VRAMMatrixVar(TensorVar):
             shape,
             display_name=display_name,
             physical_shape=physical_shape,
+            physical_layout=physical_layout,
         )

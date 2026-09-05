@@ -62,6 +62,8 @@ class IsaCompiler(
         vram_object_name: str,
         vlen: int = 64,
         preload_len: int | None = None,
+        storage_precision: int = 1,
+        precision: int = 0,
     ) -> str:
         """
         Load a Batch tensor from HBM to VRAM.
@@ -69,6 +71,12 @@ class IsaCompiler(
         HBM storage is MXFP (1 scale per 8 elements), so HBM actual size =
         logical size * real_data_ratio = 1.125. VRAM stores only the vector
         data (no scale), so VRAM size = logical size.
+
+        `storage_precision` is HBM bytes per element and `precision` is the
+        H_PREFETCH_V precision-class selector (0 = Activation, 1 = KeyValue,
+        2 = recurrent State). The PLENA Nemotron/Kimi path uses selector 2 and
+        two-byte BF16 elements.  The profiled GPU path's FP32 state is an
+        external accuracy baseline, not this ISA transfer format.
 
         Order (matters): allocate VRAM → register in symbol table → emit ISA.
         """
@@ -115,6 +123,8 @@ class IsaCompiler(
             act_vram_offset=vram_base,
             activation_offset_reg=addr_reg,
             stride_size=w,
+            storage_precision=storage_precision,
+            precision=precision,
         )
 
         self.register_allocator.free_gp(gp_regs_for_addr)
@@ -130,7 +140,7 @@ class IsaCompiler(
         hbm_object_name: str | None = None,
         hbm_addr_reg: int | None = None,
         vlen: int = 64,
-        precision: int = 0,  # 0 = Activation, 1 = KeyValue
+        precision: int = 0,  # 0 = Activation, 1 = KeyValue, 2 = recurrent State
         store_amount: int | None = None,  # HBM_V_Writeback_Amount
         hbm_element_bytes: int = 1,
         hbm_real_data_ratio: float | None = None,
@@ -205,7 +215,10 @@ class IsaCompiler(
                 tensor_info.hbm_addr = hbm_addr
                 # HBM stores element + scale rows, each row-aligned (see hbm_tensor_size).
                 size = batch_size * hidden_size
-                tensor_info.hbm_size = self.hbm_tensor_size(size)
+                tensor_info.hbm_size = self.hbm_tensor_size(
+                    size,
+                    hbm_element_bytes=hbm_element_bytes,
+                )
         finally:
             self.register_allocator.free_gp(gp_regs)
             if need_free_addr:

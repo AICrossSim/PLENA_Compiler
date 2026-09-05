@@ -58,6 +58,16 @@ jobs:
       - name: Run the stage-terminator guard
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_terminator.py -v
 
+      # The Mamba stage vocabulary is the other half of a cross-repo contract: a
+      # name the compiler emits but the emulator's StageKind lacks does not error,
+      # it bills to the preceding stage. Source-only, so it belongs in this job.
+      - name: Run the Mamba stage-marker contract guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_mamba_stage_contract.py -v
+      # Same contract for KDA. Source-only like the rest of this job, which is
+      # also why the KDA lowering must stay importable without torch.
+      - name: Run the KDA stage-marker contract guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_kda_stage_contract.py -v
+
   unit-tests:
     name: Generator unit tests
     runs-on: ubuntu-latest
@@ -71,6 +81,9 @@ jobs:
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install transformers
+          # The generator tests below are scripts, but every step after them
+          # invokes pytest. This job never installed it.
+          pip install pytest
       - name: Run parser tests
         run: |
           PYTHONPATH=. python3 generator/tests/test_llm_parser.py
@@ -83,6 +96,110 @@ jobs:
       - name: Run VLM codegen tests
         run: |
           PYTHONPATH=. python3 generator/tests/test_vlm_code_gen.py
+      # The chunked SSD reference vs the plain recurrence. Pure torch, no
+      # emulator: if these two disagree, every downstream Mamba numerical result
+      # is meaningless while still looking green.
+      - name: Run Mamba-2 reference cross-check
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_mamba2_reference.py
+      # The KDA reference, and the contract pinning its [value, key] orientation
+      # to the transposed [key, value] layout the PLENA lowering uses. If those
+      # two ever drift the lowering is validated against the wrong maths.
+      - name: Run KDA reference cross-check
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_reference.py
+      # The KDA lowering: transposed state tile, load/store precision agreement,
+      # conv history roll, and L2 normalisation on the scalar sqrt path.
+      - name: Run KDA lowering guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_lowering.py
+      # The decode step, executed against the CPU reference by the small ISA
+      # interpreter in aten/tests/isa_interpreter.py. This is the check that the
+      # lowering computes the right numbers, not merely plausible opcodes.
+      - name: Run the KDA decode step numerics
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_decode_step.py
+      # The oracle those numerics depend on. Anchored separately because the KDA
+      # lowering only emits a subset of the forms it models -- mutating the
+      # interpreter's V_MUL_VF source handling left the decode tests green.
+      - name: Run the ISA interpreter unit tests
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_isa_interpreter.py
+      # KDA's three short causal convolutions, against _causal_conv_step.
+      - name: Run the KDA causal conv numerics
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_conv.py
+      # q and k are key-width, and the L2 norm contracts over the key axis, so
+      # this is the one KDA reduction the column-block folding cannot split.
+      - name: Run the KDA normalisation numerics
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_normalize.py
+      # decay and beta, and the S_MAP_FP_V route into FPRAM the recurrence reads.
+      - name: Run the KDA gate-scalar numerics
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_gates.py
+      # The whole mixer: conv output through gates and recurrence to the token
+      # output, per-head streamed, plus the conv/mixer layout seam.
+      - name: Run the KDA mixer numerics
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_mixer.py
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_v_fma_vf.py
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_ssm_decode_step.py
+      # Chunk primitives for prefill: the cumulative decay and the UT transform.
+      - name: Run the KDA chunk primitives
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_prefill.py
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_spill_precision_guard.py
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_prefill_structure.py
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_kda_layer.py
+      # The design's central claim: one new opcode and no memory-resident
+      # descriptor, cache, state engine, queue, or runtime scheduler.
+      - name: Run the static-path guard
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_no_state_engine.py
+      # One model-independent stream contract is shared by Mamba, KDA and a
+      # generic affine loop. These tests pin the encoding, fallbacks, physical
+      # writeback and official hybrid-model workload manifests together.
+      - name: Run the Hybrid L-Compute ISA and layout guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -q \
+            assembler/tests/test_l_mview.py \
+            assembler/tests/test_experimental_fp32_dot.py \
+            aten/tests/test_affine_layout.py \
+            aten/tests/test_hybrid_compile_report.py \
+            aten/tests/test_hybrid_l_tile_schedule.py \
+            aten/tests/test_hybrid_workloads.py \
+            aten/tests/test_kda_precision_campaign.py \
+            aten/tests/test_kda_official_layer.py \
+            aten/tests/test_l_stream_cfg.py \
+            aten/tests/test_layout_planner.py \
+            aten/tests/test_lstream_lowering.py \
+            aten/tests/test_lstream_packet_lowering.py \
+            aten/tests/test_matrix_access_packets.py \
+            aten/tests/test_matrix_packet_report.py \
+            aten/tests/test_matrix_prefill_handoff.py \
+            aten/tests/test_matrix_recurrence_lowering.py \
+            aten/tests/test_prepared_vector_recurrence.py \
+            aten/tests/test_python_310_enum_compat.py \
+            aten/tests/test_mview_contract.py \
+            aten/tests/test_projection_affine_writeback.py
+      # Real published weights. Skips when the checkpoint is not cached, so it
+      # never requires network -- fetch once with
+      # snapshot_download("AntonV/mamba2-130m-hf").
+      - name: Run the real-checkpoint binding
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_real_checkpoint.py
+      # The static-footprint gate. A numerically-correct change that unrolls a
+      # sweep passes every other test and makes the program image enormous.
+      - name: Run the instruction budgets
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_instruction_budget.py
+      # Belongs here, not in moe-stage-guard: the guard resolves every registered
+      # CPU backend, and resolving imports the module, and every CPU backend
+      # imports torch. moe-stage-guard deliberately installs only pytest+pyyaml.
+      - name: Run the registry CPU-signature guard
+        run: |
+          PYTHONPATH=. python3 -m pytest -q aten/tests/test_registry_cpu_signatures.py
 
   codegen-smoke:
     name: Codegen + assembler smoke
