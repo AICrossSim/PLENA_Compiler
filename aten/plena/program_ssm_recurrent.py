@@ -183,8 +183,9 @@ class ProgramSSMRecurrentMixin:
         This is the architecture path, not a cycle annotation around
         :meth:`ssm_decode_step_v0`.  The latter remains the ordinary Vector
         fallback and Arlo baseline.  The emitted ``L_TILE`` sequence contains
-        all four algebraic steps and uses caller-owned GP registers so it can
-        be embedded safely in a complete model program.
+        all four algebraic steps and uses caller-owned GP registers. This
+        single-request entry point uses the standalone lowering's state/field
+        HBM ABI; it does not allocate request-private state for a model batch.
         """
 
         from compiler.aten.plena.matrix_recurrence_lowering import (
@@ -194,6 +195,11 @@ class ProgramSSMRecurrentMixin:
             lower_matrix_recurrence,
         )
 
+        if shape.batch_size != 1:
+            raise ValueError(
+                "ssm_decode_step_l_tile_v0 consumes one request; batched L_TILE "
+                "lowering requires explicit request-private state/field addresses"
+            )
         actual = (shape.num_heads, shape.head_dim, shape.state_size, shape.seq_len)
         expected = (
             NEMOTRON_MAMBA.heads,
@@ -203,13 +209,19 @@ class ProgramSSMRecurrentMixin:
         )
         if actual != expected:
             raise ValueError(f"L_TILE Mamba decode expects {expected}, got {actual}")
+        point = MatrixSramPoint(capacity_bytes=matrix_sram_bytes)
+        if (self.mlen, self.blen) != (point.mlen, point.bank_width):
+            raise ValueError("L_TILE wrapper requires MLEN/BLEN to match its Matrix-SRAM point")
+        if matrix_sram_bytes > self.mram_capacity_elems * point.element_bytes:
+            raise ValueError("L_TILE Matrix-SRAM point exceeds the compiler's SRAM capacity")
+        point.validate()
         allocated = self.register_allocator.allocate_gp(5)
         try:
             registers = LoweringRegisters(*allocated)
             assembly = lower_matrix_recurrence(
                 NEMOTRON_MAMBA,
                 layout=layout,
-                point=MatrixSramPoint(capacity_bytes=matrix_sram_bytes),
+                point=point,
                 registers=registers,
             )
             return self._emit(assembly)

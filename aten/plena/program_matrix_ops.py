@@ -44,10 +44,15 @@ class ProgramMatrixOpsMixin:
         return value
 
     def reserve_matrix_view_scratch_v0(
-        self, name: str = "__matrix_view_scratch"
+        self,
+        name: str = "__matrix_view_scratch",
+        *,
+        descriptor: MatrixViewDescriptor | None = None,
     ) -> int:
         """Reserve one existing Matrix-SRAM tile for explicit view traffic."""
 
+        if descriptor is not None:
+            self._validate_matrix_view_scratch_descriptor(descriptor)
         return self.mram_allocator.reserve(name, self.mlen * self.mlen)
 
     def _validate_matrix_view_descriptor(
@@ -64,15 +69,7 @@ class ProgramMatrixOpsMixin:
             banks=self.mlen // self.blen,
             bank_width=self.blen,
         )
-        words_per_row = descriptor.shape.cols // self.blen
-        row_groups = (words_per_row + self.mlen // self.blen - 1) // (
-            self.mlen // self.blen
-        )
-        final_physical_row = (
-            (descriptor.shape.tile_count - 1)
-            * descriptor.mapping.tile_pitch_rows
-            + descriptor.shape.rows * row_groups
-        )
+        final_physical_row = self._matrix_view_physical_rows(descriptor)
         available_physical_rows = self.mram_capacity_elems // self.mlen
         if final_physical_row > available_physical_rows:
             raise ValueError(
@@ -80,6 +77,82 @@ class ProgramMatrixOpsMixin:
                 f"needs {final_physical_row} physical rows, has "
                 f"{available_physical_rows}"
             )
+
+    def _matrix_view_physical_rows(self, descriptor: MatrixViewDescriptor) -> int:
+        words_per_row = descriptor.shape.cols // self.blen
+        row_groups = (words_per_row + self.mlen // self.blen - 1) // (
+            self.mlen // self.blen
+        )
+        return (
+            (descriptor.shape.tile_count - 1)
+            * descriptor.mapping.tile_pitch_rows
+            + descriptor.shape.rows * row_groups
+        )
+
+    def _validate_matrix_view_scratch_descriptor(self, descriptor: MatrixViewDescriptor) -> None:
+        self._validate_matrix_view_descriptor(descriptor)
+        rows = self._matrix_view_physical_rows(descriptor)
+        if rows > self.mlen:
+            raise ValueError(
+                "direct Matrix-view projection must fit its one reserved scratch tile: "
+                f"needs {rows} physical rows, has {self.mlen}"
+            )
+
+    def _validate_matrix_view_projection(
+        self, descriptor: MatrixViewDescriptor, *, logical_rows: int, slot: int
+    ) -> None:
+        self._validate_matrix_view_scratch_descriptor(descriptor)
+        if not 0 <= slot < 4:
+            raise ValueError(f"Matrix-view slot must be in [0, 4), got {slot}")
+        if not 1 <= logical_rows <= self.blen:
+            raise ValueError(
+                "direct Matrix-view projection currently requires one BLEN-sized "
+                f"decode row block, got {logical_rows} logical rows"
+            )
+        if descriptor.shape.rows != logical_rows:
+            raise ValueError(
+                "Matrix-view projection rows must match the live decode rows: "
+                f"expected {logical_rows}, got {descriptor.shape.rows}"
+            )
+        if descriptor.shape.cols * descriptor.shape.tile_count != self.mlen:
+            raise ValueError(
+                "Matrix-view projection must describe one complete MLEN-wide "
+                "consumer packet: "
+                f"cols * tile_count = {descriptor.shape.cols * descriptor.shape.tile_count}, "
+                f"MLEN = {self.mlen}"
+            )
+
+    def _matrix_view_projection_storage(
+        self, descriptor: MatrixViewDescriptor, base: int | None
+    ) -> tuple[int, int]:
+        """Keep every viewed word inside a persistent, tile-aligned owner.
+
+        A whole-row footprint within one reserved tile is conservative but
+        sufficient: weights allocated after reset cannot share any bank row.
+        """
+
+        tile_elems = self.mlen * self.mlen
+        if base is None:
+            base = self.mram_allocator.reserve(
+                "__matrix_view_scratch", tile_elems, required_tail=tile_elems
+            )
+        if base < 0 or base % tile_elems:
+            raise ValueError("Matrix-view base must be a non-negative tile-aligned reservation base")
+        end = base + self._matrix_view_physical_rows(descriptor) * self.mlen
+        if end > self.mram_capacity_elems:
+            raise ValueError("Matrix-view base plus footprint exceeds Matrix SRAM")
+        if not any(
+            block.addr == base and end <= block.addr + block.size
+            for block in self.mram_allocator.reserved_blocks
+        ):
+            raise ValueError("Matrix-view base must belong to a persistent MRAM reservation")
+        max_k_tiles = self.mram_allocator.capacity_after_reset // tile_elems
+        if max_k_tiles <= 0:
+            raise ValueError(
+                "Matrix-view projection needs reserved scratch and at least one "
+                "weight tile in Matrix SRAM"
+            )
+        return base, max_k_tiles
 
     def configure_matrix_view_v0(
         self,
@@ -391,23 +464,29 @@ class ProgramMatrixOpsMixin:
         narrow: it reloads MRAM per 4x4 output microtile and only writes once,
         preserving the matrix-machine accumulator across K chunks.
         """
+        if max_k_tiles <= 0:
+            raise ValueError(f"max_k_tiles must be > 0, got {max_k_tiles}")
         if matrix_view_descriptor is not None:
             if output_layout is not None:
                 raise ValueError(
                     "Matrix-view writeback and Vector affine writeback are mutually exclusive"
                 )
-            self._validate_matrix_view_descriptor(matrix_view_descriptor)
-            if matrix_view_base is None:
-                matrix_view_base = self.reserve_matrix_view_scratch_v0()
+            logical_rows = min(
+                self.mlen, max(0, target.shape[0] - target_row_idx * self.mlen)
+            )
+            self._validate_matrix_view_projection(
+                matrix_view_descriptor, logical_rows=logical_rows, slot=matrix_view_slot
+            )
+            matrix_view_base, available_k_tiles = self._matrix_view_projection_storage(
+                matrix_view_descriptor, matrix_view_base
+            )
+            max_k_tiles = min(max_k_tiles, available_k_tiles)
         elif matrix_view_base is not None:
             raise ValueError("matrix_view_base requires matrix_view_descriptor")
 
         vram_matrix, mram_input, target = self._prepare_projection(
             vram_matrix, mram_input, target, auto_reset_mram=True
         )
-        if max_k_tiles <= 0:
-            raise ValueError(f"max_k_tiles must be > 0, got {max_k_tiles}")
-
         vram_layout = self.vram_matrices[vram_matrix.name]
         vram_row_blocks = vram_layout.get_row_blocks(vram_row_idx)
         physical_k = max(vram_matrix.physical_shape[1], mram_input.physical_shape[0])
@@ -416,34 +495,6 @@ class ProgramMatrixOpsMixin:
         valid_rows = vram_row_blocks[0].valid_shape[0] if vram_row_blocks[0].valid_shape else self.mlen
         row_loop_count = min(tiles_per_mlen, max(1, math.ceil(valid_rows / self.blen)))
         if matrix_view_descriptor is not None:
-            logical_row_start = target_row_idx * self.mlen
-            logical_rows = min(
-                self.mlen,
-                max(0, target.shape[0] - logical_row_start),
-            )
-            if not 1 <= logical_rows <= self.blen:
-                raise ValueError(
-                    "direct Matrix-view projection currently requires one BLEN-sized "
-                    f"decode row block, got {logical_rows} logical rows"
-                )
-            shape = matrix_view_descriptor.shape
-            if shape.rows != logical_rows:
-                raise ValueError(
-                    "Matrix-view projection rows must match the live decode rows: "
-                    f"expected {logical_rows}, got {shape.rows}"
-                )
-            if shape.cols % self.blen:
-                raise ValueError(
-                    "Matrix-view consumer rows must contain whole BLEN-wide "
-                    f"writeback fragments, got cols={shape.cols}, BLEN={self.blen}"
-                )
-            if shape.cols * shape.tile_count != self.mlen:
-                raise ValueError(
-                    "Matrix-view projection must describe one complete MLEN-wide "
-                    "consumer packet: "
-                    f"cols * tile_count = {shape.cols * shape.tile_count}, "
-                    f"MLEN = {self.mlen}"
-                )
             row_loop_count = 1
             if configure_matrix_view:
                 self.configure_matrix_view_v0(
@@ -750,23 +801,21 @@ class ProgramMatrixOpsMixin:
             )
         matrix_view_base = None
         if matrix_view_descriptor is not None:
-            self._validate_matrix_view_descriptor(matrix_view_descriptor)
-            if rows > self.blen:
+            self._validate_matrix_view_projection(
+                matrix_view_descriptor, logical_rows=rows, slot=matrix_view_slot
+            )
+            if num_col_blocks != 1 or num_row_blocks != 1:
                 raise ValueError(
-                    "direct Matrix-view projection is a decode path and requires "
-                    f"rows <= BLEN={self.blen}, got {rows}"
+                    "direct Matrix-view projection supports exactly one output tile; "
+                    "multiple output blocks need separate views or an explicit consumer/store"
                 )
-            matrix_view_base = self.reserve_matrix_view_scratch_v0()
+            matrix_view_base, max_k_tiles = self._matrix_view_projection_storage(
+                matrix_view_descriptor, None
+            )
             self.configure_matrix_view_v0(
                 matrix_view_descriptor,
                 slot=matrix_view_slot,
             )
-            max_k_tiles = self.mram_tile_capacity - 1
-            if max_k_tiles <= 0:
-                raise ValueError(
-                    "Matrix-view projection needs one scratch tile and at least one "
-                    "weight tile in Matrix SRAM"
-                )
         else:
             max_k_tiles = self.mram_tile_capacity
 

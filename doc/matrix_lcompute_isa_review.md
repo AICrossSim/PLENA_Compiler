@@ -143,6 +143,16 @@ and provides legal view shapes; adding it does not change the ISA or decoder.
 
 ## Compiler Integration
 
+The current producer and wrapper restrictions are frozen in
+[`matrix_lcompute_pre_rtl_freeze.md`, section 4](matrix_lcompute_pre_rtl_freeze.md#4-compiler-behavior).
+Direct projection views must fit one owned scratch tile and one output packet;
+an explicit base requires a persistent reservation. Multi-output direct-view
+projection is rejected. Official recurrent wrappers require MLEN=2048/BLEN=32,
+and Mamba requires batch=1. The official-shape direct-view packet report emits
+only its first output packet and records `full_projection_emitted=false`.
+These checks were covered by 211 passing Compiler guards on 2026-09-05; they
+do not imply a completed batched full-model numerical path.
+
 The official manifests are pinned to:
 
 - Nemotron 3: 52 layers, including 23 Mamba, 23 MoE and 6 GQA layers;

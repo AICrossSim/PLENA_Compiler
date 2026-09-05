@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -460,3 +461,41 @@ def test_model_program_mixins_reject_toy_shapes() -> None:
             shape=KdaShape(64, 2, 8, 8, 4),
             layout="affine",
         )
+
+
+@pytest.mark.parametrize("batch_size", [0, 2, 16])
+def test_mamba_l_tile_wrapper_rejects_non_single_request_before_emission(batch_size) -> None:
+    program = PlenaCompiler(mlen=2048, blen=32, mram_tile_capacity=1)
+    shape = Mamba2Shape(2688, 64, 64, 128, 8, 4, 128, 1)
+    before = program.get_code()
+    registers_before = list(program.register_allocator.gp_registers)
+    with pytest.raises(ValueError, match="consumes one request"):
+        program.ssm_decode_step_l_tile_v0(
+            shape=replace(shape, batch_size=batch_size), layout="affine"
+        )
+    assert program.get_code() == before
+    assert program.register_allocator.gp_registers == registers_before
+    assert program.register_allocator.used_gp == []
+
+
+@pytest.mark.parametrize("model", ["mamba", "kda"])
+@pytest.mark.parametrize("mlen, blen, capacity, error", [
+    (64, 4, ONE_MIB, "MLEN/BLEN to match"),
+    (2048, 16, ONE_MIB, "MLEN/BLEN to match"),
+    (2048, 32, 16 * ONE_MIB, "exceeds the compiler's SRAM capacity"),
+])
+def test_l_tile_wrappers_reject_mismatched_machine_before_emission(model, mlen, blen, capacity, error) -> None:
+    program = PlenaCompiler(mlen=mlen, blen=blen, mram_tile_capacity=1)
+    before = program.get_code()
+    with pytest.raises(ValueError, match=error):
+        if model == "mamba":
+            program.ssm_decode_step_l_tile_v0(
+                shape=Mamba2Shape(2688, 64, 64, 128, 8, 4, 128, 1),
+                layout="affine", matrix_sram_bytes=capacity,
+            )
+        else:
+            program.kda_decode_step_l_tile_v0(
+                shape=KdaShape.kimi_k3(), layout="affine", matrix_sram_bytes=capacity
+            )
+    assert program.get_code() == before
+    assert program.register_allocator.used_gp == []

@@ -123,13 +123,19 @@ class ProgramKdaRecurrentMixin:
         )
         if actual != expected:
             raise ValueError(f"L_TILE KDA decode expects {expected}, got {actual}")
+        point = MatrixSramPoint(capacity_bytes=matrix_sram_bytes)
+        if (self.mlen, self.blen) != (point.mlen, point.bank_width):
+            raise ValueError("L_TILE wrapper requires MLEN/BLEN to match its Matrix-SRAM point")
+        if matrix_sram_bytes > self.mram_capacity_elems * point.element_bytes:
+            raise ValueError("L_TILE Matrix-SRAM point exceeds the compiler's SRAM capacity")
+        point.validate()
         allocated = self.register_allocator.allocate_gp(5)
         try:
             registers = LoweringRegisters(*allocated)
             assembly = lower_matrix_recurrence(
                 KIMI_KDA,
                 layout=layout,
-                point=MatrixSramPoint(capacity_bytes=matrix_sram_bytes),
+                point=point,
                 registers=registers,
             )
             return self._emit(assembly)

@@ -92,12 +92,20 @@ def _projection_assembly(
             blen=blen,
             consumer_row_elements=consumer_row_elements,
         )
-    program.linear_projection_bf16(
-        hidden,
-        weight,
-        name=f"{stage}_output",
-        matrix_view_descriptor=descriptor,
-    )
+    if descriptor is not None:
+        # The direct-view ABI owns one output packet. Preserve the real weight
+        # dimensions/stride, but emit only its first output tile. Emitting all
+        # output blocks into the same view would overwrite live results.
+        output = program.alloc(
+            f"{stage}_output", 1, output_features, strict=False,
+            physical_shape=(blen, output_features),
+        )
+        program.vram_sub_projection_stream_k_accum_to(
+            hidden, 0, weight, 0, output, 0, 0,
+            max_k_tiles=1, matrix_view_descriptor=descriptor,
+        )
+    else:
+        program.linear_projection_bf16(hidden, weight, name=f"{stage}_output")
     return program.compile()
 
 
@@ -141,6 +149,9 @@ def _case(
         "model": model,
         "stage": stage,
         "real_shape": [1, input_features, output_features],
+        "emitted_output_columns": [0, min(geometry.mlen, output_features) if matrix_view else output_features],
+        "full_output_tile_count": (output_features + geometry.mlen - 1) // geometry.mlen,
+        "full_projection_emitted": not matrix_view or output_features <= geometry.mlen,
         "repeats_in_model": repeats_in_model,
         "lowering": "matrix_view" if matrix_view else "baseline",
         "consumer_descriptor": (
@@ -175,9 +186,14 @@ def _case(
         "service_groups": coissued_packet_groups(packets),
         "packets": [packet.to_dict() for packet in packets[:32]],
         "packets_truncated": max(0, len(packets) - 32),
-        "source": "PlenaCompiler.linear_projection_bf16 official-shape emitted assembly",
+        "source": (
+            "PlenaCompiler.vram_sub_projection_stream_k_accum_to first output tile with official weight shape"
+            if matrix_view else "PlenaCompiler.linear_projection_bf16 official-shape emitted assembly"
+        ),
         "evidence_level": (
-            "official tensor dimensions and executable instruction topology; "
+            ("one output packet only; full multi-block projection is unsupported by this view ABI; "
+             if matrix_view else "full projection instruction topology; ")
+            + "official tensor dimensions; "
             "symbolic weights and a legacy square-tile scheduling fixture"
         ),
     }
@@ -301,8 +317,9 @@ def _attention_qkt_case(
 def build_report() -> dict[str, object]:
     """Cover Matrix traffic from both hybrid models and all four layer families.
 
-    Projection dimensions are the official model dimensions.  Attention also
-    contributes the executable per-head QK-transpose column read; MoE's
+    Projection dimensions are the official model dimensions. Direct-view
+    projection cases cover their first output packet, with that scope recorded
+    explicitly. Attention also contributes the per-head QK-transpose column read; MoE's
     nonlinear/vector stages do not access Matrix SRAM.
     """
 
@@ -444,7 +461,9 @@ def build_report() -> dict[str, object]:
         },
         "scope_boundary": (
             "Cases cover representative official-shape Matrix lowerings for Mamba, "
-            "KDA, GQA, MLA and MoE. They are not a real-weight first-to-last-layer "
+            "KDA, GQA, MLA and MoE. Direct-view projection cases emit one output "
+            "packet only; extraction coverage describes that emitted fixture. "
+            "They are not a real-weight first-to-last-layer "
             "transactional execution."
         ),
         "cases": cases,

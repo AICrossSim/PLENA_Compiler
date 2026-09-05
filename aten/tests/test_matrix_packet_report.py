@@ -179,9 +179,23 @@ def test_projection_writeback_uses_the_real_consumer_head_shape() -> None:
                 # one streamed weight chunk), every final BLEN fragment is
                 # explicit instead of being hidden behind an unrealistically
                 # large square-tile capacity.
-                "static_packets": 384,
-                "dynamic_packets": 384,
+                "static_packets": 64,
+                "dynamic_packets": 64,
                 "values_per_packet": 32,
                 "per_tile_phase_can_help": False,
             }
         ]
+
+
+def test_direct_view_packet_evidence_does_not_claim_full_multi_output_execution() -> None:
+    for case in build_report()["cases"]:
+        if case["lowering"] != "matrix_view":
+            continue
+        # The old report generated six output blocks into the same view. The
+        # fixture now preserves the real weight shape but emits just one.
+        assert case["real_shape"][2] > 2048
+        assert case["emitted_output_columns"] == [0, 2048]
+        assert case["full_output_tile_count"] == 6
+        assert case["full_projection_emitted"] is False
+        assert "one output packet only" in case["evidence_level"]
+        assert "first output tile" in case["source"]

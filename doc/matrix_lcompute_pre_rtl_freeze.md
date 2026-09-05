@@ -4,6 +4,12 @@ This document is the canonical handoff for the Matrix-SRAM L-Compute branch.
 It freezes only behavior supported by Compiler and Simulator evidence. RTL,
 synthesis, frequency, area, power and energy are outside this revision.
 
+Compiler contract updated and regression-tested on **2026-09-05**. The current
+Compiler guard suite has **211 passing tests**. The earlier timing tables,
+cross-repository counts, commit IDs and hashes retained below are historical
+2026-09-04 evidence, not a new freeze of the corrected working tree. Archive
+the final two commits and regenerated Simulator artifacts using section 9.
+
 ## 1. Frozen architectural boundary
 
 The final candidate reuses PLENA's existing Matrix SRAM and Vector arithmetic:
@@ -31,8 +37,11 @@ The Compiler owns every address, lifetime, load and store. The design contains:
 - no runtime queue, work scheduler or completion record;
 - no new MAC lane.
 
-Storage is BF16 for Matrix SRAM, prepared fields, state and output. Multiply and
-reduction accumulation remains FP32 inside the existing arithmetic datapath.
+Storage is BF16 for Matrix SRAM, prepared fields, state and output. The Rust
+model uses FP32 accumulation. DOT_REDUCE retains one FP32 accumulator per lane
+across rows: 65,536 bits / 8 KiB at VLEN=2048. Register reuse, feedback muxes,
+rounding points and throughput still need an explicit RTL mapping; zero extra
+SRAM payload is not a proof of zero extra arithmetic storage.
 
 ## 2. Frozen ISA
 
@@ -145,7 +154,10 @@ bank = (base_bank
 ```
 
 Read and write use the same equation. A cyclic restore returns bank words to
-logical lane order. The Compiler rejects aliasing and out-of-capacity views.
+logical lane order. The official recurrence builder proves disjoint physical
+view allocations. The direct-view projection entry points enforce the owned
+scratch boundary in section 4.1. Bare CFG/store/EXEC emitters do not provide an
+automatic lifetime proof for arbitrary caller-supplied addresses.
 
 The final map deliberately removes an arbitrary programmable row coefficient.
 The fair D' experiment showed that fixed diagonal wiring plus ordinary
@@ -157,12 +169,15 @@ arithmetic into RTL.
 ## 4. Compiler behavior
 
 Arlo's row-by-row static lowering remains the software fallback and B baseline.
-It is not executed before L-Compute on the same tensor. For each recurrent
-region the Compiler chooses exactly one path:
+It is not executed before L-Compute on the same tensor. Callers select an
+ordinary lowering or an explicit L-Tile entry point. There is no general
+automatic selector that rewrites unsupported L-Tile shapes to the ordinary
+path:
 
 ```text
-unsupported/small/tail shape -> Arlo row-by-row Vector lowering
-supported regular view       -> L_TILE multi-row lowering
+ordinary entry point       -> Arlo row-by-row Vector lowering
+supported L-Tile entry     -> L_TILE multi-row lowering
+unsupported L-Tile input  -> compile-time error; caller selects another path
 ```
 
 The official schedules emit L-Tile recurrence programs for all 23 Nemotron
@@ -178,17 +193,85 @@ State is streamed through the same 1 MiB Matrix SRAM:
 There is no residency or overlap credit at the 1 MiB point. A second live group
 does not fit after recurrence operands are included.
 
+### 4.1 Direct-view projection and scratch ownership
+
+`linear_projection(..., matrix_view_descriptor=...)` and
+`vram_sub_projection_stream_k_accum_to(...)` implement a narrow producer ABI:
+
+- The descriptor must describe one complete MLEN-wide consumer packet:
+  `cols * tile_count == MLEN`, with `rows` equal to the live decode rows and
+  `1 <= rows <= BLEN`. Column widths contain whole BLEN bank words.
+- Its full physical-row footprint must fit inside **one reserved
+  `MLEN * MLEN` scratch tile**, including gaps introduced by tile pitch. Fitting
+  the overall Matrix SRAM alone is insufficient. A larger footprint is
+  rejected before output allocation, view configuration or projection emit.
+- An explicit `matrix_view_base` must be a nonnegative, tile-aligned base of a
+  persistent MRAM reservation. `base + footprint` must fit both that owner and
+  physical capacity; a transient weight allocation is not an owner because a
+  weight reset releases it. Nonzero reserved bases are supported and tested.
+- Weight K chunks use the real contiguous capacity after all reservations.
+  The allocator preserves reservation addresses across resets and does not
+  reclaim holes below its final reserved block. A required weight tile is
+  checked before creating scratch; reservations cannot be freed as transient
+  weights or confused with an existing allocation of the same name.
+- The high-level direct-view projection accepts exactly **one physical output
+  row/column tile**. Multiple output blocks, including extra physical padding
+  blocks, are rejected because they would reuse the same view and overwrite
+  earlier results. Streaming multiple K chunks into that one output packet
+  remains supported. Multi-output producer lowering needs separate owned
+  views or an explicit consumer/store before scratch reuse and is not yet
+  implemented.
+
+These constraints govern the producer helper; they do not reduce the generic
+ISA descriptor's supported shapes or the standalone recurrence builder's
+multi-tile allocations. Nor do they turn the returned legacy output tensor
+into a general typed Matrix-view result with automatically tracked lifetime.
+
+### 4.2 Official-shape recurrent wrappers
+
+`ssm_decode_step_l_tile_v0` consumes **one request** and rejects
+`Mamba2Shape.batch_size != 1` before allocating registers or emitting code.
+The Mamba and KDA wrappers both require **MLEN=2048, BLEN=32** to match their
+Matrix-SRAM point. The selected capacity must contain whole physical rows and
+must not exceed the Compiler's configured SRAM capacity.
+
+The Mamba wrapper retains its official `64 heads x 128 state rows x 64 values`
+and `seq_len=1` contract; the KDA wrapper retains `96 x 128 x 128`. Both use
+the standalone lowering's default state/field HBM ABI. They do not allocate
+request-private HBM arenas and cannot be treated as a completed batched or
+arbitrarily composable whole-model interface. The recorded B16 GPU baseline
+and analytic timelines are separate evidence from this B1 numerical wrapper.
+
+### 4.3 Projection packet-report scope
+
+`matrix_packet_report` preserves the official full weight shape and HBM stride
+for direct-view projection examples, but emits only the first output packet.
+For the Nemotron and Kimi examples it records:
+
+```text
+emitted_output_columns = [0, 2048]
+full_output_tile_count = 6
+full_projection_emitted = false
+```
+
+Each contains 64 BLEN writeback fragments. The previous 384-fragment report
+included six output blocks writing the same scratch and must not be used as
+evidence of a valid full projection. Complete packet-extraction coverage means
+coverage of the stated emitted fixture, not complete model numerical execution.
+
 ## 5. Demonstrated evidence
 
-The complete gate currently proves:
+The previously archived connected gate supplies the following evidence; the
+2026-09-05 Compiler regression result is recorded separately in section 9:
 
 - canonical assembly and 32-bit decoding;
 - loop-aware configuration dominance and fail-closed reserved encodings;
 - physical `banks x rows x bank_width` storage, row/column reads and lane restore;
-- direct Matrix projection writeback into a configured view with zero BF16 error;
+- single-packet Matrix projection writeback into a configured view with zero BF16 error;
 - four consecutive official-geometry decode tokens for Nemotron Mamba-2 and
   Kimi KDA through Compiler -> assembler -> Rust -> HBM readback;
-- complete state and output comparisons, with maximum relative-L2 error 0.0071;
+- final state and every token output compared, with maximum relative-L2 error
+  0.0071; intermediate state snapshots are not part of the four-token count;
 - zero phased-layout bank stalls for both official recurrences;
 - a published 24-layer Mamba-2 checkpoint with every recurrence executed by
   Rust L-Tile and a continuous host-BF16 surrounding data path;
@@ -196,8 +279,11 @@ The complete gate currently proves:
 - official 52/93-layer formula timelines and real Nemotron routing replay;
 - no ordinary Attention/MLA/MoE row/column service regression in the model.
 
-At the paper point (`MLEN=2048`, `BLEN=32`, 64 banks, 1 MiB BF16 Matrix SRAM,
-1560 HBM bytes/cycle), the formula-based B1 decode sensitivity is:
+The following **historical, pre-fix 2026-09-04** B1 table used the paper point
+(`MLEN=2048`, `BLEN=32`, 64 banks, 1 MiB BF16 Matrix SRAM, 1560 HBM bytes/cycle).
+It has not been regenerated here for the corrected Vector-cycle accounting and
+final-normalization work. Use the newly archived Simulator campaign for current
+timing claims. The Kimi weight-density label is corrected to MXFP4:
 
 | Model | Weight density | Endpoint | A | B | C | D | D/A | D/B | D/C |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
@@ -205,13 +291,13 @@ At the paper point (`MLEN=2048`, `BLEN=32`, 64 banks, 1 MiB BF16 Matrix SRAM,
 | Nemotron 3 | mixed NVFP4 | ideal overlap | 2,127,686 | 1,876,583 | 1,876,583 | 1,876,583 | 1.1338x | 1.0000x | 1.0000x |
 | Nemotron 3 | uniform BF16 | strict serial | 6,360,486 | 5,415,462 | 4,498,245 | 4,319,489 | 1.4725x | 1.2537x | 1.0414x |
 | Nemotron 3 | uniform BF16 | ideal overlap | 4,181,978 | 4,181,978 | 4,181,978 | 4,181,978 | 1.0000x | 1.0000x | 1.0000x |
-| Kimi K3 | mixed NVFP4 | strict serial | 103,816,704 | 97,013,856 | 93,124,740 | 91,173,903 | 1.1387x | 1.0641x | 1.0214x |
-| Kimi K3 | mixed NVFP4 | ideal overlap | 88,142,659 | 88,142,659 | 88,420,867 | 88,142,590 | 1.0000x | 1.0000x | 1.0032x |
+| Kimi K3 | mixed MXFP4 | strict serial | 103,816,704 | 97,013,856 | 93,124,740 | 91,173,903 | 1.1387x | 1.0641x | 1.0214x |
+| Kimi K3 | mixed MXFP4 | ideal overlap | 88,142,659 | 88,142,659 | 88,420,867 | 88,142,590 | 1.0000x | 1.0000x | 1.0032x |
 | Kimi K3 | uniform BF16 | strict serial | 149,593,151 | 142,790,303 | 138,901,187 | 136,950,350 | 1.0923x | 1.0426x | 1.0142x |
 | Kimi K3 | uniform BF16 | ideal overlap | 133,919,106 | 133,919,106 | 134,197,314 | 133,919,037 | 1.0000x | 1.0000x | 1.0021x |
 
-Strict serial is `HBM + Matrix + Vector + L-Compute` and is the current
-dependency-safe result. Ideal overlap is
+Strict serial is `HBM + Matrix + Vector + L-Compute`, the dependency-safe
+endpoint evaluated in that historical table. Ideal overlap is
 `max(HBM, Matrix, Vector + L-Compute)`; it assumes complete resource overlap
 and ignores dependencies, SRAM capacity and arbitration. It is a lower bound,
 not a schedule emitted by the Compiler.
@@ -221,7 +307,7 @@ identical for the Nemotron rows above, but **not universally**: Kimi C incurs
 an intermediate fixed-layout spill, and C/D use exact state-DMA accounting.
 For example, mixed Kimi B1 has 88,420,867 HBM cycles in C versus 88,142,590
 in D. Consequently the base Kimi ideal `D/C` is 1.0032x rather than 1.0000x.
-This measured exception disproves the stronger all-variants-equal premise.
+This modeled exception disproves the stronger all-variants-equal premise.
 
 A and B charge one cycle per dynamically issued recurrence instruction while
 setting Matrix service and Vector arithmetic costs to zero. C, D and E use the
@@ -230,9 +316,9 @@ different evidence classes. These ratios combine multi-row execution,
 issue/descriptor compression and, where present, spill changes; they are not
 silicon speedups or programmable-skew speedups.
 
-### 5.1 Agentic workload envelope
+### 5.1 Historical agentic workload envelope (2026-09-04)
 
-The following medians cover 93 length-sorted, disjoint workload groups, each
+The following pre-fix medians cover 93 length-sorted, disjoint workload groups, each
 with 32 decode steps and strict replay of measured Nemotron eager-routing
 expert unions. `N` is the number of groups. P95 values for B4, B8 and B16 are
 exploratory because `N < 20`.
@@ -303,13 +389,13 @@ This freeze does not claim:
 - real producer/consumer overlap at the one-MiB point;
 - PPA, maximum frequency, power, Token/J or speedup over a GPU;
 - an executable schedule that reaches the ideal resource-overlap lower bound;
-  in the agentic envelope `D/C ideal` is 1.0000x at every batch and B1
+  in the historical agentic envelope `D/C ideal` is 1.0000x at every batch and B1
   `D/B ideal` is 1.000x, so strict-serial issue savings cannot be presented as
   a guaranteed gain on a fully overlapping machine;
 - weight/dequantization behavior beyond the stated traffic model: mixed
   NVFP4 uses about 0.5625 byte/value including one FP8 block scale per 16
   values, excludes dequantization compute, tensor-global scales and physical
-  padding, while Matrix-SRAM elements remain BF16. In the agentic B16 row,
+  padding, while Matrix-SRAM elements remain BF16. In the historical agentic B16 row,
   changing weights from mixed NVFP4 to uniform BF16 changes D/B from
   3.194/3.274 (serial/ideal) to 1.950/1.165.
 
@@ -329,16 +415,29 @@ The handoff must archive the two commit IDs, the gate exit code, test counts,
 the connected recurrence summary, the generated campaign hashes, and the
 output of `git diff main..HEAD -- doc/operation.svh`.
 
-The verified count record is mirrored in the Simulator freeze document:
+The **2026-09-05 Compiler** verification ran the 17 files in the canonical
+Hybrid L-Compute CI step: **211 passed in 179.47 seconds, exit 0** (188 existing
+cases plus 23 new regression cases). It covers footprint/ownership rejection,
+nonzero bases, wide-output rejection without partial emit, B1/geometry guards,
+and the packet-report scope. The valid B1 Mamba wrapper's assembly SHA256
+remains `cf86e2b89e86c72b1e0884317e901f85a1cae2f605aa3d0ef20ff2d2e56962cd`.
+This Compiler-only result must not be substituted for the final connected gate.
+
+The following count record is **historical**, from before the 2026-09-05 fixes:
 
 - Simulator Python: 108 passed;
 - Compiler: 188 passed;
-- Rust workspace: 298 passed across 13 test binaries, including 180 in the
-  `transactional_emulator` unit-test binary;
+- Rust workspace: 298 passed across 7 unit-test executables and 6 empty doctest
+  suites, including 180 in the `transactional_emulator` unit-test executable;
 - full gate: exit 0;
-- Compiler mechanism commit: `c2e7d03e14b4c43350fd3d232cb2ee6058a494c4`.
+- historical Compiler mechanism commit: `c2e7d03e14b4c43350fd3d232cb2ee6058a494c4`.
 
-Machine-readable evidence:
+The reviewed pre-fix Compiler HEAD was
+`330e93da425eee107a0f3299f5f039fad1d74cd4`; it is the implementation baseline,
+not the revision containing these corrections. Record the corrected Compiler
+and Simulator commit IDs after the final connected gate and submodule pin.
+
+Historical machine-readable evidence (regenerate before a new result freeze):
 
 ```text
 01a8965c58c9203c05272edab50459b64fe66fb5f4340166d57218c6d5b180c6  artifacts/matrix_lcompute_connected_bf16/summary.json
