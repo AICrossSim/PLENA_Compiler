@@ -29,6 +29,8 @@ def vram_sub_projection_asm_impl(
     gp_regs: list[int],
     caller_name: str,
     row_loop_count: int | None = None,
+    result_stream_setup: list[str] | None = None,
+    result_stream_reset: str | None = None,
 ) -> str:
     """
     Shared implementation kernel for vram_sub_projection_asm and
@@ -80,6 +82,8 @@ def vram_sub_projection_asm_impl(
     do_unroll = unroll_loops
 
     lines = list(header_lines)
+    if result_stream_setup:
+        lines.extend(result_stream_setup)
 
     if do_unroll:
         # Fully unrolled: bake all addresses at ASM-gen time.
@@ -126,4 +130,6 @@ def vram_sub_projection_asm_impl(
         lines.append(f"S_ADDI_INT gp{gp_result_col_base}, gp{gp_result_col_base}, {blen}")
         lines.append(f"C_LOOP_END gp{gp_loop_outer}")
 
+    if result_stream_reset:
+        lines.append(result_stream_reset)
     return "\n".join(lines) + "\n"
