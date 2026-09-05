@@ -168,12 +168,13 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     // Matrix-view addressing forms reuse 0x29/0x2A. Bit 31 marks the form,
     // bits [30:29] select L_TILE slot 0..3, and bits [28:26] are zero.
     // They transfer directly between HBM and the configured Matrix-SRAM view.
-    // In the legacy form funct1=0 means Activation and any non-zero value means
-    // KeyValue. In the new bit-31 form funct1 is canonical: 0=Activation,
+    // In the ordinary form funct1=0 means Activation, 1=KeyValue, 2=State;
+    // 3..15 retain historical KV aliases. In the bit-31 form: 0=Activation,
     // 1=KeyValue, 2=State; 3..15 are reserved. The evaluated L-Compute path
     // uses only Activation and State, both configured as BF16. Legacy
-    // KeyValue keeps PLENA's existing independent format and is not silently
-    // reinterpreted by this extension.
+    // KeyValue selector 1 keeps its independent format. Ordinary selector 2
+    // now matches the Compiler BF16 state ABI; old words using 2 as a KV alias
+    // must be reassembled with selector 1.
 
     // CSR Setting
     C_SET_ADDR_REG         = 6'h2B,

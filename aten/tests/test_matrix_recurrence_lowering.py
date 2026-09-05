@@ -499,3 +499,15 @@ def test_l_tile_wrappers_reject_mismatched_machine_before_emission(model, mlen, 
             )
     assert program.get_code() == before
     assert program.register_allocator.used_gp == []
+
+
+@pytest.mark.parametrize("spec", [NEMOTRON_MAMBA, KIMI_KDA])
+@pytest.mark.parametrize("layout", [RecurrenceLayout.FIXED, RecurrenceLayout.AFFINE])
+def test_diagnostic_snapshots_are_explicit_and_do_not_replace_persistent_state(spec, layout):
+    working = build_recurrence_working_set(spec, layout=layout)
+    program = lower_matrix_recurrence(spec, layout=layout, snapshot_hbm_base=64 * 1024 * 1024)
+    assert program.count("@state_snapshot ") == working.groups * working.chunks
+    assert program.count("@matrix_state_store ") == working.groups * working.chunks
+    for bad_base in (0, 3, spec.state_bytes_per_layer):
+        with pytest.raises(ValueError, match="snapshot"):
+            lower_matrix_recurrence(spec, layout=layout, snapshot_hbm_base=bad_base)

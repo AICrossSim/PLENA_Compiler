@@ -806,6 +806,7 @@ def _emit_state_transfer(
     state_hbm_base: int,
     hbm_address_register: int,
     registers: LoweringRegisters,
+    snapshot_hbm_base: int | None = None,
 ) -> None:
     if direction not in {"load", "reload_intermediate", "store", "store_intermediate"}:
         raise ValueError(f"unsupported Matrix state transfer direction {direction!r}")
@@ -848,6 +849,15 @@ def _emit_state_transfer(
         f"{opcode} gp{registers.destination}, gp{registers.source}, "
         f"a{hbm_address_register}, 0, {STATE_PRECISION_SELECTOR}, {STATE_DMA_VIEW}"
     )
+
+    if direction == "store" and snapshot_hbm_base is not None:
+        snapshot_offset = snapshot_hbm_base + packet * values * BF16_BYTES
+        lines.append(f"; @state_snapshot group={group} chunk={chunk} hbm_byte_offset={snapshot_offset}")
+        lines.extend(load_large_int(registers.source, snapshot_offset))
+        lines.append(
+            f"H_STORE_V.MV gp{registers.destination}, gp{registers.source}, "
+            f"a{hbm_address_register}, 0, {STATE_PRECISION_SELECTOR}, {STATE_DMA_VIEW}"
+        )
 
 
 def _emit_field_load(
@@ -944,6 +954,7 @@ def _lower_mamba(
     *,
     state_hbm_base: int,
     hbm_address_register: int,
+    snapshot_hbm_base: int | None = None,
 ) -> list[str]:
     lines: list[str] = []
     state = working_set.allocation("state")
@@ -994,6 +1005,7 @@ def _lower_mamba(
                 rows=working_set.state_rows_per_chunk,
                 values=values,
                 state_hbm_base=state_hbm_base,
+                snapshot_hbm_base=snapshot_hbm_base,
                 hbm_address_register=hbm_address_register,
                 registers=registers,
             )
@@ -1036,6 +1048,7 @@ def _lower_mamba(
                 rows=working_set.state_rows_per_chunk,
                 values=values,
                 state_hbm_base=state_hbm_base,
+                snapshot_hbm_base=snapshot_hbm_base,
                 hbm_address_register=hbm_address_register,
                 registers=registers,
             )
@@ -1079,6 +1092,7 @@ def _lower_kda(
     *,
     state_hbm_base: int,
     hbm_address_register: int,
+    snapshot_hbm_base: int | None = None,
 ) -> list[str]:
     lines: list[str] = []
     state = working_set.allocation("state")
@@ -1120,6 +1134,7 @@ def _lower_kda(
                 rows=working_set.state_rows_per_chunk,
                 values=values,
                 state_hbm_base=state_hbm_base,
+                snapshot_hbm_base=snapshot_hbm_base,
                 hbm_address_register=hbm_address_register,
                 registers=registers,
             )
@@ -1165,6 +1180,7 @@ def _lower_kda(
                     rows=working_set.state_rows_per_chunk,
                     values=values,
                     state_hbm_base=state_hbm_base,
+                snapshot_hbm_base=snapshot_hbm_base,
                     hbm_address_register=hbm_address_register,
                     registers=registers,
                 )
@@ -1206,6 +1222,7 @@ def _lower_kda(
                     rows=working_set.state_rows_per_chunk,
                     values=values,
                     state_hbm_base=state_hbm_base,
+                snapshot_hbm_base=snapshot_hbm_base,
                     hbm_address_register=hbm_address_register,
                     registers=registers,
                 )
@@ -1260,6 +1277,7 @@ def _lower_kda(
                 rows=working_set.state_rows_per_chunk,
                 values=values,
                 state_hbm_base=state_hbm_base,
+                snapshot_hbm_base=snapshot_hbm_base,
                 hbm_address_register=hbm_address_register,
                 registers=registers,
             )
@@ -1288,6 +1306,7 @@ def lower_matrix_recurrence(
     state_hbm_base: int = 0,
     field_hbm_base: int | None = None,
     hbm_address_register: int = 0,
+    snapshot_hbm_base: int | None = None,
 ) -> str:
     """Emit one official-shape layer's complete recurrent Matrix-SRAM path.
 
@@ -1323,6 +1342,14 @@ def lower_matrix_recurrence(
         working_set,
         field_hbm_base=field_hbm_base,
     )
+    if snapshot_hbm_base is not None:
+        if snapshot_hbm_base < 0 or snapshot_hbm_base % 64:
+            raise ValueError("snapshot_hbm_base must be a non-negative aligned byte address")
+        snapshot_end = snapshot_hbm_base + spec.state_bytes_per_layer
+        for start, end in ((state_hbm_base, state_hbm_base + spec.state_bytes_per_layer),
+                           (field_manifest.base, field_manifest.end)):
+            if snapshot_hbm_base < end and start < snapshot_end:
+                raise ValueError("snapshot overlaps live state or prepared fields")
     lines = [
         f"; @stage={spec.name}_matrix_recurrence",
         f"; @layout={working_set.layout}",
@@ -1341,6 +1368,7 @@ def lower_matrix_recurrence(
             field_manifest,
             registers,
             state_hbm_base=state_hbm_base,
+            snapshot_hbm_base=snapshot_hbm_base,
             hbm_address_register=hbm_address_register,
         )
         if spec.kind is RecurrenceKind.MAMBA
@@ -1349,6 +1377,7 @@ def lower_matrix_recurrence(
             field_manifest,
             registers,
             state_hbm_base=state_hbm_base,
+            snapshot_hbm_base=snapshot_hbm_base,
             hbm_address_register=hbm_address_register,
         )
     )

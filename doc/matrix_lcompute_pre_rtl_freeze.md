@@ -446,3 +446,32 @@ cfd26f07ce7c81b36f11532c31bd6435f8e8d24a138029fba7ab467bd60dd6c1  artifacts/matr
 3f0f015c2dc420b3ee13c827a61b086ec78904a5005efa72e6a303864af7534b  artifacts/matrix_lcompute_agentic_v1/campaign.json
 11c549ad31da440fe8973af98eca5e2234b4d99bdb4a061cd27a019e5bab41c5  artifacts/matrix_lcompute_agentic_v1/summary.csv
 ```
+
+## 2026-09-05: executable precision and recurrence controls
+
+The main weight-traffic experiment is the measured Nemotron checkpoint's
+NVFP4/BF16 exclusion policy. Recurrent state and prepared coefficients remain
+BF16; reproducing the original paper's precision point is not a goal of this
+revision. Simulator `PrecisionContract` separately declares W/A/KV/state and
+uses MX8 block8 only for the weight sensitivity table.
+
+`lower_matrix_recurrence(..., snapshot_hbm_base=...)` emits explicit diagnostic
+HBM copies of each token's completed state. The snapshot range must be aligned
+and disjoint from live state/fields. Snapshot DMA is diagnostic overhead and
+must not enter performance comparisons.
+
+`prepared_vector_recurrence.py` supplies new executable packed VV controls:
+explicit addressing (A) and static address reuse (B), using only existing
+ordinary Vector operations. These are not the historical analytic original/Arlo
+instruction census. Their prepared scalar values are expanded across HBM lanes;
+L_TILE keeps compact coefficient packets. Each ordinary VV operation rounds to
+BF16; L_TILE has local FP32 reduction. The Simulator reports exact checks against
+each operation sequence and a separate shared 1% relative-L2 budget. A failed
+shared budget disqualifies a performance claim.
+
+Ordinary DMA selector **2 now means State**, matching `STATE_PRECISION_SELECTOR`.
+The previous Simulator decoder interpreted it as KV even though this Compiler
+used it for independent BF16 state. Canonical Activation=0 and KV=1 are unchanged;
+old binaries deliberately using selector 2 as a KV alias must be reassembled
+with selector 1. Viewed DMA already decoded selector 2 correctly. No opcode or
+SRAM capacity is added by this correction.
