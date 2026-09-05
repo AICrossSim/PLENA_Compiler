@@ -180,7 +180,12 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_MAX_VF               = 6'h35,
     V_MIN_VF               = 6'h36,
     V_TOPK                 = 6'h37,
-    C_SET_TOPK_REG         = 6'h38
+    C_SET_TOPK_REG         = 6'h38,
+
+    // Packed Matrix-SRAM views and deterministic tile primitives.
+    // CFG funct1=1; EXEC funct1=3. Other funct1 values are reserved.
+    // Full descriptor, explicit-view DMA and consumer encoding: plena_isa_spec.md.
+    L_TILE                 = 6'h3F
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {
