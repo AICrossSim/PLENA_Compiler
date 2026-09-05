@@ -19,6 +19,7 @@ class ProgramTensorMixin:
         prestaged_vram_addr: int | None = None,
         physical_shape: tuple[int, int] | None = None,
         real_data_ratio: float | None = None,
+        hbm_element_bytes: int | None = None,
     ) -> InputVar:
         """
         Declare an input tensor (in HBM).
@@ -32,6 +33,9 @@ class ProgramTensorMixin:
                 ``load_batch`` will register it at that address without emitting
                 any HBM→VRAM prefetch instructions.  If None (default), the
                 normal HBM→VRAM load path is used.
+            hbm_element_bytes: Explicit element width for Plain HBM tensors.
+                BF16 Matrix/KV inputs must pass ``2`` so consecutive regions do
+                not overlap; the default keeps the configured MX layout.
 
         Returns:
             InputVar proxy object
@@ -41,7 +45,7 @@ class ProgramTensorMixin:
 
         h, w = physical_shape or shape
         size = h * w
-        hbm_size = self.hbm_tensor_size(size)
+        hbm_size = self.hbm_tensor_size(size, hbm_element_bytes=hbm_element_bytes)
 
         if hbm_addr is None:
             hbm_addr = self._allocate_hbm(hbm_size)
@@ -54,6 +58,7 @@ class ProgramTensorMixin:
             hbm_size,
             prestaged_vram_addr=prestaged_vram_addr,
             physical_shape=physical_shape,
+            hbm_element_bytes=1 if hbm_element_bytes is None else hbm_element_bytes,
         )
         self._inputs[name] = var
         super().add_hbm_object(
@@ -73,6 +78,8 @@ class ProgramTensorMixin:
         self,
         input_var: InputVar,
         name: str | None = None,
+        storage_precision: int | None = None,
+        precision: int = 0,
     ) -> VRAMMatrixVar:
         """
         Load tensor from HBM to VRAM (Batch type).
@@ -91,6 +98,9 @@ class ProgramTensorMixin:
         """
         if not isinstance(input_var, InputVar):
             raise TypeError(f"Expected InputVar, got {type(input_var)}")
+
+        if storage_precision is None:
+            storage_precision = input_var.hbm_element_bytes
 
         display_name = name if name is not None else input_var.display_name
         internal_name = self._scoped_name(display_name)
@@ -119,6 +129,8 @@ class ProgramTensorMixin:
                 vram_object_name=internal_name,
                 vlen=self.mlen,
                 preload_len=self.hbm_v_prefetch_amount,
+                storage_precision=storage_precision,
+                precision=precision,
             )
 
         var = VRAMMatrixVar(
@@ -156,14 +168,13 @@ class ProgramTensorMixin:
         display_name = name if name is not None else f"{tensor_var.display_name}_stored"
         internal_name = self._scoped_name(display_name)
 
+        # Size the region from the width actually being written. store() previously
+        # used the MX layout unconditionally, so a BF16 write-back (2 bytes/element)
+        # was allocated 1.125 and overran its region by ~78% onto the next tensor.
+        h, w = tensor_var.physical_shape
+        hbm_size = self.hbm_tensor_size(h * w, hbm_element_bytes=hbm_element_bytes)
         if hbm_addr is None:
-            h, w = tensor_var.physical_shape
-            size = h * w
-            hbm_size = self.hbm_tensor_size(size)
             hbm_addr = self._allocate_hbm(hbm_size)
-        else:
-            h, w = tensor_var.physical_shape
-            hbm_size = self.hbm_tensor_size(h * w)
 
         super().store_to_hbm(
             tensor_name=tensor_var.name,  # internal name for symbol table lookup
@@ -184,6 +195,7 @@ class ProgramTensorMixin:
             hbm_size,
             display_name=display_name,
             physical_shape=tensor_var.physical_shape,
+            hbm_element_bytes=hbm_element_bytes,
         )
         self._inputs[internal_name] = var
         return var

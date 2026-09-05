@@ -1,7 +1,13 @@
+import math
 from typing import Any
 
 import torch
 from transformers import AutoConfig, AutoModel
+
+# Architecture strings that select the Mamba-2 (selective state-space) lowering.
+# ``model_type == "mamba2"`` is the primary signal; the architecture string is
+# checked too so a config that omits model_type still routes correctly.
+MAMBA2_ARCHITECTURES = frozenset({"Mamba2ForCausalLM", "Mamba2Model"})
 
 
 class LLMModelParser:
@@ -26,6 +32,120 @@ class LLMModelParser:
             return self.config.text_config
         return self.config
 
+    def is_mamba2(self) -> bool:
+        """True when this config selects the Mamba-2 selective-SSM lowering.
+
+        Checks ``model_type`` first (the field HuggingFace's ``Mamba2Config``
+        pins to ``"mamba2"``) and falls back to the ``architectures`` list so a
+        hand-written config without a model_type still routes correctly.
+        """
+        if self.config is None:
+            self.load_model()
+        text_cfg = self._resolve_text_config()
+        if str(getattr(text_cfg, "model_type", "") or "").lower() == "mamba2":
+            return True
+        architectures = getattr(self.config, "architectures", None) or []
+        return any(arch in MAMBA2_ARCHITECTURES for arch in architectures)
+
+    def _extract_mamba2_dimensions(self) -> dict[str, Any]:
+        """Resolve the Mamba-2 mixer shape from a ``Mamba2Config``.
+
+        Field names mirror HuggingFace's ``Mamba2Config`` so a config JSON maps
+        across without a translation table.  Derived quantities:
+
+        * ``d_inner   = expand * hidden_size``   -- the mixer's inner width
+        * ``conv_dim  = d_inner + 2 * n_groups * state_size``
+                      -- the depthwise conv runs over ``[x, B, C]``
+        * ``in_proj_out = 2 * d_inner + 2 * n_groups * state_size + num_heads``
+                      -- the fused in_proj emits ``[z, x, B, C, dt]``
+        """
+        text_cfg = self._resolve_text_config()
+
+        hidden_size = getattr(text_cfg, "hidden_size")
+        expand = getattr(text_cfg, "expand", 2)
+        head_dim = getattr(text_cfg, "head_dim", 64)
+        state_size = getattr(text_cfg, "state_size", 128)
+        n_groups = getattr(text_cfg, "n_groups", 1)
+        conv_kernel = getattr(text_cfg, "conv_kernel", 4)
+        chunk_size = getattr(text_cfg, "chunk_size", 256)
+
+        d_inner = expand * hidden_size
+        num_heads = getattr(text_cfg, "num_heads", None)
+        if num_heads is None:
+            num_heads = d_inner // head_dim
+        # A mismatch here silently corrupts every downstream dimension (the dt
+        # slice width, the SSD batch axis, the gated-norm group count), so fail
+        # loudly instead of trusting whichever field happens to be wrong.
+        if num_heads * head_dim != d_inner:
+            raise ValueError(
+                f"Mamba-2 config is inconsistent: num_heads ({num_heads}) * head_dim "
+                f"({head_dim}) = {num_heads * head_dim}, but expand ({expand}) * hidden_size "
+                f"({hidden_size}) = {d_inner}.  num_heads must equal "
+                "expand * hidden_size / head_dim."
+            )
+        if num_heads % n_groups:
+            raise ValueError(
+                f"Mamba-2 config is inconsistent: num_heads ({num_heads}) is not divisible by "
+                f"n_groups ({n_groups}); B and C are shared across the heads of a group."
+            )
+
+        time_step_limit = getattr(text_cfg, "time_step_limit", (0.0, float("inf")))
+        try:
+            time_step_min, time_step_max = float(time_step_limit[0]), float(time_step_limit[1])
+        except (TypeError, IndexError, ValueError):
+            time_step_min, time_step_max = 0.0, float("inf")
+
+        return {
+            "hidden_size": hidden_size,
+            "expand": expand,
+            "d_inner": d_inner,
+            "state_size": state_size,
+            "n_groups": n_groups,
+            "conv_kernel": conv_kernel,
+            "head_dim": head_dim,
+            "num_heads": num_heads,
+            "heads_per_group": num_heads // n_groups,
+            "chunk_size": chunk_size,
+            "conv_dim": d_inner + 2 * n_groups * state_size,
+            "in_proj_out": 2 * d_inner + 2 * n_groups * state_size + num_heads,
+            "use_conv_bias": getattr(text_cfg, "use_conv_bias", True),
+            "use_bias": getattr(text_cfg, "use_bias", False),
+            "rms_norm": getattr(text_cfg, "rms_norm", True),
+            "activation": getattr(text_cfg, "hidden_act", "silu"),
+            "eps": getattr(text_cfg, "layer_norm_epsilon", getattr(text_cfg, "rms_norm_eps", 1e-5)),
+            "time_step_min": time_step_min,
+            "time_step_max": time_step_max,
+        }
+
+    def _mamba2_shape(self, batch_size: int, seq_len: int) -> dict[str, Any]:
+        """Per-layer Mamba-2 shape stamped onto every mixer node.
+
+        Carried on each node (rather than looked up from a global) so code_gen
+        can derive a single consistent VRAM map from any one of them without
+        needing the whole graph.
+        """
+        mamba = self._extract_mamba2_dimensions()
+        shape = {
+            k: mamba[k]
+            for k in (
+                "hidden_size",
+                "d_inner",
+                "conv_dim",
+                "in_proj_out",
+                "state_size",
+                "n_groups",
+                "conv_kernel",
+                "head_dim",
+                "num_heads",
+                "heads_per_group",
+                "chunk_size",
+            )
+        }
+        shape["seq_len"] = seq_len
+        shape["batch_size"] = batch_size
+        shape["num_chunks"] = math.ceil(seq_len / mamba["chunk_size"]) if mamba["chunk_size"] else 1
+        return shape
+
     def extract_critical_dimensions(self) -> dict[str, Any]:
         """Extract dimensions for attention, RMSNorm, FFN operations"""
         if self.config is None:
@@ -48,6 +168,12 @@ class LLMModelParser:
 
         # RMSNorm dimensions
         dimensions["rms_norm"] = self._extract_rms_norm_dimensions()
+
+        # Mamba-2 mixer dimensions.  A Mamba-2 config has no attention and no
+        # gated FFN, so the ``attention`` / ``ffn`` sections above are vacuous
+        # for it; ``mamba`` is the authoritative section.
+        if self.is_mamba2():
+            dimensions["mamba"] = self._extract_mamba2_dimensions()
 
         # Include vision encoder dimensions if present
         if hasattr(self.config, "vision_config") and self.config.vision_config is not None:
@@ -120,6 +246,12 @@ class LLMModelParser:
         # TODO: Additional work is needed to make it more flexible (maybe use MASEGraph or torch.fx)
         if self.config is None:
             self.load_model()
+
+        # Mamba-2 replaces the whole attention + FFN sublayer pair with a single
+        # SSM mixer, so it gets its own builder rather than a set of branches
+        # threaded through the Llama-shaped one below.
+        if self.is_mamba2():
+            return self._create_mamba2_symbolic_graph(batch_size=batch_size, seq_len=seq_len)
 
         text_cfg = self._resolve_text_config()
 
@@ -324,6 +456,257 @@ class LLMModelParser:
             "total_nodes": len(symbolic_nodes),
         }
 
+        return self.symbolic_graph
+
+    def _create_mamba2_symbolic_graph(self, batch_size: int = 1, seq_len: int = 512) -> dict[str, Any]:
+        """Build the symbolic graph for a Mamba-2 (``Mamba2ForCausalLM``) model.
+
+        Per layer the mixer is::
+
+            norm -> in_proj -> conv1d -> ssd_scan -> gated_rmsnorm -> out_proj -> residual
+
+        which is the HuggingFace ``Mamba2Mixer`` forward, one node per stage that
+        maps to a distinct PLENA kernel:
+
+        * ``in_proj``  emits the fused ``[z, x, B, C, dt]`` bundle in one GEMM,
+          exactly as the reference implementation does -- splitting it would cost
+          five weight prefetches instead of one.
+        * ``conv1d``   is depthwise and causal over ``[x, B, C]`` only (``z`` and
+          ``dt`` bypass it), hence ``conv_dim`` channels rather than
+          ``in_proj_out``.  Its SiLU is carried on the node as ``activation``
+          instead of a separate node because the two always fuse.
+        * ``ssd_scan`` is the chunked state-space-duality recurrence.  It is one
+          node, not a chunk-loop of nodes, because ``chunk_size`` is a lowering
+          parameter of a single kernel, not a graph-level structure.
+        * ``gated_rmsnorm`` normalises over ``d_inner / n_groups`` and multiplies
+          by ``silu(z)``; it cannot be folded into the plain ``normalization``
+          node because that one reduces over ``hidden_size``.
+
+        There is a single residual per layer (Mamba-2 has one sublayer, not the
+        attention + FFN pair), so a layer is 7 nodes rather than Llama's 6.
+        """
+        text_cfg = self._resolve_text_config()
+        mamba = self._extract_mamba2_dimensions()
+        shape = self._mamba2_shape(batch_size=batch_size, seq_len=seq_len)
+
+        hidden_size = mamba["hidden_size"]
+        d_inner = mamba["d_inner"]
+        conv_dim = mamba["conv_dim"]
+        in_proj_out = mamba["in_proj_out"]
+        n_groups = mamba["n_groups"]
+        state_size = mamba["state_size"]
+        num_heads = mamba["num_heads"]
+        eps = mamba["eps"]
+
+        symbolic_nodes: list[dict[str, Any]] = []
+        execution_order: list[str] = []
+        order_counter = 0
+
+        def add(node: dict[str, Any]) -> None:
+            nonlocal order_counter
+            node["execution_order"] = order_counter
+            symbolic_nodes.append(node)
+            execution_order.append(node["name"])
+            order_counter += 1
+
+        current_shape = [batch_size, seq_len, hidden_size]
+
+        vocab_size = getattr(text_cfg, "vocab_size", None)
+        if vocab_size is not None:
+            add(
+                {
+                    "name": "embed_tokens",
+                    "operation_type": "embedding",
+                    "operation_category": "embedding",
+                    "input_shape": [batch_size, seq_len],
+                    "output_shape": current_shape,
+                    "dimensions": {"num_embeddings": vocab_size, "hidden_size": hidden_size},
+                    "is_data_placeholder": True,
+                }
+            )
+
+        # Column offsets of each slice inside the fused in_proj output, in the
+        # order Mamba2Mixer concatenates them.
+        z_off = 0
+        x_off = z_off + d_inner
+        b_off = x_off + d_inner
+        c_off = b_off + n_groups * state_size
+        dt_off = c_off + n_groups * state_size
+        in_proj_slices = {
+            "z": [z_off, d_inner],
+            "x": [x_off, d_inner],
+            "B": [b_off, n_groups * state_size],
+            "C": [c_off, n_groups * state_size],
+            "dt": [dt_off, num_heads],
+        }
+
+        num_layers = getattr(text_cfg, "num_hidden_layers", 0)
+        for layer_idx in range(num_layers):
+            add(
+                {
+                    "name": f"layer_{layer_idx}_input_layernorm",
+                    "operation_type": "normalization",
+                    "operation_category": "normalization",
+                    "input_shape": current_shape,
+                    "output_shape": current_shape,
+                    "dimensions": {"normalized_shape": hidden_size, "eps": eps},
+                    "is_data_placeholder": False,
+                }
+            )
+
+            add(
+                {
+                    "name": f"layer_{layer_idx}_in_proj",
+                    "operation_type": "projection",
+                    "operation_category": "projection",
+                    "input_shape": current_shape,
+                    "output_shape": [batch_size, seq_len, in_proj_out],
+                    "dimensions": {
+                        "role": "mamba_in_proj",
+                        "in_features": hidden_size,
+                        "out_features": in_proj_out,
+                        "use_bias": mamba["use_bias"],
+                        "slices": in_proj_slices,
+                        "mamba_shape": shape,
+                    },
+                    "is_data_placeholder": False,
+                }
+            )
+
+            add(
+                {
+                    "name": f"layer_{layer_idx}_conv1d",
+                    "operation_type": "conv1d",
+                    "operation_category": "conv1d",
+                    "input_shape": [batch_size, seq_len, conv_dim],
+                    "output_shape": [batch_size, seq_len, conv_dim],
+                    "dimensions": {
+                        "in_channels": conv_dim,
+                        "out_channels": conv_dim,
+                        "groups": conv_dim,  # depthwise: one group per channel
+                        "conv_dim": conv_dim,
+                        "kernel_size": mamba["conv_kernel"],
+                        "stride": 1,
+                        "padding": mamba["conv_kernel"] - 1,
+                        "causal": True,
+                        "depthwise": True,
+                        "use_conv_bias": mamba["use_conv_bias"],
+                        "activation": mamba["activation"],
+                        "seq_len": seq_len,
+                        "mamba_shape": shape,
+                    },
+                    "is_data_placeholder": False,
+                }
+            )
+
+            add(
+                {
+                    "name": f"layer_{layer_idx}_ssd_scan",
+                    "operation_type": "ssd_scan",
+                    "operation_category": "ssd_scan",
+                    "input_shape": [batch_size, seq_len, conv_dim],
+                    "output_shape": [batch_size, seq_len, d_inner],
+                    "dimensions": {
+                        "d_inner": d_inner,
+                        "num_heads": num_heads,
+                        "head_dim": mamba["head_dim"],
+                        "state_size": state_size,
+                        "n_groups": n_groups,
+                        "heads_per_group": mamba["heads_per_group"],
+                        "chunk_size": mamba["chunk_size"],
+                        "num_chunks": shape["num_chunks"],
+                        "seq_len": seq_len,
+                        "time_step_min": mamba["time_step_min"],
+                        "time_step_max": mamba["time_step_max"],
+                        "mamba_shape": shape,
+                    },
+                    "is_data_placeholder": False,
+                }
+            )
+
+            add(
+                {
+                    "name": f"layer_{layer_idx}_gated_rmsnorm",
+                    "operation_type": "gated_rmsnorm",
+                    "operation_category": "normalization",
+                    "input_shape": [[batch_size, seq_len, d_inner], [batch_size, seq_len, d_inner]],
+                    "output_shape": [batch_size, seq_len, d_inner],
+                    "dimensions": {
+                        "normalized_shape": d_inner,
+                        # Mamba-2 normalises per group, not over the full width.
+                        "group_size": d_inner // n_groups,
+                        "n_groups": n_groups,
+                        "eps": eps,
+                        "norm_type": "gated_rms_norm",
+                        "gate_activation": mamba["activation"],
+                        "mamba_shape": shape,
+                    },
+                    "is_data_placeholder": False,
+                }
+            )
+
+            add(
+                {
+                    "name": f"layer_{layer_idx}_out_proj",
+                    "operation_type": "projection",
+                    "operation_category": "projection",
+                    "input_shape": [batch_size, seq_len, d_inner],
+                    "output_shape": current_shape,
+                    "dimensions": {
+                        "role": "mamba_out_proj",
+                        "in_features": d_inner,
+                        "out_features": hidden_size,
+                        "use_bias": mamba["use_bias"],
+                        "mamba_shape": shape,
+                    },
+                    "is_data_placeholder": False,
+                }
+            )
+
+            add(
+                {
+                    "name": f"layer_{layer_idx}_residual",
+                    "operation_type": "elementwise_add",
+                    "operation_category": "elementwise_add",
+                    "input_shape": [current_shape, current_shape],
+                    "output_shape": current_shape,
+                    "dimensions": {"shape": [hidden_size]},
+                    "is_data_placeholder": False,
+                }
+            )
+
+        add(
+            {
+                "name": "final_layernorm",
+                "operation_type": "normalization",
+                "operation_category": "normalization",
+                "input_shape": current_shape,
+                "output_shape": current_shape,
+                "dimensions": {"normalized_shape": hidden_size, "eps": eps},
+                "is_data_placeholder": False,
+            }
+        )
+
+        if vocab_size is not None:
+            add(
+                {
+                    "name": "lm_head",
+                    "operation_type": "lm_head",
+                    "operation_category": "lm_head",
+                    "input_shape": current_shape,
+                    "output_shape": [batch_size, seq_len, vocab_size],
+                    "dimensions": {"hidden_size": hidden_size, "vocab_size": vocab_size},
+                    "is_data_placeholder": False,
+                }
+            )
+
+        self.symbolic_graph = {
+            "nodes": symbolic_nodes,
+            "execution_order": execution_order,
+            "total_nodes": len(symbolic_nodes),
+            "architecture_family": "mamba2",
+            "mamba_shape": shape,
+        }
         return self.symbolic_graph
 
     def create_vision_symbolic_graph(self, batch_size: int = 1) -> dict | None:
@@ -569,23 +952,41 @@ class LLMModelParser:
         print(f"Number of Layers: {dims['num_hidden_layers']}")
         print(f"Max Position Embeddings: {dims['max_position_embeddings']}")
 
-        print("\n=== Attention Dimensions ===")
-        att_dims = dims["attention"]
-        print(f"Number of Attention Heads: {att_dims['num_attention_heads']}")
-        print(f"Number of Key-Value Heads: {att_dims['num_key_value_heads']}")
-        print(f"Head Dimension: {att_dims['head_dim']}")
-        print(f"Key-Value Head Dimension: {att_dims['key_value_head_dim']}")
+        if "mamba" in dims:
+            # Mamba-2 has neither attention nor a gated FFN; printing those
+            # sections would just report the vacuous defaults.
+            m = dims["mamba"]
+            print("\n=== Mamba-2 Mixer Dimensions ===")
+            print(f"Expand: {m['expand']}  ->  d_inner: {m['d_inner']}")
+            print(f"Heads: {m['num_heads']} x head_dim {m['head_dim']}")
+            print(f"State Size: {m['state_size']}, Groups: {m['n_groups']}")
+            print(f"Conv Kernel: {m['conv_kernel']} over conv_dim {m['conv_dim']} (depthwise, causal)")
+            print(f"in_proj: {m['hidden_size']} -> {m['in_proj_out']}  [z, x, B, C, dt]")
+            print(f"out_proj: {m['d_inner']} -> {m['hidden_size']}")
+            print(f"Chunk Size: {m['chunk_size']}")
+            print(f"time_step_limit: ({m['time_step_min']}, {m['time_step_max']})")
 
-        print("\n=== FFN Dimensions ===")
-        ffn_dims = dims["ffn"]
-        print(f"Hidden Size: {ffn_dims['hidden_size']}")
-        print(f"Intermediate Size: {ffn_dims['intermediate_size']}")
-        print(f"Activation: {ffn_dims['activation']}")
+            print("\n=== Gated RMSNorm Dimensions ===")
+            print(f"Normalized Shape: {m['d_inner'] // m['n_groups']} (per group)")
+            print(f"Epsilon: {m['eps']}")
+        else:
+            print("\n=== Attention Dimensions ===")
+            att_dims = dims["attention"]
+            print(f"Number of Attention Heads: {att_dims['num_attention_heads']}")
+            print(f"Number of Key-Value Heads: {att_dims['num_key_value_heads']}")
+            print(f"Head Dimension: {att_dims['head_dim']}")
+            print(f"Key-Value Head Dimension: {att_dims['key_value_head_dim']}")
 
-        print("\n=== RMSNorm Dimensions ===")
-        rms_dims = dims["rms_norm"]
-        print(f"Normalized Shape: {rms_dims['normalized_shape']}")
-        print(f"Epsilon: {rms_dims['eps']}")
+            print("\n=== FFN Dimensions ===")
+            ffn_dims = dims["ffn"]
+            print(f"Hidden Size: {ffn_dims['hidden_size']}")
+            print(f"Intermediate Size: {ffn_dims['intermediate_size']}")
+            print(f"Activation: {ffn_dims['activation']}")
+
+            print("\n=== RMSNorm Dimensions ===")
+            rms_dims = dims["rms_norm"]
+            print(f"Normalized Shape: {rms_dims['normalized_shape']}")
+            print(f"Epsilon: {rms_dims['eps']}")
 
         # Print vision dimensions if present
         if "vision" in dims:
@@ -656,5 +1057,22 @@ class LLMModelParser:
                     )
                 elif category == "elementwise_add":
                     print(f"     Add: shape={dims.get('shape')}")
+                elif category == "projection":
+                    print(
+                        f"     Linear ({dims.get('role', 'projection')}): "
+                        f"{dims.get('in_features')} -> {dims.get('out_features')}"
+                    )
+                elif category == "conv1d":
+                    print(
+                        f"     Conv1d: channels={dims.get('conv_dim')}, kernel={dims.get('kernel_size')}, "
+                        f"depthwise={dims.get('depthwise')}, causal={dims.get('causal')}, "
+                        f"activation={dims.get('activation')}"
+                    )
+                elif category == "ssd_scan":
+                    print(
+                        f"     SSD: heads={dims.get('num_heads')}x{dims.get('head_dim')}, "
+                        f"state={dims.get('state_size')}, groups={dims.get('n_groups')}, "
+                        f"chunk={dims.get('chunk_size')} ({dims.get('num_chunks')} chunks)"
+                    )
 
             print()

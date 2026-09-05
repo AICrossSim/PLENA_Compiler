@@ -8,7 +8,12 @@ import precision_pkg::*;
 package configuration_pkg;
     // Compute Unit Related 
     parameter   BLEN = 4;
-    parameter   HLEN = 8
+    // NOTE: the missing `;` here made this file invalid SystemVerilog and made
+    // `utils/load_config.py` (whose line-wise regex requires the trailing `;`)
+    // silently drop HLEN from the parsed settings dict. The declared value 8
+    // disagrees with doc/plena_isa_spec.md and with plena_settings.toml (both 16);
+    // the value is left alone because only RTL can settle which is correct.
+    parameter   HLEN = 8;
     parameter   MLEN = 64;
     parameter   VLEN = 64;
     parameter   INST_BUFF_DEPTH = 16;

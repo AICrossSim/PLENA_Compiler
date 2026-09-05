@@ -3,14 +3,69 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 from compiler.asm_templates._imm import load_large_int
 from compiler.asm_templates import preload_addr_reg_asm
 from compiler.asm_templates.vram_sub_projection_asm import vram_sub_projection_asm_impl
 from compiler.aten.isa_builder import IsaBuilder, addr as areg, gp
+from compiler.aten.plena.affine_layout import AffineLayout
+from compiler.aten.plena.lstream import (
+    StreamBinding,
+    StreamConfigField,
+    emit_stream_configuration,
+)
 
 
 class IsaMatrixMixin:
+    def _projection_output_stream(
+        self,
+        *,
+        output_layout: AffineLayout | None,
+        output_layout_base: int | None,
+        result_vram_addr: int,
+        target_register: int,
+        value_register: int,
+        stream_slot: int,
+    ) -> tuple[list[str] | None, str | None]:
+        """Bind a tensor-relative affine layout to one Matrix writeback.
+
+        ``AffineLayout.bank_row_base`` is relative to the tensor allocation.
+        The compiler owns physical placement, so callers never need to encode an
+        absolute Vector-SRAM row in an otherwise reusable layout descriptor.
+        """
+        if output_layout is None:
+            return None, None
+
+        logical_base = result_vram_addr if output_layout_base is None else output_layout_base
+        if logical_base % self.mlen:
+            raise ValueError("affine Matrix output base must be aligned to MLEN")
+        bound_layout = replace(
+            output_layout,
+            bank_row_base=logical_base // self.mlen + output_layout.bank_row_base,
+        )
+        bound_layout.validate(self._projection_bank_geometry())
+        binding = StreamBinding(
+            slot=stream_slot,
+            target_register=target_register,
+            target_is_fp=False,
+            base=logical_base,
+            advance=0,
+            packet_elements=self.mlen,
+            storage_atom=self.blen,
+            write=True,
+        )
+        setup = emit_stream_configuration(
+            value_gp=value_register,
+            binding=binding,
+            layout=bound_layout,
+        ).render().splitlines()
+        reset = (
+            f"L_CFG gp0, gp{target_register}, {stream_slot}, "
+            f"{int(StreamConfigField.RESET)}"
+        )
+        return setup, reset
+
     def _emit_hbm_matrix_load(self, layout, gp_count: int, build_body) -> str:
         gp_regs = self.register_allocator.allocate_gp(gp_count)
         gp_for_addr = self.register_allocator.allocate_gp(2)
@@ -277,9 +332,20 @@ class IsaMatrixMixin:
         caller_name: str,
         unroll: bool | None = None,
         row_loop_count: int | None = None,
+        output_layout: AffineLayout | None = None,
+        output_layout_base: int | None = None,
+        output_stream_slot: int = 3,
     ) -> str:
         """Emit the shared projection loop after callers resolve operands."""
         do_unroll = self.unroll_loops if unroll is None else unroll
+        result_stream_setup, result_stream_reset = self._projection_output_stream(
+            output_layout=output_layout,
+            output_layout_base=output_layout_base,
+            result_vram_addr=result_vram_addr,
+            target_register=gp_regs[2],
+            value_register=gp_regs[5],
+            stream_slot=output_stream_slot,
+        )
         return vram_sub_projection_asm_impl(
             mlen=self.mlen,
             blen=self.blen,
@@ -295,6 +361,20 @@ class IsaMatrixMixin:
             gp_regs=gp_regs,
             caller_name=caller_name,
             row_loop_count=row_loop_count,
+            result_stream_setup=result_stream_setup,
+            result_stream_reset=result_stream_reset,
+        )
+
+    def _projection_bank_geometry(self):
+        from compiler.aten.plena.affine_layout import BankGeometry
+
+        if self.mlen % self.blen:
+            raise ValueError("MLEN must be divisible by BLEN for affine Matrix writeback")
+        return BankGeometry(
+            banks=self.mlen // self.blen,
+            bank_width=self.blen,
+            read_ports=1,
+            write_ports=1,
         )
 
     def vram_sub_projection_asm(
@@ -308,6 +388,8 @@ class IsaMatrixMixin:
         k_block_start: int = 0,
         k_block_count: int | None = None,
         unroll: bool | None = None,
+        output_layout: AffineLayout | None = None,
+        output_layout_base: int | None = None,
     ) -> str:
         """Emit VRAM[row][:] @ MRAM[:][col] projection."""
         gp_regs = self._default_projection_gp_regs(gp_regs)
@@ -357,6 +439,8 @@ class IsaMatrixMixin:
             caller_name="vram_sub_projection_asm",
             unroll=unroll,
             row_loop_count=row_loop_count,
+            output_layout=output_layout,
+            output_layout_base=output_layout_base,
         )
 
     def vram_sub_projection_microtile_accumulate_asm(
@@ -373,6 +457,12 @@ class IsaMatrixMixin:
         k_block_count: int,
         write_out: bool,
         gp_regs: list[int] | None = None,
+        output_layout: AffineLayout | None = None,
+        output_layout_base: int | None = None,
+        output_stream_slot: int = 3,
+        matrix_view_base: int | None = None,
+        matrix_view_logical_offset: int | None = None,
+        matrix_view_slot: int = 0,
     ) -> str:
         """Emit M_MM for one 4x4 microtile, optionally flushing with M_MM_WO.
 
@@ -437,8 +527,39 @@ class IsaMatrixMixin:
             lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
 
         if write_out:
-            lines.extend(load_large_int(gp_result, result_addr))
-            lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
+            if matrix_view_base is not None:
+                if output_layout is not None:
+                    raise ValueError(
+                        "Matrix-view writeback and Vector affine writeback are mutually exclusive"
+                    )
+                if matrix_view_logical_offset is None:
+                    raise ValueError(
+                        "Matrix-view writeback requires a logical element offset"
+                    )
+                lines.extend(load_large_int(gp_result, matrix_view_base))
+                lines.append(
+                    f"M_MM_WO gp{gp_result}, gp0, "
+                    f"{matrix_view_logical_offset}, {matrix_view_slot}"
+                )
+            else:
+                if matrix_view_logical_offset is not None:
+                    raise ValueError(
+                        "Matrix-view logical offset was provided without a Matrix base"
+                    )
+                setup, reset = self._projection_output_stream(
+                    output_layout=output_layout,
+                    output_layout_base=output_layout_base,
+                    result_vram_addr=result_vram_addr,
+                    target_register=gp_result,
+                    value_register=gp_mat,
+                    stream_slot=output_stream_slot,
+                )
+                if setup:
+                    lines.extend(setup)
+                lines.extend(load_large_int(gp_result, result_addr))
+                lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
+                if reset:
+                    lines.append(reset)
 
         return "\n".join(lines) + "\n"
 
@@ -457,11 +578,17 @@ class IsaMatrixMixin:
         k_block_start: int,
         k_block_count: int,
         write_out: bool,
+        output_layout: AffineLayout | None = None,
+        gp_regs: list[int] | None = None,
+        matrix_view_base: int | None = None,
+        matrix_view_logical_offset: int | None = None,
+        matrix_view_slot: int = 0,
     ) -> str:
-        result_vram_addr, _target_base_addr, _target_rows = self._target_tile_addr(
+        result_vram_addr, target_base_addr, _target_rows = self._target_tile_addr(
             target_matrix, target_row_idx, target_col_idx
         )
-        gp_regs = self.register_allocator.allocate_gp(3)
+        owns_gp_regs = gp_regs is None
+        gp_regs = self.register_allocator.allocate_gp(3) if gp_regs is None else gp_regs
         try:
             asm = self.vram_sub_projection_microtile_accumulate_asm(
                 vram_mat_name=vram_mat_name,
@@ -475,9 +602,15 @@ class IsaMatrixMixin:
                 k_block_count=k_block_count,
                 write_out=write_out,
                 gp_regs=gp_regs,
+                output_layout=output_layout,
+                output_layout_base=target_base_addr,
+                matrix_view_base=matrix_view_base,
+                matrix_view_logical_offset=matrix_view_logical_offset,
+                matrix_view_slot=matrix_view_slot,
             )
         finally:
-            self.register_allocator.free_gp(gp_regs)
+            if owns_gp_regs:
+                self.register_allocator.free_gp(gp_regs)
         return self._emit(asm)
 
     def vram_sub_projection_packed_skinny_microtile_accumulate_asm(
@@ -621,6 +754,8 @@ class IsaMatrixMixin:
         result_vram_addr: int,
         gp_regs: list[int] | None = None,
         unroll: bool | None = None,
+        output_layout: AffineLayout | None = None,
+        output_layout_base: int | None = None,
     ) -> str:
         """Emit VRAM[row][:] @ MRAM[row][:]^T projection."""
         gp_regs = self._default_projection_gp_regs(gp_regs)
@@ -665,6 +800,8 @@ class IsaMatrixMixin:
             caller_name="vram_sub_projection_T_asm",
             unroll=unroll,
             row_loop_count=row_loop_count,
+            output_layout=output_layout,
+            output_layout_base=output_layout_base,
         )
 
     def vram_block_add_asm(
@@ -1115,6 +1252,7 @@ class IsaMatrixMixin:
         target_col_idx: int,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        output_layout: AffineLayout | None = None,
     ) -> str:
         result_vram_addr, target_base_addr, target_rows = self._target_tile_addr(
             target_matrix, target_row_idx, target_col_idx
@@ -1130,6 +1268,8 @@ class IsaMatrixMixin:
                 mram_row_idx=mram_idx,
                 result_vram_addr=result_vram_addr,
                 gp_regs=gp_regs,
+                output_layout=output_layout,
+                output_layout_base=target_base_addr,
             )
         else:
             isa_code = f"; VRAM Sub Projection To: {vram_mat_name}[{vram_row_idx}][:] @ {mram_mat_name}[:][{mram_idx}] -> {target_matrix}[{target_row_idx}][{target_col_idx}]\n"
@@ -1142,6 +1282,8 @@ class IsaMatrixMixin:
                 gp_regs=gp_regs,
                 k_block_start=k_block_start,
                 k_block_count=k_block_count,
+                output_layout=output_layout,
+                output_layout_base=target_base_addr,
             )
         isa_code += f"; Target VRAM addr: {result_vram_addr} (base={target_base_addr}, offset=col*{target_rows}*{self.mlen} + row*{self.mlen}*{self.mlen})\n"
         isa_code += asm
@@ -1160,6 +1302,7 @@ class IsaMatrixMixin:
         target_col_idx: int,
         k_block_start: int = 0,
         k_block_count: int | None = None,
+        output_layout: AffineLayout | None = None,
     ) -> str:
         """
         Sub-block multiplication:
@@ -1177,6 +1320,7 @@ class IsaMatrixMixin:
             target_col_idx=target_col_idx,
             k_block_start=k_block_start,
             k_block_count=k_block_count,
+            output_layout=output_layout,
         )
 
     def vram_sub_projection_T_to(
@@ -1188,6 +1332,7 @@ class IsaMatrixMixin:
         target_matrix: str,
         target_row_idx: int,
         target_col_idx: int,
+        output_layout: AffineLayout | None = None,
     ) -> str:
         """
         Transposed sub-block multiplication:
@@ -1207,6 +1352,7 @@ class IsaMatrixMixin:
             target_matrix=target_matrix,
             target_row_idx=target_row_idx,
             target_col_idx=target_col_idx,
+            output_layout=output_layout,
         )
 
 

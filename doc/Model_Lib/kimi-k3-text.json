@@ -1,0 +1,53 @@
+{
+  "model_type": "kimi_k3_text",
+  "source_model": "moonshotai/Kimi-K3",
+  "source_revision": "9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
+  "hidden_size": 7168,
+  "vocab_size": 163840,
+  "num_hidden_layers": 93,
+  "num_attention_heads": 96,
+  "num_key_value_heads": 96,
+  "q_lora_rank": 1536,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "attn_res_block_size": 12,
+  "intermediate_size": 33792,
+  "moe_intermediate_size": 3072,
+  "routed_expert_hidden_size": 3584,
+  "first_k_dense_replace": 1,
+  "moe_layer_freq": 1,
+  "num_experts": 896,
+  "num_experts_per_token": 16,
+  "num_shared_experts": 2,
+  "linear_attn_config": {
+    "num_heads": 96,
+    "head_dim": 128,
+    "short_conv_kernel_size": 4,
+    "gate_lower_bound": -5.0,
+    "use_full_rank_gate": true,
+    "kda_layers": [
+      1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19, 21, 22, 23,
+      25, 26, 27, 29, 30, 31, 33, 34, 35, 37, 38, 39, 41, 42, 43, 45, 46,
+      47, 49, 50, 51, 53, 54, 55, 57, 58, 59, 61, 62, 63, 65, 66, 67, 69,
+      70, 71, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89, 90, 91
+    ],
+    "full_attn_layers": [
+      4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48,
+      52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 93
+    ]
+  },
+  "precision_contract": {
+    "activation": "bf16",
+    "recurrent_state": "fp32",
+    "conv_state": "bf16",
+    "checkpoint_weight_default": "mxfp4",
+    "checkpoint_weight_exclusions": [
+      "self_attn",
+      "shared_experts",
+      "mlp gate/up/down",
+      "lm_head"
+    ]
+  }
+}

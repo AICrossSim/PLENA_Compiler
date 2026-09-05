@@ -135,3 +135,54 @@ jobs:
           asm.generate_binary('/tmp/smolvlm2.asm', '/tmp/smolvlm2.mem')
           print('SmolVLM2 assembled OK')
           "
+
+  recurrent-tests:
+    name: Recurrent Compiler and ISA tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest pyyaml numpy transformers
+      - name: Run recurrent lowering and encoding tests
+        run: |
+          PYTHONPATH=. python3 -m pytest -q \
+            assembler/tests \
+            aten/tests/test_affine_layout.py \
+            aten/tests/test_compiler_configuration.py \
+            aten/tests/test_hybrid_l_tile_schedule.py \
+            aten/tests/test_hybrid_workloads.py \
+            aten/tests/test_isa_interpreter.py \
+            aten/tests/test_kda_conv.py \
+            aten/tests/test_kda_decode_step.py \
+            aten/tests/test_kda_gates.py \
+            aten/tests/test_kda_layer.py \
+            aten/tests/test_kda_lowering.py \
+            aten/tests/test_kda_mixer.py \
+            aten/tests/test_kda_normalize.py \
+            aten/tests/test_kda_official_layer.py \
+            aten/tests/test_kda_prefill.py \
+            aten/tests/test_kda_prefill_structure.py \
+            aten/tests/test_kda_reference.py \
+            aten/tests/test_kda_stage_contract.py \
+            aten/tests/test_l_stream_cfg.py \
+            aten/tests/test_layout_planner.py \
+            aten/tests/test_lstream_lowering.py \
+            aten/tests/test_mamba2_reference.py \
+            aten/tests/test_mamba_stage_contract.py \
+            aten/tests/test_matrix_recurrence_lowering.py \
+            aten/tests/test_mview_contract.py \
+            aten/tests/test_prepared_vector_recurrence.py \
+            aten/tests/test_projection_affine_writeback.py \
+            aten/tests/test_python_310_enum_compat.py \
+            aten/tests/test_real_checkpoint.py \
+            aten/tests/test_registry_cpu_signatures.py \
+            aten/tests/test_spill_precision_guard.py \
+            aten/tests/test_ssm_decode_step.py \
+            aten/tests/test_v_fma_vf.py \
+            generator/tests/test_mamba_parser.py \
+            generator/tests/test_mamba_code_gen.py
