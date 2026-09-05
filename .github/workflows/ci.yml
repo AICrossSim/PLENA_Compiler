@@ -58,6 +58,29 @@ jobs:
       - name: Run the stage-terminator guard
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_terminator.py -v
 
+  moe-export-tests:
+    name: MoE numerical exporter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: AICrossSim/PLENA_Tools
+          ref: 6b31fe00d99564909c5aa68d68ec9a5d41981806
+          path: PLENA_Tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install numerical test dependencies
+        run: |
+          pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy bitstring pytest pyyaml
+      - name: Validate encoded bytes and independent numerical reference
+        run: |
+          PYTHONPATH=.:PLENA_Tools python -m pytest \
+            aten/tests/test_moe_normal_export.py \
+            aten/tests/test_moe_full_shape_export.py -q
+
   unit-tests:
     name: Generator unit tests
     runs-on: ubuntu-latest
