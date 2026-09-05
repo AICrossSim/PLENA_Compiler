@@ -74,7 +74,7 @@ jobs:
       - name: Install numerical test dependencies
         run: |
           pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install numpy pytest pyyaml
+          pip install numpy bitstring pytest pyyaml
       - name: Validate encoded bytes and independent numerical reference
         run: |
           PYTHONPATH=.:PLENA_Tools python -m pytest \

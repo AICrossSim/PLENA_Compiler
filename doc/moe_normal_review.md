@@ -36,7 +36,7 @@ Hashes bind the workload to the weight image and record its provenance.
 
 ## Run
 
-Use Python 3.10+ with torch, NumPy and pytest installed. Set `PLENA_TOOLS` to a
+Use Python 3.10+ with torch, NumPy, bitstring and pytest installed. Set `PLENA_TOOLS` to a
 checkout of the Simulator's pinned PLENA_Tools submodule. From this repository:
 
 ```sh
