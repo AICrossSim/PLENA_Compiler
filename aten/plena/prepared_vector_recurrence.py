@@ -91,7 +91,7 @@ def lower_prepared_vector_recurrence(
     pairwise_bf16_dot: bool = False,
     vector_sram_rows: int = 64,
 ) -> str:
-    """Emit BF16 row operations; peak live footprint is eight VLEN rows.
+    """Emit BF16 row operations; reserve eight rows, or 15 for pairwise dots.
 
     State HBM order is [group][recurrence row][head][lane]. The caller must
     reserve private persistent state and token fields for every request.

@@ -118,10 +118,15 @@ slots on pointer updates, scalar loads and loop control. Existing `.MV` forms
 consume one Matrix packet per issued instruction; they do not walk the whole
 view, provide one scalar per logical row, or fuse update/reduction forms.
 
-`L_TILE_EXEC` does not add arithmetic. It moves a deterministic Matrix-view walk
-from the instruction stream into a small sequencer and sends restored packets
-to existing Vector multiply/add/reduce hardware. This is analogous to a Matrix
-instruction describing a tiled GEMM rather than listing every MAC.
+The design goal for `L_TILE_EXEC` is to reuse arithmetic while moving a
+deterministic Matrix-view walk into a sequencer. That reuse is not yet a physical
+mapping proof: the current functional model retains FP32 partial sums across
+rows (up to 8 KiB at VLEN=2048) and fuses rounding boundaries in update primitives.
+Ordinary BF16 MUL/ADD instructions do not establish those same capabilities.
+Existing register capacity, feedback, precision and throughput must be mapped;
+Matrix-to-Vector routing, lane restoration and sequencer logic are additions.
+For a strict no-extra-hardware experiment use the compiler-only ordinary-ISA
+path in [kda_no_extra_hardware.md](kda_no_extra_hardware.md). It emits no L_TILE.
 
 The alternative model-specific fused instructions were rejected because they
 would duplicate arithmetic and require decoder branches for each recurrence.

@@ -45,13 +45,23 @@ The128-term binary sum already needs127 additions; the implementation reaches
 that count without copy adds. This is an economical starting point, not a
 claim of global optimality. Compensated sums need more ALU work and SRAM traffic.
 
-The original Matrix unit remains a candidate for dots, but current M_MV consumes
-an MLEN2048 tile: a fully padded BF16 tile needs8 MiB, beyond the1 MiB Matrix
-SRAM point. Compact-view support is itself an extension. KDA has private state
-per head, whereas M_BMV does not simply provide independent grouped GEMV.
-Moreover, Rust f32 host accumulators are not evidence of original RTL BF16×BF16
-FP32 hardware. Input format conversion, instruction support, capacity and
-utilization must be established before selecting a Matrix mapping.
+The original Matrix unit remains a candidate for dots. Current Rust reads a
+full MLEN-square tile (8 MiB in BF16), but this is not a hardware capacity lower
+bound: local RTL M_TMM reads BLEN contiguous MLEN-wide rows. A transposed
+32x2048 panel occupies 128 KiB. Packing 16 private heads along K and zero-masking
+16 activation rows can express the two KDA dots with 48 M_TMM instructions per
+token across all 96 heads. This is a mapping candidate, not an executed result.
+
+The current fixed Matrix prefetch length is MLEN, and Rust clamps shorter
+prefetches to MLEN; a panel path therefore needs a validated static configuration
+and simulator read-granularity correction. M_MM_WO writes 32 full VLEN rows:
+activation plus a separate output buffer plus the 15-row recurrence scratch
+would exceed 256 KiB. Reusing consumed activation storage for output could fit,
+but requires a checked lifetime schedule and extra activation reloads. Padding,
+packing, quantization and DMA cannot be free. Rust f32 host accumulators are not
+evidence of original RTL BF16-by-BF16 FP32 hardware. The MX input and accumulator
+formats must be established before selecting this mapping; changing a static
+RTL parameter is also different from keeping a frozen netlist unchanged.
 
 ## Qualification boundaries
 
