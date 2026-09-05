@@ -373,6 +373,9 @@ class IsaMatrixMixin:
         k_block_count: int,
         write_out: bool,
         gp_regs: list[int] | None = None,
+        matrix_view_base: int | None = None,
+        matrix_view_logical_offset: int | None = None,
+        matrix_view_slot: int = 0,
     ) -> str:
         """Emit M_MM for one 4x4 microtile, optionally flushing with M_MM_WO.
 
@@ -437,8 +440,23 @@ class IsaMatrixMixin:
             lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
 
         if write_out:
-            lines.extend(load_large_int(gp_result, result_addr))
-            lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
+            if matrix_view_base is not None:
+                if matrix_view_logical_offset is None:
+                    raise ValueError(
+                        "Matrix-view writeback requires a logical element offset"
+                    )
+                lines.extend(load_large_int(gp_result, matrix_view_base))
+                lines.append(
+                    f"M_MM_WO gp{gp_result}, gp0, "
+                    f"{matrix_view_logical_offset}, {matrix_view_slot}"
+                )
+            else:
+                if matrix_view_logical_offset is not None:
+                    raise ValueError(
+                        "Matrix-view logical offset was provided without a Matrix base"
+                    )
+                lines.extend(load_large_int(gp_result, result_addr))
+                lines.append(f"M_MM_WO gp{gp_result}, gp0, 0")
 
         return "\n".join(lines) + "\n"
 
@@ -457,11 +475,16 @@ class IsaMatrixMixin:
         k_block_start: int,
         k_block_count: int,
         write_out: bool,
+        gp_regs: list[int] | None = None,
+        matrix_view_base: int | None = None,
+        matrix_view_logical_offset: int | None = None,
+        matrix_view_slot: int = 0,
     ) -> str:
         result_vram_addr, _target_base_addr, _target_rows = self._target_tile_addr(
             target_matrix, target_row_idx, target_col_idx
         )
-        gp_regs = self.register_allocator.allocate_gp(3)
+        owns_gp_regs = gp_regs is None
+        gp_regs = self.register_allocator.allocate_gp(3) if gp_regs is None else gp_regs
         try:
             asm = self.vram_sub_projection_microtile_accumulate_asm(
                 vram_mat_name=vram_mat_name,
@@ -475,9 +498,13 @@ class IsaMatrixMixin:
                 k_block_count=k_block_count,
                 write_out=write_out,
                 gp_regs=gp_regs,
+                matrix_view_base=matrix_view_base,
+                matrix_view_logical_offset=matrix_view_logical_offset,
+                matrix_view_slot=matrix_view_slot,
             )
         finally:
-            self.register_allocator.free_gp(gp_regs)
+            if owns_gp_regs:
+                self.register_allocator.free_gp(gp_regs)
         return self._emit(asm)
 
     def vram_sub_projection_packed_skinny_microtile_accumulate_asm(

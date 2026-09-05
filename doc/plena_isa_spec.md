@@ -804,3 +804,67 @@ End of a hardware loop. If the loop counter (in register `rd`) is greater than 0
 **Description:**
 
 Shift the vector elements left by the amount specified by `gp_reg<rs2>`. Elements are shifted left, and zeros are filled in from the right. For example, `[a0, a1, a2, a3]` with shift=2 becomes `[a2, a3, 0, 0]`.
+
+### Matrix SRAM views and L_TILE
+
+`L_TILE` uses opcode `0x3F`. Four explicit view slots describe BF16 values in
+Matrix SRAM; the existing Matrix, Vector and DMA opcodes select a slot only
+through the qualified forms below. Ordinary DMA precision selectors retain
+their existing meaning. This is a Compiler/Simulator interface proposal; RTL
+resource reuse, timing and PPA have not been established.
+
+| Assembly form | Encoding and behavior |
+| --- | --- |
+| `L_TILE_CFG slot, gp_shape, gp_map` | `funct1=1`; atomically binds one of four slots. |
+| `L_TILE_EXEC gp_dst, gp_src, gp_scale, primitive[, axes]` | `funct1=3`; uses slots 0/1/2 and explicit Matrix SRAM bases. |
+| `H_PREFETCH_V.MV rd, rs1, rs2, stride, precision, slot` | Existing opcode `0x29`; bit 31 marks Matrix-view DMA, bits 30:29 select its slot. |
+| `H_STORE_V.MV rd, rs1, rs2, stride, precision, slot` | Same qualifier on existing opcode `0x2A`. |
+| `M_MM_WO gp_base, gp_offset, immediate, slot` | Existing opcode `0x06`; writes the Matrix accumulator directly into the selected view. |
+| `M_… rd, rs1, rs2, slot` | Supported Matrix consumers encode `slot + 1` in `funct1`; zero remains ordinary addressing. |
+| `V_ADD_VV.MV`, `V_SUB_VV.MV`, `V_MUL_VV.MV` | Existing arithmetic opcodes; `funct1[3]=1` marks viewed operands and bits 2:0 select destination/source1/source2 slots. |
+
+The packed shape word is `rows-1[11:0]`, `cols-1[23:12]`,
+`tiles-1[31:24]`. The mapping word is `tile_pitch_rows[15:0]`,
+reserved-zero bits 21:16, `tile_phase_stride[27:22]`, and flags 31:28.
+Only flag bit 3 (`BROADCAST_MINOR`) is defined. The diagonal row coefficient
+remains one; the descriptor adds a phase between logical tiles. A zero tile
+pitch is accepted only when logical bank words remain disjoint. Compiler
+validation checks descriptor bounds, live allocation overlap and configuration
+dominance across loops and reachable branches.
+The supported bank count is a power of two from 1 through 64, matching the Simulator.
+
+For `CFG`, instruction fields 9:6/13:10/17:14 carry shape GP/map GP/slot,
+bits 21:18 and 31:26 are zero. For `EXEC`, those fields carry destination,
+source and scale GP registers, bits 21:18 carry the primitive, and bits 26/27
+choose source/scale row (0) or column (1) axes. Bits 31:28 are zero.
+Primitive 0 performs scale-and-accumulate, 1 adds a dot reduction to the existing
+destination, and 2 performs an outer update.
+Other function selectors and primitives are reserved.
+
+Explicit `.MV` DMA reserves bits 28:26. Its precision selectors are
+0=Activation, 1=KeyValue and 2=BF16 state; the prepared recurrence path uses 2.
+This leaves weight, activation and KV formats independent. Viewed `M_MM_WO`
+uses immediate bit 17 as the marker, bits 16:15 as the slot and bits 14:0 as the
+offset. **Compatibility:** previously assembled writebacks with immediate bit
+17 set are reinterpreted as viewed writes (for example `0x80000046` selects
+view 0). The assembler now rejects unqualified offsets that require that bit;
+existing binaries need review before use with this extension.
+
+`isa_matrix_view.py` owns packing and layout validation; the existing Matrix
+emitters and `program_matrix_ops.py` provide direct projection writeback.
+Scratch is an explicit persistent MRAM reservation so weight allocator resets
+cannot overwrite it. The direct projection currently supports one complete
+MLEN-wide output packet with at most BLEN live rows, and retains accumulator
+values across K chunks.
+
+`program_lcompute.py` emits complete Mamba-2/KDA recurrent cores from prepared
+BF16 coefficients, including state/field DMA and per-head-group output stores.
+Persistent state and operands are BF16. The Rust L_TILE primitives use FP32
+intermediates and accumulation, then round results to BF16 on writeback; this
+numeric contract does not establish additional physical storage or its mapping.
+The builder validates disjoint state, field and optional snapshot HBM ranges
+within the 32-bit GP offset window. It exposes fixed and phased layouts
+(`affine` is the existing API spelling). Projection, convolution, gates and whole-model
+checkpoint ingestion are outside that prepared-input contract. Simulator tests
+execute four-token official-shape recurrences and an actual projection consumer;
+these do not establish whole-model numerical execution or hardware speedup.

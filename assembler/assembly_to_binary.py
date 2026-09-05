@@ -1,5 +1,14 @@
 from utils.load_config import load_svh_settings
 
+from compiler.aten.plena.isa_matrix_view import (
+    LTilePrimitive,
+    MatrixViewAxis,
+    encode_matrix_view_dma_word,
+    encode_l_tile_exec,
+    encode_l_tile_cfg,
+    validate_matrix_view_dominance,
+)
+
 from .parser import load_isa_definitions, parse_asm_file
 
 
@@ -23,6 +32,16 @@ _RMASK_VECTOR_OPS = frozenset(
         "V_TOPK",
     }
 )
+_PSEUDO_OPCODE_ALIASES = {
+    "L_TILE_CFG": "L_TILE",
+    "L_TILE_EXEC": "L_TILE",
+    "V_ADD_VV.MV": "V_ADD_VV",
+    "V_SUB_VV.MV": "V_SUB_VV",
+    "V_MUL_VV.MV": "V_MUL_VV",
+    "H_PREFETCH_V.MV": "H_PREFETCH_V",
+    "H_STORE_V.MV": "H_STORE_V",
+}
+
 _IMM_RS1_RD_OPS = frozenset(
     {
         "S_ADDI_INT",
@@ -89,7 +108,8 @@ class AssemblyToBinary:
         :return: Binary representation of the instruction
         """
         # Example conversion logic (to be replaced with actual logic)
-        opcode = self.isa_definitions[instruction.opcode]
+        mnemonic = instruction.opcode
+        opcode = self.isa_definitions[_PSEUDO_OPCODE_ALIASES.get(mnemonic, mnemonic)]
         rd = instruction.rd
         rs1 = instruction.rs1
         rs2 = instruction.rs2
@@ -105,7 +125,114 @@ class AssemblyToBinary:
             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
             rmask = 0
 
-        if instruction.opcode in _IMM_RS1_RD_OPS:
+        if mnemonic == "L_TILE_CFG":
+            # Text: L_TILE_CFG slot, gp_shape, gp_map.
+            slot = rd
+            shape_register = rs1
+            map_register = rs2
+            if slot is None or shape_register is None or map_register is None:
+                raise ValueError("L_TILE_CFG requires slot, shape register, and map register")
+            if not 0 <= slot < 4:
+                raise ValueError(f"L_TILE_CFG slot must be in [0, 4), got {slot}")
+            binary_instruction = encode_l_tile_cfg(
+                slot=slot,
+                shape_register=shape_register,
+                map_register=map_register,
+            )
+        elif mnemonic == "L_TILE_EXEC":
+            # Text: L_TILE_EXEC gp_dst, gp_src1, gp_scale, primitive[, axis_mask].
+            # axis_mask[0] selects source columns and axis_mask[1] selects scale
+            # columns.  Omission is the byte-compatible row/row form.
+            if rd is None or rs1 is None or rs2 is None or rstride is None:
+                raise ValueError(
+                    "L_TILE_EXEC requires destination/source base registers and primitive"
+                )
+            try:
+                primitive = LTilePrimitive(rstride)
+            except ValueError as error:
+                raise ValueError(f"reserved L_TILE primitive {rstride}") from error
+            axis_mask = 0 if funct1 is None else funct1
+            if not isinstance(axis_mask, int) or not 0 <= axis_mask <= 0b11:
+                raise ValueError("L_TILE_EXEC axis mask must be in [0, 3]")
+            binary_instruction = encode_l_tile_exec(
+                dst_register=rd,
+                src1_register=rs1,
+                src2_register=rs2,
+                primitive=primitive,
+                source_axis=MatrixViewAxis((axis_mask >> 0) & 1),
+                scale_axis=MatrixViewAxis((axis_mask >> 1) & 1),
+            )
+        elif mnemonic in {"H_PREFETCH_V.MV", "H_STORE_V.MV"}:
+            # Existing vector DMA with an explicit Matrix-view destination or
+            # source: rd, rs1, rs2, rstride, precision, view_slot.
+            if None in (rd, rs1, rs2, rstride, funct1, instruction.funct2):
+                raise ValueError(f"{mnemonic} requires all six operands")
+            if not isinstance(funct1, int) or not 0 <= funct1 <= 2:
+                raise ValueError(f"{mnemonic}: precision must be in [0, 2]")
+            slot = instruction.funct2
+            if not isinstance(slot, int) or not 0 <= slot < 4:
+                raise ValueError(f"{mnemonic}: Matrix view slot must be in [0, 4)")
+            legacy_word = (
+                (funct1 << (opw + 4 * ow))
+                + (rstride << (opw + 3 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+            binary_instruction = encode_matrix_view_dma_word(legacy_word, slot=slot)
+        elif mnemonic == "M_MM_WO" and rstride is not None:
+            # View-qualified existing writeback. The 18-bit immediate uses its
+            # top bit as an explicit view marker and the next two bits as the
+            # slot. Legacy three-operand words retain marker=0 byte-for-byte.
+            if rd is None or rs1 is None or imm is None:
+                raise ValueError("M_MM_WO requires base, stride register, and offset")
+            if not 0 <= rstride < 4:
+                raise ValueError(f"M_MM_WO Matrix view slot must be in [0, 4), got {rstride}")
+            if not 0 <= imm < (1 << 15):
+                raise ValueError(
+                    f"view-qualified M_MM_WO offset must fit 15 bits, got {imm}"
+                )
+            encoded_imm = (1 << 17) | (rstride << 15) | imm
+            binary_instruction = (
+                (encoded_imm << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+        elif mnemonic in _RS2_RS1_RD_OPS and mnemonic.startswith("M_") and rstride is not None:
+            # A fourth Matrix operand is an explicit view slot. funct1=0 keeps
+            # the legacy no-view word; codes 1..4 select slots 0..3.
+            if not 0 <= rstride < 4:
+                raise ValueError(f"{mnemonic}: Matrix view slot must be in [0, 4), got {rstride}")
+            binary_instruction = (
+                ((rstride + 1) << (opw + 4 * ow))
+                + (rs2 << (opw + 2 * ow))
+                + (rs1 << (opw + ow))
+                + (rd << opw)
+                + opcode
+            )
+        elif mnemonic in {"V_ADD_VV.MV", "V_SUB_VV.MV", "V_MUL_VV.MV"}:
+            if not isinstance(funct1, int) or isinstance(funct1, bool):
+                raise TypeError(f"{mnemonic}: Matrix-view operand mask must be an int")
+            if funct1 == 0:
+                raise ValueError(f"{mnemonic}: Matrix-view operand mask cannot be zero")
+            if not 1 <= funct1 <= 7:
+                raise ValueError(f"{mnemonic}: Matrix-view operand mask must be in [1, 7]")
+            binary_instruction = (
+                ((funct1 | 0x8) << (opw + 4 * ow))
+                + ((rmask or 0) << (opw + 3 * ow))
+                + ((rs2 or 0) << (opw + 2 * ow))
+                + ((rs1 or 0) << (opw + ow))
+                + ((rd or 0) << opw)
+                + opcode
+            )
+        elif instruction.opcode in _IMM_RS1_RD_OPS:
+            if mnemonic == "M_MM_WO" and not 0 <= imm < (1 << 17):
+                raise ValueError(
+                    "legacy M_MM_WO offset must fit 17 bits; bit 17 is the "
+                    f"Matrix-view marker, got {imm}"
+                )
             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _IMM_RD_OPS:
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
@@ -153,6 +280,8 @@ class AssemblyToBinary:
         """
         Generate binary instructions from the assembled instructions.
         """
+        with open(asm_file) as source:
+            validate_matrix_view_dominance(source.read())
         instructions = parse_asm_file(asm_file)
         binary_instructions = []
         for instruction in instructions:

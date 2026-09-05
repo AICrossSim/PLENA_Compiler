@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 
+from compiler.asm_templates._imm import load_large_int
+from compiler.aten.plena.isa_matrix_view import LTilePrimitive, MatrixViewDescriptor
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar
 
 
@@ -31,6 +33,194 @@ def _matrix_precision_code(matrix_precision: str | int) -> int:
 
 
 class ProgramMatrixOpsMixin:
+    def reserve_matrix_view_scratch_v0(
+        self,
+        name: str = "__matrix_view_scratch",
+        *,
+        descriptor: MatrixViewDescriptor | None = None,
+    ) -> int:
+        """Reserve one existing Matrix-SRAM tile for explicit view traffic."""
+
+        if descriptor is not None:
+            self._validate_matrix_view_scratch_descriptor(descriptor)
+        return self.mram_allocator.reserve(name, self.mlen * self.mlen)
+
+    def _validate_matrix_view_descriptor(
+        self, descriptor: MatrixViewDescriptor
+    ) -> None:
+        if not isinstance(descriptor, MatrixViewDescriptor):
+            raise TypeError(
+                "descriptor must be MatrixViewDescriptor, got "
+                f"{type(descriptor).__name__}"
+            )
+        if self.mlen % self.blen:
+            raise ValueError("MLEN must contain a whole number of Matrix bank words")
+        descriptor.validate_for_machine(
+            banks=self.mlen // self.blen,
+            bank_width=self.blen,
+        )
+        final_physical_row = self._matrix_view_physical_rows(descriptor)
+        available_physical_rows = self.mram_capacity_elems // self.mlen
+        if final_physical_row > available_physical_rows:
+            raise ValueError(
+                "Matrix view does not fit Matrix SRAM: "
+                f"needs {final_physical_row} physical rows, has "
+                f"{available_physical_rows}"
+            )
+
+    def _matrix_view_physical_rows(self, descriptor: MatrixViewDescriptor) -> int:
+        words_per_row = descriptor.shape.cols // self.blen
+        row_groups = (words_per_row + self.mlen // self.blen - 1) // (
+            self.mlen // self.blen
+        )
+        return (
+            (descriptor.shape.tile_count - 1)
+            * descriptor.mapping.tile_pitch_rows
+            + descriptor.shape.rows * row_groups
+        )
+
+    def _validate_matrix_view_scratch_descriptor(self, descriptor: MatrixViewDescriptor) -> None:
+        self._validate_matrix_view_descriptor(descriptor)
+        rows = self._matrix_view_physical_rows(descriptor)
+        if rows > self.mlen:
+            raise ValueError(
+                "direct Matrix-view projection must fit its one reserved scratch tile: "
+                f"needs {rows} physical rows, has {self.mlen}"
+            )
+
+    def _validate_matrix_view_projection(
+        self, descriptor: MatrixViewDescriptor, *, logical_rows: int, slot: int
+    ) -> None:
+        self._validate_matrix_view_scratch_descriptor(descriptor)
+        if not 0 <= slot < 4:
+            raise ValueError(f"Matrix-view slot must be in [0, 4), got {slot}")
+        if not 1 <= logical_rows <= self.blen:
+            raise ValueError(
+                "direct Matrix-view projection currently requires one BLEN-sized "
+                f"decode row block, got {logical_rows} logical rows"
+            )
+        if descriptor.shape.rows != logical_rows:
+            raise ValueError(
+                "Matrix-view projection rows must match the live decode rows: "
+                f"expected {logical_rows}, got {descriptor.shape.rows}"
+            )
+        if descriptor.shape.cols * descriptor.shape.tile_count != self.mlen:
+            raise ValueError(
+                "Matrix-view projection must describe one complete MLEN-wide "
+                "consumer packet: "
+                f"cols * tile_count = {descriptor.shape.cols * descriptor.shape.tile_count}, "
+                f"MLEN = {self.mlen}"
+            )
+
+    def _matrix_view_projection_storage(
+        self, descriptor: MatrixViewDescriptor, base: int | None
+    ) -> tuple[int, int]:
+        """Keep every viewed word inside a persistent, tile-aligned owner.
+
+        A whole-row footprint within one reserved tile is conservative but
+        sufficient: weights allocated after reset cannot share any bank row.
+        """
+
+        tile_elems = self.mlen * self.mlen
+        if base is None:
+            base = self.mram_allocator.reserve(
+                "__matrix_view_scratch", tile_elems, required_tail=tile_elems
+            )
+        if base < 0 or base % tile_elems:
+            raise ValueError("Matrix-view base must be a non-negative tile-aligned reservation base")
+        end = base + self._matrix_view_physical_rows(descriptor) * self.mlen
+        if end > self.mram_capacity_elems:
+            raise ValueError("Matrix-view base plus footprint exceeds Matrix SRAM")
+        if not any(
+            block.addr == base and end <= block.addr + block.size
+            for block in self.mram_allocator.reserved_blocks
+        ):
+            raise ValueError("Matrix-view base must belong to a persistent MRAM reservation")
+        max_k_tiles = self.mram_allocator.capacity_after_reset // tile_elems
+        if max_k_tiles <= 0:
+            raise ValueError(
+                "Matrix-view projection needs reserved scratch and at least one "
+                "weight tile in Matrix SRAM"
+            )
+        return base, max_k_tiles
+
+    def configure_matrix_view_v0(
+        self,
+        descriptor: MatrixViewDescriptor,
+        *,
+        slot: int = 0,
+    ) -> str:
+        """Emit the packed hot-form Matrix-view configuration."""
+
+        self._validate_matrix_view_descriptor(descriptor)
+        if not 0 <= slot < 4:
+            raise ValueError(f"Matrix-view slot must be in [0, 4), got {slot}")
+        registers = self.register_allocator.allocate_gp(2)
+        try:
+            shape_register, map_register = registers
+            lines = [
+                "; Configure compiler-managed Matrix SRAM affine view",
+                *load_large_int(shape_register, descriptor.shape.pack()),
+                *load_large_int(map_register, descriptor.mapping.pack()),
+                f"L_TILE_CFG {slot}, gp{shape_register}, gp{map_register}",
+            ]
+            return self._emit("\n".join(lines) + "\n")
+        finally:
+            self.register_allocator.free_gp(registers)
+
+    def matrix_view_accumulator_store_v0(
+        self,
+        *,
+        matrix_base: int,
+        logical_offset: int,
+        slot: int = 0,
+    ) -> str:
+        """Flush the current Matrix accumulator directly through a view."""
+
+        registers = self.register_allocator.allocate_gp(1)
+        try:
+            (matrix_register,) = registers
+            lines = [
+                *load_large_int(matrix_register, matrix_base),
+                f"M_MM_WO gp{matrix_register}, gp0, {logical_offset}, {slot}",
+            ]
+            return self._emit("\n".join(lines) + "\n")
+        finally:
+            self.register_allocator.free_gp(registers)
+
+    def matrix_tile_execute_v0(
+        self,
+        *,
+        destination_base: int,
+        source_base: int,
+        scale_base: int,
+        primitive: LTilePrimitive,
+    ) -> str:
+        """Execute one deterministic recurrence primitive over views 0/1/2.
+
+        The three views must already dominate this call.  All tensor bases are
+        explicit architectural operands; the instruction has no hidden model
+        state, cache lookup, queue, or runtime-selected loop bounds.
+        """
+
+        if not isinstance(primitive, LTilePrimitive):
+            raise TypeError("primitive must be an LTilePrimitive")
+        registers = self.register_allocator.allocate_gp(3)
+        try:
+            destination, source, scale = registers
+            lines = [
+                *load_large_int(destination, destination_base),
+                *load_large_int(source, source_base),
+                *load_large_int(scale, scale_base),
+                (
+                    f"L_TILE_EXEC gp{destination}, gp{source}, gp{scale}, "
+                    f"{int(primitive)}"
+                ),
+            ]
+            return self._emit("\n".join(lines) + "\n")
+        finally:
+            self.register_allocator.free_gp(registers)
+
     # ========================================================================
     # Matrix Projection and VRAM Operations
     # ========================================================================
@@ -166,6 +356,10 @@ class ProgramMatrixOpsMixin:
         matrix_precision: str | int = "keyvalue",
         set_scale: bool = False,
         hbm_element_bytes: int = 2,
+        matrix_view_descriptor: MatrixViewDescriptor | None = None,
+        matrix_view_base: int | None = None,
+        matrix_view_slot: int = 0,
+        configure_matrix_view: bool = True,
     ):
         """Project one output tile while keeping K chunks in the FP32 accumulator.
 
@@ -175,12 +369,25 @@ class ProgramMatrixOpsMixin:
         narrow: it reloads MRAM per 4x4 output microtile and only writes once,
         preserving the matrix-machine accumulator across K chunks.
         """
+        if max_k_tiles <= 0:
+            raise ValueError(f"max_k_tiles must be > 0, got {max_k_tiles}")
+        if matrix_view_descriptor is not None:
+            logical_rows = min(
+                self.mlen, max(0, target.shape[0] - target_row_idx * self.mlen)
+            )
+            self._validate_matrix_view_projection(
+                matrix_view_descriptor, logical_rows=logical_rows, slot=matrix_view_slot
+            )
+            matrix_view_base, available_k_tiles = self._matrix_view_projection_storage(
+                matrix_view_descriptor, matrix_view_base
+            )
+            max_k_tiles = min(max_k_tiles, available_k_tiles)
+        elif matrix_view_base is not None:
+            raise ValueError("matrix_view_base requires matrix_view_descriptor")
+
         vram_matrix, mram_input, target = self._prepare_projection(
             vram_matrix, mram_input, target, auto_reset_mram=True
         )
-        if max_k_tiles <= 0:
-            raise ValueError(f"max_k_tiles must be > 0, got {max_k_tiles}")
-
         vram_layout = self.vram_matrices[vram_matrix.name]
         vram_row_blocks = vram_layout.get_row_blocks(vram_row_idx)
         physical_k = max(vram_matrix.physical_shape[1], mram_input.physical_shape[0])
@@ -188,35 +395,163 @@ class ProgramMatrixOpsMixin:
         tiles_per_mlen = self.mlen // self.blen
         valid_rows = vram_row_blocks[0].valid_shape[0] if vram_row_blocks[0].valid_shape else self.mlen
         row_loop_count = min(tiles_per_mlen, max(1, math.ceil(valid_rows / self.blen)))
+        if matrix_view_descriptor is not None:
+            row_loop_count = 1
+            if configure_matrix_view:
+                self.configure_matrix_view_v0(
+                    matrix_view_descriptor,
+                    slot=matrix_view_slot,
+                )
         chunks = list(_iter_k_chunks(num_k_tiles, max_k_tiles))
-
-        for micro_col_idx in range(tiles_per_mlen):
-            for micro_row_idx in range(row_loop_count):
-                for chunk_idx, (k_block_start, k_block_count) in enumerate(chunks):
-                    super().reset_mram()
-                    super().load_sub_matrix_col(
-                        name=mram_input.name,
-                        col_idx=mram_col_idx,
-                        k_block_start=k_block_start,
-                        k_block_count=k_block_count,
-                        precision=_matrix_precision_code(matrix_precision),
-                        set_scale=set_scale,
-                        hbm_element_bytes=hbm_element_bytes,
+        compact_view_loop = (
+            matrix_view_descriptor is not None
+            and len(chunks) == 1
+            and row_loop_count == 1
+        )
+        gp_regs = self.register_allocator.allocate_gp(7 if compact_view_loop else 3)
+        try:
+            # If the complete K span fits beside the statically reserved view,
+            # load it once and reuse it for every output micro-column.  The old
+            # ordering reloaded the same weight tiles once per BLEN column,
+            # making direct affine writeback up to MLEN/BLEN times more
+            # expensive than the ordinary projection despite identical GEMM
+            # work.  Multi-chunk K still uses the conservative reload path
+            # because this machine has only one Matrix accumulator.
+            if len(chunks) == 1:
+                k_block_start, k_block_count = chunks[0]
+                super().reset_mram()
+                super().load_sub_matrix_col(
+                    name=mram_input.name,
+                    col_idx=mram_col_idx,
+                    k_block_start=k_block_start,
+                    k_block_count=k_block_count,
+                    precision=_matrix_precision_code(matrix_precision),
+                    set_scale=set_scale,
+                    hbm_element_bytes=hbm_element_bytes,
+                )
+                if compact_view_loop:
+                    assert matrix_view_descriptor is not None
+                    assert matrix_view_base is not None
+                    (
+                        gp_act_base,
+                        gp_act_work,
+                        gp_mat_base,
+                        gp_mat_work,
+                        gp_result,
+                        gp_logical_offset,
+                        gp_loop,
+                    ) = gp_regs
+                    mram_layout = self.hbm_matrices[mram_input.name]
+                    mram_col_blocks = mram_layout.get_col_blocks(mram_col_idx)[
+                        k_block_start : k_block_start + k_block_count
+                    ]
+                    mram_col_start_addr = self._loaded_mram_start(
+                        mram_col_blocks,
+                        lambda block: (
+                            f"{mram_input.name}[{block.row_idx}][{mram_col_idx}]"
+                        ),
                     )
-                    super().vram_sub_projection_microtile_accumulate_to(
-                        vram_mat_name=vram_matrix.name,
-                        vram_row_idx=vram_row_idx,
-                        mram_mat_name=mram_input.name,
-                        mram_col_idx=mram_col_idx,
-                        target_matrix=target.name,
-                        target_row_idx=target_row_idx,
-                        target_col_idx=target_col_idx,
-                        micro_row_idx=micro_row_idx,
-                        micro_col_idx=micro_col_idx,
-                        k_block_start=k_block_start,
-                        k_block_count=k_block_count,
-                        write_out=(chunk_idx == len(chunks) - 1),
+                    full_batch = (
+                        vram_layout.physical_shape or vram_layout.full_shape
+                    )[0]
+                    vram_row_start_addr = vram_row_blocks[k_block_start].vram_addr
+                    lines = [
+                        "; Compact Matrix-view projection loop: preserve the ordinary "
+                        "weight reuse while advancing the logical affine destination",
+                        *load_large_int(gp_act_base, vram_row_start_addr),
+                        *load_large_int(gp_mat_base, mram_col_start_addr),
+                        *load_large_int(gp_result, matrix_view_base),
+                        *load_large_int(gp_logical_offset, 0),
+                        f"C_LOOP_START gp{gp_loop}, {tiles_per_mlen}",
+                        f"S_ADD_INT gp{gp_act_work}, gp{gp_act_base}, gp0",
+                        f"S_ADD_INT gp{gp_mat_work}, gp{gp_mat_base}, gp0",
+                    ]
+                    for hidden_tile in range(k_block_count):
+                        lines.append(f"M_MM 0, gp{gp_mat_work}, gp{gp_act_work}")
+                        if hidden_tile + 1 < k_block_count:
+                            lines.append(
+                                f"S_ADDI_INT gp{gp_mat_work}, gp{gp_mat_work}, "
+                                f"{self.mlen * self.mlen}"
+                            )
+                            lines.append(
+                                f"S_ADDI_INT gp{gp_act_work}, gp{gp_act_work}, "
+                                f"{full_batch * self.mlen}"
+                            )
+                    lines.extend(
+                        [
+                            f"M_MM_WO gp{gp_result}, gp{gp_logical_offset}, 0, "
+                            f"{matrix_view_slot}",
+                            f"S_ADDI_INT gp{gp_mat_base}, gp{gp_mat_base}, "
+                            f"{self.blen * self.mlen}",
+                            f"S_ADDI_INT gp{gp_logical_offset}, gp{gp_logical_offset}, "
+                            f"{self.blen}",
+                            f"C_LOOP_END gp{gp_loop}",
+                        ]
                     )
+                    self._emit("\n".join(lines) + "\n")
+                else:
+                    for micro_col_idx in range(tiles_per_mlen):
+                        for micro_row_idx in range(row_loop_count):
+                            super().vram_sub_projection_microtile_accumulate_to(
+                                vram_mat_name=vram_matrix.name,
+                                vram_row_idx=vram_row_idx,
+                                mram_mat_name=mram_input.name,
+                                mram_col_idx=mram_col_idx,
+                                target_matrix=target.name,
+                                target_row_idx=target_row_idx,
+                                target_col_idx=target_col_idx,
+                                micro_row_idx=micro_row_idx,
+                                micro_col_idx=micro_col_idx,
+                                k_block_start=k_block_start,
+                                k_block_count=k_block_count,
+                                write_out=True,
+                                gp_regs=gp_regs,
+                                matrix_view_base=matrix_view_base,
+                                matrix_view_logical_offset=(
+                                    micro_col_idx * self.blen
+                                    if matrix_view_descriptor is not None
+                                    else None
+                                ),
+                                matrix_view_slot=matrix_view_slot,
+                            )
+            else:
+                for micro_col_idx in range(tiles_per_mlen):
+                    for micro_row_idx in range(row_loop_count):
+                        for chunk_idx, (k_block_start, k_block_count) in enumerate(chunks):
+                            super().reset_mram()
+                            super().load_sub_matrix_col(
+                                name=mram_input.name,
+                                col_idx=mram_col_idx,
+                                k_block_start=k_block_start,
+                                k_block_count=k_block_count,
+                                precision=_matrix_precision_code(matrix_precision),
+                                set_scale=set_scale,
+                                hbm_element_bytes=hbm_element_bytes,
+                            )
+                            super().vram_sub_projection_microtile_accumulate_to(
+                                vram_mat_name=vram_matrix.name,
+                                vram_row_idx=vram_row_idx,
+                                mram_mat_name=mram_input.name,
+                                mram_col_idx=mram_col_idx,
+                                target_matrix=target.name,
+                                target_row_idx=target_row_idx,
+                                target_col_idx=target_col_idx,
+                                micro_row_idx=micro_row_idx,
+                                micro_col_idx=micro_col_idx,
+                                k_block_start=k_block_start,
+                                k_block_count=k_block_count,
+                                write_out=(chunk_idx == len(chunks) - 1),
+                                gp_regs=gp_regs,
+                                matrix_view_base=matrix_view_base,
+                                matrix_view_logical_offset=(
+                                    micro_col_idx * self.blen
+                                    if matrix_view_descriptor is not None
+                                    else None
+                                ),
+                                matrix_view_slot=matrix_view_slot,
+                            )
+        finally:
+            self.register_allocator.free_gp(gp_regs)
 
     def vram_sub_projection_packed_skinny_stream_k_accum_to(
         self,
@@ -318,6 +653,8 @@ class ProgramMatrixOpsMixin:
         matrix_precision: str | int = "weights",
         set_scale: bool = True,
         hbm_element_bytes: int = 1,
+        matrix_view_descriptor: MatrixViewDescriptor | None = None,
+        matrix_view_slot: int = 0,
     ):
         """Emit tiled PLENA linear projection, including K-split accumulation."""
         mlen = self.mlen
@@ -338,7 +675,25 @@ class ProgramMatrixOpsMixin:
         num_row_blocks = math.ceil(physical_rows / mlen)
         num_col_blocks = math.ceil(physical_out_features / mlen)
         num_k_tiles = math.ceil(physical_k / mlen)
-        max_k_tiles = self.mram_tile_capacity
+        matrix_view_base = None
+        if matrix_view_descriptor is not None:
+            self._validate_matrix_view_projection(
+                matrix_view_descriptor, logical_rows=rows, slot=matrix_view_slot
+            )
+            if num_col_blocks != 1 or num_row_blocks != 1:
+                raise ValueError(
+                    "direct Matrix-view projection supports exactly one output tile; "
+                    "multiple output blocks need separate views or an explicit consumer/store"
+                )
+            matrix_view_base, max_k_tiles = self._matrix_view_projection_storage(
+                matrix_view_descriptor, None
+            )
+            self.configure_matrix_view_v0(
+                matrix_view_descriptor,
+                slot=matrix_view_slot,
+            )
+        else:
+            max_k_tiles = self.mram_tile_capacity
 
         # When rows is not a multiple of mlen the hardware still operates on
         # full tiles; only the first `rows` rows contain valid output.
@@ -364,6 +719,29 @@ class ProgramMatrixOpsMixin:
                 hbm_element_bytes=hbm_element_bytes,
                 **k_split,
             )
+
+        if matrix_view_descriptor is not None:
+            assert matrix_view_base is not None
+            for col_idx in range(num_col_blocks):
+                for row_idx in range(num_row_blocks):
+                    self.vram_sub_projection_stream_k_accum_to(
+                        input_var,
+                        row_idx,
+                        weight_var,
+                        col_idx,
+                        output,
+                        row_idx,
+                        col_idx,
+                        max_k_tiles=max_k_tiles,
+                        matrix_precision=matrix_precision,
+                        set_scale=set_scale,
+                        hbm_element_bytes=hbm_element_bytes,
+                        matrix_view_descriptor=matrix_view_descriptor,
+                        matrix_view_base=matrix_view_base,
+                        matrix_view_slot=matrix_view_slot,
+                        configure_matrix_view=False,
+                    )
+            return output
 
         if num_k_tiles <= max_k_tiles:
             for col_idx in range(num_col_blocks):
@@ -476,6 +854,8 @@ class ProgramMatrixOpsMixin:
         weight_var: InputVar,
         name: str = "linear_out_bf16",
         physical_shape: tuple[int, int] | None = None,
+        matrix_view_descriptor: MatrixViewDescriptor | None = None,
+        matrix_view_slot: int = 0,
     ):
         """Emit a high-precision BF16 matrix projection through HBM_M_KV_TYPE.
 
@@ -491,6 +871,8 @@ class ProgramMatrixOpsMixin:
             matrix_precision="keyvalue",
             set_scale=False,
             hbm_element_bytes=2,
+            matrix_view_descriptor=matrix_view_descriptor,
+            matrix_view_slot=matrix_view_slot,
         )
 
     def linear_projection_bias_bf16(
