@@ -17,6 +17,9 @@ from .parser import load_isa_definitions, parse_asm_file
 # to the previous `opcode in [ ... ]` list literals.
 _RMASK_VECTOR_OPS = frozenset(
     {
+        "V_DOT_RESET",
+        "V_DOT_ACC",
+        "V_DOT_WRITE",
         "V_ADD_VV",
         "V_ADD_VF",
         "V_MUL_VV",
@@ -61,6 +64,9 @@ _LSTREAM_VIEW_OPS = frozenset(
     }
 )
 _PSEUDO_OPCODE_ALIASES = {
+    "V_DOT_RESET": "V_ADD_VV",
+    "V_DOT_ACC": "V_MUL_VV",
+    "V_DOT_WRITE": "V_SUB_VV",
     "V_FMA_VF": "V_MUL_VF",
     "L_CFG": "L_TILE",
     "L_TILE_CFG": "L_TILE",
@@ -186,7 +192,17 @@ class AssemblyToBinary:
         # injected only here, so spelling V_MUL_VF with a non-canonical mode bit
         # cannot silently change its arithmetic semantics.
         encoded_funct1 = funct1
-        if mnemonic in {"V_ADD_VV.MV", "V_SUB_VV.MV", "V_MUL_VV.MV"}:
+        if mnemonic in {"V_DOT_RESET", "V_DOT_ACC", "V_DOT_WRITE"}:
+            # Experimental FP32 accumulator ABI, never selected by legacy VV.
+            unused = (
+                (rd, rs1, rs2) if mnemonic == "V_DOT_RESET"
+                else (rd,) if mnemonic == "V_DOT_ACC"
+                else (rs1, rs2)
+            )
+            if rmask != 0 or any(reg != 0 for reg in unused):
+                raise ValueError(f"{mnemonic}: unused registers and mask must be zero")
+            encoded_funct1 = 0x8
+        elif mnemonic in {"V_ADD_VV.MV", "V_SUB_VV.MV", "V_MUL_VV.MV"}:
             if funct1 == 0:
                 raise ValueError(f"{mnemonic}: Matrix-view operand mask cannot be zero")
             # funct1[3] is an explicit Matrix-view addressing marker for the

@@ -100,6 +100,9 @@ vector_masked_unary_or_reduction_ops = frozenset(
 )
 vector_masked_binary_ops = frozenset(
     {
+        "V_DOT_RESET",
+        "V_DOT_ACC",
+        "V_DOT_WRITE",
         "V_ADD_VV",
         "V_ADD_VF",
         "V_MUL_VV",

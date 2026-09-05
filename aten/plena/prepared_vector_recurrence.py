@@ -2,7 +2,8 @@
 
 These are new executable controls, not the historical analytic A/B instruction
 census. A emits explicit addresses; B applies static register-value reuse.
-Both use existing VV operations, BF16 SRAM, and identical prepared operands.
+By default both use existing VV operations, BF16 SRAM, and identical operands.
+The explicit experimental_fp32_dot option adds storage outside the frozen ISA.
 Coefficients are explicitly expanded across lanes in HBM (no hidden gather).
 """
 
@@ -44,6 +45,18 @@ class _Emitter:
         self.address(2, address)
         self.lines.append(f"H_{'STORE' if store else 'PREFETCH'}_V gp1, gp2, a0, 0, 2")
 
+    def dot_reset(self):
+        self.lines.append("V_DOT_RESET gp0, gp0, gp0, 0")
+
+    def dot_acc(self, source1: int, source2: int):
+        self.address(2, source1 * self.mlen)
+        self.address(3, source2 * self.mlen)
+        self.lines.append("V_DOT_ACC gp0, gp2, gp3, 0")
+
+    def dot_write(self, destination: int):
+        self.address(1, destination * self.mlen)
+        self.lines.append("V_DOT_WRITE gp1, gp0, gp0, 0")
+
     def binary(self, op: str, destination: int, source1: int, source2: int):
         for register, row in ((1, destination), (2, source1), (3, source2)):
             self.address(register, row * self.mlen)
@@ -56,15 +69,22 @@ def lower_prepared_vector_recurrence(
     *,
     mlen: int = 2048,
     static_address_reuse: bool = False,
+    experimental_fp32_dot: bool = False,
 ) -> str:
     """Emit BF16 row operations; peak live footprint is eight VLEN rows.
 
     State HBM order is [group][recurrence row][head][lane]. The caller must
     reserve private persistent state and token fields for every request.
-    All arithmetic boundaries are explicitly BF16, including each reduction
+    By default all arithmetic boundaries are BF16, including each reduction
     addition. This differs from L_TILE's local FP32 reduction and is audited
     numerically by the executable comparison, never silently equated to it.
+    experimental_fp32_dot explicitly adds a VLEN-wide FP32 accumulator (4*VLEN
+    bytes plus validity), using RESET/ACC/WRITE. Only the two KDA dot products
+    retain FP32 products/partial sums; other BF16 boundaries remain unchanged.
+    This is an experimental hardware extension, not the frozen ordinary ISA.
     """
+    if experimental_fp32_dot and spec.kind is not RecurrenceKind.KDA:
+        raise ValueError("experimental FP32 dot is a KDA-only control")
     if mlen % spec.row_elements or spec.heads % (mlen // spec.row_elements):
         raise ValueError("controlled Vector baseline requires full packed head groups")
     if len(groups) != spec.heads // (mlen // spec.row_elements):
@@ -98,7 +118,10 @@ def lower_prepared_vector_recurrence(
             out.binary("MUL", 5, 2, 1)
             out.binary("ADD", 4, 4, 5)
         else:
-            out.binary("ADD", 6, 7, 7)
+            if experimental_fp32_dot:
+                out.dot_reset()
+            else:
+                out.binary("ADD", 6, 7, 7)
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
                 out.transfer(0, group.state_base + offset)
@@ -106,12 +129,20 @@ def lower_prepared_vector_recurrence(
                 out.binary("MUL", 0, 0, 1)
                 out.transfer(0, group.state_base + offset, store=True)
                 out.transfer(1, f["key"] + offset)
-                out.binary("MUL", 5, 0, 1)
-                out.binary("ADD", 6, 6, 5)
+                if experimental_fp32_dot:
+                    out.dot_acc(0, 1)
+                else:
+                    out.binary("MUL", 5, 0, 1)
+                    out.binary("ADD", 6, 6, 5)
+            if experimental_fp32_dot:
+                out.dot_write(6)
             out.binary("SUB", 3, 2, 6)
             out.transfer(1, f["beta"])
             out.binary("MUL", 3, 3, 1)
-            out.binary("ADD", 4, 7, 7)
+            if experimental_fp32_dot:
+                out.dot_reset()
+            else:
+                out.binary("ADD", 4, 7, 7)
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
                 out.transfer(0, group.state_base + offset)
@@ -120,7 +151,12 @@ def lower_prepared_vector_recurrence(
                 out.binary("ADD", 0, 0, 5)
                 out.transfer(0, group.state_base + offset, store=True)
                 out.transfer(1, f["query"] + offset)
-                out.binary("MUL", 5, 0, 1)
-                out.binary("ADD", 4, 4, 5)
+                if experimental_fp32_dot:
+                    out.dot_acc(0, 1)
+                else:
+                    out.binary("MUL", 5, 0, 1)
+                    out.binary("ADD", 4, 4, 5)
+            if experimental_fp32_dot:
+                out.dot_write(4)
         out.transfer(4, f["output"], store=True)
     return "\n".join(out.lines) + "\n"
