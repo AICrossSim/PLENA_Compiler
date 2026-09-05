@@ -62,6 +62,24 @@ class _Emitter:
             self.address(register, row * self.mlen)
         self.lines.append(f"V_{op}_VV gp1, gp2, gp3, 0")
 
+    def pairwise_product(self, index: int, rows: int, destination: int):
+        """Stream one product into a compiler-scheduled balanced BF16 tree.
+
+        Partial sums live in existing Vector SRAM rows 8..14 for 128 terms.
+        Trailing-one merges are resolved at compile time, not by new hardware.
+        An even leaf writes directly to level zero; an odd leaf uses row 5.
+        Each merge writes its final level directly, so no copy adds are needed.
+        """
+        merges = 0
+        while index & (1 << merges):
+            merges += 1
+        self.binary("MUL", 8 if merges == 0 else 5, 0, 1)
+        for level in range(merges):
+            target = 5
+            if level == merges - 1:
+                target = destination if index == rows - 1 else 8 + merges
+            self.binary("ADD", target, 8 + level, 5)
+
 
 def lower_prepared_vector_recurrence(
     spec: MatrixRecurrenceSpec,
@@ -70,6 +88,8 @@ def lower_prepared_vector_recurrence(
     mlen: int = 2048,
     static_address_reuse: bool = False,
     experimental_fp32_dot: bool = False,
+    pairwise_bf16_dot: bool = False,
+    vector_sram_rows: int = 64,
 ) -> str:
     """Emit BF16 row operations; peak live footprint is eight VLEN rows.
 
@@ -82,7 +102,17 @@ def lower_prepared_vector_recurrence(
     bytes plus validity), using RESET/ACC/WRITE. Only the two KDA dot products
     retain FP32 products/partial sums; other BF16 boundaries remain unchanged.
     This is an experimental hardware extension, not the frozen ordinary ISA.
+    pairwise_bf16_dot instead changes only the compiler schedule: seven partial
+    BF16 rows inside existing Vector SRAM, 15 reserved rows total (60 KiB at
+    VLEN=2048), no new opcode, storage capacity, port or FP32 arithmetic state.
     """
+    if pairwise_bf16_dot:
+        if experimental_fp32_dot:
+            raise ValueError("pairwise BF16 and experimental FP32 are exclusive")
+        if spec.kind is not RecurrenceKind.KDA or spec.recurrence_rows != 128:
+            raise ValueError("pairwise BF16 control requires the 128-row KDA geometry")
+        if vector_sram_rows < 15:
+            raise ValueError("pairwise BF16 control must reserve 15 existing Vector SRAM rows")
     if experimental_fp32_dot and spec.kind is not RecurrenceKind.KDA:
         raise ValueError("experimental FP32 dot is a KDA-only control")
     if mlen % spec.row_elements or spec.heads % (mlen // spec.row_elements):
@@ -120,7 +150,7 @@ def lower_prepared_vector_recurrence(
         else:
             if experimental_fp32_dot:
                 out.dot_reset()
-            else:
+            elif not pairwise_bf16_dot:
                 out.binary("ADD", 6, 7, 7)
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
@@ -131,6 +161,8 @@ def lower_prepared_vector_recurrence(
                 out.transfer(1, f["key"] + offset)
                 if experimental_fp32_dot:
                     out.dot_acc(0, 1)
+                elif pairwise_bf16_dot:
+                    out.pairwise_product(row, spec.recurrence_rows, 6)
                 else:
                     out.binary("MUL", 5, 0, 1)
                     out.binary("ADD", 6, 6, 5)
@@ -141,7 +173,7 @@ def lower_prepared_vector_recurrence(
             out.binary("MUL", 3, 3, 1)
             if experimental_fp32_dot:
                 out.dot_reset()
-            else:
+            elif not pairwise_bf16_dot:
                 out.binary("ADD", 4, 7, 7)
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
@@ -153,6 +185,8 @@ def lower_prepared_vector_recurrence(
                 out.transfer(1, f["query"] + offset)
                 if experimental_fp32_dot:
                     out.dot_acc(0, 1)
+                elif pairwise_bf16_dot:
+                    out.pairwise_product(row, spec.recurrence_rows, 4)
                 else:
                     out.binary("MUL", 5, 0, 1)
                     out.binary("ADD", 4, 4, 5)
