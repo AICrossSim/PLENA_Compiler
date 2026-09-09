@@ -46,6 +46,64 @@ class TestVectorRmaskHandling(unittest.TestCase):
             ),
         )
 
+    def test_qwen_topk8_preserves_all_operands_and_rmask(self):
+        instruction = Instruction("V_TOPK", 1, 2, 3, 1, None, None, None)
+        encoded = self.asm._convert_to_binary(instruction)
+
+        self.assertEqual(encoded & 0x3F, 0x37)
+        self.assertEqual((encoded >> 6) & 0xF, 1)
+        self.assertEqual((encoded >> 10) & 0xF, 2)
+        self.assertEqual((encoded >> 14) & 0xF, 3)
+        self.assertEqual((encoded >> 18) & 0xF, 1)
+
+    def test_qwen_router_linear_preserves_all_operands_and_policy(self):
+        instruction = Instruction(
+            "V_ROUTER_LINEAR_BF16", 3, 7, 12, 1, None, None, None
+        )
+        encoded = self.asm._convert_to_binary(instruction)
+
+        self.assertEqual(encoded & 0x3F, 0x36)
+        self.assertEqual((encoded >> 6) & 0xF, 3)
+        self.assertEqual((encoded >> 10) & 0xF, 7)
+        self.assertEqual((encoded >> 14) & 0xF, 12)
+        self.assertEqual((encoded >> 18) & 0xF, 1)
+
+    def test_qwen_fp32_route_multiply_preserves_all_operands(self):
+        instruction = Instruction(
+            "V_MUL_ROUTE_F32", 4, 5, 6, 0, None, None, None
+        )
+        encoded = self.asm._convert_to_binary(instruction)
+
+        self.assertEqual(encoded & 0x3F, 0x38)
+        self.assertEqual((encoded >> 6) & 0xF, 4)
+        self.assertEqual((encoded >> 10) & 0xF, 5)
+        self.assertEqual((encoded >> 14) & 0xF, 6)
+        self.assertEqual((encoded >> 18) & 0xF, 0)
+
+    def test_qwen_exact_expert_combine_preserves_descriptor_addr_register(self):
+        instruction = Instruction(
+            "V_QWEN3_EXPERT_COMBINE_BF16", 4, 5, 6, 13, None, None, None
+        )
+        encoded = self.asm._convert_to_binary(instruction)
+
+        self.assertEqual(encoded & 0x3F, 0x39)
+        self.assertEqual((encoded >> 6) & 0xF, 4)
+        self.assertEqual((encoded >> 10) & 0xF, 5)
+        self.assertEqual((encoded >> 14) & 0xF, 6)
+        self.assertEqual((encoded >> 18) & 0xF, 13)
+
+    def test_qwen_exact_rmsnorm_preserves_policy(self):
+        instruction = Instruction(
+            "V_QWEN3_RMSNORM_BF16", 7, 8, 9, 1, None, None, None
+        )
+        encoded = self.asm._convert_to_binary(instruction)
+
+        self.assertEqual(encoded & 0x3F, 0x3A)
+        self.assertEqual((encoded >> 6) & 0xF, 7)
+        self.assertEqual((encoded >> 10) & 0xF, 8)
+        self.assertEqual((encoded >> 14) & 0xF, 9)
+        self.assertEqual((encoded >> 18) & 0xF, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,22 @@ from .parser import load_isa_definitions, parse_asm_file
 # instruction (millions of times for large programs). Membership is O(1) and identical
 # to the previous `opcode in [ ... ]` list literals.
 _RMASK_VECTOR_OPS = frozenset(
-    {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"}
+    {
+        "V_ADD_VV",
+        "V_ADD_VF",
+        "V_MUL_VV",
+        "V_SUB_VV",
+        "V_MUL_VF",
+        "V_EXP_V",
+        "V_RECI_V",
+        "V_RED_SUM",
+        "V_RED_MAX",
+        "V_ROUTER_LINEAR_BF16",
+        "V_TOPK",
+        "V_MUL_ROUTE_F32",
+        "V_QWEN3_EXPERT_COMBINE_BF16",
+        "V_QWEN3_RMSNORM_BF16",
+    }
 )
 _IMM_RS1_RD_OPS = frozenset(
     {

@@ -102,6 +102,7 @@ EMULATOR_EXECUTABLE_OPCODES = frozenset(
         "M_MV", "M_TMV", "M_BMV", "M_BTMV", "M_MV_WO", "M_BMV_WO",
         "V_ADD_VV", "V_ADD_VF", "V_SUB_VV", "V_SUB_VF", "V_MUL_VV",
         "V_MUL_VF", "V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX",
+        "V_ROUTER_LINEAR_BF16", "V_TOPK", "V_MUL_ROUTE_F32",
         "S_ADD_FP", "S_SUB_FP", "S_MAX_FP", "S_MUL_FP", "S_EXP_FP",
         "S_RECI_FP", "S_SQRT_FP", "S_LD_FP", "S_ST_FP", "S_MAP_V_FP",
         "S_ADD_INT", "S_ADDI_INT", "S_SUB_INT", "S_MUL_INT", "S_LUI_INT",

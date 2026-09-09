@@ -287,6 +287,89 @@ Similar to `V_ADD_VV`, but performs element-wise multiplication.
 
 Similar to `V_ADD_VF`, but performs element-wise multiplication.
 
+### V_ROUTER_LINEAR_BF16
+
+**Format:** `V_ROUTER_LINEAR_BF16 rd, rs1, rs2, policy`
+
+**Operation:** Reconstruct one BF16 router input row from
+`Vector[gp_reg<rs1>]` and the 128-row BF16 router matrix from
+`Vector[gp_reg<rs2>]`, execute libtorch `F.linear`, and write 128 BF16 logits
+at `Vector[gp_reg<rd>]`. The output is cast once. Input column tiles use the
+configured BLEN row stride; router-weight column tiles use a fixed 128-row
+stride.
+
+Policy `0` is the hidden-64 validation geometry. Policy `1` is the exact
+hidden-2048 target. Other policies, incompatible VLEN values, non-BF16
+storage, non-finite operands/results, address overflow, and SRAM bounds errors
+fail closed.
+
+Hidden-64 and hidden-2048 deterministic fixtures pin every output BF16 logit
+against Transformers 5.5. The emulator logits remain visible in
+`vram_dump.bin`. Timing is an uncalibrated structural composition of existing
+multiply/reduction costs, and the opcode has no validated RTL implementation.
+
+### V_TOPK
+
+**Format:** `V_TOPK rd, rs1, rs2, policy`
+
+**Operation:** Read BF16 router logits from `Vector[gp_reg<rs1>]`, apply FP32
+softmax, top-k, and selected-probability renormalization, then write FP32
+scores to route SRAM at `gp_reg<rd>` and expert IDs to integer SRAM at
+`gp_reg<rs2>`.
+
+Policy `0` selects top-4 from 32 experts. Policy `1` selects top-8 from 128
+experts. Other policies fail closed. Non-finite logits also fail closed.
+The dedicated route SRAM has 1,024 FP32 entries (4,096 bytes). Qwen3 lowering
+uses a whole-batch resident schedule with eight entries per token, caps batches
+at 128, and fails before emission for larger batches. Token-serial reuse is not
+currently implemented.
+
+### V_MUL_ROUTE_F32
+
+**Format:** `V_MUL_ROUTE_F32 rd, rs1, rs2, rmask`
+
+**Operation:** Multiply `Vector[gp_reg<rs1>]` by the FP32 route score at route
+SRAM address `gp_reg<rs2>`, then cast once to the destination vector format at
+`Vector[gp_reg<rd>]`.
+
+This emulator/compiler extension prevents premature BF16 rounding of Qwen3
+route scores. Its cycle charge is a structural composition of existing vector
+costs; it has no calibrated or RTL-valid timing claim. The emulator writes the
+runtime bank to `route_f32_sram_dump.bin` for bit-level validation.
+
+### V_QWEN3_EXPERT_COMBINE_BF16
+
+**Format:** `V_QWEN3_EXPERT_COMBINE_BF16 rd, rs1, rs2, descriptor_addr_reg`
+
+**Operation:** Read eight expert IDs and FP32 scores from the common scalar
+SRAM base in `gp_reg<rs2>`, sort the pairs by ascending expert ID, load only
+the selected fused gate/up and down matrices from the raw-BF16 HBM descriptor
+addressed by `descriptor_addr_reg`, and execute the Transformers 5.5 expert
+loop. Each FP32-weighted contribution is cast once to BF16 before BF16
+`index_add`; the final row is written to `Vector[gp_reg<rd>]`.
+
+The descriptor is one aligned 64-byte `Q3MOEBF1` record followed by canonical
+contiguous expert-major fused gate/up and down banks. Supported geometries are
+hidden/intermediate 64/64 for validation and 2048/768 for the target, always
+with 128 experts and top-8. Malformed descriptors, non-canonical offsets,
+wrong strides, duplicate/out-of-range expert IDs, non-normalized scores,
+non-finite data, and address overflow fail closed. Timing is structural and
+uncalibrated; no RTL implementation is claimed.
+
+### V_QWEN3_RMSNORM_BF16
+
+**Format:** `V_QWEN3_RMSNORM_BF16 rd, rs1, rs2, policy`
+
+**Operation:** Compute variance and reciprocal square root in FP32 from the
+BF16 source at `Vector[gp_reg<rs1>]`, cast the normalized activation to BF16,
+multiply by the BF16 affine weight at `Vector[gp_reg<rs2>]`, and write BF16 to
+`Vector[gp_reg<rd>]`. Epsilon is fixed at the sealed target value `1e-6`.
+
+Policy `0` is hidden-64 validation and policy `1` is hidden-2048 target.
+Other policies, non-BF16 storage, non-finite data, and bounds errors fail
+closed. Timing is structural and uncalibrated; no RTL implementation is
+claimed.
+
 ### V_EXP_V
 
 **Format:** `V_EXP_V rd, rs1, rmask`
