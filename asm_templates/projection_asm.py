@@ -302,6 +302,18 @@ def projection_T_asm(
     in_features = hidden_size
     if out_features is None:
         out_features = hidden_size
+    if min(mlen, blen, batch, hidden_size, out_features) <= 0:
+        raise ValueError("projection_T dimensions must be positive")
+    if mlen % blen:
+        raise ValueError("projection_T requires MLEN divisible by BLEN")
+    if hidden_size % mlen:
+        raise ValueError("projection_T requires hidden_size divisible by MLEN")
+    if out_features % mlen:
+        raise ValueError(
+            "projection_T requires out_features physically padded to MLEN "
+            "so the final H_PREFETCH_M cannot cross the weight allocation"
+        )
+    physical_batch = ((batch + blen - 1) // blen) * blen
 
     w_actual_register = alive_registers[0]
     w_temp_register = alive_registers[1]
@@ -314,6 +326,9 @@ def projection_T_asm(
 
     lines = ["; Projection_T Generation (act @ weight.T)"]
     lines.append(f"; Linear T: (batch, {in_features}) @ ({out_features}, {in_features})^T -> (batch, {out_features})")
+    lines.append(
+        f"; Active rows={batch}, physical rows={physical_batch}; caller must zero padded inputs and ignore padded results"
+    )
 
     # Scale = total weight size, Stride = in_features (row stride of weight in HBM)
     lines.extend(_load_large_int(act_reg, in_features * out_features))
@@ -349,7 +364,7 @@ def projection_T_asm(
             lines.append(
                 f"S_ADDI_INT gp{intermediate_register}, gp{result_reg}, {column_group * blen} "
             )
-        for act_col in range(batch // blen):
+        for act_col in range(physical_batch // blen):
             lines.extend(_load_large_int(act_reg, activation_base_address + act_col * mlen * blen))
             lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_actual_register}, 0 ")
             for inner_loop_index in range(hidden_size // mlen):
@@ -360,10 +375,10 @@ def projection_T_asm(
                 # dimension with out_features instead.
                 lines.append(f"M_TMM 0, gp{act_reg}, gp{w_temp_register} ")
                 lines.append(f"S_ADDI_INT gp{w_temp_register}, gp{w_temp_register}, {mlen * mlen} ")
-                lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * batch} ")
+                lines.append(f"S_ADDI_INT gp{act_reg}, gp{act_reg}, {mlen * physical_batch} ")
             lines.append(f"M_MM_WO gp{intermediate_register}, gp0, 0 ")
             lines.append(f"S_ADDI_INT gp{intermediate_register}, gp{intermediate_register}, {blen * mlen} ")
         if (weight_row + 1) % tiles_per_mlen == 0 and weight_row != out_features // blen - 1:
-            lines.append(f"S_ADDI_INT gp{result_reg}, gp{result_reg}, {mlen * batch} ")
+            lines.append(f"S_ADDI_INT gp{result_reg}, gp{result_reg}, {mlen * physical_batch} ")
 
     return "\n".join(lines) + "\n"

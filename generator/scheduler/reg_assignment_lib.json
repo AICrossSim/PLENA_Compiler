@@ -8,6 +8,7 @@
         "ffn_gate_offset"       : 6,
         "ffn_up_offset"         : 7,
         "ffn_down_offset"       : 8,
-        "previous_activation_offset"    : 9
+        "previous_activation_offset"    : 9,
+        "lm_head_weight_offset"         : 10
     }
 }

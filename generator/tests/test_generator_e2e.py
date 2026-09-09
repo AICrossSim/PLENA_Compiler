@@ -71,7 +71,7 @@ from assembler import AssemblyToBinary  # noqa: E402
 
 # Tools imports for HBM weight population (same stack create_mem_for_sim uses).
 sys.path.insert(0, str(_REPO_ROOT / "tools"))
-from memory_mapping.memory_map import map_mx_data_to_hbm_for_behave_sim  # noqa: E402
+from memory_mapping.behave_sim import map_mx_data_to_hbm_for_behave_sim  # noqa: E402
 from memory_mapping.rand_gen import RandomMxfpTensorGenerator  # noqa: E402
 from utils.load_config import load_toml_config  # noqa: E402
 
@@ -105,16 +105,19 @@ def _build_hbm_from_hf_weights(
         ffn_gate       (layer_0 gate_proj.weight, transposed)
         ffn_up         (layer_0 up_proj.weight, transposed)
         ffn_down       (layer_0 down_proj.weight, transposed)
-        lm_head        (lm_head.weight, transposed — if present and untied)
+        lm_head        (native row-major lm_head.weight — if present and untied)
 
     nn.Linear stores (out_features, in_features); PLENA expects (in, out),
-    so we transpose.
+    so ordinary projections are transposed. The LM head uses projection_T_asm
+    and therefore keeps its native (vocab, hidden) layout.
 
     Returns: dict with per-weight {offset, bytes, shape} for logging.
     """
     plena_toml = _REPO_ROOT / "plena_settings.toml"
-    precision = load_toml_config(str(plena_toml), "PRECISION")
-    config = load_toml_config(str(plena_toml), "CONFIG")
+    precision = load_toml_config(
+        str(plena_toml), "PRECISION", mode="TRANSACTIONAL"
+    )
+    config = load_toml_config(str(plena_toml), "CONFIG", mode="TRANSACTIONAL")
 
     quant_config = {
         "exp_width": precision["HBM_V_ACT_TYPE"]["ELEM"]["exponent"],
@@ -208,7 +211,25 @@ def _build_hbm_from_hf_weights(
     if lm_head is not None and hasattr(lm_head, "weight"):
         # Skip if tied to embedding — weights id-match means shared tensor.
         if embed is None or lm_head.weight.data_ptr() != embed.weight.data_ptr():
-            to_write.append(("lm_head", lm_head.weight.detach().T.contiguous()))
+            # projection_T_asm consumes native row-major (vocab, hidden).
+            native_weight = lm_head.weight.detach().contiguous()
+            mlen = int(config["MLEN"]["value"])
+            padded_vocab = ((native_weight.shape[0] + mlen - 1) // mlen) * mlen
+            padded_hidden = ((native_weight.shape[1] + mlen - 1) // mlen) * mlen
+            if (
+                padded_vocab != native_weight.shape[0]
+                or padded_hidden != native_weight.shape[1]
+            ):
+                padded_weight = torch.zeros(
+                    (padded_vocab, padded_hidden),
+                    dtype=native_weight.dtype,
+                    device=native_weight.device,
+                )
+                padded_weight[
+                    : native_weight.shape[0], : native_weight.shape[1]
+                ].copy_(native_weight)
+                native_weight = padded_weight
+            to_write.append(("lm_head", native_weight))
 
     # Start with an empty file. Weights are appended sequentially starting
     # at offset 0.  The file is padded to the emulator's required size after

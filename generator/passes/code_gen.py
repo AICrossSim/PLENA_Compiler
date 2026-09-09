@@ -26,6 +26,8 @@ from asm_templates import (
     im2col_asm_no_shift,
     layer_norm_asm,
     lm_head_asm,
+    lm_head_hidden_padding,
+    lm_head_vocab_padding,
     preload_addr_reg_asm,
     projection_asm,
     rms_norm_asm,
@@ -735,6 +737,10 @@ def _generate_addr_reg_init(
     num_heads = model_info.get("num_attention_heads", 4)
     num_kv_heads = model_info.get("num_key_value_heads", num_heads)
     head_dim = model_info.get("head_dim", hidden_size // num_heads)
+    mlen = int(hardware_config.get("MLEN", 64))
+    blen = int(hardware_config.get("BLEN", 4))
+    physical_vocab_size = lm_head_vocab_padding(vocab_size, blen, mlen)
+    physical_hidden_size = lm_head_hidden_padding(hidden_size, mlen)
 
     hbm_addr_reg = scheduler["register_assignment"].get("hbm_addr_reg", {})
 
@@ -749,6 +755,12 @@ def _generate_addr_reg_init(
         ("ffn_gate", hidden_size, intermediate_size, "ffn_gate_offset"),
         ("ffn_up", hidden_size, intermediate_size, "ffn_up_offset"),
         ("ffn_down", intermediate_size, hidden_size, "ffn_down_offset"),
+        (
+            "lm_head",
+            physical_vocab_size,
+            physical_hidden_size,
+            "lm_head_weight_offset",
+        ),
     ]
 
     # Compute cumulative offsets
@@ -770,9 +782,16 @@ def _generate_addr_reg_init(
 
     code = "\n; --- HBM address register initialization ---\n"
     code += f"; Total HBM weight footprint: {offset} bytes ({offset / 1024:.1f} KiB)\n"
+    scratch_registers = [9, 10, 11, 12, 13, 14, 15]
     code += preload_addr_reg_asm(
         addr_reg_to_set=addr_regs_to_set,
-        available_registers=[9, 10, 11, 12, 13, 14, 15][: len(addr_regs_to_set)],
+        # Each address is committed before the next constant is loaded, so a
+        # scratch GP register can be reused when more than seven HBM bases are
+        # initialized.
+        available_registers=[
+            scratch_registers[index % len(scratch_registers)]
+            for index in range(len(addr_regs_to_set))
+        ],
         addr_reg_val=addr_reg_vals,
     )
     return code
