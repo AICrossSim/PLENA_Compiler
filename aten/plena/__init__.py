@@ -12,6 +12,11 @@ from compiler.aten.plena.packed_kv import (
     resolve_packed_kv_append,
     validate_selector_lowering,
 )
+from compiler.aten.plena.program_routed_moe import (
+    MOE_STAGE_MARKER_PREFIX,
+    ProgramRoutedMoeMixin,
+    moe_stage_marker,
+)
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
 
 __all__ = [
@@ -24,12 +29,15 @@ __all__ = [
     "InputVar",
     "IsaCompiler",
     "MemoryStateMixin",
+    "MOE_STAGE_MARKER_PREFIX",
     "PackedKVAppendAddress",
     "PackedKVAblation",
     "PackedKVLayout",
     "PlenaCompiler",
+    "ProgramRoutedMoeMixin",
     "TensorVar",
     "VRAMMatrixVar",
     "resolve_packed_kv_append",
+    "moe_stage_marker",
     "validate_selector_lowering",
 ]

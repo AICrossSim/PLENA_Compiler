@@ -3489,6 +3489,12 @@ def compile_native_hf_decoder(
         raise ValueError("decode context is only valid with an external PackedKV cache")
 
     model_cfg = extract_model_config(model)
+    if model_cfg.model_type == "qwen3_moe":
+        raise NotImplementedError(
+            "native Qwen3-MoE frontend execution is blocked: the 48-layer "
+            "attention-to-runtime-MoE dataflow and complete layer transaction "
+            "parity are not yet wired; dense FFN fallback is forbidden"
+        )
     if hidden_size is not None and hidden_size != model_cfg.hidden_size:
         raise ValueError(
             f"compile_native_hf_decoder supports native hidden size only: "

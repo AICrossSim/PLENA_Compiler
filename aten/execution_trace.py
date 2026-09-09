@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Mapping, Sequence
@@ -1405,6 +1406,11 @@ def build_request_memory_trace(
 
     if vector_prefetch_amount <= 0 or vector_store_amount <= 0:
         raise ValueError("vector DMA amounts must be positive")
+    env_limit = os.environ.get("PLENA_TRACE_MAX_DYNAMIC_INSTRUCTIONS")
+    if env_limit is not None:
+        # Opt-in ceiling raise for large trace-only compiles; the default
+        # fail-closed limit is unchanged when the variable is unset.
+        max_dynamic_instructions = max(int(env_limit), max_dynamic_instructions)
     if max_dynamic_instructions <= 0:
         raise ValueError("dynamic instruction limit must be positive")
     tensor_metadata = tuple(tensors)
