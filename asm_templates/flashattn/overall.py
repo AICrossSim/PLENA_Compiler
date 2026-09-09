@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import os
+
+
+def _pipelined_decode_enabled() -> bool:
+    """Ablation knob: PLENA_DISABLE_PIPELINED_DECODE=1 reverts decode to the
+    at-use prefetch placement (same instructions, later issue points)."""
+    return os.environ.get("PLENA_DISABLE_PIPELINED_DECODE") != "1"
+
 """Main Flash Attention assembly code generation - orchestrates all components."""
 
 from .._imm import load_large_int_str as _load_large_int
@@ -178,7 +186,9 @@ def _kv_head_reuse_body(
     # Decode has one complete query tile per iteration. Prefetch K before the
     # first QK product, issue V once that product releases the DMA engine, and
     # overlap V with online softmax. The next K then overlaps row finalization.
-    pipelined_decode = q_seq_iteration_number == 1
+    pipelined_decode = (
+        q_seq_iteration_number == 1 and _pipelined_decode_enabled()
+    )
     iteration_count = len(row_tile_starts) * k_seq_iteration_number
     iteration_index = 0
     if pipelined_decode and iteration_count:
@@ -498,7 +508,9 @@ def flash_attn_asm(
     # The pipelined schedule is valid whenever one (kv head, kv tile) iteration
     # contains the entire q loop (q_seq == 1). Long-q prefill (q_seq > 1) keeps
     # the original at-use prefetch placement.
-    pipelined_decode = q_seq_iteration_number == 1
+    pipelined_decode = (
+        q_seq_iteration_number == 1 and _pipelined_decode_enabled()
+    )
 
     # Query-row tiling bounds the softmax state. The emitter walks
     # (kv head, row tile, key tile); when every query row is intentionally bound

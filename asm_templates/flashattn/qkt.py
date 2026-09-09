@@ -86,6 +86,8 @@ def qkt_multiply(
         # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
         # When stride < 64 elements, strided access causes unaligned HBM reads
         # Parameter order: rd, rs1, rs2, rstride(stride_en), funct1(scale_en)
+        # Ledger tag so at-use issue stays attributable in the read ledger.
+        generated_code += f"; Pipelined K prefetch for KV head {k_head_index} at use\n"
         generated_code += f"H_PREFETCH_M gp0, gp{k_base_register}, a{k_base_hbm_offset_reg}, 0, 1 \n"
 
     if use_batched:

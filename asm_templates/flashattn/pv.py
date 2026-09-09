@@ -76,6 +76,8 @@ def computing_pv_code(
         generated_code += _load_large_int(v_base_register, v_hbm_offset)
         generated_code += _load_large_int(out_base_register, v_msram_base)
         # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
+        # Ledger tag so at-use issue stays attributable in the read ledger.
+        generated_code += f"; Pipelined V prefetch for KV head {v_head_index} at use\n"
         generated_code += f"H_PREFETCH_M gp{out_base_register}, gp{v_base_register}, a{v_base_hbm_offset_reg}, 0, 1 \n"
 
     # P address for this head's softmax scores
