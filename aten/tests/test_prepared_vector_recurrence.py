@@ -35,3 +35,21 @@ def test_pairwise_kda_uses_only_ordinary_isa_and_fits_existing_sram():
         lower_prepared_vector_recurrence(KIMI_KDA, groups, vector_sram_rows=14, **kwargs)
     with pytest.raises(ValueError, match="exclusive"):
         lower_prepared_vector_recurrence(KIMI_KDA, groups, experimental_fp32_dot=True, **kwargs)
+
+
+def test_invariant_mamba_decay_reuses_one_existing_row_and_preserves_arithmetic():
+    fields = {name: (i + 2) * 1048576 for i, name in enumerate(("x", "a", "b", "c", "d", "dt", "zero", "output"))}
+    groups = tuple(PreparedVectorGroup(i * 524288, fields) for i in range(2))
+    base = lower_prepared_vector_recurrence(NEMOTRON_MAMBA, groups, static_address_reuse=True)
+    cached = lower_prepared_vector_recurrence(NEMOTRON_MAMBA, groups, static_address_reuse=True,
+                                              mamba_decay_row_invariant=True, vector_sram_rows=9)
+    assert base.count("H_PREFETCH_V") - cached.count("H_PREFETCH_V") == 254
+    for op in ("V_ADD_VV", "V_MUL_VV", "H_STORE_V"):
+        assert base.count(op) == cached.count(op)
+    assert "L_TILE" not in cached and "V_DOT" not in cached
+    with pytest.raises(ValueError, match="nine existing"):
+        lower_prepared_vector_recurrence(NEMOTRON_MAMBA, groups, mamba_decay_row_invariant=True,
+                                         vector_sram_rows=8)
+    from compiler.aten.plena.matrix_recurrence_lowering import KIMI_KDA
+    with pytest.raises(ValueError, match="Mamba producer"):
+        lower_prepared_vector_recurrence(KIMI_KDA, groups, mamba_decay_row_invariant=True)

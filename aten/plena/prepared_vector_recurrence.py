@@ -89,6 +89,7 @@ def lower_prepared_vector_recurrence(
     static_address_reuse: bool = False,
     experimental_fp32_dot: bool = False,
     pairwise_bf16_dot: bool = False,
+    mamba_decay_row_invariant: bool = False,
     vector_sram_rows: int = 64,
 ) -> str:
     """Emit BF16 row operations; reserve eight rows, or 15 for pairwise dots.
@@ -105,7 +106,16 @@ def lower_prepared_vector_recurrence(
     pairwise_bf16_dot instead changes only the compiler schedule: seven partial
     BF16 rows inside existing Vector SRAM, 15 reserved rows total (60 KiB at
     VLEN=2048), no new opcode, storage capacity, port or FP32 arithmetic state.
+    mamba_decay_row_invariant is an explicit producer contract: every row of
+    each group's prepared a field equals its first row. Keep that row in VRAM
+    row 8, requiring nine workspace rows. Arbitrary prepared recurrences must
+    leave this disabled; static_address_reuse alone does not imply invariance.
     """
+    if mamba_decay_row_invariant:
+        if spec.kind is not RecurrenceKind.MAMBA:
+            raise ValueError("row-invariant decay caching is a Mamba producer contract")
+        if vector_sram_rows < 9:
+            raise ValueError("cached Mamba decay requires nine existing Vector SRAM rows")
     if pairwise_bf16_dot:
         if experimental_fp32_dot:
             raise ValueError("pairwise BF16 and experimental FP32 are exclusive")
@@ -132,11 +142,14 @@ def lower_prepared_vector_recurrence(
             out.transfer(1, f["dt"])
             out.binary("MUL", 3, 2, 1)
             out.binary("ADD", 4, 7, 7)
+            if mamba_decay_row_invariant:
+                out.transfer(8, f["a"])
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
                 out.transfer(0, group.state_base + offset)
-                out.transfer(1, f["a"] + offset)
-                out.binary("MUL", 0, 0, 1)
+                if not mamba_decay_row_invariant:
+                    out.transfer(1, f["a"] + offset)
+                out.binary("MUL", 0, 0, 8 if mamba_decay_row_invariant else 1)
                 out.transfer(1, f["b"] + offset)
                 out.binary("MUL", 5, 3, 1)
                 out.binary("ADD", 0, 0, 5)
