@@ -22,6 +22,7 @@ def computing_pv_code(
     head_offset: int,
     v_msram_base: int = 0,  # MSRAM base address for V (can be 0, prefetched after K is used)
     rows: int | None = None,
+    v_tile_offset: int = 0,
 ) -> str:
     """
     Compute PV = P @ V and write directly to packed output format.
@@ -43,6 +44,8 @@ def computing_pv_code(
         output_base_address: base address for packed output
         head_offset: offset within each row for this head (= q_head_index * head_dim)
         v_msram_base: MSRAM base address for V (can be 0 since K was already used)
+        v_tile_offset: element offset of this key tile in the V cache; the
+            head's window is added on top of it here
     """
     generated_code = "; PV Per KV Head Multiplication (packed output) \n"
     p_base_register = alive_registers[0]
@@ -56,7 +59,7 @@ def computing_pv_code(
     # NOTE: We ALWAYS prefetch V because K prefetch in qkt_multiply uses MSRAM 0,
     # which overwrites any previously prefetched V. Even though all heads share
     # the same V data (same KV head), we must re-prefetch after each K prefetch.
-    generated_code += _load_large_int(v_base_register, v_head_index * head_dim)
+    generated_code += _load_large_int(v_base_register, v_tile_offset + v_head_index * head_dim)
     # Use v_msram_base as MSRAM destination (can be 0 since K was already used)
     generated_code += _load_large_int(out_base_register, v_msram_base)
     # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues

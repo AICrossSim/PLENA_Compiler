@@ -1,6 +1,7 @@
 """QKT multiplication assembly code generation for Flash Attention."""
 
 from .._imm import load_large_int as _load_large_int
+from .._imm import load_large_int_str as _load_large_int_str
 
 IMM2_BOUND = 2**18 - 1
 
@@ -16,6 +17,7 @@ def qkt_multiply(
     k_head_index: int,
     s_base_address: int = 0,
     s_head_offset: int = 0,
+    k_tile_offset: int = 0,
     use_batched: bool = True,
     blen: int = 4,
 ) -> str:
@@ -34,6 +36,9 @@ def qkt_multiply(
         k_head_index: KV-head index (used for HBM prefetch offset).
         s_base_address: scratch VRAM base for S tiles.
         s_head_offset: relative head offset (0..ratio-1) for S writeback.
+        k_tile_offset: element offset of this key tile in the K cache. The
+            caller advances it by one MLEN-row tile per key iteration; the
+            head's HLEN window is added on top of it here.
         use_batched: True  → emit M_BTMM + M_BMM_WO  (ratio == blen path).
                      False → emit per-head M_TMM + M_MM_WO loop.
         blen: hardware systolic block length (needed for M_TMM loop counts).
@@ -58,7 +63,9 @@ def qkt_multiply(
 
     # Prefetch K from HBM (shared by both batched and per-head paths)
     generated_code += f"S_ADDI_INT gp{q_base_register}, gp0, {q_base_address + q_head_index * d} \n"
-    generated_code += f"S_ADDI_INT gp{k_base_register}, gp0, {k_head_index * d} \n"
+    # The tile offset plus the head window exceeds the 18-bit immediate once
+    # the cache is a few tiles long, so load it through the large-int helper.
+    generated_code += _load_large_int_str(k_base_register, k_tile_offset + k_head_index * d)
 
     # Use stride_en=0 for contiguous prefetch to avoid 64-byte alignment issues
     # When stride < 64 elements, strided access causes unaligned HBM reads
