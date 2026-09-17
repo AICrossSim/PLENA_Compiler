@@ -61,6 +61,10 @@ def flash_attn_asm(
     # Iteration Settings
     q_seq_iteration_number = (q_len + mlen - 1) // mlen
     k_seq_iteration_number = (kv_len + mlen - 1) // mlen
+    # A K/V cache row carries every KV head's window, padded to MLEN. This is
+    # the row width reset_kv_prefetch programs into the stride register, so a
+    # key tile of MLEN rows is mlen * kv_row_elements elements long.
+    kv_row_elements = mlen if hkv * d < mlen else hkv * d
     q_index_2_kv_index_ratio = hq // hkv
     broadcast_amount = blen if broadcast_amount is None else broadcast_amount
 
@@ -140,8 +144,13 @@ def flash_attn_asm(
         )
 
         # loop over per kv head kv_len // MLEN
-        for _ in range(k_seq_iteration_number):
+        for k_tile_index in range(k_seq_iteration_number):
             print(f" Computing {q_index_2_kv_index_ratio} Q heads for KV head {kv_head_index} in GQA mode")
+
+            # Where this key tile starts in the K and V caches. The prefetches
+            # below add the head window to it; without the tile term every
+            # iteration re-read the first MLEN keys of the cache.
+            kv_tile_offset = k_tile_index * mlen * kv_row_elements
 
             # Reset m_fp_sram_start_address for each iteration
             m_fp_sram_start_address = fp_sram_start_address
@@ -214,6 +223,7 @@ def flash_attn_asm(
                         k_head_index=kv_head_index,
                         s_base_address=s_base_address,
                         s_head_offset=0,
+                        k_tile_offset=kv_tile_offset,
                         use_batched=True,
                         blen=blen,
                     )
@@ -237,6 +247,7 @@ def flash_attn_asm(
                             k_head_index=kv_head_index,
                             s_base_address=s_base_address,
                             s_head_offset=0,  # single S tile, always at offset 0
+                            k_tile_offset=kv_tile_offset,
                             use_batched=False,
                             blen=blen,
                         )
@@ -283,6 +294,7 @@ def flash_attn_asm(
                         v_base_hbm_offset_reg=v_base_hbm_offset_reg,
                         q_head_index=inner_q_head_index,
                         v_head_index=kv_head_index,
+                        v_tile_offset=kv_tile_offset,
                         output_base_address=pv_base_address,
                         head_offset=inner_q_head_index,  # This head's position within the row
                         rows=br,
