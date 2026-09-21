@@ -76,6 +76,19 @@ class LTilePrimitive(IntEnum):
     # generic outer/rank-1 update used by linear recurrences.
     OUTER_UPDATE = 2
 
+    # v2 fused delta update: dst - delta*dst + b*src. Scale pairs are
+    # BF16 (delta, b), every input is BF16, internal operations are FP32.
+    # The state store alone rounds to BF16. This does not change forms 0-2.
+    DELTA_UPDATE = 3
+
+    # Explicit, bounded reduction lifetime. These interfaces are shared by
+    # scalar row control and the descriptor walker in the v2 comparison.
+    REDUCE_BEGIN = 4
+    REDUCE_ACC = 5
+    DECAY_REDUCE_ACC = 6
+    REDUCE_WRITE = 7
+    RESIDUAL_WRITE = 8
+
 
 class MatrixViewAxis(IntEnum):
     """Logical line direction selected by an ``L_TILE.EXEC`` operand.

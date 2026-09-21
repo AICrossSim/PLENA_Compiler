@@ -813,6 +813,11 @@ def _l_tile_exec_packets(
         ) from error
     dst, source, scales = descriptors
     primitive = LTilePrimitive(int(operands[3], 0))
+    if int(primitive) >= int(LTilePrimitive.DELTA_UPDATE):
+        raise ValueError(
+            "DELTA_UPDATE requires the v2 Rust lane/service model; "
+            "legacy analytic packet timing is not valid for this primitive"
+        )
     axis_mask = int(operands[4], 0) if len(operands) == 5 else 0
     if not 0 <= axis_mask <= 3:
         raise ValueError("L_TILE_EXEC axis mask must be in [0, 3]")

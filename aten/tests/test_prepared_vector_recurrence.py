@@ -53,3 +53,15 @@ def test_invariant_mamba_decay_reuses_one_existing_row_and_preserves_arithmetic(
     from compiler.aten.plena.matrix_recurrence_lowering import KIMI_KDA
     with pytest.raises(ValueError, match="Mamba producer"):
         lower_prepared_vector_recurrence(KIMI_KDA, groups, mamba_decay_row_invariant=True)
+
+
+def test_mamba_tree_does_not_alias_cached_decay_with_partial_sum():
+    fields = {name: (i+2)*1048576 for i,name in enumerate(("x","a","b","c","d","dt","zero","output"))}
+    groups = tuple(PreparedVectorGroup(i*524288,fields) for i in range(2))
+    options = dict(pairwise_bf16_dot=True,mamba_decay_row_invariant=True,static_address_reuse=True)
+    with pytest.raises(ValueError,match="16 Vector SRAM rows"):
+        lower_prepared_vector_recurrence(NEMOTRON_MAMBA,groups,vector_sram_rows=15,**options)
+    asm=lower_prepared_vector_recurrence(NEMOTRON_MAMBA,groups,vector_sram_rows=16,**options)
+    assert 'S_ADDI_INT gp1, gp0, 30720' in asm
+    assert asm.count('V_ADD_VV') == 2*(1+128+127+1)
+    assert 'L_TILE' not in asm and 'V_DOT' not in asm
