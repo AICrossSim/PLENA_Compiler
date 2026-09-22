@@ -45,7 +45,9 @@ def lower_delta_from_log(input_bases, output_bases, constants_base, *, mlen=2048
 DELTA_RATIONAL_CONSTANTS = (-1 / 16, 1 / 6, 1 / 2, 1, 2)
 
 
-def lower_delta_rational(input_bases, output_bases, constants_base, *, mlen=2048):
+def lower_delta_rational(
+    input_bases, output_bases, constants_base, *, mlen=2048, addend_bases=None
+):
     """Candidate for BF16 log-decay in [-32768,0], caller-checked domain.
 
     For t=-log/16, approximate exp(-t) by 1/(1+t+t*t/2+t*t*t/6).
@@ -53,14 +55,23 @@ def lower_delta_rational(input_bases, output_bases, constants_base, *, mlen=2048
     apply four doubling identities. This uses the existing reciprocal unit.
     It is not the accepted ideal-expm1 precision contract. Measure quality
     before selecting this producer. Constants own rows 16..20, scratch 21..23.
+
+    Optional addends form prepacked (delta, b) rows: input logs occupy even
+    positions with zero in odd positions; addends occupy odd positions with
+    zero in even positions. The caller must establish that layout. The addend
+    read and BF16 add are actual instructions, not a host-side coefficient
+    insertion. Input row 21 is dead when reused for this addend. Packing log
+    and b at the input boundary remains outside this producer.
     """
     if len(input_bases) != len(output_bases) or not input_bases:
         raise ValueError("one output row per nonempty input row is required")
+    if addend_bases is not None and len(addend_bases) != len(input_bases):
+        raise ValueError("one packed addend row per input row is required")
     out = _Emitter(mlen, True)
     out.lines.append("; @stage=recurrent_delta_rational_candidate")
     for i in range(len(DELTA_RATIONAL_CONSTANTS)):
         out.transfer(16 + i, constants_base + i * mlen * 2)
-    for source, destination in zip(input_bases, output_bases):
+    for index, (source, destination) in enumerate(zip(input_bases, output_bases)):
         out.transfer(21, source)
         out.binary("MUL", 21, 21, 16)
         out.binary("MUL", 22, 21, 17)
@@ -76,5 +87,8 @@ def lower_delta_rational(input_bases, output_bases, constants_base, *, mlen=2048
         for _ in range(4):
             out.binary("SUB", 23, 20, 22)
             out.binary("MUL", 22, 22, 23)
+        if addend_bases is not None:
+            out.transfer(21, addend_bases[index])
+            out.binary("ADD", 22, 22, 21)
         out.transfer(22, destination, store=True)
     return "\n".join(out.lines) + "\n"
