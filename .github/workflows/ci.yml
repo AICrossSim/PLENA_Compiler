@@ -172,6 +172,8 @@ jobs:
             aten/tests/test_kda_official_layer.py \
             aten/tests/test_l_stream_cfg.py \
             aten/tests/test_ltile_v2.py \
+            aten/tests/test_recurrent_gate_producer.py \
+            aten/tests/test_connected_layer_lowering.py \
             aten/tests/test_prepared_vector_recurrence.py \
             aten/tests/test_layout_planner.py \
             aten/tests/test_lstream_lowering.py \

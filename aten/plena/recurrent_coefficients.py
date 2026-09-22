@@ -117,9 +117,19 @@ def _sigmoid(out, row):
     _unary(out, "EXP", row, row)
 
 
-def _gate_emitter(rows, constants_base, mlen, vector_sram_rows, row_type, output_fields):
-    if type(mlen) is not int or type(vector_sram_rows) is not int or mlen < 32 or mlen % 32 or vector_sram_rows < 26:
-        raise ValueError("gate producer needs whole 32-element words and 26 Vector rows")
+def _gate_emitter(
+    rows, constants_base, mlen, vector_sram_rows, row_type, output_fields
+):
+    if (
+        type(mlen) is not int
+        or type(vector_sram_rows) is not int
+        or mlen < 32
+        or mlen % 32
+        or vector_sram_rows < 26
+    ):
+        raise ValueError(
+            "gate producer needs whole 32-element words and 26 Vector rows"
+        )
     if not rows or any(not isinstance(row, row_type) for row in rows):
         raise ValueError("nonempty, uniformly typed gate rows required")
     span = mlen * 2
@@ -129,16 +139,32 @@ def _gate_emitter(rows, constants_base, mlen, vector_sram_rows, row_type, output
     outputs = []
     for row in rows:
         for name, address in vars(row).items():
-            if type(address) is not int or address < 0 or address % 64 or address + span > 2**32:
-                raise ValueError("HBM rows require aligned, nonnegative 32-bit byte addresses")
-            (outputs if name in output_fields else inputs).append((address, address + span))
-    if not isinstance(constants_base, int) or constants_base < 0 or constants_base % 64 or inputs[0][1] > 2**32:
+            if (
+                type(address) is not int
+                or address < 0
+                or address % 64
+                or address + span > 2**32
+            ):
+                raise ValueError(
+                    "HBM rows require aligned, nonnegative 32-bit byte addresses"
+                )
+            (outputs if name in output_fields else inputs).append(
+                (address, address + span)
+            )
+    if (
+        not isinstance(constants_base, int)
+        or constants_base < 0
+        or constants_base % 64
+        or inputs[0][1] > 2**32
+    ):
         raise ValueError("invalid constants HBM range")
     # Reject aliases across the ENTIRE program, including a future row's input.
     # In-place operation needs a separate lifetime analysis, not a local check.
     for index, (start, end) in enumerate(outputs):
         if any(start < b and a < end for a, b in inputs + outputs[:index]):
-            raise ValueError("gate output aliases an input, constants, or another output")
+            raise ValueError(
+                "gate output aliases an input, constants, or another output"
+            )
     out = _Emitter(mlen, True)
     out.lines.append("; @stage=raw_gate_producer_bf16_rational_candidate")
     for index, row in enumerate((16, 17, 18, 19, 20, 24, 25)):
@@ -155,7 +181,9 @@ def lower_mamba_gate_rows(rows, constants_base, *, mlen=2048, vector_sram_rows=6
     Workspace rows 0..2 and 16..25; no dynamic allocation or added ISA.
     """
     rows = tuple(rows)
-    out = _gate_emitter(rows, constants_base, mlen, vector_sram_rows, MambaGateRow, {"dt", "delta"})
+    out = _gate_emitter(
+        rows, constants_base, mlen, vector_sram_rows, MambaGateRow, {"dt", "delta"}
+    )
     for row in rows:
         out.transfer(0, row.raw_dt)
         out.transfer(1, row.dt_bias)
@@ -176,7 +204,9 @@ def lower_kda_gate_rows(rows, constants_base, *, mlen=2048, vector_sram_rows=64)
     producers. Their outputs must not be silently substituted by this API.
     """
     rows = tuple(rows)
-    out = _gate_emitter(rows, constants_base, mlen, vector_sram_rows, KdaGateRow, {"delta", "beta"})
+    out = _gate_emitter(
+        rows, constants_base, mlen, vector_sram_rows, KdaGateRow, {"delta", "beta"}
+    )
     for row in rows:
         out.transfer(0, row.gate)
         out.transfer(1, row.dt_bias)
@@ -194,7 +224,9 @@ def lower_kda_gate_rows(rows, constants_base, *, mlen=2048, vector_sram_rows=64)
     return "\n".join(out.lines) + "\n"
 
 
-def lower_delta_rational(input_bases, output_bases, constants_base, *, mlen=2048, addend_bases=None):
+def lower_delta_rational(
+    input_bases, output_bases, constants_base, *, mlen=2048, addend_bases=None
+):
     """Candidate for BF16 log-decay in [-32768,0], caller-checked domain.
 
     For t=-log/16, approximate exp(-t) by 1/(1+t+t*t/2+t*t*t/6).
@@ -226,3 +258,361 @@ def lower_delta_rational(input_bases, output_bases, constants_base, *, mlen=2048
             out.binary("ADD", 22, 22, 21)
         out.transfer(22, destination, store=True)
     return "\n".join(out.lines) + "\n"
+
+
+@dataclass(frozen=True)
+class ConvStep:
+    """Four-tap depthwise convolution, tap-major BF16 history/weights in HBM.
+
+    Each channel block is a complete 2048-value row. History survives tokens;
+    newest projected input is read from its producer's output allocation.
+    """
+
+    input: int
+    history: int
+    weights: int
+    output: int
+    channels: int
+    bias: int | None = None
+
+
+def lower_conv_steps(steps, constants_base, *, mlen=2048):
+    """Four BF16 products, balanced BF16 adds, optional bias and SiLU.
+
+    This explicit per-instruction contract differs from the native FP32
+    convolution accumulation. No precomputed convolved inputs or free shifts.
+    Workspace: Vector rows 0..5, 24. History shifts are actual HBM stores.
+    """
+    steps = tuple(steps)
+    if not steps or mlen != 2048:
+        raise ValueError("nonempty conv steps at VLEN=2048 required")
+    regions = [(constants_base, constants_base + len(GATE_CONSTANTS) * mlen * 2)]
+    for step in steps:
+        if (
+            not isinstance(step, ConvStep)
+            or type(step.channels) is not int
+            or step.channels < 1
+        ):
+            raise ValueError("positive channel count required")
+        size = (step.channels + mlen - 1) // mlen * mlen * 2
+        for name, address, span in (
+            ("input", step.input, size),
+            ("history", step.history, 4 * size),
+            ("weights", step.weights, 4 * size),
+            ("output", step.output, size),
+        ):
+            if (
+                type(address) is not int
+                or address < 0
+                or address % 64
+                or address + span > 2**32
+            ):
+                raise ValueError("invalid convolution HBM region")
+            regions.append((address, address + span))
+        if step.bias is not None:
+            if (
+                type(step.bias) is not int
+                or step.bias < 0
+                or step.bias % 64
+                or step.bias + size > 2**32
+            ):
+                raise ValueError("invalid bias region")
+            regions.append((step.bias, step.bias + size))
+        local = [
+            (step.input, step.input + size),
+            (step.weights, step.weights + 4 * size),
+            (constants_base, constants_base + len(GATE_CONSTANTS) * mlen * 2),
+        ]
+        if step.bias is not None:
+            local.append((step.bias, step.bias + size))
+        if any(a < step.history + 4 * size and step.history < b for a, b in local):
+            raise ValueError("history aliases immutable operands")
+        if any(
+            a < step.output + size and step.output < b
+            for a, b in local + [(step.history, step.history + 4 * size)]
+        ):
+            raise ValueError("output aliases live convolution operands")
+    if (
+        type(constants_base) is not int
+        or constants_base < 0
+        or constants_base % 64
+        or regions[0][1] > 2**32
+    ):
+        raise ValueError("invalid constant region")
+    out = _Emitter(mlen, True)
+    out.lines.append("; @stage=causal_conv4_bf16_tree_silu")
+    out.transfer(24, constants_base + 5 * mlen * 2)  # -1 for stable sigmoid
+    for step in steps:
+        blocks = (step.channels + mlen - 1) // mlen
+        span = blocks * mlen * 2
+        for block in range(blocks):
+            offset = block * mlen * 2
+            for tap in range(4):
+                source = (
+                    step.input + offset
+                    if tap == 3
+                    else step.history + (tap + 1) * span + offset
+                )
+                out.transfer(0, source)
+                out.transfer(0, step.history + tap * span + offset, store=True)
+                out.transfer(1, step.weights + tap * span + offset)
+                out.binary("MUL", 2 + tap, 0, 1)
+            out.binary("ADD", 2, 2, 3)
+            out.binary("ADD", 4, 4, 5)
+            out.binary("ADD", 2, 2, 4)
+            if step.bias is not None:
+                out.transfer(1, step.bias + offset)
+                out.binary("ADD", 2, 2, 1)
+            # Preserve the preactivation in row 2 while sigmoid runs in row 3.
+            out.binary("MUL", 3, 2, 24)
+            _unary(out, "SOFTPLUS", 3, 3)
+            out.binary("MUL", 3, 3, 24)
+            _unary(out, "EXP", 3, 3)
+            out.binary("MUL", 2, 2, 3)
+            out.transfer(2, step.output + offset, store=True)
+    return "\n".join(out.lines) + "\n"
+
+
+@dataclass(frozen=True)
+class L2NormRows:
+    input: int
+    output: int
+    channels: int
+    masks: int
+    zero: int
+    # FP SRAM slots: epsilon, output scale (1 for k, 1/sqrt(width) for q).
+    epsilon_slot: int = 0
+    scale_slot: int = 1
+    width: int = 128
+
+
+def lower_l2norm_rows(p: L2NormRows, *, mlen=2048):
+    """Head-local BF16 square/tree/scalar sqrt/reciprocal and scale.
+
+    All masks are static constants, not prepared norms. Each logical head is
+    reduced separately using existing Vector and scalar instructions. The
+    conservative schedule recomputes no values on the host and needs six rows.
+    """
+    if (
+        mlen != 2048
+        or p.width not in (32, 64, 128, 256, 512, 1024, 2048)
+        or p.channels < 1
+        or p.channels % p.width
+    ):
+        raise ValueError("normalization needs complete power-of-two groups")
+    span = (p.channels + mlen - 1) // mlen * mlen * 2
+    regions = [
+        (p.input, span),
+        (p.output, span),
+        (p.masks, (mlen // p.width) * mlen * 2),
+        (p.zero, mlen * 2),
+    ]
+    for i, (a, n) in enumerate(regions):
+        if type(a) is not int or a < 0 or a % 64 or a + n > 2**32:
+            raise ValueError("invalid norm allocation")
+        if any(a < b + m and b < a + n for b, m in regions[:i]):
+            raise ValueError("norm allocations overlap")
+    if not 0 <= p.epsilon_slot < 512 or not 0 <= p.scale_slot < 512:
+        raise ValueError("norm constants exceed existing FP SRAM")
+    e = _Emitter(mlen, True)
+    e.lines.append("; @stage=qk_l2norm_bf16_tree_candidate")
+    e.address(4, 0)
+    e.lines.extend(
+        [f"S_LD_FP f2, gp4, {p.epsilon_slot}", f"S_LD_FP f3, gp4, {p.scale_slot}"]
+    )
+    for start in range(0, p.channels, mlen):
+        e.transfer(0, p.input + start * 2)
+        e.transfer(5, p.zero)
+        for head in range(min(mlen // p.width, (p.channels - start) // p.width)):
+            e.transfer(1, p.masks + head * mlen * 2)
+            e.binary("MUL", 2, 0, 1)
+            e.binary("MUL", 3, 2, 2)
+            e.address(1, 3 * mlen)
+            e.lines.extend(
+                [
+                    "S_SUB_FP f1, f0, f0",
+                    "V_RED_SUM f1, gp1, 0",
+                    "S_ADD_FP f1, f1, f2",
+                    "S_SQRT_FP f1, f1, 0",
+                    "S_RECI_FP f1, f1, 0",
+                    "S_MUL_FP f1, f1, f3",
+                ]
+            )
+            e.address(1, 4 * mlen)
+            e.address(2, 2 * mlen)
+            e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+            e.binary("ADD", 5, 5, 4)
+        e.transfer(5, p.output + start * 2, store=True)
+    return "\n".join(e.lines) + "\n"
+
+
+def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048):
+    """Correctness-first software packing using existing scalar/Vector ISA.
+
+    sources[i] is None (zero) or (aligned HBM row base, lane). A one-hot mask,
+    BF16 tree reduction, and scalar multiply copy each live element exactly.
+    It uses no FP SRAM staging, arbitrary SRAM gather port, or host-produced
+    intermediate. Expensive; not a claim of the optimal software baseline.
+    Full destination rows are owned by caller. Vector workspace rows 0..6.
+    """
+    sources = tuple(sources)
+    if mlen != 2048 or not sources:
+        raise ValueError("nonempty VLEN=2048 gather required")
+    span = (len(sources) + mlen - 1) // mlen * mlen * 2
+    for a, n in ((destination, span), (zero, mlen * 2), (one_hot, mlen * 2)):
+        if type(a) is not int or a < 0 or a % 64 or a + n > 2**32:
+            raise ValueError("invalid gather allocation")
+    reads = [(zero, zero + mlen * 2), (one_hot, one_hot + mlen * 2)]
+    for src in sources:
+        if src is None:
+            continue
+        if len(src) != 2 or any(type(v) is not int for v in src):
+            raise ValueError("source must be an HBM row/lane pair")
+        a, lane = src
+        if a < 0 or a % 64 or a + mlen * 2 > 2**32 or not 0 <= lane < mlen:
+            raise ValueError("gather source out of range")
+        reads.append((a, a + mlen * 2))
+    if any(a < destination + span and destination < b for a, b in reads):
+        raise ValueError("gather destination aliases a source")
+    e = _Emitter(mlen, True)
+    e.lines.append("; @stage=software_coefficient_gather_reference")
+    e.transfer(6, one_hot)
+    loaded = None
+
+    def shift(dst, index):
+        e.address(1, dst * mlen)
+        e.address(2, 6 * mlen)
+        e.address(3, index)
+        e.lines.append("V_SHFT_V gp1, gp2, gp3")
+
+    for first in range(0, len(sources), mlen):
+        e.transfer(5, zero)
+        for index, src in enumerate(sources[first : first + mlen]):
+            if src is None:
+                continue
+            address, lane = src
+            if loaded != address:
+                e.transfer(0, address)
+                loaded = address
+            shift(1, lane)
+            e.binary("MUL", 2, 0, 1)
+            e.address(1, 2 * mlen)
+            e.lines.extend(["S_SUB_FP f1, f0, f0", "V_RED_SUM f1, gp1, 0"])
+            shift(3, index)
+            e.address(1, 4 * mlen)
+            e.address(2, 3 * mlen)
+            e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+            e.binary("ADD", 5, 5, 4)
+        e.transfer(5, destination + first * 2, store=True)
+    return "\n".join(e.lines) + "\n"
+
+
+def lower_global_rms(
+    input_base,
+    weight_base,
+    output_base,
+    channels,
+    *,
+    epsilon_slot=0,
+    scale_slot=1,
+    mlen=2048,
+):
+    """Whole hidden vector RMS: BF16 row trees and scalar inter-row sum.
+
+    FP slots hold channels*epsilon and sqrt(channels). Input and weight tail
+    lanes MUST be zero, and allocations include complete Vector rows. No
+    source/output overlap is allowed. Existing scalar precision stays BF16.
+    """
+    if type(channels) is not int or channels < 1 or mlen != 2048:
+        raise ValueError("invalid RMS shape")
+    span = (channels + mlen - 1) // mlen * mlen * 2
+    regions = [(input_base, span), (weight_base, span), (output_base, span)]
+    for i, (a, n) in enumerate(regions):
+        if type(a) is not int or a < 0 or a % 64 or a + n > 2**32:
+            raise ValueError("invalid RMS allocation")
+        if any(a < b + m and b < a + n for b, m in regions[:i]):
+            raise ValueError("RMS allocations overlap")
+    if not 0 <= epsilon_slot < 512 or not 0 <= scale_slot < 512:
+        raise ValueError("invalid FP constant slot")
+    e = _Emitter(mlen, True)
+    e.lines.append("; @stage=global_rms_bf16_tree_candidate")
+    e.address(4, 0)
+    e.lines.extend(
+        [
+            f"S_LD_FP f2, gp4, {epsilon_slot}",
+            f"S_LD_FP f3, gp4, {scale_slot}",
+            "S_SUB_FP f1, f0, f0",
+        ]
+    )
+    for first in range(0, channels, mlen):
+        e.transfer(0, input_base + first * 2)
+        e.binary("MUL", 1, 0, 0)
+        e.address(1, mlen)
+        e.lines.append("V_RED_SUM f1, gp1, 0")
+    e.lines.extend(
+        [
+            "S_ADD_FP f1, f1, f2",
+            "S_SQRT_FP f1, f1, 0",
+            "S_RECI_FP f1, f1, 0",
+            "S_MUL_FP f1, f1, f3",
+        ]
+    )
+    for first in range(0, channels, mlen):
+        e.transfer(0, input_base + first * 2)
+        e.address(1, mlen)
+        e.address(2, 0)
+        e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+        e.transfer(2, weight_base + first * 2)
+        e.binary("MUL", 1, 1, 2)
+        e.transfer(1, output_base + first * 2, store=True)
+    return "\n".join(e.lines) + "\n"
+
+
+def lower_pointwise_rows(
+    input_base,
+    other_base,
+    output_base,
+    rows,
+    *,
+    sigmoid_input=False,
+    constants_base=None,
+    mlen=2048,
+):
+    """Elementwise product, optionally sigmoid(input)*other, using real rows."""
+    if type(rows) is not int or rows < 1 or mlen != 2048:
+        raise ValueError("invalid row count")
+    span = rows * mlen * 2
+    regions = [(input_base, span), (other_base, span), (output_base, span)]
+    if sigmoid_input:
+        if constants_base is None:
+            raise ValueError("sigmoid requires static constants")
+        regions.append((constants_base, len(GATE_CONSTANTS) * mlen * 2))
+    if any(type(a) is not int or a < 0 or a % 64 or a + n > 2**32 for a, n in regions):
+        raise ValueError("invalid pointwise allocation")
+    # Exact in-place rows are safe: both operands are read before the store.
+    # Partial overlap can overwrite a future input row and must be rejected.
+    for source in (input_base, other_base):
+        if (
+            source != output_base
+            and source < output_base + span
+            and output_base < source + span
+        ):
+            raise ValueError("pointwise output partially overlaps a live input")
+    if (
+        sigmoid_input
+        and constants_base < output_base + span
+        and output_base < constants_base + len(GATE_CONSTANTS) * mlen * 2
+    ):
+        raise ValueError("pointwise output overlaps static constants")
+    e = _Emitter(mlen, True)
+    e.lines.append("; @stage=pointwise_gate_product")
+    if sigmoid_input:
+        e.transfer(24, constants_base + 5 * mlen * 2)
+    for r in range(rows):
+        e.transfer(0, input_base + r * mlen * 2)
+        if sigmoid_input:
+            _sigmoid(e, 0)
+        e.transfer(1, other_base + r * mlen * 2)
+        e.binary("MUL", 0, 0, 1)
+        e.transfer(0, output_base + r * mlen * 2, store=True)
+    return "\n".join(e.lines) + "\n"
