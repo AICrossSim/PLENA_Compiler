@@ -8,6 +8,169 @@ from dataclasses import dataclass
 
 from compiler.aten.plena.prepared_vector_recurrence import _Emitter
 
+
+class CompactCoefficientLoader:
+    """Ordinary-ISA broadcast with finite, explicitly loaded Vector storage.
+
+    mappings[(field,row)] lists (HBM row, source lane, destination first, count).
+    The supplied static masks contain ones over each destination interval and
+    zero elsewhere. Dynamic coefficients are cached once per recurrent group.
+    Rows 0..15 belong to the recurrence, 16..57 cache data/masks, 58 holds a
+    one-hot constant, 59..61 are scratch. No Matrix view or fused arithmetic.
+    """
+
+    def __init__(self, mappings, mask_addresses, one_hot):
+        self.mappings = mappings
+        self.masks = dict(mask_addresses)
+        sources = sorted({a for entries in mappings.values() for a, _, _, _ in entries})
+        intervals = sorted({(start, count) for entries in mappings.values() for _, _, start, count in entries})
+        if set(intervals) != set(self.masks) or len(sources) + len(intervals) > 42:
+            raise ValueError("compact coefficient cache exceeds 42 existing Vector rows or masks missing")
+        self.source_rows = {a: 16 + i for i, a in enumerate(sources)}
+        self.mask_rows = {key: 16 + len(sources) + i for i, key in enumerate(intervals)}
+        self.one_hot = one_hot
+        for entries in mappings.values():
+            occupied = set()
+            for a, lane, start, count in entries:
+                if a % 64 or not 0 <= lane < 2048 or not 0 <= start < start + count <= 2048:
+                    raise ValueError("invalid compact coefficient range")
+                target = set(range(start, start + count))
+                if occupied & target:
+                    raise ValueError("coefficient destinations overlap")
+                occupied |= target
+            if len(occupied) != 2048:
+                raise ValueError("expanded coefficient must cover the complete row")
+
+    def prepare(self, out):
+        for address, row in self.source_rows.items():
+            out.transfer(row, address)
+        for key, row in self.mask_rows.items():
+            out.transfer(row, self.masks[key])
+        out.transfer(58, self.one_hot)
+
+    def load(self, out, name, index, target):
+        if not 0 <= target < 16:
+            raise ValueError("coefficient destination aliases cache")
+        out.binary("ADD", target, 7, 7)
+        for address, lane, start, count in self.mappings[name, index]:
+            out.address(1, 59 * 2048)
+            out.address(2, 58 * 2048)
+            out.address(3, lane)
+            out.lines.append("V_SHFT_V gp1, gp2, gp3")
+            out.binary("MUL", 60, self.source_rows[address], 59)
+            out.address(1, 60 * 2048)
+            out.lines.extend(["S_SUB_FP f1, f0, f0", "V_RED_SUM f1, gp1, 0"])
+            out.address(1, 61 * 2048)
+            out.address(2, self.mask_rows[start, count] * 2048)
+            out.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+            out.binary("ADD", target, target, 61)
+
+
+def lower_softmax_rows(source, temporary, destination, values, tail_mask, *, minimum_slot=0):
+    """Bounded three-pass softmax with existing Vector/scalar instructions.
+
+    FP SRAM minimum_slot contains a finite BF16 lower bound on live logits.
+    Input padding is at or below that bound. tail_mask contains ones on the
+    live lanes of the last row and zeros elsewhere. No unbounded SRAM vector;
+    intermediate exponentials spill to owned HBM rows. BF16 after each op.
+    """
+    if type(values) is not int or values < 1:
+        raise ValueError("positive softmax extent")
+    rows = (values + 2047) // 2048
+    regions = [(a, rows * 4096) for a in (source, temporary, destination)] + [(tail_mask, 4096)]
+    for i, (a, n) in enumerate(regions):
+        if a % 64 or a < 0 or a + n > 2**32 or any(a < b + m and b < a + n for b, m in regions[:i]):
+            raise ValueError("softmax buffers overlap or exceed ABI")
+    e = _Emitter(2048, True)
+    e.address(4, 0)
+    e.lines.append(f"S_LD_FP f1, gp4, {minimum_slot}")
+    for r in range(rows):
+        e.transfer(0, source + r * 4096)
+        e.address(1, 0)
+        e.lines.append("V_RED_MAX f1, gp1, 0")
+    e.lines.append("S_SUB_FP f2, f0, f0")
+    e.transfer(2, tail_mask)
+    for r in range(rows):
+        e.transfer(0, source + r * 4096)
+        e.address(1, 0)
+        e.address(2, 0)
+        e.lines.append("V_SUB_VF gp1, gp2, f1, 0, 0")
+        _unary(e, "EXP", 0, 0)
+        if r == rows - 1:
+            e.binary("MUL", 0, 0, 2)
+        e.address(1, 0)
+        e.lines.append("V_RED_SUM f2, gp1, 0")
+        e.transfer(0, temporary + r * 4096, store=True)
+    e.lines.append("S_RECI_FP f2, f2, 0")
+    for r in range(rows):
+        e.transfer(0, temporary + r * 4096)
+        e.address(1, 0)
+        e.address(2, 0)
+        e.lines.append("V_MUL_VF gp1, gp2, f2, 0")
+        e.transfer(0, destination + r * 4096, store=True)
+    return "\n".join(e.lines) + "\n"
+
+
+def lower_positive_normalize(source, destination, values):
+    """Normalize positive, zero-padded rows with BF16 tree and reciprocal.
+
+    The caller guarantees a nonzero sum. Used after router selection; unlike
+    softmax this does not exponentiate already-positive sigmoid scores.
+    """
+    if type(values) is not int or values < 1:
+        raise ValueError("positive normalization extent required")
+    rows = (values + 2047) // 2048
+    size = rows * 4096
+    if any(a < 0 or a % 64 or a + size > 2**32 for a in (source, destination)) or (
+        source < destination + size and destination < source + size
+    ):
+        raise ValueError("normalization buffers overlap or exceed ABI")
+    e = _Emitter(2048, True)
+    e.lines.append("S_SUB_FP f1, f0, f0")
+    for r in range(rows):
+        e.transfer(0, source + r * 4096)
+        e.address(1, 0)
+        e.lines.append("V_RED_SUM f1, gp1, 0")
+    e.lines.append("S_RECI_FP f1, f1, 0")
+    for r in range(rows):
+        e.transfer(0, source + r * 4096)
+        e.address(1, 0)
+        e.address(2, 0)
+        e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+        e.transfer(0, destination + r * 4096, store=True)
+    return "\n".join(e.lines) + "\n"
+
+
+def lower_dot_rows(source, weights, destination, one_hot, values):
+    """Padded BF16 multiply/tree, scalar row sum, one live scalar output lane."""
+    if values < 1:
+        raise ValueError("empty dot")
+    rows = (values + 2047) // 2048
+    spans = [
+        (source, rows * 4096),
+        (weights, rows * 4096),
+        (destination, 4096),
+        (one_hot, 4096),
+    ]
+    for i, (a, n) in enumerate(spans):
+        if a < 0 or a % 64 or a + n > 2**32 or any(a < b + m and b < a + n for b, m in spans[:i]):
+            raise ValueError("dot regions overlap or exceed ABI")
+    e = _Emitter(2048, True)
+    e.lines.append("S_SUB_FP f1, f0, f0")
+    for r in range(rows):
+        e.transfer(0, source + r * 4096)
+        e.transfer(1, weights + r * 4096)
+        e.binary("MUL", 2, 0, 1)
+        e.address(1, 4096)
+        e.lines.append("V_RED_SUM f1, gp1, 0")
+    e.transfer(0, one_hot)
+    e.address(1, 0)
+    e.address(2, 0)
+    e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+    e.transfer(0, destination, store=True)
+    return "\n".join(e.lines) + "\n"
+
+
 DELTA_CONSTANTS = (-1 / 16, 1 / 24, 1 / 6, 1 / 2, 1, 2)
 
 
@@ -117,19 +280,9 @@ def _sigmoid(out, row):
     _unary(out, "EXP", row, row)
 
 
-def _gate_emitter(
-    rows, constants_base, mlen, vector_sram_rows, row_type, output_fields
-):
-    if (
-        type(mlen) is not int
-        or type(vector_sram_rows) is not int
-        or mlen < 32
-        or mlen % 32
-        or vector_sram_rows < 26
-    ):
-        raise ValueError(
-            "gate producer needs whole 32-element words and 26 Vector rows"
-        )
+def _gate_emitter(rows, constants_base, mlen, vector_sram_rows, row_type, output_fields):
+    if type(mlen) is not int or type(vector_sram_rows) is not int or mlen < 32 or mlen % 32 or vector_sram_rows < 26:
+        raise ValueError("gate producer needs whole 32-element words and 26 Vector rows")
     if not rows or any(not isinstance(row, row_type) for row in rows):
         raise ValueError("nonempty, uniformly typed gate rows required")
     span = mlen * 2
@@ -139,32 +292,16 @@ def _gate_emitter(
     outputs = []
     for row in rows:
         for name, address in vars(row).items():
-            if (
-                type(address) is not int
-                or address < 0
-                or address % 64
-                or address + span > 2**32
-            ):
-                raise ValueError(
-                    "HBM rows require aligned, nonnegative 32-bit byte addresses"
-                )
-            (outputs if name in output_fields else inputs).append(
-                (address, address + span)
-            )
-    if (
-        not isinstance(constants_base, int)
-        or constants_base < 0
-        or constants_base % 64
-        or inputs[0][1] > 2**32
-    ):
+            if type(address) is not int or address < 0 or address % 64 or address + span > 2**32:
+                raise ValueError("HBM rows require aligned, nonnegative 32-bit byte addresses")
+            (outputs if name in output_fields else inputs).append((address, address + span))
+    if not isinstance(constants_base, int) or constants_base < 0 or constants_base % 64 or inputs[0][1] > 2**32:
         raise ValueError("invalid constants HBM range")
     # Reject aliases across the ENTIRE program, including a future row's input.
     # In-place operation needs a separate lifetime analysis, not a local check.
     for index, (start, end) in enumerate(outputs):
         if any(start < b and a < end for a, b in inputs + outputs[:index]):
-            raise ValueError(
-                "gate output aliases an input, constants, or another output"
-            )
+            raise ValueError("gate output aliases an input, constants, or another output")
     out = _Emitter(mlen, True)
     out.lines.append("; @stage=raw_gate_producer_bf16_rational_candidate")
     for index, row in enumerate((16, 17, 18, 19, 20, 24, 25)):
@@ -181,9 +318,7 @@ def lower_mamba_gate_rows(rows, constants_base, *, mlen=2048, vector_sram_rows=6
     Workspace rows 0..2 and 16..25; no dynamic allocation or added ISA.
     """
     rows = tuple(rows)
-    out = _gate_emitter(
-        rows, constants_base, mlen, vector_sram_rows, MambaGateRow, {"dt", "delta"}
-    )
+    out = _gate_emitter(rows, constants_base, mlen, vector_sram_rows, MambaGateRow, {"dt", "delta"})
     for row in rows:
         out.transfer(0, row.raw_dt)
         out.transfer(1, row.dt_bias)
@@ -204,9 +339,7 @@ def lower_kda_gate_rows(rows, constants_base, *, mlen=2048, vector_sram_rows=64)
     producers. Their outputs must not be silently substituted by this API.
     """
     rows = tuple(rows)
-    out = _gate_emitter(
-        rows, constants_base, mlen, vector_sram_rows, KdaGateRow, {"delta", "beta"}
-    )
+    out = _gate_emitter(rows, constants_base, mlen, vector_sram_rows, KdaGateRow, {"delta", "beta"})
     for row in rows:
         out.transfer(0, row.gate)
         out.transfer(1, row.dt_bias)
@@ -224,9 +357,7 @@ def lower_kda_gate_rows(rows, constants_base, *, mlen=2048, vector_sram_rows=64)
     return "\n".join(out.lines) + "\n"
 
 
-def lower_delta_rational(
-    input_bases, output_bases, constants_base, *, mlen=2048, addend_bases=None
-):
+def lower_delta_rational(input_bases, output_bases, constants_base, *, mlen=2048, addend_bases=None):
     """Candidate for BF16 log-decay in [-32768,0], caller-checked domain.
 
     For t=-log/16, approximate exp(-t) by 1/(1+t+t*t/2+t*t*t/6).
@@ -288,11 +419,7 @@ def lower_conv_steps(steps, constants_base, *, mlen=2048):
         raise ValueError("nonempty conv steps at VLEN=2048 required")
     regions = [(constants_base, constants_base + len(GATE_CONSTANTS) * mlen * 2)]
     for step in steps:
-        if (
-            not isinstance(step, ConvStep)
-            or type(step.channels) is not int
-            or step.channels < 1
-        ):
+        if not isinstance(step, ConvStep) or type(step.channels) is not int or step.channels < 1:
             raise ValueError("positive channel count required")
         size = (step.channels + mlen - 1) // mlen * mlen * 2
         for name, address, span in (
@@ -301,21 +428,11 @@ def lower_conv_steps(steps, constants_base, *, mlen=2048):
             ("weights", step.weights, 4 * size),
             ("output", step.output, size),
         ):
-            if (
-                type(address) is not int
-                or address < 0
-                or address % 64
-                or address + span > 2**32
-            ):
+            if type(address) is not int or address < 0 or address % 64 or address + span > 2**32:
                 raise ValueError("invalid convolution HBM region")
             regions.append((address, address + span))
         if step.bias is not None:
-            if (
-                type(step.bias) is not int
-                or step.bias < 0
-                or step.bias % 64
-                or step.bias + size > 2**32
-            ):
+            if type(step.bias) is not int or step.bias < 0 or step.bias % 64 or step.bias + size > 2**32:
                 raise ValueError("invalid bias region")
             regions.append((step.bias, step.bias + size))
         local = [
@@ -328,16 +445,10 @@ def lower_conv_steps(steps, constants_base, *, mlen=2048):
         if any(a < step.history + 4 * size and step.history < b for a, b in local):
             raise ValueError("history aliases immutable operands")
         if any(
-            a < step.output + size and step.output < b
-            for a, b in local + [(step.history, step.history + 4 * size)]
+            a < step.output + size and step.output < b for a, b in local + [(step.history, step.history + 4 * size)]
         ):
             raise ValueError("output aliases live convolution operands")
-    if (
-        type(constants_base) is not int
-        or constants_base < 0
-        or constants_base % 64
-        or regions[0][1] > 2**32
-    ):
+    if type(constants_base) is not int or constants_base < 0 or constants_base % 64 or regions[0][1] > 2**32:
         raise ValueError("invalid constant region")
     out = _Emitter(mlen, True)
     out.lines.append("; @stage=causal_conv4_bf16_tree_silu")
@@ -348,11 +459,7 @@ def lower_conv_steps(steps, constants_base, *, mlen=2048):
         for block in range(blocks):
             offset = block * mlen * 2
             for tap in range(4):
-                source = (
-                    step.input + offset
-                    if tap == 3
-                    else step.history + (tap + 1) * span + offset
-                )
+                source = step.input + offset if tap == 3 else step.history + (tap + 1) * span + offset
                 out.transfer(0, source)
                 out.transfer(0, step.history + tap * span + offset, store=True)
                 out.transfer(1, step.weights + tap * span + offset)
@@ -393,12 +500,7 @@ def lower_l2norm_rows(p: L2NormRows, *, mlen=2048):
     reduced separately using existing Vector and scalar instructions. The
     conservative schedule recomputes no values on the host and needs six rows.
     """
-    if (
-        mlen != 2048
-        or p.width not in (32, 64, 128, 256, 512, 1024, 2048)
-        or p.channels < 1
-        or p.channels % p.width
-    ):
+    if mlen != 2048 or p.width not in (32, 64, 128, 256, 512, 1024, 2048) or p.channels < 1 or p.channels % p.width:
         raise ValueError("normalization needs complete power-of-two groups")
     span = (p.channels + mlen - 1) // mlen * mlen * 2
     regions = [
@@ -417,9 +519,7 @@ def lower_l2norm_rows(p: L2NormRows, *, mlen=2048):
     e = _Emitter(mlen, True)
     e.lines.append("; @stage=qk_l2norm_bf16_tree_candidate")
     e.address(4, 0)
-    e.lines.extend(
-        [f"S_LD_FP f2, gp4, {p.epsilon_slot}", f"S_LD_FP f3, gp4, {p.scale_slot}"]
-    )
+    e.lines.extend([f"S_LD_FP f2, gp4, {p.epsilon_slot}", f"S_LD_FP f3, gp4, {p.scale_slot}"])
     for start in range(0, p.channels, mlen):
         e.transfer(0, p.input + start * 2)
         e.transfer(5, p.zero)
@@ -446,16 +546,19 @@ def lower_l2norm_rows(p: L2NormRows, *, mlen=2048):
     return "\n".join(e.lines) + "\n"
 
 
-def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048):
+def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strategy="reference"):
     """Correctness-first software packing using existing scalar/Vector ISA.
 
     sources[i] is None (zero) or (aligned HBM row base, lane). A one-hot mask,
     BF16 tree reduction, and scalar multiply copy each live element exactly.
     It uses no FP SRAM staging, arbitrary SRAM gather port, or host-produced
     intermediate. Expensive; not a claim of the optimal software baseline.
-    Full destination rows are owned by caller. Vector workspace rows 0..6.
+    Full destination rows are owned by caller. Reference/grouped workspace is
+    rows 0..6; pattern additionally owns rows 7..63 for reusable static masks.
     """
     sources = tuple(sources)
+    if strategy not in ("reference", "grouped", "pattern"):
+        raise ValueError("unknown software gather strategy")
     if mlen != 2048 or not sources:
         raise ValueError("nonempty VLEN=2048 gather required")
     span = (len(sources) + mlen - 1) // mlen * mlen * 2
@@ -479,25 +582,70 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048):
     e.transfer(6, one_hot)
     loaded = None
 
-    def shift(dst, index):
+    def shift(dst, index, source=6):
         e.address(1, dst * mlen)
-        e.address(2, 6 * mlen)
+        e.address(2, source * mlen)
         e.address(3, index)
         e.lines.append("V_SHFT_V gp1, gp2, gp3")
 
+    patterns = {}
+    if strategy == "pattern":
+        for first in range(0, len(sources), mlen):
+            groups = {}
+            for i, src in enumerate(sources[first : first + mlen]):
+                if src is not None:
+                    groups.setdefault(src, []).append(i)
+            for indices in groups.values():
+                pattern = tuple(i - indices[0] for i in indices)
+                if len(pattern) > 1:
+                    patterns.setdefault(pattern, 7 + len(patterns))
+        if len(patterns) > 57:
+            strategy = "grouped"
+            patterns = {}
+        for pattern, row in patterns.items():
+            e.transfer(row, zero)
+            for index in pattern:
+                shift(3, index)
+                e.binary("ADD", row, row, 3)
+
     for first in range(0, len(sources), mlen):
         e.transfer(5, zero)
-        for index, src in enumerate(sources[first : first + mlen]):
-            if src is None:
-                continue
+        if strategy == "pattern":
+            groups = {}
+            for i, src in enumerate(sources[first : first + mlen]):
+                if src is not None:
+                    groups.setdefault(src, []).append(i)
+            for (address, lane), indices in sorted(groups.items()):
+                if loaded != address:
+                    e.transfer(0, address)
+                    loaded = address
+                shift(1, lane)
+                e.binary("MUL", 2, 0, 1)
+                e.address(1, 2 * mlen)
+                e.lines.extend(["S_SUB_FP f1, f0, f0", "V_RED_SUM f1, gp1, 0"])
+                pattern = tuple(i - indices[0] for i in indices)
+                shift(3, indices[0], patterns.get(pattern, 6))
+                e.address(1, 4 * mlen)
+                e.address(2, 3 * mlen)
+                e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+                e.binary("ADD", 5, 5, 4)
+            e.transfer(5, destination + first * 2, store=True)
+            continue
+        entries = [(i, s) for i, s in enumerate(sources[first : first + mlen]) if s is not None]
+        if strategy == "grouped":
+            entries.sort(key=lambda pair: pair[1])
+        previous_source = None
+        for index, src in entries:
             address, lane = src
             if loaded != address:
                 e.transfer(0, address)
                 loaded = address
-            shift(1, lane)
-            e.binary("MUL", 2, 0, 1)
-            e.address(1, 2 * mlen)
-            e.lines.extend(["S_SUB_FP f1, f0, f0", "V_RED_SUM f1, gp1, 0"])
+            if strategy == "reference" or src != previous_source:
+                shift(1, lane)
+                e.binary("MUL", 2, 0, 1)
+                e.address(1, 2 * mlen)
+                e.lines.extend(["S_SUB_FP f1, f0, f0", "V_RED_SUM f1, gp1, 0"])
+            previous_source = src
             shift(3, index)
             e.address(1, 4 * mlen)
             e.address(2, 3 * mlen)
@@ -592,11 +740,7 @@ def lower_pointwise_rows(
     # Exact in-place rows are safe: both operands are read before the store.
     # Partial overlap can overwrite a future input row and must be rejected.
     for source in (input_base, other_base):
-        if (
-            source != output_base
-            and source < output_base + span
-            and output_base < source + span
-        ):
+        if source != output_base and source < output_base + span and output_base < source + span:
             raise ValueError("pointwise output partially overlaps a live input")
     if (
         sigmoid_input

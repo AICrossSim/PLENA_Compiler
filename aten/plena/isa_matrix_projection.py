@@ -111,3 +111,76 @@ def lower_b1_projection(p: Projection) -> str:
             e.lines.append("M_MV_WO gp1, 0")
         transfer(1, p.outputs + row0 * 2, store=True)
     return "\n".join(e.lines) + "\n"
+
+
+def lower_batch_projection(p: Projection, inputs, outputs):
+    """Reuse each complete K-by-32 weight panel across private requests.
+
+    K packets occupy disjoint columns of existing Matrix SRAM. Partial sums
+    for only one request live in Matrix accumulators; request outputs spill
+    through the existing Vector row. This is deliberately serial and needs no
+    additional accumulator, SRAM capacity, ports, or simultaneous requests.
+    """
+    from dataclasses import replace
+    from compiler.aten.plena.mview import (
+        MatrixViewAllocation,
+        validate_disjoint_matrix_views,
+    )
+
+    inputs, outputs = tuple(inputs), tuple(outputs)
+    if not inputs or len(inputs) != len(outputs):
+        raise ValueError("one private output per batch input")
+    for source, destination in zip(inputs, outputs):
+        replace(p, inputs=source, outputs=destination).validate()
+    # Check request allocations jointly, not only one request at a time.
+    ranges = [(x, x + p.input_values * 2) for x in inputs] + [
+        (x, x + p.output_values * 2) for x in outputs
+    ]
+    for i, (a, b) in enumerate(ranges):
+        if any(a < d and c < b for c, d in ranges[:i]):
+            raise ValueError("batch input/output allocations overlap")
+    views = []
+    for index, k0 in enumerate(range(0, p.k, p.k_tile)):
+        rows = (min(p.k_tile, p.k - k0) + 31) // 32 * 32
+        views.append(
+            View(
+                index * 32,
+                MatrixViewDescriptor(MatrixViewShape(rows, 32), MatrixViewMap(rows)),
+            )
+        )
+    validate_disjoint_matrix_views(
+        [
+            MatrixViewAllocation(str(i), v.base, v.descriptor)
+            for i, v in enumerate(views)
+        ],
+        mlen=2048,
+        banks=64,
+        bank_width=32,
+        depth_rows=256,
+    )
+    e = Emitter()
+    e.lines.append("; @stage=matrix_projection_shared_weight_panel")
+
+    def transfer(row, hbm, store=False):
+        e.address(1, row * p.mlen)
+        e.address(2, hbm)
+        e.lines.append(f"H_{'STORE' if store else 'PREFETCH'}_V gp1, gp2, a0, 0, 2")
+
+    packets = iter(p.packets())
+    for col in range(0, p.n, 32):
+        for view in views:
+            _, _, _, address = next(packets)
+            e.dma(view, address)
+        for source, destination in zip(inputs, outputs):
+            row0 = col // 2048 * 2048
+            transfer(1, p.zero if col == row0 else destination + row0 * 2)
+            for k0, view in zip(range(0, p.k, p.k_tile), views):
+                transfer(0, source + k0 * 2)
+                e.view(0, view.descriptor)
+                e.address(1, view.base)
+                e.address(2, 0)
+                e.lines.append("M_MV 0, gp1, gp2, 0")
+            e.address(1, p.mlen + col - row0)
+            e.lines.append("M_MV_WO gp1, 0")
+            transfer(1, destination + row0 * 2, True)
+    return "\n".join(e.lines) + "\n"

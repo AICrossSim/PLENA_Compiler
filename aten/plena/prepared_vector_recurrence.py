@@ -92,6 +92,7 @@ def lower_prepared_vector_recurrence(
     mamba_decay_row_invariant: bool = False,
     decay_is_delta: bool = False,
     vector_sram_rows: int = 64,
+    coefficient_loaders=None,
 ) -> str:
     """Emit BF16 row operations; reserve eight rows, or 15 for pairwise dots.
 
@@ -120,20 +121,30 @@ def lower_prepared_vector_recurrence(
         if spec.kind is not RecurrenceKind.MAMBA:
             raise ValueError("row-invariant decay caching is a Mamba producer contract")
         if vector_sram_rows < 9:
-            raise ValueError("cached Mamba decay requires nine existing Vector SRAM rows")
+            raise ValueError(
+                "cached Mamba decay requires nine existing Vector SRAM rows"
+            )
     if pairwise_bf16_dot:
         if experimental_fp32_dot:
             raise ValueError("pairwise BF16 and experimental FP32 are exclusive")
         if spec.recurrence_rows != 128:
             raise ValueError("pairwise BF16 control requires a 128-row geometry")
         if vector_sram_rows < 15:
-            raise ValueError("pairwise BF16 control must reserve 15 existing Vector SRAM rows")
+            raise ValueError(
+                "pairwise BF16 control must reserve 15 existing Vector SRAM rows"
+            )
     if experimental_fp32_dot and spec.kind is not RecurrenceKind.KDA:
         raise ValueError("experimental FP32 dot is a KDA-only control")
     if mlen % spec.row_elements or spec.heads % (mlen // spec.row_elements):
         raise ValueError("controlled Vector baseline requires full packed head groups")
     if len(groups) != spec.heads // (mlen // spec.row_elements):
         raise ValueError("prepared Vector group count differs from model shape")
+    if coefficient_loaders is not None and (
+        len(coefficient_loaders) != len(groups) or vector_sram_rows < 64
+    ):
+        raise ValueError(
+            "one compact software loader per group and 64 Vector rows required"
+        )
     out = _Emitter(mlen, static_address_reuse)
     # Tree levels own rows 8..14. Keeping the Mamba decay row simultaneously
     # requires row 15; never silently alias it with the first partial sum.
@@ -142,39 +153,55 @@ def lower_prepared_vector_recurrence(
         raise ValueError("Mamba tree plus cached decay requires 16 Vector SRAM rows")
     out.lines.append("; @stage=prepared_vector_recurrence")
     row_bytes = mlen * 2
-    for group in groups:
+    for group_index, group in enumerate(groups):
         f = group.fields
+        loader = (
+            None if coefficient_loaders is None else coefficient_loaders[group_index]
+        )
+        if loader is not None:
+            loader.prepare(out)
+
+        def coefficient(name, index=0, target=1):
+            if loader is None:
+                out.transfer(target, f[name] + index * row_bytes)
+            else:
+                loader.load(out, name, index, target)
+
         # VRAM: state=0, coefficients=1, x/value=2, scratch/error=3,
         # output=4, temporary=5, prediction=6, zero=7.
         out.transfer(7, f["zero"])
         out.transfer(2, f["x" if spec.kind is RecurrenceKind.MAMBA else "value"])
         if spec.kind is RecurrenceKind.MAMBA:
-            out.transfer(1, f["dt"])
+            coefficient("dt")
             out.binary("MUL", 3, 2, 1)
             out.binary("ADD", 4, 7, 7)
             if mamba_decay_row_invariant:
-                out.transfer(decay_row, f["a"])
+                coefficient("a", target=decay_row)
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
                 out.transfer(0, group.state_base + offset)
                 if not mamba_decay_row_invariant:
-                    out.transfer(1, f["a"] + offset)
+                    coefficient("a", row)
                 if decay_is_delta:
-                    out.binary("MUL", 5, 0, decay_row if mamba_decay_row_invariant else 1)
+                    out.binary(
+                        "MUL", 5, 0, decay_row if mamba_decay_row_invariant else 1
+                    )
                     out.binary("SUB", 0, 0, 5)
                 else:
-                    out.binary("MUL", 0, 0, decay_row if mamba_decay_row_invariant else 1)
-                out.transfer(1, f["b"] + offset)
+                    out.binary(
+                        "MUL", 0, 0, decay_row if mamba_decay_row_invariant else 1
+                    )
+                coefficient("b", row)
                 out.binary("MUL", 5, 3, 1)
                 out.binary("ADD", 0, 0, 5)
                 out.transfer(0, group.state_base + offset, store=True)
-                out.transfer(1, f["c"] + offset)
+                coefficient("c", row)
                 if pairwise_bf16_dot:
                     out.pairwise_product(row, spec.recurrence_rows, 4)
                 else:
                     out.binary("MUL", 5, 0, 1)
                     out.binary("ADD", 4, 4, 5)
-            out.transfer(1, f["d"])
+            coefficient("d")
             out.binary("MUL", 5, 2, 1)
             out.binary("ADD", 4, 4, 5)
         else:
@@ -185,14 +212,14 @@ def lower_prepared_vector_recurrence(
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
                 out.transfer(0, group.state_base + offset)
-                out.transfer(1, f["decay"] + offset)
+                coefficient("decay", row)
                 if decay_is_delta:
                     out.binary("MUL", 5, 0, 1)
                     out.binary("SUB", 0, 0, 5)
                 else:
                     out.binary("MUL", 0, 0, 1)
                 out.transfer(0, group.state_base + offset, store=True)
-                out.transfer(1, f["key"] + offset)
+                coefficient("key", row)
                 if experimental_fp32_dot:
                     out.dot_acc(0, 1)
                 elif pairwise_bf16_dot:
@@ -203,7 +230,7 @@ def lower_prepared_vector_recurrence(
             if experimental_fp32_dot:
                 out.dot_write(6)
             out.binary("SUB", 3, 2, 6)
-            out.transfer(1, f["beta"])
+            coefficient("beta")
             out.binary("MUL", 3, 3, 1)
             if experimental_fp32_dot:
                 out.dot_reset()
@@ -212,11 +239,11 @@ def lower_prepared_vector_recurrence(
             for row in range(spec.recurrence_rows):
                 offset = row * row_bytes
                 out.transfer(0, group.state_base + offset)
-                out.transfer(1, f["key"] + offset)
+                coefficient("key", row)
                 out.binary("MUL", 5, 3, 1)
                 out.binary("ADD", 0, 0, 5)
                 out.transfer(0, group.state_base + offset, store=True)
-                out.transfer(1, f["query"] + offset)
+                coefficient("query", row)
                 if experimental_fp32_dot:
                     out.dot_acc(0, 1)
                 elif pairwise_bf16_dot:
