@@ -4,7 +4,11 @@ from dataclasses import replace
 
 import pytest
 
-from compiler.aten.plena.isa_matrix_projection import Projection, lower_b1_projection
+from compiler.aten.plena.isa_matrix_projection import (
+    Projection,
+    lower_b1_projection,
+    lower_resident_projection,
+)
 from compiler.aten.plena.recurrent_coefficients import (
     L2NormRows,
     lower_bf16_gather,
@@ -43,6 +47,22 @@ def test_projection_rejects_dma_overread_into_a_neighbor_allocation():
         lower_b1_projection(replace(p, weights=1024))
     with pytest.raises(ValueError, match="aligned"):
         lower_b1_projection(replace(p, weights=65538))
+
+
+def test_resident_projection_preserves_private_lifetimes_and_capacity():
+    p = projection()
+    for inputs, outputs in [([0, 0], [131072, 139264]), ([0, 8192], [131072, 8192])]:
+        with pytest.raises(ValueError, match="overlap"):
+            lower_resident_projection(p, inputs, outputs)
+    with pytest.raises(ValueError, match="workspace"):
+        lower_resident_projection(p, [0, 8192], [131072, 139264], vector_rows=2)
+    with pytest.raises(ValueError, match="workspace"):
+        lower_resident_projection(p, vector_rows=65)
+    # A 65-packet K panel cannot occupy 65 banks, even when K < 16384.
+    # Fall back to serial request packets instead of overcommitting Matrix.
+    p = Projection(0, 1048576, 4194304, 8388608, 8193, 33, 128)
+    code = lower_resident_projection(p, [0, 32768], [4194304, 4198400])
+    assert code.count("@stage=matrix_projection_resident_rows") == 2
 
 
 def test_gather_rejects_source_destruction_and_out_of_range_lanes():

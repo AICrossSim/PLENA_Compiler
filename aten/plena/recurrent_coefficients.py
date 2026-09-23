@@ -555,9 +555,11 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
     intermediate. Expensive; not a claim of the optimal software baseline.
     Full destination rows are owned by caller. Reference/grouped workspace is
     rows 0..6; pattern additionally owns rows 7..63 for reusable static masks.
+    Cached also reuses source rows and identical contributions across output
+    rows within the same 64-row budget. All construction uses ordinary ISA.
     """
     sources = tuple(sources)
-    if strategy not in ("reference", "grouped", "pattern"):
+    if strategy not in ("reference", "grouped", "pattern", "cached"):
         raise ValueError("unknown software gather strategy")
     if mlen != 2048 or not sources:
         raise ValueError("nonempty VLEN=2048 gather required")
@@ -577,6 +579,8 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
         reads.append((a, a + mlen * 2))
     if any(a < destination + span and destination < b for a, b in reads):
         raise ValueError("gather destination aliases a source")
+    if strategy == "cached":
+        return _lower_cached_gather(sources, destination, zero, one_hot, mlen)
     e = _Emitter(mlen, True)
     e.lines.append("; @stage=software_coefficient_gather_reference")
     e.transfer(6, one_hot)
@@ -652,6 +656,103 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
             e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
             e.binary("ADD", 5, 5, 4)
         e.transfer(5, destination + first * 2, store=True)
+    return "\n".join(e.lines) + "\n"
+
+
+def _lower_cached_gather(sources, destination, zero, one_hot, mlen):
+    """Reuse identical (source, destination-mask) contributions, not values.
+
+    Compiler analysis only inspects addresses. In particular a repeated decay
+    layout is constructed once on the accelerator and retained in an existing
+    Vector row; coefficients are never folded from a host numerical capture.
+    A contribution may be shared only by the output rows that actually contain
+    it. Unique pieces still use the reference scalar extraction arithmetic.
+    """
+    from collections import defaultdict
+
+    rows, uses, patterns = [], defaultdict(list), {}
+    for first in range(0, len(sources), mlen):
+        groups = {}
+        for index, source in enumerate(sources[first : first + mlen]):
+            if source is not None:
+                groups.setdefault(source, []).append(index)
+        keys = [(source, tuple(indices)) for source, indices in sorted(groups.items())]
+        for source, indices in keys:
+            uses[source, indices].append(len(rows))
+            pattern = tuple(i - indices[0] for i in indices)
+            if len(pattern) > 1:
+                patterns.setdefault(pattern, 7 + len(patterns))
+        rows.append(keys)
+    if len(patterns) > 57:
+        return lower_bf16_gather(sources, destination, zero, one_hot, strategy="grouped")
+
+    # Group common contributions by identical live output-row sets. This uses
+    # one SRAM row for an entire shared part (e.g. all heads' decay fields).
+    common = defaultdict(list)
+    for key, output_rows in uses.items():
+        if len(output_rows) > 1:
+            common[tuple(output_rows)].append(key)
+    next_row = 7 + len(patterns)
+    ranked = sorted(common.items(), key=lambda item: (-(len(item[0]) - 1) * len(item[1]), item[0]))
+    retained = {}
+    for output_rows, keys in ranked:
+        if next_row == 64:
+            break
+        retained[output_rows] = (next_row, keys)
+        next_row += 1
+    addresses = sorted({source[0] for keys in rows for source, _ in keys})
+    source_cache = {a: next_row + i for i, a in enumerate(addresses[: 64 - next_row])}
+    cached_keys = {key for _, keys in retained.values() for key in keys}
+    e = _Emitter(mlen, True)
+    e.lines.append("; @stage=software_coefficient_gather_cached workspace=64")
+    e.transfer(6, one_hot)
+
+    def shift(dst, index, source=6):
+        e.address(1, dst * mlen)
+        e.address(2, source * mlen)
+        e.address(3, index)
+        e.lines.append("V_SHFT_V gp1, gp2, gp3")
+
+    for pattern, row in patterns.items():
+        e.transfer(row, zero)
+        for index in pattern:
+            shift(3, index)
+            e.binary("ADD", row, row, 3)
+    for address, row in source_cache.items():
+        e.transfer(row, address)
+    loaded = None
+
+    def contribute(destination_row, key):
+        nonlocal loaded
+        (address, lane), indices = key
+        source_row = source_cache.get(address, 0)
+        if source_row == 0 and loaded != address:
+            e.transfer(0, address)
+            loaded = address
+        shift(1, lane)
+        e.binary("MUL", 2, source_row, 1)
+        e.address(1, 2 * mlen)
+        e.lines.extend(["S_SUB_FP f1, f0, f0", "V_RED_SUM f1, gp1, 0"])
+        pattern = tuple(i - indices[0] for i in indices)
+        shift(3, indices[0], patterns.get(pattern, 6))
+        e.address(1, 4 * mlen)
+        e.address(2, 3 * mlen)
+        e.lines.append("V_MUL_VF gp1, gp2, f1, 0")
+        e.binary("ADD", destination_row, destination_row, 4)
+
+    for row, keys in retained.values():
+        e.transfer(row, zero)
+        for key in keys:
+            contribute(row, key)
+    for index, keys in enumerate(rows):
+        e.transfer(5, zero)
+        for output_rows, (row, _) in retained.items():
+            if index in output_rows:
+                e.binary("ADD", 5, 5, row)
+        for key in keys:
+            if key not in cached_keys:
+                contribute(5, key)
+        e.transfer(5, destination + index * mlen * 2, store=True)
     return "\n".join(e.lines) + "\n"
 
 

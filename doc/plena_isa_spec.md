@@ -1004,4 +1004,9 @@ End of a hardware loop. If the loop counter (in register `rd`) is greater than 0
 
 **Description:**
 
-Shift the vector elements left by the amount specified by `gp_reg<rs2>`. Elements are shifted left, and zeros are filled in from the right. For example, `[a0, a1, a2, a3]` with shift=2 becomes `[a2, a3, 0, 0]`.
+Move vector elements toward higher lane indices by the unsigned amount in
+`gp_reg<rs2>`, filling lower lanes with zero. For example, `[a0, a1, a2, a3]`
+with shift=2 becomes `[0, 0, a0, a1]`. A shift of at least VLEN returns zeros.
+This matches the Rust executor and the RTL `MAMBA_EXTENSION_EN` shift path
+(`fp_vec_shift.RIGHT_SHIFT=0`). It is not a rotation or a bidirectional shift;
+Compiler schedules must not use it to extract a higher-lane slice into lane 0.

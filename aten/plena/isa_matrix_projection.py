@@ -184,3 +184,115 @@ def lower_batch_projection(p: Projection, inputs, outputs):
             e.lines.append("M_MV_WO gp1, 0")
             transfer(1, destination + row0 * 2, True)
     return "\n".join(e.lines) + "\n"
+
+
+def lower_resident_projection(
+    p: Projection, inputs=None, outputs=None, *, vector_rows=58
+):
+    """Keep private output rows and a bounded set of input windows in SRAM.
+
+    The arithmetic order and weight packet ABI are unchanged. Rows 58..63
+    remain available to the finite weight decoder in the common platform.
+    Each cached input is an actual, owned 2048-element DMA window: this does
+    not assume unaligned Vector reads or a left-shift/rotate instruction.
+    Uncached windows stream through row zero. No compute/DMA overlap is used.
+
+    Complete K-by-32 weight panels are shared when they fit Matrix SRAM.
+    Larger K falls back to one request at a time, explicitly rereading weights.
+    """
+    from dataclasses import replace
+    from compiler.aten.plena.mview import (
+        MatrixViewAllocation,
+        validate_disjoint_matrix_views,
+    )
+
+    inputs = (p.inputs,) if inputs is None else tuple(inputs)
+    outputs = (p.outputs,) if outputs is None else tuple(outputs)
+    if not inputs or len(inputs) != len(outputs) or len(inputs) > 16:
+        raise ValueError("one private output per request, batch 1..16")
+    if type(vector_rows) is not int or not len(inputs) + 1 <= vector_rows <= 64:
+        raise ValueError(
+            "Vector workspace must fit streaming input and private outputs"
+        )
+    for source, destination in zip(inputs, outputs):
+        replace(p, inputs=source, outputs=destination).validate()
+    ranges = [(x, x + p.input_values * 2) for x in inputs] + [
+        (x, x + p.output_values * 2) for x in outputs
+    ]
+    for i, (a, b) in enumerate(ranges):
+        if any(a < d and c < b for c, d in ranges[:i]):
+            raise ValueError("batch input/output allocations overlap")
+    if (p.k + p.k_tile - 1) // p.k_tile > 64 and len(inputs) > 1:
+        return "".join(
+            lower_resident_projection(
+                replace(p, inputs=x, outputs=y), vector_rows=vector_rows
+            )
+            for x, y in zip(inputs, outputs)
+        )
+
+    starts = tuple(range(0, p.k, p.k_tile))
+    shared = len(inputs) > 1
+    views = [
+        View(
+            index * 32 if shared else 0,
+            MatrixViewDescriptor(
+                MatrixViewShape((min(p.k_tile, p.k - k0) + 31) // 32 * 32, 32),
+                MatrixViewMap((min(p.k_tile, p.k - k0) + 31) // 32 * 32),
+            ),
+        )
+        for index, k0 in enumerate(starts)
+    ]
+    if shared:
+        validate_disjoint_matrix_views(
+            [
+                MatrixViewAllocation(str(i), v.base, v.descriptor)
+                for i, v in enumerate(views)
+            ],
+            mlen=2048,
+            banks=64,
+            bank_width=32,
+            depth_rows=256,
+        )
+    e = Emitter()
+    e.lines.append(f"; @stage=matrix_projection_resident_rows workspace={vector_rows}")
+
+    def transfer(row, hbm, store=False):
+        e.address(1, row * p.mlen)
+        e.address(2, hbm)
+        e.lines.append(f"H_{'STORE' if store else 'PREFETCH'}_V gp1, gp2, a0, 0, 2")
+
+    # K-major choice distributes a limited cache across requests. All windows
+    # have equal reuse count (one per output32 block), so no profile is fitted.
+    cache = {}
+    for k0 in starts:
+        for request, source in enumerate(inputs):
+            row = len(inputs) + 1 + len(cache)
+            if row < vector_rows:
+                cache[request, k0] = row
+                transfer(row, source + k0 * 2)
+    packets = iter(p.packets())
+    for row0 in range(0, p.n, p.mlen):
+        for request in range(len(inputs)):
+            transfer(request + 1, p.zero)
+        for col in range(row0, min(row0 + p.mlen, p.n), 32):
+            panel = [next(packets) for _ in starts]
+            if shared:
+                for view, (_, _, _, address) in zip(views, panel):
+                    e.dma(view, address)
+            for request, source in enumerate(inputs):
+                for view, (packet_col, k0, _, address) in zip(views, panel):
+                    assert packet_col == col
+                    if not shared:
+                        e.dma(view, address)
+                    row = cache.get((request, k0), 0)
+                    if row == 0:
+                        transfer(0, source + k0 * 2)
+                    e.view(0, view.descriptor)
+                    e.address(1, view.base)
+                    e.address(2, row * p.mlen)
+                    e.lines.append("M_MV 0, gp1, gp2, 0")
+                e.address(1, (request + 1) * p.mlen + col - row0)
+                e.lines.append("M_MV_WO gp1, 0")
+        for request, destination in enumerate(outputs):
+            transfer(request + 1, destination + row0 * 2, True)
+    return "\n".join(e.lines) + "\n"
