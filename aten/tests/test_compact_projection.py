@@ -70,9 +70,10 @@ def execute_addresses(p, inputs, outputs, assembly, path, vector_rows):
         start = (address - base) // 2
         return values[start : start + count]
 
-    gp, views, matrix = [0] * 16, {}, {}
+    packet_coordinates = {address: (column, k0) for column, k0, _, address in p.packets()}
+    gp, views, matrix, matrix_coordinates = [0] * 16, {}, {}, {}
     vector = np.full(64 * 2048, np.nan, dtype=np.float32)
-    trace = {"input_reads": [], "weight_reads": [], "writes": [], "batch_sizes": []}
+    trace = {"input_reads": [], "weight_reads": [], "writes": [], "batch_sizes": [], "contributions": {}}
     for instruction in instructions:
         op = instruction.opcode
         if op == "S_ADDI_INT":
@@ -88,6 +89,7 @@ def execute_addresses(p, inputs, outputs, assembly, path, vector_rows):
                 .reshape(shape.rows, shape.cols)
                 .copy()
             )
+            matrix_coordinates[gp[instruction.rd]] = packet_coordinates[gp[instruction.rs1]]
             trace["weight_reads"].append(gp[instruction.rs1])
         elif op in ("H_PREFETCH_V", "H_STORE_V"):
             base, address = gp[instruction.rd], gp[instruction.rs1]
@@ -128,6 +130,8 @@ def execute_addresses(p, inputs, outputs, assembly, path, vector_rows):
                 vector[destination : destination + 32] += (
                     vector[source : source + weight.shape[0]] @ weight
                 )
+                column, k0 = matrix_coordinates[gp[instruction.rs1]]
+                trace["contributions"].setdefault((destination // 2048, column), []).append(k0)
         else:
             raise AssertionError(op)
     for request, address in enumerate(outputs):
@@ -136,6 +140,8 @@ def execute_addresses(p, inputs, outputs, assembly, path, vector_rows):
     assert sorted(trace["weight_reads"]) == sorted(
         address for _, _, _, address in p.packets()
     )
+    assert len(trace["contributions"]) == len(inputs) * ((p.n + 31) // 32)
+    assert all(order == list(range(0, p.k, 256)) for order in trace["contributions"].values())
     return trace
 
 
@@ -203,3 +209,39 @@ def test_projection_weight_packet_accounting_includes_candidate_mode():
         sum(packet.values_per_packet * packet.repeats for packet in reads)
         == p.weight_bytes // 2
     )
+
+
+@pytest.mark.parametrize("n_panel_tile", [2, 4, 8])
+def test_panel_loop_interchange_reuses_streamed_inputs_without_weight_rereads(tmp_path, n_panel_tile):
+    # Zero input-cache rows: every input read is necessary for this schedule.
+    # Two K chunks, a partial K packet, and ten N panels exercise replacement
+    # of Matrix slots, a second N group, and masked output padding.
+    p, inputs, outputs = fixture(16, k=2305, n=289)
+    assembly = lower_compact_projection(
+        p, inputs, outputs, batch_tile=4, vector_rows=20, n_panel_tile=n_panel_tile,
+    )
+    trace = execute_addresses(p, inputs, outputs, assembly, tmp_path / "panels.asm", 20)
+    assert len(trace["input_reads"]) == 16 * 2 * ((10 + n_panel_tile - 1) // n_panel_tile)
+    assert len(trace["writes"]) == 16
+    assert len(trace["weight_reads"]) == 10 * 10
+
+
+def test_panel_schedule_keeps_private_outputs_across_output_row_boundaries(tmp_path):
+    p, inputs, outputs = fixture(2, k=257, n=2051)
+    assembly = lower_compact_projection(
+        p, inputs, outputs, batch_tile=4, vector_rows=6, n_panel_tile=8,
+    )
+    trace = execute_addresses(p, inputs, outputs, assembly, tmp_path / "row_boundary.asm", 6)
+    assert len(trace["writes"]) == 4
+    # Eight N256 groups in the first output row, one in the second.
+    assert len(trace["input_reads"]) == 2 * 9
+
+
+def test_panel_schedule_validation_and_default_are_explicit():
+    p, inputs, outputs = fixture(4)
+    assert lower_compact_projection(p, inputs, outputs) == lower_compact_projection(
+        p, inputs, outputs, n_panel_tile=1,
+    )
+    for value in (0, 3, 16, True):
+        with pytest.raises(ValueError, match="n_panel_tile"):
+            lower_compact_projection(p, inputs, outputs, n_panel_tile=value)

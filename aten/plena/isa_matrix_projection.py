@@ -317,7 +317,8 @@ def projection_config(rows: int, input_stride: int = 2048, output_stride: int = 
 
 
 def lower_compact_projection(
-    p: Projection, inputs=None, outputs=None, *, batch_tile=1, vector_rows=58
+    p: Projection, inputs=None, outputs=None, *, batch_tile=1, vector_rows=58,
+    n_panel_tile=1,
 ) -> str:
     """Use nonoverlapping input rows and bounded 1/4-request Matrix execution.
 
@@ -338,6 +339,14 @@ def lower_compact_projection(
     M_MM.P performs the historical per-column BF16 reduction, adds the tile
     contribution to the existing BF16 output slice, and writes only 32 output
     elements. The other output slices remain live until the full row store.
+
+    n_panel_tile=2/4/8 interchanges only the software loops. Up to that many
+    N32 panels share one K2048 input chunk before it is replaced. At most
+    8*8 K256-by-N32 views occupy the existing 1 MiB Matrix SRAM. Every weight
+    packet is loaded once, every output sees increasing K256 contributions,
+    and the instruction/data-path contract is unchanged. Output rows stay
+    private and live across all K chunks. The default retains the historical
+    full-K-panel schedule, allowing an exact before/after comparison.
     """
     from dataclasses import replace
     from compiler.aten.plena.mview import (
@@ -351,6 +360,8 @@ def lower_compact_projection(
         raise ValueError("one private output per request, batch 1..16")
     if type(batch_tile) is not int or batch_tile not in (1, 4):
         raise ValueError("compact projection batch_tile must be 1 or 4")
+    if type(n_panel_tile) is not int or n_panel_tile not in (1, 2, 4, 8):
+        raise ValueError("compact projection n_panel_tile must be 1, 2, 4 or 8")
     if type(vector_rows) is not int or not len(inputs) + batch_tile <= vector_rows <= 64:
         raise ValueError("Vector workspace must fit private outputs and bounded streaming rows")
     if p.k_tile != 256:
@@ -365,8 +376,12 @@ def lower_compact_projection(
             raise ValueError("batch input/output allocations overlap")
 
     starts = tuple(range(0, p.k, p.k_tile))
-    if len(starts) > 64:
+    if n_panel_tile == 1 and len(starts) > 64:
         raise ValueError("complete K256-by-32 weight panel exceeds Matrix SRAM capacity")
+    # The tiled schedule replaces the weight working set after each K2048
+    # chunk. Validate the largest possible simultaneous allocation; a short
+    # last K chunk or N group uses a subset of these cells.
+    allocation_starts = starts if n_panel_tile == 1 else (0,) * (min(8, len(starts)) * n_panel_tile)
     views = [
         View(
             index * p.blen,
@@ -375,7 +390,7 @@ def lower_compact_projection(
                 MatrixViewMap((min(p.k_tile, p.k - k0) + 31) // 32 * 32),
             ),
         )
-        for index, k0 in enumerate(starts)
+        for index, k0 in enumerate(allocation_starts)
     ]
     validate_disjoint_matrix_views(
         [MatrixViewAllocation(str(i), view.base, view.descriptor) for i, view in enumerate(views)],
@@ -385,6 +400,7 @@ def lower_compact_projection(
     e = Emitter()
     e.lines.append(
         f"; @stage=matrix_projection_compact_rows workspace={vector_rows} batch_tile={batch_tile}"
+        + (f" n_panel_tile={n_panel_tile}" if n_panel_tile != 1 else "")
     )
 
     def transfer(row, address, store=False):
@@ -404,6 +420,50 @@ def lower_compact_projection(
                 for offset in range(count):
                     transfer(next_row + offset, inputs[first + offset] + chunk * 2)
                 next_row += count
+
+    if n_panel_tile != 1:
+        packets = {
+            (column, k0): (rows, address)
+            for column, k0, rows, address in p.packets()
+        }
+        for row0 in range(0, p.n, p.mlen):
+            for request in range(batch):
+                transfer(request, p.zero)
+            for column0 in range(row0, min(row0 + p.mlen, p.n), n_panel_tile * p.blen):
+                columns = tuple(range(
+                    column0,
+                    min(column0 + n_panel_tile * p.blen, row0 + p.mlen, p.n),
+                    p.blen,
+                ))
+                for chunk in chunks:
+                    chunk_starts = tuple(range(chunk, min(chunk + p.mlen, p.k), p.k_tile))
+                    chunk_views = {}
+                    for panel, column in enumerate(columns):
+                        for packet_index, k0 in enumerate(chunk_starts):
+                            rows, address = packets[column, k0]
+                            view = View(
+                                (panel * len(chunk_starts) + packet_index) * p.blen,
+                                MatrixViewDescriptor(MatrixViewShape(rows, p.blen), MatrixViewMap(rows)),
+                            )
+                            chunk_views[column, k0] = view
+                            e.dma(view, address)
+                    for first, count in groups:
+                        input_row = cache.get((chunk, first), batch)
+                        if (chunk, first) not in cache:
+                            for offset in range(count):
+                                transfer(input_row + offset, inputs[first + offset] + chunk * 2)
+                        for k0 in chunk_starts:
+                            for column in columns:
+                                view = chunk_views[column, k0]
+                                e.view(0, view.descriptor)
+                                e.address(1, first * p.mlen + column - row0)
+                                e.address(2, view.base)
+                                e.address(3, input_row * p.mlen + k0 - chunk)
+                                e.address(4, projection_config(count))
+                                e.lines.append("M_MM.P gp1, gp2, gp3, gp4, 0")
+            for request, destination in enumerate(outputs):
+                transfer(request, destination + row0 * 2, store=True)
+        return "\n".join(e.lines) + "\n"
 
     packets = iter(p.packets())
     for row0 in range(0, p.n, p.mlen):
