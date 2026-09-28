@@ -90,3 +90,21 @@ def test_pointwise_exact_inplace_is_safe_but_partial_overlap_is_not():
         lower_pointwise_rows(
             65536, 81920, 4096, 1, sigmoid_input=True, constants_base=0
         )
+
+
+def test_packed_kv_append_rejects_live_aliases_and_missing_masks():
+    from compiler.aten.plena.recurrent_coefficients import lower_packed_matrix_append, packed_append_edits
+
+    edits = packed_append_edits(65, 257, column=True)
+    # The 65th key channel is in a second Vector row; a final partial
+    # packet still needs its own preservation mask and RMW ownership.
+    assert sum(map(len, edits.values())) == 65
+    masks = {row: 0x100000 + i * 4096 for i, row in enumerate(edits)}
+    args = (0, 65, 257, 0x20000, 0x30000, 0x40000, 0x50000)
+    lower_packed_matrix_append(*args, column=True, keep_masks=masks)
+    with pytest.raises(ValueError, match="preservation mask"):
+        lower_packed_matrix_append(*args, column=True, keep_masks={})
+    with pytest.raises(ValueError, match="overlap"):
+        lower_packed_matrix_append(*args[:-1], 0, column=True, keep_masks=masks)
+    with pytest.raises(ValueError, match="32-bit"):
+        lower_packed_matrix_append(*args, column=True, keep_masks={row: 2**32 for row in edits})

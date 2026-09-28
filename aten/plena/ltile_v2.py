@@ -106,6 +106,9 @@ def lower_group(o: Options, memory: dict, emitter: Emitter | None = None) -> Emi
     arrays are prepacked to the selected views. No dynamic queues or models
     are encoded in the hardware instruction.
     """
+    if "native" in memory:
+        from compiler.aten.plena.ltile_native import lower_native_group
+        return lower_native_group(o, memory, emitter)
     e = emitter or Emitter()
     v = views(o)
     state, coeff, x, out, scratch, scalar = (v[n] for n in ("state","coeff","input","output","scratch","scalar"))

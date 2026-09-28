@@ -89,6 +89,11 @@ class LTilePrimitive(IntEnum):
     REDUCE_WRITE = 7
     RESIDUAL_WRITE = 8
 
+    # Same arithmetic, explicit native-coefficient descriptor operands.
+    NATIVE_DELTA_UPDATE = 9
+    NATIVE_REDUCE_ACC = 10
+    NATIVE_DECAY_REDUCE_ACC = 11
+
 
 class MatrixViewAxis(IntEnum):
     """Logical line direction selected by an ``L_TILE.EXEC`` operand.
@@ -346,6 +351,15 @@ def encode_l_tile_cfg(*, slot: int, shape_register: int, map_register: int) -> i
     )
 
 
+def encode_l_tile_ccfg(*, slot: int, low_register: int, high_register: int) -> int:
+    """L_TILE form2: coefficient descriptor from two GP registers."""
+    if type(slot) is not int or not 0 <= slot < 3:
+        raise ValueError("coefficient slot must be 0..2")
+    _require_register(low_register, "low_register")
+    _require_register(high_register, "high_register")
+    return L_MVIEW_OPCODE | low_register << 6 | high_register << 10 | slot << 14 | 2 << 22
+
+
 def encode_l_tile_exec(
     *,
     dst_register: int,
@@ -542,9 +556,13 @@ def validate_matrix_view_dominance(assembly: str) -> None:
 
     def transfer(state: State, opcode: str, operands: list[str]) -> State:
         result = set(state)
+        if opcode == "L_TILE_CCFG":
+            if len(operands) != 3 or not 0 <= int(operands[0], 0) < 3:
+                raise ValueError("invalid coefficient configuration")
+            result.add(("coefficient", int(operands[0], 0)))
         if opcode == "L_TILE_CFG":
             slot = int(operands[0], 0)
-            result.difference_update({token for token in result if token[1] == slot})
+            result.difference_update({token for token in result if token[1] == slot and token[0] != "coefficient"})
             result.update({("shape", slot), ("mapping", slot), ("configured", slot)})
         return frozenset(result)
 
@@ -578,7 +596,12 @@ def validate_matrix_view_dominance(assembly: str) -> None:
         if opcode == "L_TILE_EXEC":
             if len(operands) not in {4, 5}:
                 raise ValueError(f"line {line_number}: malformed L_TILE_EXEC")
-            LTilePrimitive(int(operands[3], 0))
+            primitive = LTilePrimitive(int(operands[3], 0))
+            native_slots = (2,) if primitive == LTilePrimitive.NATIVE_REDUCE_ACC else ((0, 1)
+                if primitive in (LTilePrimitive.NATIVE_DELTA_UPDATE, LTilePrimitive.NATIVE_DECAY_REDUCE_ACC) else ())
+            for slot in native_slots:
+                if ("coefficient", slot) not in state:
+                    raise ValueError(f"native EXEC without dominating coefficient slot {slot}")
             if len(operands) == 5:
                 axis_mask = int(operands[4], 0)
                 if not 0 <= axis_mask <= 0b11:
@@ -591,6 +614,17 @@ def validate_matrix_view_dominance(assembly: str) -> None:
                         f"line {line_number}: L_TILE_EXEC consumes Matrix view {slot} "
                         "before a dominating configuration"
                     )
+            continue
+        if opcode == "M_MM.P":
+            if len(operands) != 5:
+                raise ValueError(f"line {line_number}: malformed M_MM.P")
+            slot = int(operands[4], 0)
+            _require_slot(slot)
+            if ("configured", slot) not in state:
+                raise ValueError(
+                    f"line {line_number}: M_MM.P consumes Matrix view {slot} "
+                    "before a dominating configuration"
+                )
             continue
         if opcode == "M_MM_WO" and len(operands) == 4:
             slot = int(operands[3], 0)

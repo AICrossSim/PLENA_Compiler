@@ -5,6 +5,7 @@ from compiler.aten.plena.mview import (
     encode_matrix_view_dma_word,
     encode_l_tile_exec,
     encode_l_tile_cfg,
+    encode_l_tile_ccfg,
     validate_matrix_view_dominance,
 )
 
@@ -64,12 +65,14 @@ _LSTREAM_VIEW_OPS = frozenset(
     }
 )
 _PSEUDO_OPCODE_ALIASES = {
+    "M_MM.P": "M_MM",
     "V_DOT_RESET": "V_ADD_VV",
     "V_DOT_ACC": "V_MUL_VV",
     "V_DOT_WRITE": "V_SUB_VV",
     "V_FMA_VF": "V_MUL_VF",
     "L_CFG": "L_TILE",
     "L_TILE_CFG": "L_TILE",
+    "L_TILE_CCFG": "L_TILE",
     "L_TILE_EXEC": "L_TILE",
     "V_ADD_VV.MV": "V_ADD_VV",
     "V_SUB_VV.MV": "V_SUB_VV",
@@ -221,7 +224,26 @@ class AssemblyToBinary:
         # With the old ordering a masked V_EXP_V silently executed on the whole
         # tile: no diagnostic, wrong answer. rmask == 0 encodes identically under
         # either ordering, so this is a no-op for every unmasked call site.
-        if mnemonic == "L_TILE_CFG":
+        if mnemonic == "M_MM.P":
+            if any(type(reg) is not int or not 0 <= reg < 16 for reg in (rd, rs1, rs2, rstride)):
+                raise ValueError("M_MM.P requires four GP registers in [0, 16)")
+            if type(funct1) is not int or not 0 <= funct1 < 4:
+                raise ValueError("M_MM.P view slot must be in [0, 4)")
+            if instruction.funct2 is not None or imm is not None:
+                raise ValueError("M_MM.P has no immediate or second function field")
+            binary_instruction = (
+                ((8 | funct1) << (opw + 4 * ow))
+                | (rstride << (opw + 3 * ow))
+                | (rs2 << (opw + 2 * ow))
+                | (rs1 << (opw + ow))
+                | (rd << opw)
+                | opcode
+            )
+        elif mnemonic == "L_TILE_CCFG":
+            if rd is None or not 0 <= rd < 3 or rs1 is None or rs2 is None:
+                raise ValueError("L_TILE_CCFG requires slot 0..2, low register, high register")
+            binary_instruction = encode_l_tile_ccfg(slot=rd, low_register=rs1, high_register=rs2)
+        elif mnemonic == "L_TILE_CFG":
             # Text: L_TILE_CFG slot, gp_shape, gp_map.
             slot = rd
             shape_register = rs1

@@ -192,7 +192,19 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             funct2 = None
             imm = None
 
-            if len(operands) == 1:
+            if opcode == "M_MM.P":
+                # Explicit bounded projection mode. The fourth operand is a
+                # GP configuration register, unlike legacy Matrix view syntax.
+                if len(operands) != 5 or not all(
+                    re.fullmatch(r"gp\d+", operand) for operand in operands[:4]
+                ):
+                    raise ValueError("M_MM.P requires four GP registers and a view slot")
+                rd, rs1, rs2, rstride = map(_parse_operand, operands[:4])
+                try:
+                    funct1 = int(operands[4], 0)
+                except ValueError as error:
+                    raise ValueError("M_MM.P requires an integer view slot") from error
+            elif len(operands) == 1:
                 operand_0 = operands[0]
                 rd = _parse_operand(operand_0)
             elif len(operands) == 2:

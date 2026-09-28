@@ -546,7 +546,7 @@ def lower_l2norm_rows(p: L2NormRows, *, mlen=2048):
     return "\n".join(e.lines) + "\n"
 
 
-def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strategy="reference"):
+def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strategy="reference", vector_rows=64):
     """Correctness-first software packing using existing scalar/Vector ISA.
 
     sources[i] is None (zero) or (aligned HBM row base, lane). A one-hot mask,
@@ -554,7 +554,7 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
     It uses no FP SRAM staging, arbitrary SRAM gather port, or host-produced
     intermediate. Expensive; not a claim of the optimal software baseline.
     Full destination rows are owned by caller. Reference/grouped workspace is
-    rows 0..6; pattern additionally owns rows 7..63 for reusable static masks.
+    rows 0..6; pattern additionally owns rows 7..vector_rows-1 for reusable masks.
     Cached also reuses source rows and identical contributions across output
     rows within the same 64-row budget. All construction uses ordinary ISA.
     """
@@ -563,6 +563,8 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
         raise ValueError("unknown software gather strategy")
     if mlen != 2048 or not sources:
         raise ValueError("nonempty VLEN=2048 gather required")
+    if type(vector_rows) is not int or not 7 <= vector_rows <= 64:
+        raise ValueError("gather workspace needs 7..64 Vector rows")
     span = (len(sources) + mlen - 1) // mlen * mlen * 2
     for a, n in ((destination, span), (zero, mlen * 2), (one_hot, mlen * 2)):
         if type(a) is not int or a < 0 or a % 64 or a + n > 2**32:
@@ -580,7 +582,7 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
     if any(a < destination + span and destination < b for a, b in reads):
         raise ValueError("gather destination aliases a source")
     if strategy == "cached":
-        return _lower_cached_gather(sources, destination, zero, one_hot, mlen)
+        return _lower_cached_gather(sources, destination, zero, one_hot, mlen, vector_rows)
     e = _Emitter(mlen, True)
     e.lines.append("; @stage=software_coefficient_gather_reference")
     e.transfer(6, one_hot)
@@ -603,7 +605,7 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
                 pattern = tuple(i - indices[0] for i in indices)
                 if len(pattern) > 1:
                     patterns.setdefault(pattern, 7 + len(patterns))
-        if len(patterns) > 57:
+        if len(patterns) > vector_rows - 7:
             strategy = "grouped"
             patterns = {}
         for pattern, row in patterns.items():
@@ -659,7 +661,7 @@ def lower_bf16_gather(sources, destination, zero, one_hot, *, mlen=2048, strateg
     return "\n".join(e.lines) + "\n"
 
 
-def _lower_cached_gather(sources, destination, zero, one_hot, mlen):
+def _lower_cached_gather(sources, destination, zero, one_hot, mlen, vector_rows):
     """Reuse identical (source, destination-mask) contributions, not values.
 
     Compiler analysis only inspects addresses. In particular a repeated decay
@@ -683,8 +685,8 @@ def _lower_cached_gather(sources, destination, zero, one_hot, mlen):
             if len(pattern) > 1:
                 patterns.setdefault(pattern, 7 + len(patterns))
         rows.append(keys)
-    if len(patterns) > 57:
-        return lower_bf16_gather(sources, destination, zero, one_hot, strategy="grouped")
+    if len(patterns) > vector_rows - 7:
+        return lower_bf16_gather(sources, destination, zero, one_hot, strategy="grouped", vector_rows=vector_rows)
 
     # Group common contributions by identical live output-row sets. This uses
     # one SRAM row for an entire shared part (e.g. all heads' decay fields).
@@ -696,15 +698,15 @@ def _lower_cached_gather(sources, destination, zero, one_hot, mlen):
     ranked = sorted(common.items(), key=lambda item: (-(len(item[0]) - 1) * len(item[1]), item[0]))
     retained = {}
     for output_rows, keys in ranked:
-        if next_row == 64:
+        if next_row == vector_rows:
             break
         retained[output_rows] = (next_row, keys)
         next_row += 1
     addresses = sorted({source[0] for keys in rows for source, _ in keys})
-    source_cache = {a: next_row + i for i, a in enumerate(addresses[: 64 - next_row])}
+    source_cache = {a: next_row + i for i, a in enumerate(addresses[: vector_rows - next_row])}
     cached_keys = {key for _, keys in retained.values() for key in keys}
     e = _Emitter(mlen, True)
-    e.lines.append("; @stage=software_coefficient_gather_cached workspace=64")
+    e.lines.append(f"; @stage=software_coefficient_gather_cached workspace={vector_rows}")
     e.transfer(6, one_hot)
 
     def shift(dst, index, source=6):
@@ -754,6 +756,62 @@ def _lower_cached_gather(sources, destination, zero, one_hot, mlen):
                 contribute(5, key)
         e.transfer(5, destination + index * mlen * 2, store=True)
     return "\n".join(e.lines) + "\n"
+
+
+def packed_append_edits(k, n, *, column):
+    """Compile-time destination rows and source indices for BLEN32 storage."""
+    if type(k) is not int or type(n) is not int or min(k, n) < 1:
+        raise ValueError("positive integer append dimensions required")
+    pk = (k + 31) // 32 * 32
+    edits = {}
+    for i in range(k if column else n):
+        r, c = (i, n - 1) if column else (k - 1, i)
+        index = (c // 32) * pk * 32 + r * 32 + c % 32
+        edits.setdefault(index // 2048, {})[index % 2048] = i
+    return edits
+
+
+def lower_packed_matrix_append(base, k, n, source, zero, one_hot, scratch, *, column, keep_masks):
+    """Append the last column/row of BLEN32-packed BF16 storage.
+
+    Read/modify/write complete owned Vector rows with ordinary ISA. Scratch
+    is one disjoint Vector row; no 64-byte arbitrary lane-write is assumed.
+    Caller owns padded K/N packets plus a trailing Vector row for reads.
+    keep_masks maps each changed row to an immutable 2048-element BF16
+    constant: one at preserved positions, zero at updated positions. These
+    compile-time masks are loaded and charged, never generated for free at
+    runtime. Only new values require gather; existing data remains in place.
+    Inputs must be finite. As with ordinary BF16 add/mul, signed zero is not
+    guaranteed to retain its sign through the merge.
+    """
+    edits = packed_append_edits(k, n, column=column)
+    if set(keep_masks) != set(edits):
+        raise ValueError("one preservation mask is required for each changed row")
+    span = ((k + 31) // 32 * 32) * ((n + 31) // 32 * 32) * 2 + 4096
+    regions = [(base, span), (source, (((k if column else n) + 2047) // 2048) * 4096),
+               (zero, 4096), (one_hot, 4096), (scratch, 4096)]
+    regions += [(address, 4096) for address in set(keep_masks.values())]
+    for i, (address, size) in enumerate(regions):
+        if type(address) is not int or address < 0 or address % 64 or address + size > 2**32:
+            raise ValueError("append allocation exceeds aligned 32-bit byte ABI")
+        if any(address < other + count and other < address + size for other, count in regions[:i]):
+            raise ValueError("append allocations overlap")
+    code = []
+    for row, replacements in sorted(edits.items()):
+        address = base + row * 4096
+        mapping = [None] * 2048
+        for index, i in replacements.items():
+            mapping[index] = (source + (i // 2048) * 4096, i % 2048)
+        code.append(lower_bf16_gather(mapping, scratch, zero, one_hot, strategy="cached"))
+        e = _Emitter(2048, True)
+        e.transfer(0, address)
+        e.transfer(1, keep_masks[row])
+        e.binary("MUL", 0, 0, 1)
+        e.transfer(2, scratch)
+        e.binary("ADD", 0, 0, 2)
+        e.transfer(0, address, store=True)
+        code.append("\n".join(e.lines) + "\n")
+    return "".join(code)
 
 
 def lower_global_rms(

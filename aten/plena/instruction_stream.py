@@ -95,7 +95,7 @@ ARITHMETIC = frozenset({
     "V_MUL_VV.MV", "V_ADD_VV.MV", "V_SUB_VV.MV",
     "V_SUB_VF", "V_MAX_VF", "V_EXP_V", "V_RECI_V", "V_SOFTPLUS_V", "V_RED_SUM",
     "V_RED_MAX", "V_MOV_VF", "V_SHIFT_V", "V_CLR_V",
-    "M_MM", "M_TMM", "M_MM_WO", "M_BTMM",
+    "M_MM", "M_MM.P", "M_TMM", "M_MM_WO", "M_BTMM",
     "S_ADD_FP", "S_MUL_FP", "S_RECI_FP", "S_SQRT_FP", "S_EXP_FP",
 })
 

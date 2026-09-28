@@ -40,7 +40,7 @@ def test_exec_uses_0x3f_and_a_distinct_funct(
 def test_exec_rejects_a_reserved_primitive() -> None:
     with pytest.raises(ValueError, match="reserved L_TILE primitive"):
         _assembler()._convert_to_binary(
-            Instruction("L_TILE_EXEC", 4, 5, 6, 9, None, None)
+            Instruction("L_TILE_EXEC", 4, 5, 6, 12, None, None)
         )
 
 

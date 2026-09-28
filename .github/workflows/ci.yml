@@ -8,7 +8,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    branches: [main, feat/matrix-sram-lcompute]
 
 jobs:
   syntax-check:
@@ -164,6 +164,9 @@ jobs:
         run: |
           PYTHONPATH=. python3 -m pytest -q \
             assembler/tests/test_l_mview.py \
+            assembler/tests/test_projection_mode.py \
+            aten/tests/test_compact_projection.py \
+            aten/tests/test_projection_handoff.py \
             aten/tests/test_affine_layout.py \
             aten/tests/test_hybrid_compile_report.py \
             aten/tests/test_hybrid_l_tile_schedule.py \

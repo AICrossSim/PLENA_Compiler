@@ -25,7 +25,7 @@ from compiler.aten.plena.mview import (
 
 
 _MATRIX_READ_OPS = frozenset(
-    {"M_MM", "M_TMM", "M_BMM", "M_BTMM", "M_MV", "M_TMV", "M_BMV", "M_BTMV"}
+    {"M_MM", "M_MM.P", "M_TMM", "M_BMM", "M_BTMM", "M_MV", "M_TMV", "M_BMV", "M_BTMV"}
 )
 _MATRIX_WRITE_OPS = frozenset({"H_PREFETCH_M"})
 _MATRIX_VIEW_VECTOR_OPS = frozenset({"V_ADD_VV.MV", "V_SUB_VV.MV", "V_MUL_VV.MV"})
@@ -462,13 +462,14 @@ def _matrix_read_packet(
     views: dict[int, MatrixViewDescriptor],
     loop_strides: dict[int, int | None],
 ) -> MatrixAccessPacket:
-    if len(operands) not in (3, 4):
+    projection = opcode == "M_MM.P"
+    if (projection and len(operands) != 5) or (not projection and len(operands) not in (3, 4)):
         raise ValueError(
             f"{opcode} requires 3 operands plus an optional view, got {operands}"
         )
     matrix_operand = operands[1]
     matrix_address = _resolve_operand(matrix_operand, registers)
-    view_slot = int(operands[3]) if len(operands) == 4 else None
+    view_slot = int(operands[4], 0) if projection else int(operands[3]) if len(operands) == 4 else None
     descriptor = None
     if view_slot is not None:
         try:
@@ -521,7 +522,9 @@ def _matrix_read_packet(
         matrix_address=matrix_address,
         tile_count=tile_count,
         elements_per_tile=elements_per_tile,
-        repeats=multiplier * geometry.mlen,
+        # Projection fetches its bounded weight packet once for all request
+        # rows. Batch count changes arithmetic work, not the weight read count.
+        repeats=multiplier * (descriptor.shape.rows if projection else geometry.mlen),
         sample_cells=cells,
         view_slot=view_slot,
         view_rows=descriptor.shape.rows if descriptor is not None else None,
