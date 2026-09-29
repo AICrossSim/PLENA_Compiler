@@ -218,6 +218,19 @@ class CompilerContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compiler.column_ranges(4, [4, 2])
 
+    def test_current_next_return_tags_fit_existing_control_reserve(self):
+        w = self.data["workloads"][-1]
+        for lanes, expected in (([6], 2752), ([3, 3], 3744), ([4, 2], 3744)):
+            plan = compiler.compile_workload(w, lanes)
+            ctrl = plan["controller"]
+            self.assertEqual(ctrl["total_state_bytes"], expected)
+            self.assertEqual(ctrl["dma_credit_capacity"] * ctrl["dma_credit_unit_bytes"], 8192)
+            self.assertEqual(ctrl["next_prefetch_tiles_per_core"], 1)
+            self.assertEqual(ctrl["next_experts_per_core"], 1)
+            self.assertTrue(all(n >= 0 for n in ctrl["headroom_bytes_per_core"]))
+            self.assertEqual(sum(ctrl["state_bytes_per_core"]), expected)
+            self.assertEqual(plan["runtime_protocol"]["current_next_limit_per_core"], [1, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

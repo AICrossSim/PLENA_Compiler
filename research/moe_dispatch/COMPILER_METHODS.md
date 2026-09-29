@@ -147,21 +147,43 @@ borrow the other core's SRAM.
 
 ## Finite control accounting
 
-The control plan reserves an eight-entry 64-byte pending window, one 128-byte
-active context per core, an 8-Me-bucket x 3-phase x per-core x 8-byte cost table,
-and 128 bytes for global credits/age/cursors. Added state is 1,280 B for a pair.
-Including the existing 1,872 B gives 3,152 B, leaving 944 B in the old 4 KiB.
-The shared queue/global counters are assigned to core 0's control reservation;
-local contexts and local table entries are charged to their own core. For 4+2
-the assigned control states are 1,896/1,256 B, both within their private reserves.
+The 2026-09-30 Current/Next repair replaces the reserved but unused cost LUT with
+explicit successor, progress and return ownership state. All state remains inside
+the original **4 KiB arena reservation**, not W/X SRAM. Registers/tags are charged
+as bytes; their physical placement and synthesized implementation are unproven.
+
+| Item | Single | Dual |
+|---|---:|---:|
+| Existing controller records | 1,200 B | 1,872 B |
+| Pending FIFO, 8 × 64 B | 512 B | 512 B |
+| Current, 128 B/core | 128 B | 256 B |
+| Next, 128 B/core | 128 B | 256 B |
+| Progress/service estimate state, 64 B/core | 64 B | 128 B |
+| Return tags, 256 × 16 bits | 512 B | 512 B |
+| W slot owner records, 10 × 8 B | 80 B | 80 B |
+| Global credit/aging/cursor state | 128 B | 128 B |
+| **Used / remaining reserve** | **2,752 / 1,344 B** | **3,744 / 352 B** |
+
+Previous totals were 2,160/3,152 B: this revision consumes 592 more bytes, with no
+new physical capacity. Shared control records are placed in available reserved
+partitions and accessed through one charged control port. Per-core totals are
+2,048/1,696 B for 3+3 and 2,448/1,296 B for 4+2, within the respective reserves.
+Return tags encode core/slot/sector offset; task/phase/tile lives in the slot owner.
+An outstanding response prevents slot reuse, so those tags cannot alias a later
+owner. Software event IDs and reporting histories are simulator instrumentation,
+not extra hardware queues. No synthesis area/timing claim is implied.
 
 The plan does not grant zero-cost selection: its consuming simulator must charge
 descriptor reads, bounded candidate comparisons, state updates and owner commit.
-An owner is committed after workspace feasibility is checked and workspace is
-reserved. Weight slots and credits are reserved by the finite prefetch path before
-each request; whole weight tensors are never reserved. Already-prefetched work does
-not migrate. Prefetch cannot consume the slots required to complete admission of
-the current executable group.
+An owner commits atomically with FIFO-to-Next binding after standalone workspace
+feasibility is checked. The workspace itself is acquired only at promotion after
+Current retires. Next can reserve **one** existing W slot, not another X/accumulator
+workspace. W destination reservation precedes the first request; each **32 B**
+credit is consumed only on DMA acceptance and returned after safe SRAM landing.
+Already-prefetched work does not migrate. Four Current bands plus one Next tile
+fit each dual core's five slots. `runtime_protocol` documents these interface and
+release rules; descriptor identity is the stable expert-array index plus the
+explicit expert ID, Me, shapes, token map, phase addresses and result-plan index.
 
 ## Verification performed here
 

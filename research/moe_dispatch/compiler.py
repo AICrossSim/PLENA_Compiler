@@ -423,16 +423,30 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
         experts.append({"expert_id": e["id"], "Me": e["Me"], "H": e["H"], "F": e["F"],
                         "is_shared": e["is_shared"], "candidates": variants})
     existing = 1200 if nc == 1 else 1872
+    # The old reserved cost LUT was not trained or read by the timing engine.
+    # Replace it with explicit bounded successor and progress state, within the
+    # same 4 KiB reservation. Return tags encode core/slot/32B-offset (<=12 bits);
+    # task/phase/tile identities reside once per slot, not in each sector tag.
     added = {"pending_descriptors": 8 * 64, "active_contexts": nc * 128,
-             "cost_lut": 8 * 3 * nc * 8, "global_credit_age_cursors": 128}
+             "next_contexts": nc * 128, "progress_estimate_registers": nc * 64,
+             "dma_return_tags": 256 * 2, "weight_slot_owners": 10 * 8,
+             "global_credit_age_cursors": 128}
     control_used = existing + sum(added.values())
     if control_used > CONTROL_BYTES:
         raise ValueError("finite controller state exceeds old 4KiB reservation")
-    # Locate the shared pending queue/global counters in core 0's reserved
-    # control arena. Local context and per-core LUT storage are charged locally.
-    local_control = [existing // nc + 128 + 8 * 3 * 8 for _ in m_lanes]
-    local_control[0] += added["pending_descriptors"] + added["global_credit_age_cursors"]
     local_reserves = partition_bytes(CONTROL_BYTES, m_lanes)
+    local_control = [existing // nc + 128 + 128 + 64 + (10 // nc) * 8 for _ in m_lanes]
+    # A single charged control port addresses shared records. Assign their
+    # physical storage to available control partitions; no W/X arena is borrowed.
+    shared = added["pending_descriptors"] + added["dma_return_tags"] + added["global_credit_age_cursors"]
+    shared_locations = []
+    for c, reserve in enumerate(local_reserves):
+        amount = min(shared, max(0, reserve - local_control[c]))
+        shared_locations.append({"core": c, "base": local_control[c], "bytes": amount})
+        local_control[c] += amount
+        shared -= amount
+    if shared:
+        raise ValueError("shared controller records exceed private control partitions")
     if any(used > reserve for used, reserve in zip(local_control, local_reserves)):
         raise ValueError("controller state exceeds an individual private reservation")
     assert sum(local_control) == control_used
@@ -451,13 +465,27 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
                        "total_state_bytes": control_used, "reserve_headroom_bytes": CONTROL_BYTES - control_used,
                        "state_bytes_per_core": local_control,
                        "headroom_bytes_per_core": [r - u for r, u in zip(local_reserves, local_control)],
-                       "global_queue_storage_owner": 0,
+                       "shared_control_storage": shared_locations,
                        "pending_window": 8, "active_experts_per_core": 1,
+                       "next_experts_per_core": 1, "next_prefetch_tiles_per_core": 1,
+                       "next_workspace_policy": "capacity checked at bind, exclusive arena acquired only after Current retires; Next may hold one existing W slot",
+                       "dma_credit_unit_bytes": 32, "dma_credit_capacity": 256,
+                       "dma_return_tag_bits": 16,
                        "selection_service": "finite scan and descriptor updates must be charged by simulator"},
         "result_layout": results, "result_total_bytes": expected_results,
         "result_policy": "fixed output-column owners; original X, component inboxes and final output reserved before dispatch",
         "combine_policy": "ascending captured route slot; BF16-round down results, FP32 weighted sum, BF16-round then add shared",
-        "ownership_policy": "unbound until atomic workspace/result/W-group admission; immutable after first DMA",
+        "ownership_policy": "atomic FIFO-to-Next binding after private fit check; immutable until retirement; workspace acquired only at Current promotion",
+        "runtime_protocol": {
+            "descriptor_fields": ["task_id", "expert_id", "Me", "configuration_ref", "input_route_ref", "output_ref"],
+            "current_next_limit_per_core": [1, 1],
+            "prefetch_limit": "one gate-first tile per Next; uses existing private W slots",
+            "credit_release": "32B response safely written to reserved W slot",
+            "weight_release": "last actual SRAM operand read completes",
+            "current_release": "final result copied into pre-reserved inbox; never waits for layer combine",
+            "promotion": "Current absent and Next admitted; execution separately waits for operands and dependencies",
+            "addressing": "weights[phase].hbm_base + output_row*row_stride_bytes + k_offset*2",
+        },
         "weight_policy": "one expert owner does not imply all weights resident; finite streaming slots",
         "x_policy": "two operand slots; resident group uses same X across its N bands",
         "resident_bands": resident_bands,
@@ -512,6 +540,7 @@ def engine_layout(workload: dict[str, Any], m_lanes: list[int] | tuple[int, ...]
         "paired_n": [[compact(c) for c in e["candidates"][0]["cores"]]
                      for e in paired["experts"]],
         "control_accounting": whole["controller"],
+        "runtime_protocol": whole["runtime_protocol"],
     }
 
 
