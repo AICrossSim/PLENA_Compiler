@@ -430,7 +430,8 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
     added = {"pending_descriptors": 8 * 64, "active_contexts": nc * 128,
              "next_contexts": nc * 128, "progress_estimate_registers": nc * 64,
              "dma_return_tags": 256 * 2, "weight_slot_owners": 10 * 8,
-             "global_credit_age_cursors": 128}
+             "global_credit_age_cursors": 128,
+             "runtime_policy_registers": 32, "surplus_lut_and_state": 160}
     control_used = existing + sum(added.values())
     if control_used > CONTROL_BYTES:
         raise ValueError("finite controller state exceeds old 4KiB reservation")
@@ -438,7 +439,9 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
     local_control = [existing // nc + 128 + 128 + 64 + (10 // nc) * 8 for _ in m_lanes]
     # A single charged control port addresses shared records. Assign their
     # physical storage to available control partitions; no W/X arena is borrowed.
-    shared = added["pending_descriptors"] + added["dma_return_tags"] + added["global_credit_age_cursors"]
+    shared = (added["pending_descriptors"] + added["dma_return_tags"]
+              + added["global_credit_age_cursors"] + added["runtime_policy_registers"]
+              + added["surplus_lut_and_state"])
     shared_locations = []
     for c, reserve in enumerate(local_reserves):
         amount = min(shared, max(0, reserve - local_control[c]))
@@ -477,6 +480,11 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
         "combine_policy": "ascending captured route slot; BF16-round down results, FP32 weighted sum, BF16-round then add shared",
         "ownership_policy": "atomic FIFO-to-Next binding after private fit check; immutable until retirement; workspace acquired only at Current promotion",
         "runtime_protocol": {
+            "policy_registers": "32B inside existing 4KiB control reservation: thresholds, candidate mask and two stock-cycle estimates; observer histories excluded",
+            "prefetch_gate": "optional: entire Current Gate/Up/Down requests accepted and ready unconsumed tiles below threshold; permission latched by slot reservation",
+            "late_binding": "optional: remaining estimate strictly below cycle threshold; keep FIFO head when no core qualifies",
+            "shared_pinning": "optional: greatest M core, lowest core index on ties",
+            "default_arbitration": "least ready-tile nominal operand-feed cycles; existing age override and round-robin ties",
             "descriptor_fields": ["task_id", "expert_id", "Me", "configuration_ref", "input_route_ref", "output_ref"],
             "current_next_limit_per_core": [1, 1],
             "prefetch_limit": "one gate-first tile per Next; uses existing private W slots",
@@ -494,6 +502,50 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
         "claims": {"latency_estimated_here": False, "main_compiler_isa": False,
                    "full_model_end_to_end": False, "actual_sram_payload_execution": False},
     }
+
+
+
+def surplus_policy_lut(lanes, config):
+    """Compile bounded byte thresholds; predictions, not bandwidth guarantees.
+
+    Use the LOW endpoint of each logarithmic Me bin: it maximizes consumption
+    rate in that bin. Enforce resident-group capacity even when the scalar
+    Little-law estimate suggests fewer slots. In-flight bytes count once.
+    """
+    from fractions import Fraction
+    latency = config.get("hbm_latency_ns", 64)
+    bandwidth = config.get("hbm_bytes_per_ns", 256)
+    credits = config.get("credits", 256)
+    margin = config.get("surplus_margin_cycles", 64)
+    group = config.get("group", 4)
+    if (tuple(lanes) not in ORGANIZATIONS or latency < 0 or bandwidth < 32
+            or credits <= 0 or margin < 0 or group not in (1, 2, 4)):
+        raise ValueError("invalid surplus LUT configuration")
+    effective = min(Fraction(bandwidth), Fraction(credits * 32, max(latency, 1)))
+    share = effective / len(lanes)
+    transfer = math.ceil(Fraction(4096, bandwidth))
+    result = []
+    lower = [1, 2, 3, 5, 9, 17, 33, 65]
+    upper = [1, 2, 4, 8, 16, 32, 64, 2**32-1]
+    for m in lanes:
+        entries = []
+        for lo, hi in zip(lower, upper):
+            c = max(math.ceil(4096 / ((64 // len(lanes))*16)), 16)
+            tile_cycles = math.ceil(lo / m) * c
+            b = min(Fraction(4096, tile_cycles), share)
+            required = max(group, math.ceil(b * (latency + transfer) / 4096) + 1)
+            entries.append({"me_max": hi, "representative_me": lo,
+                            "depth": min(10 // len(lanes), required),
+                            "unclipped_depth": required,
+                            "low_bytes": math.ceil(b * latency),
+                            "target_bytes": math.ceil(b * (latency + margin)),
+                            "nominal_tile_cycles": tile_cycles,
+                            "budget_bytes_per_cycle": float(b)})
+        result.append(entries)
+    return {"cores": result, "latency_cycles": latency, "margin_cycles": margin,
+            "effective_credit_bandwidth_upper_bound": float(effective),
+            "depth_is_estimate_not_guarantee": True,
+            "inventory": "accepted Current bytes retained until last operand read; landing adds zero"}
 
 
 def engine_layout(workload: dict[str, Any], m_lanes: list[int] | tuple[int, ...],

@@ -220,7 +220,7 @@ class CompilerContractTests(unittest.TestCase):
 
     def test_current_next_return_tags_fit_existing_control_reserve(self):
         w = self.data["workloads"][-1]
-        for lanes, expected in (([6], 2752), ([3, 3], 3744), ([4, 2], 3744)):
+        for lanes, expected in (([6], 2944), ([3, 3], 3936), ([4, 2], 3936)):
             plan = compiler.compile_workload(w, lanes)
             ctrl = plan["controller"]
             self.assertEqual(ctrl["total_state_bytes"], expected)
@@ -230,6 +230,21 @@ class CompilerContractTests(unittest.TestCase):
             self.assertTrue(all(n >= 0 for n in ctrl["headroom_bytes_per_core"]))
             self.assertEqual(sum(ctrl["state_bytes_per_core"]), expected)
             self.assertEqual(plan["runtime_protocol"]["current_next_limit_per_core"], [1, 1])
+
+    def test_surplus_table_preserves_group_capacity_and_units(self):
+        for lanes in compiler.ORGANIZATIONS:
+            lut=compiler.surplus_policy_lut(lanes,{"group":4,"credits":256})
+            self.assertEqual(lut["effective_credit_bandwidth_upper_bound"],128)
+            for entries in lut["cores"]:
+                self.assertEqual(len(entries),8)
+                self.assertEqual([e["me_max"] for e in entries[:4]],[1,2,4,8])
+                for e in entries:
+                    self.assertGreaterEqual(e["depth"],4)
+                    self.assertLessEqual(e["depth"],10//len(lanes))
+                    self.assertLessEqual(e["low_bytes"],e["target_bytes"])
+                    self.assertLessEqual(e["budget_bytes_per_cycle"],128/len(lanes))
+            with self.assertRaises(ValueError):
+                compiler.surplus_policy_lut(lanes,{"credits":0})
 
 
 if __name__ == "__main__":

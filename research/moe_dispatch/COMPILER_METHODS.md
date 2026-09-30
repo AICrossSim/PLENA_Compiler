@@ -214,3 +214,20 @@ records (16-byte FP32 data, 16-byte metadata). Thus the timing engine can charge
 the banks touched by actual planned addresses rather than one placeholder address
 for every transfer. `--engine-layouts-dir /tmp/plena-dispatch-v1-engine-layouts`
 exports these twelve compact layouts.
+
+## Residual-capacity policy table (2026-09-30)
+
+`surplus_policy_lut` emits eight Me bins per core, nominal depth and byte
+thresholds, and the explicit unclipped depth. Runtime reads one entry on
+promotion and charges that read. It never predicts expert IDs or changes
+weight addresses. Depth is at least the resident N group, with end-of-stage
+clamping in the runtime; byte inventory counts accepted in-flight/landed
+Current data once. The scalar model is a depth estimate, not a guaranteed
+bandwidth allocation or an exact completion model.
+
+The existing 4 KiB control reservation now includes 32 B policy registers and
+160 B padded LUT/cached threshold/next-stage state. Total counted state is
+2,944 B for single and 3,936 B for dual, leaving 1,152 B and 160 B respectively.
+The data budgets and SRAM bank counts are unchanged. Historical output files
+retain their original accounting. Full raw timing and sampled numerical replay
+remain distinct evidence scopes.
