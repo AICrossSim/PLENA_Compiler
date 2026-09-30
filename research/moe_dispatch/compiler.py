@@ -24,6 +24,7 @@ ACC_BYTES, CONTROL_BYTES = 2 * 1024**2, 4096
 WEIGHT_BYTES, INGRESS_BYTES, X_BYTES = 48 * 1024, 8 * 1024, 12 * 1024
 EXPERT_PHASE_STRIDE = 16 * 1024**2
 ORGANIZATIONS = ((6,), (3, 3), (4, 2))
+ROBUST_ORGANIZATIONS = ORGANIZATIONS + ((5, 1), (8,), (4, 4), (5, 3), (6, 2), (7, 1))
 
 
 def align(n: int, granule: int = 32) -> int:
@@ -72,6 +73,39 @@ def partition_bytes(total: int, m_lanes: list[int], granule: int = 32) -> list[i
         sizes.append(end - previous)
         previous = end
     return sizes
+
+
+def hardware_budget(lanes, resources=None):
+    """Validate a physical budget; explicit research overrides never add banks."""
+    lanes = list(lanes)
+    if tuple(lanes) not in ROBUST_ORGANIZATIONS:
+        raise ValueError("unsupported physical M partition")
+    total, nc = sum(lanes), len(lanes)
+    result = {
+        "weight_slots": [10 // nc] * nc,
+        "weight_banks": [64 // nc] * nc,
+        "x_banks": [4*m for m in lanes],
+        "acc_banks": [2*m for m in lanes],
+        "acc_bytes": partition_bytes(ACC_BYTES, lanes),
+        "control_bytes": partition_bytes(CONTROL_BYTES, lanes),
+        "feedback_state_bytes": 0,
+    }
+    if resources is not None:
+        unknown = set(resources) - set(result)
+        if unknown:
+            raise ValueError("unknown physical resource fields: " + str(sorted(unknown)))
+        result.update(resources)
+    for field, budget, granule in (("weight_slots", 10, 1), ("weight_banks", 64, 1),
+                                   ("x_banks", 4*total, 1), ("acc_banks", 2*total, 1),
+                                   ("acc_bytes", ACC_BYTES, 32), ("control_bytes", CONTROL_BYTES, 32)):
+        values = result[field]
+        if len(values) != nc or any(not isinstance(x, int) or x <= 0 or x % granule for x in values):
+            raise ValueError("invalid resource partition: " + field)
+        if sum(values) != budget:
+            raise ValueError("aggregate budget violated: " + field)
+    if result["feedback_state_bytes"] not in (0, 96):
+        raise ValueError("feedback controller requires the declared 96-byte reservation")
+    return result
 
 
 def _check_routes(manifest: dict[str, Any]) -> None:
@@ -222,11 +256,11 @@ def extract_workloads(manifest_path: Path, config_path: Path,
     }
 
 
-def _result_layout(workload: dict[str, Any], m_lanes: list[int]) -> list[dict[str, Any]]:
+def _result_layout(workload: dict[str, Any], m_lanes: list[int], hw) -> list[dict[str, Any]]:
     """Reserve every eventual output before execution; completed experts can drain."""
     result = []
     for core, (lo, hi) in enumerate(column_ranges(workload["hidden"], m_lanes)):
-        control = partition_bytes(CONTROL_BYTES, m_lanes)[core]
+        control = hw["control_bytes"][core]
         route_bytes = workload["batch"] * workload["top_k"] * 16 + len(workload["experts"]) * 64
         route_state = {"address_bytes": control, "bytes": route_bytes,
                        "route_entry_bytes": 16, "expert_entry_bytes": 64,
@@ -258,11 +292,11 @@ def _result_layout(workload: dict[str, Any], m_lanes: list[int]) -> list[dict[st
 
 
 def _arena(expert: dict[str, Any], core: int, m_lanes: list[int], f_range: list[int],
-           h_range: list[int], result: dict[str, Any], resident_bands: int) -> dict[str, Any]:
+           h_range: list[int], result: dict[str, Any], resident_bands: int, hw) -> dict[str, Any]:
     m, h, f = expert["Me"], expert["H"], expert["F"]
     nf, nh = f_range[1] - f_range[0], h_range[1] - h_range[0]
-    share = partition_bytes(ACC_BYTES, m_lanes)[core]
-    control = partition_bytes(CONTROL_BYTES, m_lanes)[core]
+    share = hw["acc_bytes"][core]
+    control = hw["control_bytes"][core]
     at = align(result["arena_base_bytes"] + result["reserve_bytes"])
     base = at
     allocations = []
@@ -371,16 +405,17 @@ def _input_copies(expert: dict[str, Any], destination_core: int,
 
 
 def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, ...],
-                     mode: str = "whole", resident_bands: int = 4) -> dict[str, Any]:
+                     mode: str = "whole", resident_bands: int = 4, resources=None) -> dict[str, Any]:
     """Emit candidates, never use future latency or secretly assign extra memory."""
     m_lanes = list(m_lanes)
-    if tuple(m_lanes) not in ORGANIZATIONS or mode not in ("whole", "paired_n"):
-        raise ValueError("supported organizations are 6, 3+3, 4+2; modes whole/paired_n")
+    if (tuple(m_lanes) not in ORGANIZATIONS and not (resources is not None and tuple(m_lanes) in ROBUST_ORGANIZATIONS)) or mode not in ("whole", "paired_n"):
+        raise ValueError("unsupported organization or whole/paired_n mode")
     nc = len(m_lanes)
-    w_slots = (WEIGHT_BYTES - INGRESS_BYTES) // nc // 4096
+    hw = hardware_budget(m_lanes, resources)
+    w_slots = min(hw["weight_slots"])
     if not 1 <= resident_bands <= w_slots - 1:
         raise ValueError("current group must leave one W slot for bounded lookahead")
-    results = _result_layout(workload, m_lanes)
+    results = _result_layout(workload, m_lanes, hw)
     total_rows = sum(e["Me"] for e in workload["experts"])
     expected_results = (4 * workload["hidden"] * (total_rows + workload["batch"])
                         + 2 * workload["batch"] * workload["hidden"])
@@ -396,7 +431,7 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
         for choice in choices:
             cores = []
             for c, fr, hr in choice:
-                arena = _arena(e, c, m_lanes, fr, hr, results[c], resident_bands)
+                arena = _arena(e, c, m_lanes, fr, hr, results[c], resident_bands, hw)
                 stages = _stages(e, fr, hr, m_lanes[c])
                 cores.append({"core": c, "f_columns": fr, "h_columns": hr,
                               "storage": arena, "stages": stages,
@@ -432,16 +467,18 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
              "dma_return_tags": 256 * 2, "weight_slot_owners": 10 * 8,
              "global_credit_age_cursors": 128,
              "runtime_policy_registers": 32, "surplus_lut_and_state": 160}
+    if hw["feedback_state_bytes"]:
+        added["online_service_feedback"] = hw["feedback_state_bytes"]
     control_used = existing + sum(added.values())
     if control_used > CONTROL_BYTES:
         raise ValueError("finite controller state exceeds old 4KiB reservation")
-    local_reserves = partition_bytes(CONTROL_BYTES, m_lanes)
-    local_control = [existing // nc + 128 + 128 + 64 + (10 // nc) * 8 for _ in m_lanes]
+    local_reserves = hw["control_bytes"]
+    local_control = [existing // nc + 128 + 128 + 64 + n * 8 for n in hw["weight_slots"]]
     # A single charged control port addresses shared records. Assign their
     # physical storage to available control partitions; no W/X arena is borrowed.
     shared = (added["pending_descriptors"] + added["dma_return_tags"]
               + added["global_credit_age_cursors"] + added["runtime_policy_registers"]
-              + added["surplus_lut_and_state"])
+              + added["surplus_lut_and_state"] + hw["feedback_state_bytes"])
     shared_locations = []
     for c, reserve in enumerate(local_reserves):
         amount = min(shared, max(0, reserve - local_control[c]))
@@ -458,11 +495,11 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
         "dimensions_order": "M,N,K", "n_tile": N_TILE, "k_tile": K_TILE,
         "physical_multiplier_count": sum(m_lanes) * N_TILE * K_TILE,
         "budget": {"private_accumulator_total_bytes": ACC_BYTES, "control_reserve_inside_acc_bytes": CONTROL_BYTES,
-                   "private_weight_slots_per_core": w_slots, "weight_total_bytes": WEIGHT_BYTES,
-                   "weight_ingress_bytes": INGRESS_BYTES, "x_total_bytes": X_BYTES, "x_slots_per_core": 2,
+                   "private_weight_slots_per_core": w_slots, "weight_slots_per_core": hw["weight_slots"], "weight_total_bytes": WEIGHT_BYTES,
+                   "weight_ingress_bytes": INGRESS_BYTES, "x_total_bytes": sum(m_lanes)*2048, "x_slots_per_core": 2,
                    "x_bytes_per_core": [m * 2 * K_TILE * 2 for m in m_lanes],
-                   "private_accumulator_bytes": partition_bytes(ACC_BYTES, m_lanes),
-                   "control_bytes_per_core": partition_bytes(CONTROL_BYTES, m_lanes),
+                   "private_accumulator_bytes": hw["acc_bytes"],
+                   "control_bytes_per_core": hw["control_bytes"],
                    "residue_bytes_unallocated": 0},
         "controller": {"existing_state_bytes": existing, "added_state": added,
                        "total_state_bytes": control_used, "reserve_headroom_bytes": CONTROL_BYTES - control_used,
@@ -475,6 +512,7 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
                        "dma_credit_unit_bytes": 32, "dma_credit_capacity": 256,
                        "dma_return_tag_bits": 16,
                        "selection_service": "finite scan and descriptor updates must be charged by simulator"},
+        "hardware": hw,
         "result_layout": results, "result_total_bytes": expected_results,
         "result_policy": "fixed output-column owners; original X, component inboxes and final output reserved before dispatch",
         "combine_policy": "ascending captured route slot; BF16-round down results, FP32 weighted sum, BF16-round then add shared",
@@ -549,15 +587,15 @@ def surplus_policy_lut(lanes, config):
 
 
 def engine_layout(workload: dict[str, Any], m_lanes: list[int] | tuple[int, ...],
-                  group: int = 4) -> dict[str, Any]:
+                  group: int = 4, resources=None) -> dict[str, Any]:
     """Compact absolute bank addresses for the timing engine, indexed by expert.
 
     `whole[e][c]` and `paired_n[e][c]` have the same expert/core order as the
     workload and organization. Every base is local to the named core's private
     accumulator SRAM. Alias views do not allocate additional payload.
     """
-    whole = compile_workload(workload, m_lanes, "whole", group)
-    paired = compile_workload(workload, m_lanes, "paired_n", group)
+    whole = compile_workload(workload, m_lanes, "whole", group, resources)
+    paired = compile_workload(workload, m_lanes, "paired_n", group, resources)
 
     def compact(c: dict[str, Any]) -> dict[str, Any]:
         storage = c["storage"]
@@ -580,6 +618,7 @@ def engine_layout(workload: dict[str, Any], m_lanes: list[int] | tuple[int, ...]
     return {
         "schema": "plena_moe_dispatch_engine_layout_v1", "workload_id": workload["id"],
         "m_lanes": list(m_lanes), "group": group, "address_units": "local private SRAM bytes",
+        "hardware": whole["hardware"],
         "expert_ids": [e["id"] for e in workload["experts"]],
         "cores": [{"core": r["core"],
                    "capacity": whole["budget"]["private_accumulator_bytes"][r["core"]],

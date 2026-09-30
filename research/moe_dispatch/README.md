@@ -62,3 +62,22 @@ experiment. There is no duplicate editable planner in the Simulator.
 See [COMPILER_METHODS.md](COMPILER_METHODS.md) for layouts, copies and accounting.
 The Simulator contains the analytical assumptions, numerical audit and result
 tables; none of those are native HBM or full-model inference measurements.
+
+## Fixed-design research interface
+
+`engine_layout(workload, lanes, group, resources)` accepts explicit, validated
+resource partitions. The historical three organizations keep their defaults;
+the added M6/M8 shapes require an explicit research resource configuration.
+`robust_space.py` defines 132 unique physical/group points without inspecting
+workload timings. Each preserves its group's total slots, bytes and bank ports.
+
+X staging remains two buffers per core. Accumulator capacity, bank allocation,
+weight slots and control reservations are separate fields. The 96B adaptive
+runtime reservation is inside the existing 4KiB control/2MiB arena, including
+in comparison policies that do not use feedback. Per-core feasibility and
+control headroom are returned by the same planner used by the Simulator.
+
+No model-specific hardware selection occurs here. The companion
+`robust_study.py` performs design/validation selection and freezes hardware
+before running heldout requests. `test_robust_space.py` checks budget rejection
+and every generated physical point.
