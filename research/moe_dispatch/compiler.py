@@ -89,15 +89,19 @@ def hardware_budget(lanes, resources=None):
         "acc_bytes": partition_bytes(ACC_BYTES, lanes),
         "control_bytes": partition_bytes(CONTROL_BYTES, lanes),
         "feedback_state_bytes": 0,
+        "joint_state_bytes": 0,
     }
     if resources is not None:
         unknown = set(resources) - set(result)
         if unknown:
             raise ValueError("unknown physical resource fields: " + str(sorted(unknown)))
         result.update(resources)
+    if result["joint_state_bytes"] not in (0, 256):
+        raise ValueError("joint controller requires the declared 256-byte reservation")
+    control_budget = CONTROL_BYTES + result["joint_state_bytes"]
     for field, budget, granule in (("weight_slots", 10, 1), ("weight_banks", 64, 1),
                                    ("x_banks", 4*total, 1), ("acc_banks", 2*total, 1),
-                                   ("acc_bytes", ACC_BYTES, 32), ("control_bytes", CONTROL_BYTES, 32)):
+                                   ("acc_bytes", ACC_BYTES, 32), ("control_bytes", control_budget, 32)):
         values = result[field]
         if len(values) != nc or any(not isinstance(x, int) or x <= 0 or x % granule for x in values):
             raise ValueError("invalid resource partition: " + field)
@@ -469,16 +473,19 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
              "runtime_policy_registers": 32, "surplus_lut_and_state": 160}
     if hw["feedback_state_bytes"]:
         added["online_service_feedback"] = hw["feedback_state_bytes"]
+    if hw["joint_state_bytes"]:
+        added["joint_window_snapshot_and_scan"] = hw["joint_state_bytes"]
+    control_budget = sum(hw["control_bytes"])
     control_used = existing + sum(added.values())
-    if control_used > CONTROL_BYTES:
-        raise ValueError("finite controller state exceeds old 4KiB reservation")
+    if control_used > control_budget:
+        raise ValueError("finite controller state exceeds declared reservation inside accumulator budget")
     local_reserves = hw["control_bytes"]
     local_control = [existing // nc + 128 + 128 + 64 + n * 8 for n in hw["weight_slots"]]
     # A single charged control port addresses shared records. Assign their
     # physical storage to available control partitions; no W/X arena is borrowed.
     shared = (added["pending_descriptors"] + added["dma_return_tags"]
               + added["global_credit_age_cursors"] + added["runtime_policy_registers"]
-              + added["surplus_lut_and_state"] + hw["feedback_state_bytes"])
+              + added["surplus_lut_and_state"] + hw["feedback_state_bytes"] + hw["joint_state_bytes"])
     shared_locations = []
     for c, reserve in enumerate(local_reserves):
         amount = min(shared, max(0, reserve - local_control[c]))
@@ -494,7 +501,7 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
         "schema": PLAN_SCHEMA, "workload_id": workload["id"], "mode": mode, "m_lanes": m_lanes,
         "dimensions_order": "M,N,K", "n_tile": N_TILE, "k_tile": K_TILE,
         "physical_multiplier_count": sum(m_lanes) * N_TILE * K_TILE,
-        "budget": {"private_accumulator_total_bytes": ACC_BYTES, "control_reserve_inside_acc_bytes": CONTROL_BYTES,
+        "budget": {"private_accumulator_total_bytes": ACC_BYTES, "control_reserve_inside_acc_bytes": control_budget,
                    "private_weight_slots_per_core": w_slots, "weight_slots_per_core": hw["weight_slots"], "weight_total_bytes": WEIGHT_BYTES,
                    "weight_ingress_bytes": INGRESS_BYTES, "x_total_bytes": sum(m_lanes)*2048, "x_slots_per_core": 2,
                    "x_bytes_per_core": [m * 2 * K_TILE * 2 for m in m_lanes],
@@ -502,7 +509,7 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
                    "control_bytes_per_core": hw["control_bytes"],
                    "residue_bytes_unallocated": 0},
         "controller": {"existing_state_bytes": existing, "added_state": added,
-                       "total_state_bytes": control_used, "reserve_headroom_bytes": CONTROL_BYTES - control_used,
+                       "total_state_bytes": control_used, "reserve_headroom_bytes": control_budget - control_used,
                        "state_bytes_per_core": local_control,
                        "headroom_bytes_per_core": [r - u for r, u in zip(local_reserves, local_control)],
                        "shared_control_storage": shared_locations,
@@ -516,7 +523,9 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
         "result_layout": results, "result_total_bytes": expected_results,
         "result_policy": "fixed output-column owners; original X, component inboxes and final output reserved before dispatch",
         "combine_policy": "ascending captured route slot; BF16-round down results, FP32 weighted sum, BF16-round then add shared",
-        "ownership_policy": "atomic FIFO-to-Next binding after private fit check; immutable until retirement; workspace acquired only at Current promotion",
+        "ownership_policy": ("atomic visible-window-to-Next binding with one reserved W slot; immutable until retirement; workspace acquired only at Current promotion"
+                             if hw["joint_state_bytes"] else
+                             "atomic FIFO-to-Next binding after private fit check; immutable until retirement; workspace acquired only at Current promotion"),
         "runtime_protocol": {
             "policy_registers": "32B inside existing 4KiB control reservation: thresholds, candidate mask and two stock-cycle estimates; observer histories excluded",
             "prefetch_gate": "optional: entire Current Gate/Up/Down requests accepted and ready unconsumed tiles below threshold; permission latched by slot reservation",
@@ -531,6 +540,13 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
             "current_release": "final result copied into pre-reserved inbox; never waits for layer combine",
             "promotion": "Current absent and Next admitted; execution separately waits for operands and dependencies",
             "addressing": "weights[phase].hbm_base + output_row*row_stride_bytes + k_offset*2",
+            "joint_window": ({"snapshot_entries": 8, "snapshot_entry_bytes": 24,
+                              "scan_and_winner_register_bytes": 64, "estimate_width_bits": 32,
+                              "snapshot_fields": ["task_id", "potential_owner_mask", "commit_due_mask", "bypass_age", "per_core_service_cycles", "per_core_finish_delay_cycles"],
+                              "age_storage": "reuses existing 64B pending descriptor; at most eight live ages",
+                              "commit_rule": "potential placement and due-now admission are distinct; deferred proposals issue no DMA",
+                              "control_reserve_within_acc_bytes": control_budget}
+                             if hw["joint_state_bytes"] else None),
         },
         "weight_policy": "one expert owner does not imply all weights resident; finite streaming slots",
         "x_policy": "two operand slots; resident group uses same X across its N bands",
