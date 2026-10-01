@@ -7,6 +7,20 @@ branch is a separate, smaller mechanism review; it is not this implementation.
 
 ## What is implemented
 
+The main candidate as of 2026-10-01 uses **software-only projection mapping**.
+`aten/plena/isa_projection_software.py` selects bounded request groups and
+existing Vector SRAM allocations using resident M_MV. Its transposed schedule
+uses the existing M_TMV opcode with offline N32-by-K weight packets and
+K256/512/1024. Four output rows are read serially into the same finite Matrix
+operand registers; larger K changes the BF16 reduction grouping and is tested
+as a separate numerical contract. It introduces no new projection opcode or
+payload storage relative to the common Matrix-view platform. M_MM.P, replay/slice
+buffers and segmented reduction below remain historical hardware ablations,
+not requirements of that candidate. The original packed M_MM address stride
+has also been corrected to BLEN*MLEN and checked by machine execution with
+partial sums surviving weight reloads. Full-size M_MM cycle calibration is
+still required before calling this the best original Matrix mapping.
+
 The compiler emits input/output projections, convolution, normalization, gate
 and delta producers, coefficient placement, recurrence, and output processing
 for Mamba/KDA sublayers. Requests have private inputs, outputs and state;
@@ -16,6 +30,7 @@ through output projection, excluding the outer residual and FFN/MoE block.
 | Module | Responsibility |
 | --- | --- |
 | `aten/plena/isa_matrix_projection.py` | Resident M_MV and compact/batched M_MM.P schedules; bounded input rows, K/N tails and private output merges |
+| `aten/plena/isa_projection_software.py` | Request grouping, existing-row allocation and static-transposed M_TMV; explicit reloads and K boundaries, no new projection datapath |
 | `aten/plena/recurrent_coefficients.py` | Executed BF16 gate/delta producers, gather and compact software coefficient reuse |
 | `aten/plena/ltile_v2.py` | Fused delta update and explicit reduction lifetime |
 | `aten/plena/ltile_native.py` | Compact coefficient descriptors and native Mamba/KDA recurrence lowering |
@@ -45,7 +60,7 @@ emitted instructions; it does not replace them with a measured speedup factor.
   update intermediates, BF16 RN commit and a BF16 pairwise tree. Ordinary
   Vector recurrence is a different arithmetic contract.
 
-The projection candidate needs a finite 16 KiB weight replay buffer, 4 KiB
+The historical M_MM.P projection candidate needs a finite 16 KiB weight replay buffer, 4 KiB
 row-transfer buffer, 2 KiB useful-input storage and 256 B output hold, plus
 selection/control. These are modeled hardware requirements, not free compiler
 optimizations or synthesized area. No concurrent Matrix/recurrence execution

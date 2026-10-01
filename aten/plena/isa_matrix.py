@@ -694,7 +694,11 @@ class IsaMatrixMixin:
         ]
         for ih in range(k_block_count):
             act_addr = vram_row_start_addr + ih * vram_hidden_block_stride
-            mat_addr = packed_block.mram_addr + ih * self.blen
+            # M_MM encodes a column selection as a row-granular offset,
+            # just like the ordinary microtile emitter above. Bare BLEN
+            # addresses select the wrong columns (or fail the decoder's
+            # MLEN-alignment check) after the first packed K slice.
+            mat_addr = packed_block.mram_addr + ih * self.blen * self.mlen
             lines.extend(load_large_int(gp_act, act_addr))
             lines.extend(load_large_int(gp_mat, mat_addr))
             lines.append(f"M_MM 0, gp{gp_mat}, gp{gp_act}")
