@@ -246,6 +246,21 @@ class CompilerContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 compiler.surplus_policy_lut(lanes,{"credits":0})
 
+    def test_ipd_reuses_joint_control_and_fixed_credit_budget(self):
+        w = self.data["workloads"][0]
+        for lanes in ([6], [3, 3], [4, 2]):
+            resources = compiler.hardware_budget(lanes, {
+                "joint_state_bytes": 256,
+                "feedback_state_bytes": 96,
+                "control_bytes": [4352] if len(lanes) == 1 else [2176, 2176],
+            })
+            plan = compiler.compile_workload(w, lanes, resources=resources)
+            ipd = plan["runtime_protocol"]["ipd_fixed_budget"]
+            self.assertEqual(sum(plan["hardware"]["weight_slots"]), 10)
+            self.assertEqual(plan["controller"]["dma_credit_capacity"], 256)
+            self.assertEqual(plan["budget"]["private_accumulator_total_bytes"], 2*1024**2)
+            self.assertIn("no extra SRAM", ipd["control_state"])
+
 
 if __name__ == "__main__":
     unittest.main()

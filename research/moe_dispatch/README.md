@@ -1,6 +1,10 @@
 # Heterogeneous MoE dispatch planner
 
-Research branch: `research/moe-heterogeneous-dispatch`.
+Research branch: `research/moe-ipd-bf16-ab` (descended from
+`research/moe-joint-runtime`). The matching Simulator branch implements the
+fixed-budget BF16 `ipd` controller and sequential multi-layer baseline. The
+planner's `ipd_fixed_budget` protocol metadata explicitly reuses the existing
+256 B joint snapshot and 256 shared DMA credits; it adds no hardware capacity.
 
 This frontend compiles captured MoE routes into **explicit task and private-memory
 plans** for one `6x4x512`, two `3x4x512`, or `4x4x512 + 2x4x512` engines. Dimensions

@@ -545,8 +545,17 @@ def compile_workload(workload: dict[str, Any], m_lanes: list[int] | tuple[int, .
                               "snapshot_fields": ["task_id", "potential_owner_mask", "commit_due_mask", "bypass_age", "per_core_service_cycles", "per_core_finish_delay_cycles"],
                               "age_storage": "reuses existing 64B pending descriptor; at most eight live ages",
                               "commit_rule": "potential placement and due-now admission are distinct; deferred proposals issue no DMA",
-                              "control_reserve_within_acc_bytes": control_budget}
+                             "control_reserve_within_acc_bytes": control_budget}
                              if hw["joint_state_bytes"] else None),
+            "ipd_fixed_budget": ({
+                "dispatch_unit": "one complete BF16 expert FFN; no I slicing",
+                "visibility": "same eight arrived descriptors as joint; one arrives per cycle",
+                "selection": "Shared/high Me to wider available core and lowest-Me visible companion to other core; bounded age override",
+                "late_commit": "reuses joint potential/due masks and charged snapshot service",
+                "credit_quota": "optional per-core 32B-request caps derived from Me/M operand-feed demand; both caps sum to existing 256 credits; unused peer share may be borrowed; update charged eight control cycles when Current/Next task identity changes",
+                "control_state": "reuses joint 256B snapshot and existing 32B policy registers/global credit counters; no extra SRAM",
+                "excluded": ["expert slicing", "shared W pool", "cross-layer prefetch", "quantization"],
+            } if hw["joint_state_bytes"] else None),
         },
         "weight_policy": "one expert owner does not imply all weights resident; finite streaming slots",
         "x_policy": "two operand slots; resident group uses same X across its N bands",
