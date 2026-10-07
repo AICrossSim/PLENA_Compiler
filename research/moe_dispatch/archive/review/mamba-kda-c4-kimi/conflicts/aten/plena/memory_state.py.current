@@ -351,16 +351,5 @@ class MemoryStateMixin:
         self.mram_allocator.reset()
         self.fpram_allocator.reset()
 
-    def bind_mram_subblock(self, sub_block: SubMatrixInfo, mram_addr: int) -> None:
-        """Record one currently resident HBM tile.
-
-        A tile can be rebound before reset, but it must appear only once in the
-        live list so reset work remains bounded by physical MRAM capacity.
-        """
-        if sub_block.mram_addr is None:
-            self._mram_bound_subblocks.append(sub_block)
-        sub_block.mram_addr = mram_addr
-
-
 
 __all__ = ["MemoryStateMixin"]
