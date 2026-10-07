@@ -50,3 +50,10 @@ All conflicting blobs archived under `research/moe_dispatch/archive/local/candid
 
 - `aten/plena/program_routed_moe.py`: 2 conflict block(s), chose current. Retain stage attribution and programmable TOPK policies supporting DeepSeek 64/top-6; old contract documentation lacks those later extensions.
 - `doc/plena_isa_spec.md`: 1 conflict block(s), chose current. Retain stage attribution and programmable TOPK policies supporting DeepSeek 64/top-6; old contract documentation lacks those later extensions.
+
+## Merge `local/compiler-expert-ffn-20260727` (`8cfb0d071524d18c5a3bc98d2ef498509e123389`)
+
+All conflicting blobs archived under `research/moe_dispatch/archive/local/compiler-expert-ffn-20260727/conflicts`. Non-conflicting edits are retained.
+
+- `aten/plena/program_routed_moe.py`: 0 conflict block(s), chose current. Keep newer stage-correct routed implementation and version-aware reference tests; preserve new historical standalone expert-FFN, scalar route-weight and dynamic-combine methods alongside it, adding required modern stage arguments without changing current methods.
+- `aten/tests/test_gpt_oss_moe_reference.py`: 2 conflict block(s), chose current. Keep newer stage-correct routed implementation and version-aware reference tests; preserve new historical standalone expert-FFN, scalar route-weight and dynamic-combine methods alongside it, adding required modern stage arguments without changing current methods.

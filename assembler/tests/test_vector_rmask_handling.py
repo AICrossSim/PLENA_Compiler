@@ -6,16 +6,22 @@ from assembler.assembly_to_binary import AssemblyToBinary
 from assembler.parser import Instruction, parse_asm_file
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 class TestVectorRmaskHandling(unittest.TestCase):
     def setUp(self):
-        self.asm = AssemblyToBinary("doc/operation.svh", "doc/configuration.svh")
+        self.asm = AssemblyToBinary(
+            str(REPO_ROOT / "doc" / "operation.svh"),
+            str(REPO_ROOT / "doc" / "configuration.svh"),
+        )
 
     def test_parser_sets_default_rmask_for_three_operand_vector_binary(self):
-        asm_path = "/tmp/plena_test_vector_binary_missing_rmask.asm"
-        with open(asm_path, "w") as f:
-            f.write("V_ADD_VV gp1, gp2, gp3\n")
+        with TemporaryDirectory() as tmpdir:
+            asm_path = Path(tmpdir) / "vector_binary_missing_rmask.asm"
+            asm_path.write_text("V_ADD_VV gp1, gp2, gp3\n")
 
-        parsed = parse_asm_file(asm_path)
+            parsed = parse_asm_file(str(asm_path))
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0].rmask, 0)
 

@@ -24,13 +24,17 @@ Exit codes:
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Add parent repo's tools + testbench to sys.path (mirror existing testbench bootstrap).
 _COMPILER_ROOT = Path(__file__).resolve().parents[2]  # compiler/
-_REPO_ROOT = _COMPILER_ROOT.parent
+_REPO_ROOT = Path(
+    os.environ.get("PLENA_REPO_ROOT", str(_COMPILER_ROOT.parent))
+).resolve()
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "tools"))
+sys.path.insert(0, str(_REPO_ROOT / "PLENA_Tools"))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -70,14 +74,24 @@ def _load_model_for_weights(model_id: str, torch_dtype=None):
 from assembler import AssemblyToBinary  # noqa: E402
 
 # Tools imports for HBM weight population (same stack create_mem_for_sim uses).
-sys.path.insert(0, str(_REPO_ROOT / "tools"))
-from memory_mapping.memory_map import map_mx_data_to_hbm_for_behave_sim  # noqa: E402
+from memory_mapping.behave_sim import map_mx_data_to_hbm_for_behave_sim  # noqa: E402
 from memory_mapping.rand_gen import RandomMxfpTensorGenerator  # noqa: E402
 from utils.load_config import load_toml_config  # noqa: E402
 
-# Use existing emulator runner for the Rust invocation.
-sys.path.insert(0, str(_REPO_ROOT / "transactional_emulator" / "testbench"))
-from emulator_runner import run_emulator  # noqa: E402
+
+def _load_run_emulator():
+    """Load the cross-repository emulator only when this CLI harness runs."""
+    testbench_dir = _REPO_ROOT / "transactional_emulator" / "testbench"
+    runner_path = testbench_dir / "emulator_runner.py"
+    if not runner_path.is_file():
+        raise RuntimeError(
+            "PLENA Simulator testbench not found; set PLENA_REPO_ROOT to a "
+            "PLENA_Simulator checkout before running generator E2E"
+        )
+    sys.path.insert(0, str(testbench_dir))
+    from emulator_runner import run_emulator
+
+    return run_emulator
 
 
 def _build_hbm_from_hf_weights(
@@ -430,7 +444,7 @@ def run_pipeline(model_id: str, seq_len: int, build_dir: Path, num_layers: int |
     # Step 4: run emulator
     print("[4/5] Rust transactional emulator")
     try:
-        run_emulator(build_dir)
+        _load_run_emulator()(build_dir)
     except RuntimeError as e:
         print(f"      emulator failed: {e}", file=sys.stderr)
         raise
@@ -459,7 +473,7 @@ def pytorch_reference(model_id: str, input_ids: torch.Tensor) -> np.ndarray:
 
 
 def run_test(model_id: str = "AICrossSim/clm-60m", seq_len: int = 128, num_layers: int | None = None) -> int:
-    build_dir = Path("/tmp") / f"gen_e2e_{model_id.replace('/', '_')}_sl{seq_len}"
+    build_dir = Path(tempfile.gettempdir()) / f"gen_e2e_{model_id.replace('/', '_')}_sl{seq_len}"
     print("=" * 80)
     layers_note = f", num_layers={num_layers}" if num_layers is not None else ""
     print(f"Generator e2e harness — {model_id} — seq_len={seq_len}{layers_note}")
