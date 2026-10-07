@@ -302,6 +302,7 @@ class PlenaCompiler(
         self.stream_packetized = stream_packetized
 
         # HBM address auto-allocation
+        self._scratch_serial = 0
         self._next_hbm_addr: int = 0
         self._hbm_free_blocks: list[tuple[int, int]] = []  # (addr, size)
 

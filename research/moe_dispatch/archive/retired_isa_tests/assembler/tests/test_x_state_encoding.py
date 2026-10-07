@@ -7,8 +7,6 @@ from assembler.parser import Instruction
 from aten.state import StateSubop, decode_instruction
 
 
-pytestmark = pytest.mark.skip(reason="Retired X_STATE prototype profile; authoritative Matrix/L-TILE ISA uses its former opcode. Original tests are archived.")
-
 def _assembler() -> AssemblyToBinary:
     return AssemblyToBinary("doc/operation.svh", "doc/configuration.svh")
 

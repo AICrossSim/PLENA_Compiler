@@ -116,8 +116,6 @@ def test_legacy_bias_mnemonic_does_not_occupy_the_route_opcode() -> None:
             (name for name, value in opcodes.items() if value == opcode), None
         )
         assert occupant in {None, reserved_name}
-    assert opcodes["V_SOFTPLUS_V"] == 0x3D
-    assert opcodes["S_MAP_FP_V"] == 0x3E
-    assert "X_STATE" not in opcodes
-    assert opcodes["L_TILE"] == 0x3F
-    assert "L_SCATTER_M" not in opcodes
+    assert opcodes["X_STATE"] == 0x3D
+    assert 0x3E not in opcodes.values()
+    assert opcodes["L_SCATTER_M"] == 0x3F

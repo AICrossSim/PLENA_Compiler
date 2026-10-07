@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from compiler.asm_templates._imm import load_large_int
+from compiler.aten.isa_builder import IsaBuilder, addr as areg, gp
 from compiler.aten.plena.affine_layout import AffineLayout
 from compiler.aten.plena.mview import LTilePrimitive, MatrixViewDescriptor
 from compiler.aten.plena.vars import InputVar, TensorVar, VRAMMatrixVar

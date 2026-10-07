@@ -11,8 +11,6 @@ from aten.state import (
 )
 
 
-pytestmark = pytest.mark.skip(reason="Retired L_SCATTER_M prototype profile; authoritative Matrix/L-TILE ISA uses its former opcode. Original tests are archived.")
-
 def _assembler() -> AssemblyToBinary:
     return AssemblyToBinary("doc/operation.svh", "doc/configuration.svh")
 

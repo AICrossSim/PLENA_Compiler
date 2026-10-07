@@ -3,11 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import pytest
 from pathlib import Path
 
-
-pytestmark = pytest.mark.skip(reason="Historical X_STATE/L_SCATTER_M ISA freeze; primary active profile is Matrix/L-TILE. Original freeze and tests remain archived.")
 
 ROOT = Path(__file__).parents[2]
 FREEZE = json.loads((ROOT / "spec" / "hybrid_isa_freeze_v1.json").read_text())

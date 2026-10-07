@@ -363,6 +363,15 @@ class AssemblyToBinary:
             binary_instruction = (rs1 << (opw + ow)) + (rd << opw) + opcode
         elif mnemonic in _NO_OPERAND_OPS:
             binary_instruction = opcode
+        elif mnemonic == "C_SET_TOPK_REG":
+            if type(rd) is not int or not 0 <= rd < 16:
+                raise ValueError("C_SET_TOPK_REG rd must fit the 4-bit GP field")
+            if any(v is not None for v in (rs1, rs2, instruction.rstride, instruction.funct1, instruction.funct2)):
+                raise ValueError("C_SET_TOPK_REG accepts only rd and an optional numeric target")
+            target = 0 if imm is None else imm
+            if target not in (0, 1):
+                raise ValueError("C_SET_TOPK_REG target must be 0 (policy) or 1 (bias VRAM address)")
+            binary_instruction = (target << (opw + ow)) + (rd << opw) + opcode
         elif mnemonic in _RD_ONLY_OPS:
             binary_instruction = (rd << opw) + opcode
         elif mnemonic == "C_LOOP_START":

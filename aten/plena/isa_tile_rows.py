@@ -402,7 +402,14 @@ class IsaTileRowMixin:
         rows: list[int],
         tile_row_idx: int = 0,
         tile_col_idx: int = 0,
+        *,
+        zero_row_addr: int | None = None,
     ) -> str:
+        if zero_row_addr is not None:
+            return self.vram_fill_zero_asm(
+                self._tile_addr(matrix_name, tile_row_idx, tile_col_idx),
+                rows, zero_row_addr,
+            )
         return self._tile_row_single_matrix_op(
             "vram_fill_zero_asm", matrix_name, rows, tile_row_idx, tile_col_idx
         )

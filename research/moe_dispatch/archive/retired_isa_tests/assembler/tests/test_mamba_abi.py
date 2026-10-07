@@ -31,7 +31,6 @@ def test_mamba_instruction_exact_encoding_and_round_trip():
     }
 
 
-@pytest.mark.skip(reason="Retired X_MAMBA prototype opcode 0x39; current profile uses C_ROUTE_BEGIN. Codec-only tests remain active.")
 def test_assembler_encodes_x_mamba_with_queue_and_subop(tmp_path):
     asm_path = tmp_path / "mamba.asm"
     output_path = tmp_path / "mamba.hex"

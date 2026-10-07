@@ -3,6 +3,7 @@ import re
 from aten.nemotron3.blocks import (
     NemotronAttentionShape,
     NemotronAttentionWeights,
+    allocate_nemotron_gqa_decode_cache,
     NemotronMoeConstants,
     NemotronMoeShape,
     NemotronMoeWeights,

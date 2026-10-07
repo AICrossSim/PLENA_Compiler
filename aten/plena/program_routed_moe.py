@@ -105,6 +105,33 @@ _PAIR_INDEXED_STAGES: frozenset[str] = frozenset({"expert_route_weight"})
 #: ``rmask`` value that makes V_TOPK read its shape from ``C_SET_TOPK_REG``
 #: instead of the two-entry hardwired table.
 _TOPK_POLICY_REGISTER_RMASK = 15
+_TOPK_POLICY_EXPERT_SHIFT = 8
+
+#: ``C_SET_TOPK_REG`` target selecting the sticky correction-bias VRAM base.
+#: Target 0 is the legacy policy register and remains implicit in its one-operand
+#: spelling; target 1 shares opcode 0x38 so 0x39 stays available to Shared-MoE.
+_TOPK_REGISTER_TARGET_BIAS = 1
+
+#: Number of bits reserved for ``num_experts``. 14 bits leaves bit 22 for the
+#: route-weight transform while covering substantially larger expert tables
+#: than current Kimi K3 (896 experts).
+_TOPK_POLICY_EXPERT_BITS = 14
+_TOPK_POLICY_EXPERT_MASK = (1 << _TOPK_POLICY_EXPERT_BITS) - 1
+
+#: When set, V_TOPK ranks raw logits (sigmoid is monotonic) and writes
+#: ``sigmoid(selected) / sum(sigmoid(selected))`` instead of selected-softmax.
+#: This is Kimi K3's ``moe_router_activation_func=sigmoid`` plus
+#: ``moe_renormalize=true`` contract.
+_TOPK_POLICY_SIGMOID_NORMALIZED = 1 << (
+    _TOPK_POLICY_EXPERT_SHIFT + _TOPK_POLICY_EXPERT_BITS
+)
+
+#: Rank experts using ``raw_logit + correction_bias`` while route weights are
+#: still derived from the unmodified raw logits. This is the no-auxiliary-loss
+#: routing rule used by Kimi K3 and DeepSeek-style gates.
+_TOPK_POLICY_CORRECTION_BIAS = 1 << 23
+
+
 
 #: Bit position of ``num_experts`` inside the packed ``C_SET_TOPK_REG`` value.
 #: Must match ``AcceleratorRegFile::topk_policy`` in the emulator.
@@ -125,7 +152,7 @@ _TOPK_POLICY_SINGLE_ADDI_MAX_PACKED = (1 << 18) - 1
 #: correctly: ``IsaBuilder.render`` runs ``legalize_large_immediates``, which
 #: rewrites an over-wide ``S_ADDI_INT`` into ``S_LUI_INT`` + ``S_ADDI_INT``.
 #: They only lose the single-instruction property the 8-bit shift buys.
-_TOPK_POLICY_MAX_PACKED = (1 << 22) - 1
+_TOPK_POLICY_MAX_PACKED = (1 << 24) - 1
 
 # The first hardware route dispatcher is deliberately narrower than the generic
 # V_TOPK policy register. Keep these limits local to the batch4 lowering: normal
@@ -134,8 +161,13 @@ _ROUTE_DISPATCH_MAX_EXPERTS = 256
 _ROUTE_DISPATCH_MAX_TOPK = 8
 
 
-def _pack_topk_policy(num_experts: int, top_k: int) -> int:
-    """Pack ``(num_experts, top_k)`` for ``C_SET_TOPK_REG``.
+def _pack_topk_policy(
+    num_experts: int,
+    top_k: int,
+    route_weight_mode: str = "softmax",
+    correction_bias: bool = False,
+) -> int:
+    """Pack shape and route-weight normalization for ``C_SET_TOPK_REG``.
 
     Layout is ``(num_experts << 8) | top_k``. The emulator unpacks it in
     ``AcceleratorRegFile::topk_policy``; nothing but the unit tests on either side
@@ -148,12 +180,27 @@ def _pack_topk_policy(num_experts: int, top_k: int) -> int:
         raise ValueError(
             f"top_k={top_k} does not fit {_TOPK_POLICY_EXPERT_SHIFT} bits; the C_SET_TOPK_REG packing bounds it at 255"
         )
-    packed = (num_experts << _TOPK_POLICY_EXPERT_SHIFT) | top_k
+    if num_experts > _TOPK_POLICY_EXPERT_MASK:
+        raise ValueError(
+            f"num_experts={num_experts} does not fit {_TOPK_POLICY_EXPERT_BITS} bits; "
+            f"the C_SET_TOPK_REG packing bounds it at {_TOPK_POLICY_EXPERT_MASK}"
+        )
+    mode_bits = {
+        "softmax": 0,
+        "sigmoid_normalized": _TOPK_POLICY_SIGMOID_NORMALIZED,
+    }.get(route_weight_mode)
+    if mode_bits is None:
+        raise ValueError(
+            "route_weight_mode must be 'softmax' or 'sigmoid_normalized', got "
+            f"{route_weight_mode!r}"
+        )
+    packed = (num_experts << _TOPK_POLICY_EXPERT_SHIFT) | top_k | mode_bits
+    if correction_bias:
+        packed |= _TOPK_POLICY_CORRECTION_BIAS
     if packed > _TOPK_POLICY_MAX_PACKED:
         raise ValueError(
             f"num_experts={num_experts} packs to {packed}, past the C_SET_TOPK_REG packing "
-            f"ceiling of {_TOPK_POLICY_MAX_PACKED}; it tops out at "
-            f"{_TOPK_POLICY_MAX_PACKED >> _TOPK_POLICY_EXPERT_SHIFT} experts"
+            f"ceiling of {_TOPK_POLICY_MAX_PACKED}"
         )
     return packed
 
@@ -661,13 +708,14 @@ class ProgramRoutedMoeMixin:
         num_experts: int = 32,
         top_k: int = 4,
         emit_policy_config: bool = True,
+        route_weight_mode: str = "softmax",
+        correction_bias: VRAMMatrixVar | None = None,
         policy_name: str = "gpt_oss",
         name: str = "moe_router_select",
     ) -> None:
         """Emit V_TOPK for one router-logit row.
 
-        V_TOPK v0 reads vector-format router logits from VRAM (V_FP12 in the
-        current RTL), performs a
+        V_TOPK v0 reads one BF16 router-logit row from VRAM, performs a
         linear-scan top-k with low-index tie break, stores the selected expert
         ids to INT SRAM, and stores the softmax-over-selected weights to FP
         SRAM.  The instruction intentionally keeps router/top-k on the BF16
@@ -692,14 +740,34 @@ class ProgramRoutedMoeMixin:
             )
         if top_k < 1 or top_k > num_experts:
             raise ValueError(f"top_k={top_k} must be in [1, num_experts={num_experts}]")
+        if correction_bias is not None:
+            if correction_bias.shape[0] < expert_blocks or correction_bias.shape[1] < self.mlen:
+                raise ValueError(
+                    "correction_bias must contain one contiguous MLEN row per expert block, "
+                    f"need at least {(expert_blocks, self.mlen)}, got {correction_bias.shape}"
+                )
 
         # The fixed rmask table is preferred where it applies so existing GPT-OSS
         # and Qwen3 programs keep emitting byte-identical ASM.
-        policy_rmask = {(32, 4): 0, (128, 8): 1}.get((num_experts, top_k))
+        if route_weight_mode not in {"softmax", "sigmoid_normalized"}:
+            raise ValueError(
+                "route_weight_mode must be 'softmax' or 'sigmoid_normalized', got "
+                f"{route_weight_mode!r}"
+            )
+        policy_rmask = (
+            {(32, 4): 0, (128, 8): 1}.get((num_experts, top_k))
+            if route_weight_mode == "softmax" and correction_bias is None
+            else None
+        )
         packed_policy = None
         if policy_rmask is None:
             policy_rmask = _TOPK_POLICY_REGISTER_RMASK
-            packed_policy = _pack_topk_policy(num_experts, top_k)
+            packed_policy = _pack_topk_policy(
+                num_experts,
+                top_k,
+                route_weight_mode=route_weight_mode,
+                correction_bias=correction_bias is not None,
+            )
 
         gp_weights, gp_logits, gp_indices = self._reg.allocate_gp(3)
         try:
@@ -707,7 +775,9 @@ class ProgramRoutedMoeMixin:
                 moe_stage_marker(
                     "router_topk",
                     f"[{policy_name}] V_TOPK {name}: token={token_idx}, experts={num_experts}, "
-                    f"top_k={top_k}, weights_fp={weights_fp_base}, indices_int={indices_int_base}",
+                    f"top_k={top_k}, weight_mode={route_weight_mode}, "
+                    f"correction_bias={correction_bias is not None}, "
+                    f"weights_fp={weights_fp_base}, indices_int={indices_int_base}",
                 )
             )
             if packed_policy is not None and emit_policy_config:
@@ -716,6 +786,18 @@ class ProgramRoutedMoeMixin:
                 # emitter that can run in between; two scalar instructions are cheap.
                 asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), packed_policy)
                 asm.instr("C_SET_TOPK_REG", gp(gp_weights))
+            if correction_bias is not None:
+                asm.instr(
+                    "S_ADDI_INT",
+                    gp(gp_logits),
+                    gp(0),
+                    self._vram_matrix_row_addr(correction_bias, 0, 0),
+                )
+                asm.instr(
+                    "C_SET_TOPK_REG",
+                    gp(gp_logits),
+                    _TOPK_REGISTER_TARGET_BIAS,
+                )
             asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), weights_fp_base)
             asm.instr(
                 "S_ADDI_INT",
@@ -744,26 +826,34 @@ class ProgramRoutedMoeMixin:
         gp_offset: int,
         gp_base: int,
         name: str,
+        pair_index_gp: int | None = None,
         expert_gp_source: int | None = None,
     ) -> None:
         """Emit the shared true-expert-id -> HBM-base address calculation."""
         if per_expert_stride <= 0:
             raise ValueError(f"{name}: per_expert_stride must be positive, got {per_expert_stride}")
+        if per_expert_stride <= 0:
+            raise ValueError(f"{name}: per_expert_stride must be positive")
         asm.comment(
             moe_stage_marker(
                 "expert_weight_address",
                 f"{name}: pair={pair_idx}, table_base={table_base}, stride={per_expert_stride}",
             )
         )
-        if expert_gp_source is None:
-            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+        if expert_gp_source is not None:
+            asm.instr("S_ADD_INT", gp(gp_expert), gp(expert_gp_source), gp(0))
+        elif pair_index_gp is None:
             asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
-        resolved_expert_gp = gp_expert if expert_gp_source is None else expert_gp_source
+        else:
+            asm.instr("S_ADD_INT", gp(gp_table), gp(gp_table), gp(pair_index_gp))
+            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), 0)
         asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), per_expert_stride)
-        asm.instr("S_MUL_INT", gp(gp_offset), gp(resolved_expert_gp), gp(gp_stride))
-        asm.instr("S_ADDI_INT", gp(gp_base), gp(0), table_base)
+        asm.instr("S_MUL_INT", gp(gp_offset), gp(gp_expert), gp(gp_stride))
+        asm.instr("S_ADDI_INT", gp(gp_base), gp(0), table_base & 0xFFFF_FFFF)
         asm.instr("S_ADD_INT", gp(gp_base), gp(gp_base), gp(gp_offset))
-        asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(0), gp(gp_base))
+        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), table_base >> 32)
+        asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(gp_table), gp(gp_base))
 
     def _emit_expert_id_to_weight_base_table_v0(
         self,
@@ -777,6 +867,7 @@ class ProgramRoutedMoeMixin:
         gp_expert: int,
         gp_base: int,
         name: str,
+        pair_index_gp: int | None = None,
         expert_gp_source: int | None = None,
     ) -> None:
         """Emit expert-id -> HBM-base lookup through an IntSRAM base table."""
@@ -786,11 +877,15 @@ class ProgramRoutedMoeMixin:
                 f"{name}: table lookup pair={pair_idx}, base_table_int={expert_base_table_int_base}",
             )
         )
-        if expert_gp_source is None:
-            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+        if expert_gp_source is not None:
+            asm.instr("S_ADD_INT", gp(gp_expert), gp(expert_gp_source), gp(0))
+        elif pair_index_gp is None:
             asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
-        resolved_expert_gp = gp_expert if expert_gp_source is None else expert_gp_source
-        asm.instr("S_LD_INT", gp(gp_base), gp(resolved_expert_gp), expert_base_table_int_base)
+        else:
+            asm.instr("S_ADD_INT", gp(gp_table), gp(gp_table), gp(pair_index_gp))
+            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), 0)
+        asm.instr("S_LD_INT", gp(gp_base), gp(gp_expert), expert_base_table_int_base)
         asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(0), gp(gp_base))
 
     def moe_expert_id_to_weight_base_v0(
@@ -840,26 +935,19 @@ class ProgramRoutedMoeMixin:
         pair_idx: int,
         table_base: int,
         per_expert_stride: int,
+        num_experts: int | None = None,
+        tile_group_stride: int | None = None,
         expert_base_table_int_base: int | None = None,
         mram_start_addr: int | None = None,
         k_block_start: int = 0,
         k_block_count: int | None = None,
-        expert_gp: int | None = None,
         name: str = "gpt_oss_dynamic_weight_load",
+        pair_index_gp: int | None = None,
+        expert_gp: int | None = None,
     ) -> None:
-        """Load one weight column tile using runtime true expert id addressing.
-
-        ``table_base`` and ``per_expert_stride`` are byte addresses. In affine
-        mode each stride must cover the template's complete element, scale, and
-        padding footprint; larger strides may be used for table alignment.
-        """
+        """Load one weight column tile using runtime true expert id addressing."""
         self._ensure_hbm_sub_matrix_registered(weight_template)
         layout = self.get_hbm_layout(weight_template.name)
-        if expert_base_table_int_base is None and per_expert_stride < layout.hbm_size:
-            raise ValueError(
-                f"{name}: per_expert_stride={per_expert_stride} bytes is smaller than "
-                f"{weight_template.name} HBM footprint={layout.hbm_size} bytes"
-            )
         num_row_blocks = layout.num_row_blocks
         block_size = self.mlen * self.mlen
         effective_count = k_block_count if k_block_count is not None else num_row_blocks
@@ -880,7 +968,37 @@ class ProgramRoutedMoeMixin:
                     f"dynamic HBM weight prefetch: template={weight_template.name}, pair={pair_idx}, col={col_idx}",
                 )
             )
-            if expert_base_table_int_base is None:
+            block_coords = tuple(
+                (row_idx, col_idx)
+                for row_idx in range(k_block_start, k_block_start + effective_count)
+            )
+            if tile_group_stride is not None:
+                if num_experts is None:
+                    raise ValueError("tile-major expert loading requires num_experts")
+                self._emit_tile_major_expert_tiles_v0(
+                    asm,
+                    layout=layout,
+                    block_coords=block_coords,
+                    expert_indices_int_base=expert_indices_int_base,
+                    pair_idx=pair_idx,
+                    table_base=table_base,
+                    num_experts=num_experts,
+                    tile_group_stride=tile_group_stride,
+                    mram_start_addr=mram_start_addr,
+                    addr_reg=addr_reg,
+                    gp_table=gp_table,
+                    gp_expert=gp_expert,
+                    gp_expert_stride=gp_expert_stride,
+                    gp_expert_offset=gp_expert_offset,
+                    gp_base=gp_base,
+                    gp_scale=gp_scale,
+                    gp_stride=gp_stride,
+                    gp_mram=gp_mram,
+                    name=name,
+                    pair_index_gp=pair_index_gp,
+                    expert_gp_source=expert_gp,
+                )
+            elif expert_base_table_int_base is None:
                 self._emit_expert_id_to_weight_base_v0(
                     asm,
                     expert_indices_int_base=expert_indices_int_base,
@@ -894,6 +1012,7 @@ class ProgramRoutedMoeMixin:
                     gp_offset=gp_expert_offset,
                     gp_base=gp_base,
                     name=name,
+                    pair_index_gp=pair_index_gp,
                     expert_gp_source=expert_gp,
                 )
             else:
@@ -907,28 +1026,20 @@ class ProgramRoutedMoeMixin:
                     gp_expert=gp_expert,
                     gp_base=gp_base,
                     name=name,
+                    pair_index_gp=pair_index_gp,
                     expert_gp_source=expert_gp,
                 )
-            # Address selection has its own stage marker. Hand attribution back
-            # before setup and H_PREFETCH_M so transfer cycles and bytes are not
-            # silently charged to ``expert_weight_address``.
-            asm.comment(
-                moe_stage_marker(
-                    "expert_weight_prefetch",
-                    f"issue dynamic HBM weight tile: template={weight_template.name}, "
-                    f"pair={pair_idx}, col={col_idx}",
+            if tile_group_stride is None:
+                self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
+                self._emit_hbm_subblock_sequence(
+                    asm,
+                    layout,
+                    block_coords,
+                    mram_start_addr,
+                    addr_reg,
+                    gp_scale,
+                    gp_mram,
                 )
-            )
-            self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
-            self._emit_hbm_subblock_sequence(
-                asm,
-                layout,
-                ((row_idx, col_idx) for row_idx in range(k_block_start, k_block_start + effective_count)),
-                mram_start_addr,
-                addr_reg,
-                gp_scale,
-                gp_mram,
-            )
             self._emit(asm)
         finally:
             self._reg.free_gp(
@@ -950,12 +1061,15 @@ class ProgramRoutedMoeMixin:
         pair_idx: int,
         table_base: int,
         per_expert_stride: int,
+        num_experts: int | None = None,
+        tile_group_stride: int | None = None,
         expert_base_table_int_base: int | None = None,
         auto_reset_mram: bool = True,
         k_block_start: int = 0,
         k_block_count: int | None = None,
-        expert_gp: int | None = None,
         name: str = "gpt_oss_dynamic_projection",
+        pair_index_gp: int | None = None,
+        expert_gp: int | None = None,
     ) -> None:
         """Projection tile where the HBM weight base comes from V_TOPK expert id."""
         vram_matrix = self._require_var(vram_matrix, VRAMMatrixVar, "vram_matrix")
@@ -972,11 +1086,14 @@ class ProgramRoutedMoeMixin:
             pair_idx=pair_idx,
             table_base=table_base,
             per_expert_stride=per_expert_stride,
+            num_experts=num_experts,
+            tile_group_stride=tile_group_stride,
             expert_base_table_int_base=expert_base_table_int_base,
             k_block_start=k_block_start,
             k_block_count=k_block_count,
-            expert_gp=expert_gp,
             name=name,
+            pair_index_gp=pair_index_gp,
+            expert_gp=expert_gp,
         )
         # The helper above marked `expert_weight_prefetch`; hand the stage back
         # before the GEMM, or every matmul in this tile is billed to prefetch. It
@@ -1008,6 +1125,9 @@ class ProgramRoutedMoeMixin:
         pair_idx: int,
         table_base: int,
         per_expert_stride: int,
+        num_experts: int | None = None,
+        tile_group_stride: int | None = None,
+        pair_index_gp: int | None = None,
         expert_base_table_int_base: int | None = None,
         expert_gp: int | None = None,
         name: str,
@@ -1071,6 +1191,25 @@ class ProgramRoutedMoeMixin:
             physical_shape=(physical_rows, physical_out_features),
         )
 
+        if tile_group_stride is not None and pair_index_gp is not None:
+            if num_experts is None:
+                raise ValueError("compact tile-major projection requires num_experts")
+            if rows != self.blen:
+                raise NotImplementedError(
+                    "compact tile-major projection currently requires one BLEN routed slot"
+                )
+            return self._moe_compact_tile_major_projection_v0(
+                input_var,
+                weight_template,
+                output,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_index_gp=pair_index_gp,
+                table_base=table_base,
+                tile_group_stride=tile_group_stride,
+                num_experts=num_experts,
+                name=name,
+            )
+
         if weight_panel_mode != "blocking":
             panel_tiles = 4 if panel_k_tiles is None else int(panel_k_tiles)
             if panel_tiles <= 0:
@@ -1103,6 +1242,9 @@ class ProgramRoutedMoeMixin:
                     pair_idx=pair_idx,
                     table_base=table_base,
                     per_expert_stride=per_expert_stride,
+                    num_experts=num_experts,
+                    tile_group_stride=tile_group_stride,
+                    pair_index_gp=pair_index_gp,
                     expert_base_table_int_base=expert_base_table_int_base,
                     expert_gp=expert_gp,
                     mram_start_addr=mram_start_addr,
@@ -1186,6 +1328,9 @@ class ProgramRoutedMoeMixin:
                     pair_idx=pair_idx,
                     table_base=table_base,
                     per_expert_stride=per_expert_stride,
+                    num_experts=num_experts,
+                    tile_group_stride=tile_group_stride,
+                    pair_index_gp=pair_index_gp,
                     expert_base_table_int_base=expert_base_table_int_base,
                     expert_gp=expert_gp,
                     name=f"{name}_pair{pair_idx}",
@@ -2335,9 +2480,14 @@ class ProgramRoutedMoeMixin:
                 constants=constants,
                 name=name,
             )
+        if activation_policy == "kimi_situ":
+            return self.kimi_situ_activation_v0(
+                gate, up, rows=rows, intermediate=intermediate,
+                constants=constants, name=name,
+            )
         raise NotImplementedError(
             "moe_expert_activation_v0 supports activation_policy in "
-            "{'gpt_oss_clamp_gated', 'standard_swiglu'}, got "
+            "{'gpt_oss_clamp_gated', 'standard_swiglu', 'kimi_situ'}, got "
             f"{activation_policy!r}"
         )
 
@@ -2459,6 +2609,7 @@ class ProgramRoutedMoeMixin:
         gp_mram: int,
         name: str,
         pair_index_gp: int | None = None,
+        expert_gp_source: int | None = None,
     ) -> None:
         """Load runtime-selected expert tiles through static 64-bit groups."""
         block_size = self.mlen * self.mlen
@@ -2477,7 +2628,9 @@ class ProgramRoutedMoeMixin:
             )
         )
         asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
-        if pair_index_gp is None:
+        if expert_gp_source is not None:
+            asm.instr("S_ADD_INT", gp(gp_expert), gp(expert_gp_source), gp(0))
+        elif pair_index_gp is None:
             asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
         else:
             asm.instr("S_ADD_INT", gp(gp_table), gp(gp_table), gp(pair_index_gp))

@@ -179,14 +179,18 @@ class TestVectorRmaskHandling(unittest.TestCase):
 
         self.assertEqual(
             words,
-            # The authoritative profile has three distinct route opcodes.
-            [0x000001B8, 0x0004C879, 0x0000003A, 0x000C153C, 0x0000003B],
+            # The three route mnemonics share opcode 0x3D and select the
+            # operation in funct1, which is what leaves 0x39-0x3B for the static
+            # state path (V_SOFTPLUS_V, S_MAP_FP_V, V_FMA_VF).
+            [0x000001B8, 0x0004C87D, 0x0040003D, 0x000C153C, 0x0080003D],
         )
 
-        self.assertEqual([word & 0x3F for word in words[1:]], [0x39, 0x3A, 0x3C, 0x3B])
-        self.assertEqual(self.asm.isa_definitions["V_SOFTPLUS_V"], 0x3D)
-        self.assertEqual(self.asm.isa_definitions["S_MAP_FP_V"], 0x3E)
-        self.assertEqual(self.asm.isa_definitions["L_TILE"], 0x3F)
+        for word in (0x0004C87D, 0x0040003D, 0x0080003D):
+            self.assertEqual(word & 0x3F, 0x3D)
+        self.assertEqual(
+            {name for name, value in self.asm.isa_definitions.items() if value in (0x39, 0x3A, 0x3B)},
+            set(),
+        )
 
     def test_batch4_route_encoder_rejects_unsupported_fields(self):
         invalid = (

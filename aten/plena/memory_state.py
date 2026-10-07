@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from compiler.aten.plena.constants import BLEN, MLEN
 from compiler.aten.plena.memory import (
     FPRAMAllocator,
@@ -24,6 +26,7 @@ class MemoryStateMixin:
         blen: int = BLEN,
         unroll_loops: bool = False,
         mram_tile_capacity: int = 4,
+        vram_total_size: int = 0,
         hbm_row_width: int = 256,
         hbm_element_width: int = 8,
         hbm_block_size: int = 8,
@@ -49,6 +52,7 @@ class MemoryStateMixin:
         self.hbm_scale_width = hbm_scale_width
 
         # Layout tables
+        self._mram_bound_subblocks: list[SubMatrixInfo] = []
         self.hbm_matrices: dict[str, MatrixBlockLayout] = {}
         self.vram_matrices: dict[str, VRAMMatrixBlockLayout] = {}
         self.fpram_matrices: dict[str, FPRAMObjectLayout] = {}
@@ -56,7 +60,7 @@ class MemoryStateMixin:
         # Matrix ops consume VRAM in MLEN x MLEN tiles. Row-only alignment is
         # enough for vector reads/writes, but a matrix result can become the
         # next layer's M_MM input, so keep VRAM allocations tile-aligned.
-        self.vram_allocator = VRAMAllocator(alignment=mlen * mlen)
+        self.vram_allocator = VRAMAllocator(alignment=mlen * mlen, total_size=vram_total_size)
         self.mram_allocator = MRAMAllocator(mlen=mlen, tile_capacity=mram_tile_capacity)
         self.fpram_allocator = FPRAMAllocator()
 
@@ -340,10 +344,10 @@ class MemoryStateMixin:
         return self.vram_matrices[name].get_sub_block(row_idx, col_idx)
 
     def clear_mram_bindings(self) -> None:
-        """Clear cached MRAM addresses on all HBM sub-blocks."""
-        for layout in self.hbm_matrices.values():
-            for sub_block in layout.sub_blocks.values():
-                sub_block.mram_addr = None
+        """Clear only tiles that were bound, with work bounded by live MRAM."""
+        for sub_block in self._mram_bound_subblocks:
+            sub_block.mram_addr = None
+        self._mram_bound_subblocks.clear()
 
     def reset(self):
         """Reset manager state."""
