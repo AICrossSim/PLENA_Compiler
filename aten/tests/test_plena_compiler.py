@@ -350,6 +350,49 @@ def test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts():
     print("  PASS test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts")
 
 
+def test_router_mx_linear_rowpacked_compiles_for_rtl_topk():
+    """Current MXINT RTL router emits matrix linear, row pack, then V_TOPK."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(
+        mlen=8,
+        blen=4,
+        mram_tile_capacity=128,
+        hbm_v_prefetch_amount=4,
+        unroll_loops=True,
+    )
+    x_input = prog.input("X", shape=(1, 8), physical_shape=(4, 8))
+    x = prog.load_batch(x_input, name="X")
+    router_weight = prog.input("W_router", shape=(8, 32), physical_shape=(8, 32))
+
+    logits = prog.router_logits_matrix_mx_rowpacked_v0(
+        x,
+        router_weight,
+        rows=1,
+        hidden=8,
+        num_experts=32,
+    )
+    prog.gpt_oss_router_topk_softmax_v0(
+        logits,
+        token_idx=0,
+        weights_fp_base=0,
+        indices_int_base=0,
+        num_experts=32,
+        top_k=4,
+    )
+    code = prog.compile()
+
+    assert logits.shape == (4, 8)
+    assert x_input.hbm_addr == 0
+    assert router_weight.hbm_addr == 64
+    assert code.count("H_PREFETCH_M") == 4
+    assert code.count("M_MM ") == 8
+    assert code.count("M_MM_WO") == 8
+    assert code.count("V_ADD_VF") == 4
+    assert "C_SET_SCALE_REG" in code
+    assert "V_TOPK" in code
+
+
 def _build_dynamic_expert_projection(hidden, out_features=64, mlen=64, blen=4):
     """Compile one runtime-expert-id linear projection and return (code, output)."""
     from compiler.aten.plena import PlenaCompiler
@@ -369,7 +412,7 @@ def _build_dynamic_expert_projection(hidden, out_features=64, mlen=64, blen=4):
         expert_indices_int_base=0,
         pair_idx=0,
         table_base=0,
-        per_expert_stride=hidden * out_features,
+        per_expert_stride=prog.hbm_tensor_size(hidden * out_features),
         name="proj",
     )
     return prog.get_code(), output
@@ -404,6 +447,34 @@ def test_gpt_oss_dynamic_linear_projection_k_split_compiles():
     assert "proj_temp" in code
     assert code.count("V_ADD_VV") >= 1
     print("  PASS test_gpt_oss_dynamic_linear_projection_k_split_compiles")
+
+
+def test_gpt_oss_dynamic_linear_projection_rejects_overlapping_expert_stride():
+    """Affine expert tables must include each MX tensor's full HBM footprint."""
+    from compiler.aten.plena import PlenaCompiler
+
+    prog = PlenaCompiler(mlen=8, blen=4, mram_tile_capacity=4)
+    x_input = prog.input("X", shape=(4, 8), physical_shape=(4, 8))
+    x = prog.load_batch(x_input, name="X")
+    weight = prog.input("W_expert", shape=(8, 8), physical_shape=(8, 8))
+    required_stride = prog.hbm_tensor_size(8 * 8)
+
+    try:
+        prog.gpt_oss_dynamic_linear_projection_v0(
+            x,
+            weight,
+            expert_indices_int_base=0,
+            pair_idx=0,
+            table_base=0,
+            per_expert_stride=required_stride - 1,
+            name="bad_stride",
+        )
+    except ValueError as error:
+        assert f"HBM footprint={required_stride} bytes" in str(error)
+    else:
+        raise AssertionError("overlapping affine expert stride was accepted")
+
+    print("  PASS test_gpt_oss_dynamic_linear_projection_rejects_overlapping_expert_stride")
 
 
 def test_vram_layout_tracks_logical_and_physical_shape():
@@ -995,6 +1066,7 @@ if __name__ == "__main__":
         test_packed_skinny_stream_k_probe_compiles_cap8_under_cap4_mram,
         test_gpt_oss_dynamic_linear_projection_single_k_group_compiles,
         test_gpt_oss_dynamic_linear_projection_k_split_compiles,
+        test_gpt_oss_dynamic_linear_projection_rejects_overlapping_expert_stride,
         test_vram_layout_tracks_logical_and_physical_shape,
         test_partial_row_linear_uses_one_blen_row_group,
         test_ffn_workspace_uses_allocator_and_avoids_rope_tables,

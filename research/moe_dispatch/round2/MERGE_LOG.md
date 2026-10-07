@@ -21,3 +21,9 @@ Three-stage conflicting blobs preserved under `research/moe_dispatch/archive/fea
 - `aten/tests/test_plena_compiler.py`: Retain added dynamic single-K and split-K regression tests.
 - `doc/operation.svh`: Retain C_SET_TOPK_REG opcode added after initial V_TOPK substrate.
 - `doc/plena_isa_spec.md`: Retain newer runtime TOPK/row-aligned ISA documentation; incoming version preserved in archive.
+
+## Merge `codex/moe-e2e-sync` (`1add2606985e5962df3a0e7c2ea90b8b302a2ec8`)
+
+All conflicting blobs archived under `research/moe_dispatch/archive/codex/moe-e2e-sync/conflicts`. Non-conflicting edits are retained.
+
+- `aten/plena/program_routed_moe.py`: 2 conflict block(s), chose current. Retain newer sticky router stage markers and arbitrary runtime top-k policy; keep non-conflicting Qwen label and vector-format documentation updates.

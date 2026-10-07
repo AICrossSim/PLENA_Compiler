@@ -311,13 +311,15 @@ Element-wise minimum between a vector and a scalar. This is the upper-bound clam
 
 **Format:** `V_TOPK rd, rs1, rs2, rmask`
 
-**Operation:** Routed-MoE router top-k helper over one BF16 logits row.
+**Operation:** Routed-MoE router top-k helper over contiguous physical `V_FP` logits.
 
 **Description:**
 
-`rs1` contains the Vector SRAM address of a router-logit row. The instruction
-scans logits in descending logit order and breaks exact ties by smaller expert
-index. `rmask` selects the routed-MoE policy:
+`gp_reg<rs1>` contains the element address of the first logit in Vector SRAM;
+additional logits occupy contiguous `VLEN`-wide physical rows. `gp_reg<rs2>` is
+the scalar INT-SRAM output base and `gp_reg<rd>` is the scalar FP-SRAM output
+base. `rmask` is the 4-bit field in instruction bits `[21:18]` and selects the
+routed-MoE policy:
 
 - `rmask=0`: scan 32 logits, select top-4, and write weights/indices to
   `FP_MEM[gp_reg<rd> + 0..3]` / `INT_MEM[gp_reg<rs2> + 0..3]`.
@@ -326,7 +328,13 @@ index. `rmask` selects the routed-MoE policy:
 - `rmask=15`: take `(num_experts, top_k)` from the `TOPK_POLICY` control
   register instead of a fixed table. See `C_SET_TOPK_REG`.
 
-Weights are softmax-over-selected logits.
+Logits are ranked numerically in descending order. NaNs are treated as
+unavailable (`-Inf`), `+0` and `-0` compare equal, and every tie is broken by
+smaller expert index. Finite selected logits use stable softmax. If selected
+logits contain `+Inf`, the selected `+Inf` experts split unit weight uniformly
+and all other selected experts receive zero. If every selected logit is
+unavailable/`-Inf`, all weights are zero. Weights are written in the hardware
+`S_FP` format; indices are unsigned scalar INT values.
 
 Every other production MoE shape — Qwen2-MoE 60/top-4, DeepSeek-V2-Lite 64/top-6,
 DeepSeek-V3 256/top-8, Llama-4 Scout 16/top-1 — needs `rmask=15`: a table entry

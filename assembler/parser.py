@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import re
+from pathlib import Path
 
 
 def load_isa_definitions(file_path: str) -> dict:
@@ -308,12 +310,10 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
 
 
 if __name__ == "__main__":
-    # Example usage
-    # file_path = '/home/george/Coprocessor_for_Llama/src/definitions/operation.svh'
-    # enum_dict = load_isa_definitions(file_path)
-    # print(enum_dict)
+    parser = argparse.ArgumentParser(description="Parse and print one PLENA assembly file.")
+    parser.add_argument("asm_file", type=Path)
+    args = parser.parse_args()
 
-    asm_file_path = "/home/george/Coprocessor_for_Llama/src/system/test/benchmarks/fixed.asm"
-    loaded_instr = parse_asm_file(asm_file_path)
+    loaded_instr = parse_asm_file(str(args.asm_file))
     for instr in loaded_instr:
         print(instr)
