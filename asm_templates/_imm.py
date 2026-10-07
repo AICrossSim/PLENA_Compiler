@@ -22,6 +22,11 @@ def load_large_int(reg: int, value: int) -> list[str]:
     For values >= 2^18, emits S_LUI_INT (sets gp{reg} = imm << 12) followed
     by an S_ADDI_INT for the low 12 bits when non-zero.
     """
+    if not 0 <= value < 1 << 32:
+        raise ValueError(
+            f"GP immediates must fit u32, got {value}; split 64-bit HBM "
+            "addresses with preload_addr_reg_asm"
+        )
     if value < IMM2_BOUND:
         return [f"S_ADDI_INT gp{reg}, gp0, {value}"]
     upper = value >> 12

@@ -18,7 +18,10 @@ import pytest
 from assembler.assembly_to_binary import AssemblyToBinary
 from compiler.aten.isa_builder import IsaBuilder, gp
 from compiler.aten.plena.program_routed_moe import (
+    _TOPK_POLICY_EXPERT_MASK,
+    _TOPK_POLICY_CORRECTION_BIAS,
     _TOPK_POLICY_MAX_PACKED,
+    _TOPK_POLICY_SIGMOID_NORMALIZED,
     _TOPK_POLICY_SINGLE_ADDI_MAX_PACKED,
     _pack_topk_policy,
 )
@@ -43,8 +46,12 @@ def test_single_addi_ceiling_matches_the_imm2_field() -> None:
     assert _TOPK_POLICY_SINGLE_ADDI_MAX_PACKED >> 8 == 1023
 
 
-def _render_policy(num_experts: int, top_k: int) -> list[str]:
-    packed = _pack_topk_policy(num_experts, top_k)
+def _render_policy(
+    num_experts: int,
+    top_k: int,
+    route_weight_mode: str = "softmax",
+) -> list[str]:
+    packed = _pack_topk_policy(num_experts, top_k, route_weight_mode)
     asm = IsaBuilder()
     asm.instr("S_ADDI_INT", gp(4), gp(0), packed)
     asm.instr("C_SET_TOPK_REG", gp(4))
@@ -81,9 +88,33 @@ def test_wide_policies_are_legalized_into_a_lui_pair(num_experts: int, top_k: in
 
 
 def test_packing_ceiling_is_enforced() -> None:
-    _pack_topk_policy(_TOPK_POLICY_MAX_PACKED >> 8, 255)
-    with pytest.raises(ValueError, match="tops out at 16383 experts"):
-        _pack_topk_policy((_TOPK_POLICY_MAX_PACKED >> 8) + 1, 1)
+    assert _TOPK_POLICY_MAX_PACKED == (1 << 24) - 1
+    _pack_topk_policy(_TOPK_POLICY_EXPERT_MASK, 255)
+    with pytest.raises(ValueError, match="does not fit 14 bits"):
+        _pack_topk_policy(_TOPK_POLICY_EXPERT_MASK + 1, 1)
+
+
+def test_kimi_sigmoid_normalized_mode_is_packed_and_legalized() -> None:
+    packed = _pack_topk_policy(
+        896,
+        16,
+        "sigmoid_normalized",
+        correction_bias=True,
+    )
+    assert packed == (
+        _TOPK_POLICY_CORRECTION_BIAS
+        | _TOPK_POLICY_SIGMOID_NORMALIZED
+        | (896 << 8)
+        | 16
+    )
+    asm = IsaBuilder()
+    asm.instr("S_ADDI_INT", gp(4), gp(0), packed)
+    asm.instr("C_SET_TOPK_REG", gp(4))
+    assert asm.render().splitlines() == [
+        f"S_LUI_INT gp4, {packed >> 12}",
+        f"S_ADDI_INT gp4, gp4, {packed & 0xFFF}",
+        "C_SET_TOPK_REG gp4",
+    ]
 
 
 @pytest.mark.parametrize(("num_experts", "top_k"), [(32, 4), (1023, 255), (1024, 1), (16383, 255)])

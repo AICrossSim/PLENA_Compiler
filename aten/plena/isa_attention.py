@@ -901,6 +901,15 @@ class IsaAttentionMixin:
             addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
         )
 
+        # QK and PV may consume tensors with different physical widths (MLA is
+        # Q/K=192, V=128).  C_SET_SCALE_REG is sticky, so inheriting K's scale
+        # base here decodes V with the wrong scale stream and can turn P@V into
+        # zeros.  Set V's element-payload size explicitly before every PV load.
+        v_physical_rows = (v_layout.physical_shape or v_layout.full_shape)[0]
+        v_scale_base = v_physical_rows * physical_head_dim * v_hbm_element_bytes
+        isa_code += "\n".join(load_large_int(gp_regs[0], v_scale_base)) + "\n"
+        isa_code += f"C_SET_SCALE_REG gp{gp_regs[0]}\n"
+
         isa_code += self._pv_multiply_asm(
             mlen=self.mlen,
             blen=self.blen,
@@ -945,6 +954,10 @@ class IsaAttentionMixin:
         isa_code += preload_addr_reg_asm(
             addr_reg_to_set=[v_hbm_reg], available_registers=gp_regs, addr_reg_val=[v_layout.hbm_base_addr]
         )
+        v_physical_rows = (v_layout.physical_shape or v_layout.full_shape)[0]
+        v_scale_base = v_physical_rows * physical_head_dim * v_hbm_element_bytes
+        isa_code += "\n".join(load_large_int(gp_regs[0], v_scale_base)) + "\n"
+        isa_code += f"C_SET_SCALE_REG gp{gp_regs[0]}\n"
         # Byte-based row stride, mirroring _pv_multiply_asm's V prefetch.
         isa_code += f"S_ADDI_INT gp{gp_regs[0]}, gp0, {physical_head_dim * v_hbm_element_bytes}\n"
         isa_code += f"C_SET_STRIDE_REG gp{gp_regs[0]}\n"

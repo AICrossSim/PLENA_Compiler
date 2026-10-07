@@ -2,6 +2,14 @@
 
 from compiler.aten.plena.compiler import PlenaCompiler
 from compiler.aten.plena.constants import BLEN, IMM2_BOUND, MLEN
+from compiler.aten.plena.expert_table import (
+    ExpertWeightTable,
+    reserve_expert_weight_table,
+)
+from compiler.aten.plena.full_model import (
+    FullModelProgram,
+    assert_registers_are_free,
+)
 from compiler.aten.plena.isa_compiler import IsaCompiler
 from compiler.aten.plena.memory_state import MemoryStateMixin
 from compiler.aten.plena.vars import FPVar, InputVar, TensorVar, VRAMMatrixVar
@@ -11,10 +19,14 @@ __all__ = [
     "IMM2_BOUND",
     "MLEN",
     "FPVar",
+    "ExpertWeightTable",
+    "FullModelProgram",
     "InputVar",
     "IsaCompiler",
     "MemoryStateMixin",
     "PlenaCompiler",
     "TensorVar",
     "VRAMMatrixVar",
+    "assert_registers_are_free",
+    "reserve_expert_weight_table",
 ]
