@@ -105,6 +105,7 @@ _OPS = frozenset(
         "V_RED_SUM",
         "S_ST_FP",
         "S_MAP_FP_V",
+        "S_MAP_V_FP",
         "S_ADD_FP",
         "S_SUB_FP",
         "S_MUL_FP",
@@ -215,6 +216,17 @@ class Machine:
                 self._set_fp(fd, self.fp[fd] + sum(self.vram[src : src + self.vlen]))
             elif op.startswith("V_"):
                 self._vector(op, args)
+            elif op == "S_MAP_V_FP":
+                rd, rs1, imm = _reg(args[0], "gp"), _reg(args[1], "gp"), int(args[2])
+                dst = self._gp(rd)
+                start = self._gp(rs1) + imm
+                if dst % self.vlen:
+                    raise UnsupportedInstruction("S_MAP_V_FP destination is not a vector row")
+                if start < 0 or start + self.vlen > len(self.fpram):
+                    raise UnsupportedInstruction("S_MAP_V_FP source exceeds FPRAM")
+                if dst < 0 or dst + self.vlen > len(self.vram):
+                    raise UnsupportedInstruction("S_MAP_V_FP destination exceeds VRAM")
+                self.vram[dst : dst + self.vlen] = self.fpram[start : start + self.vlen]
             elif op == "S_MAP_FP_V":
                 # Mirror of S_MAP_V_FP, and the operand roles mirror too: rs1 is
                 # the VRAM source row, rd the FP_MEM base, so that in both

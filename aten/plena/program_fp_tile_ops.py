@@ -631,25 +631,27 @@ class ProgramFPTileOpsMixin:
                 f"vram_fill_zero rows out of bounds for {matrix.name}: shape={matrix.shape}, rows={resolved_rows}"
             )
 
-        # VRAM matrices are column-block-major. Build one known-zero FPRAM row,
-        # then map it over every requested row and column block. A multiply by
-        # zero is not a clear because NaN * 0 remains NaN.
-        self._scratch_serial += 1
-        zero_row = self.fp_var(
-            f"_vram_true_zero_row_{self._scratch_serial}", size=self.mlen
-        )
-        try:
+        # A real zero copy must clear NaNs as well. Initialize one private,
+        # counted FPRAM row per program and reuse it; do not rebuild it for
+        # every scratch clear inside an unrolled kernel.
+        zero_row = getattr(self, "_vram_zero_fpram_row", None)
+        if zero_row is None or self._fp_vars.get(zero_row.name) is not zero_row:
+            # Report builders may construct the base ISA allocator first and
+            # attach high-level registries without invoking this mixin's full
+            # constructor. The row still uses the real finite FPRAM allocator.
+            self._scratch_serial = getattr(self, "_scratch_serial", 0) + 1
+            zero_row = self.fp_var(
+                f"_vram_true_zero_row_{self._scratch_serial}", size=self.mlen
+            )
             super().fpvar_zero_asm(zero_row.address, self.mlen)
-            num_col_blocks = (cols + self.mlen - 1) // self.mlen
-            for col_block in range(num_col_blocks):
-                super().vram_fill_zero(
-                    matrix.name,
-                    resolved_rows,
-                    tile_col_idx=col_block,
-                    zero_row_addr=zero_row.address,
-                )
-        finally:
-            self.free_fp_var(zero_row)
+            self._vram_zero_fpram_row = zero_row
+        num_col_blocks = (cols + self.mlen - 1) // self.mlen
+        for col_block in range(num_col_blocks):
+            super().vram_fill_zero(
+                matrix.name, resolved_rows, tile_col_idx=col_block,
+                zero_row_addr=zero_row.address,
+            )
+
 
 
 __all__ = ["ProgramFPTileOpsMixin"]
