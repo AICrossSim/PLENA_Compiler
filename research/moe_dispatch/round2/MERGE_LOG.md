@@ -149,3 +149,11 @@ All conflicting blobs archived under `research/moe_dispatch/archive/local/shared
 
 - `assembler/assembly_to_binary.py`: 0 conflict block(s), chose current. This historical shared-dependency branch uses a superseded consolidated C_ROUTE opcode profile. Kept current routed opcode mapping and latest Matrix/L-TILE encoder; archived original conflicting encoding/profile and retained independent nonconflicting state/dependency helpers.
 - `doc/operation.svh`: 0 conflict block(s), chose current. This historical shared-dependency branch uses a superseded consolidated C_ROUTE opcode profile. Kept current routed opcode mapping and latest Matrix/L-TILE encoder; archived original conflicting encoding/profile and retained independent nonconflicting state/dependency helpers.
+
+## Merge `feat/fixed-route-expert-grouping` (`e4cd6c5f9887f0118a43e3e5484130f45291fce9`)
+
+All conflicting blobs archived under `research/moe_dispatch/archive/feat/fixed-route-expert-grouping/conflicts`. Non-conflicting edits are retained.
+
+- `aten/plena/isa_matrix.py`: 0 conflict block(s), chose current. Combined affine-output and resident-panel arguments instead of selecting one. Integrated grouped row-block weight reuse and ping-pong panels while retaining the latest expert-id GP/addressing helpers, current BF16 allocation and shape behavior. Incoming standalone grouped gather/scatter helpers are preserved.
+- `aten/plena/program_routed_moe.py`: 0 conflict block(s), chose current. Combined affine-output and resident-panel arguments instead of selecting one. Integrated grouped row-block weight reuse and ping-pong panels while retaining the latest expert-id GP/addressing helpers, current BF16 allocation and shape behavior. Incoming standalone grouped gather/scatter helpers are preserved.
+- `aten/plena/program_tensors.py`: 0 conflict block(s), chose current. Combined affine-output and resident-panel arguments instead of selecting one. Integrated grouped row-block weight reuse and ping-pong panels while retaining the latest expert-id GP/addressing helpers, current BF16 allocation and shape behavior. Incoming standalone grouped gather/scatter helpers are preserved.

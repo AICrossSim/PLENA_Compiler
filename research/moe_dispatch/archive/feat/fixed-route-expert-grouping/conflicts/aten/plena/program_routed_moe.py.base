@@ -3,26 +3,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from collections.abc import Sequence
 
 from compiler.aten.isa_builder import IsaBuilder, addr as areg, fp, gp
 from compiler.aten.plena.vars import FPVar, InputVar, VRAMMatrixVar
 
 GptOssFPConstants = tuple[FPVar, FPVar, FPVar, FPVar, FPVar]
-@dataclass(frozen=True)
-class KimiSituFPConstants:
-    """FPRAM rows needed by Kimi K3's SiTU activation."""
-
-    zero: FPVar
-    one: FPVar
-    neg_one: FPVar
-    beta: FPVar
-    neg_two_over_beta: FPVar
-    linear_beta: FPVar
-    neg_two_over_linear_beta: FPVar
-
-
 ExpertWeights = tuple[InputVar, InputVar, InputVar]
 ExpertBiases = tuple[VRAMMatrixVar | None, VRAMMatrixVar | None, VRAMMatrixVar | None]
 
@@ -127,12 +113,6 @@ _TOPK_POLICY_SINGLE_ADDI_MAX_PACKED = (1 << 18) - 1
 #: They only lose the single-instruction property the 8-bit shift buys.
 _TOPK_POLICY_MAX_PACKED = (1 << 22) - 1
 
-# The first hardware route dispatcher is deliberately narrower than the generic
-# V_TOPK policy register. Keep these limits local to the batch4 lowering: normal
-# token-major V_TOPK code generation remains generic.
-_ROUTE_DISPATCH_MAX_EXPERTS = 256
-_ROUTE_DISPATCH_MAX_TOPK = 8
-
 
 def _pack_topk_policy(num_experts: int, top_k: int) -> int:
     """Pack ``(num_experts, top_k)`` for ``C_SET_TOPK_REG``.
@@ -156,20 +136,6 @@ def _pack_topk_policy(num_experts: int, top_k: int) -> int:
             f"{_TOPK_POLICY_MAX_PACKED >> _TOPK_POLICY_EXPERT_SHIFT} experts"
         )
     return packed
-
-
-def _route_dispatch_policy(num_experts: int, top_k: int) -> tuple[int, int | None]:
-    """Return the RTL dispatcher policy and optional sticky-register payload."""
-    if num_experts > _ROUTE_DISPATCH_MAX_EXPERTS or top_k > _ROUTE_DISPATCH_MAX_TOPK:
-        raise NotImplementedError(
-            "batch4 route dispatch currently supports at most "
-            f"{_ROUTE_DISPATCH_MAX_EXPERTS} experts/top-{_ROUTE_DISPATCH_MAX_TOPK}; "
-            f"got {num_experts}/top-{top_k}"
-        )
-    fixed = {(32, 4): 0, (128, 8): 1}.get((num_experts, top_k))
-    if fixed is not None:
-        return fixed, None
-    return _TOPK_POLICY_REGISTER_RMASK, _pack_topk_policy(num_experts, top_k)
 
 
 def moe_stage_marker(stage: str, detail: str = "") -> str:
@@ -410,74 +376,6 @@ class ProgramRoutedMoeMixin:
         self.free_tensor(matrix_logits)
         return packed_logits
 
-    def moe_router_logits_matrix_mx_rowpacked_v0(
-        self,
-        x: VRAMMatrixVar,
-        router_weight_matrix: InputVar,
-        *,
-        rows: int,
-        hidden: int,
-        num_experts: int,
-        policy_name: str = "moe",
-        name: str = "router_logits_matrix_mx",
-    ) -> VRAMMatrixVar:
-        """Emit router logits through the RTL MXINT matrix path.
-
-        The HBM weight tensor uses the one-byte MX element layout consumed by
-        ``H_PREFETCH_M`` precision 0. Matrix results are vector FP values. When
-        experts span multiple MLEN blocks, the result is packed into contiguous
-        token-major rows before it is consumed by ``V_TOPK``.
-        """
-        if hidden <= 0 or hidden % self.mlen != 0:
-            raise ValueError(f"router hidden={hidden} must be divisible by MLEN={self.mlen}")
-        if rows <= 0 or rows > x.shape[0]:
-            raise ValueError(f"router rows={rows} outside x rows={x.shape[0]}")
-        if num_experts <= 0:
-            raise ValueError(f"router num_experts={num_experts} must be positive")
-        if hidden > x.shape[1]:
-            raise ValueError(f"router hidden={hidden} exceeds x width={x.shape[1]}")
-        if router_weight_matrix.shape[0] < hidden or router_weight_matrix.shape[1] < num_experts:
-            raise ValueError(
-                "router_weight_matrix must have shape at least "
-                f"({hidden}, {num_experts}), got {router_weight_matrix.shape}"
-            )
-
-        expert_blocks = math.ceil(num_experts / self.mlen)
-        physical_rows = max(self.blen, math.ceil(x.shape[0] / self.blen) * self.blen)
-        physical_experts = expert_blocks * self.mlen
-        logical_logit_rows = rows if expert_blocks == 1 else rows * expert_blocks
-        physical_logit_rows = max(self.blen, math.ceil(logical_logit_rows / self.blen) * self.blen)
-
-        self._emit(
-            IsaBuilder().comment(
-                moe_stage_marker(
-                    "router_topk",
-                    f"[{policy_name}] MXINT matrix logits: rows={rows}, "
-                    f"hidden={hidden}, experts={num_experts}",
-                )
-            )
-        )
-        matrix_logits = self.linear_projection(
-            x,
-            router_weight_matrix,
-            name=f"{name}_matrix",
-            physical_shape=(physical_rows, physical_experts),
-            matrix_precision="weights",
-            set_scale=True,
-            hbm_element_bytes=1,
-        )
-        return self._pack_router_logits_token_major(
-            matrix_logits,
-            rows=rows,
-            num_experts=num_experts,
-            expert_blocks=expert_blocks,
-            logical_logit_rows=logical_logit_rows,
-            physical_logit_rows=physical_logit_rows,
-            policy_name=policy_name,
-            name=name,
-            label="MXINT matrix",
-        )
-
     def qwen3_router_logits_matrix_bf16_rowpacked_v0(
         self,
         x: VRAMMatrixVar,
@@ -558,7 +456,7 @@ class ProgramRoutedMoeMixin:
             logical_logit_rows=logical_logit_rows,
             physical_logit_rows=physical_logit_rows,
             name=name,
-            label="Qwen router matrix",
+            label="matrix",
         )
 
     def qwen3_router_logits_packed_skinny_bf16_rowpacked_v0(
@@ -648,7 +546,7 @@ class ProgramRoutedMoeMixin:
             logical_logit_rows=logical_logit_rows,
             physical_logit_rows=physical_logit_rows,
             name=name,
-            label="Qwen router packed-skinny",
+            label="packed-skinny",
         )
 
     def moe_router_select_v0(
@@ -660,14 +558,12 @@ class ProgramRoutedMoeMixin:
         indices_int_base: int,
         num_experts: int = 32,
         top_k: int = 4,
-        emit_policy_config: bool = True,
         policy_name: str = "gpt_oss",
         name: str = "moe_router_select",
     ) -> None:
         """Emit V_TOPK for one router-logit row.
 
-        V_TOPK v0 reads vector-format router logits from VRAM (V_FP12 in the
-        current RTL), performs a
+        V_TOPK v0 reads one BF16 router-logit row from VRAM, performs a
         linear-scan top-k with low-index tie break, stores the selected expert
         ids to INT SRAM, and stores the softmax-over-selected weights to FP
         SRAM.  The instruction intentionally keeps router/top-k on the BF16
@@ -710,7 +606,7 @@ class ProgramRoutedMoeMixin:
                     f"top_k={top_k}, weights_fp={weights_fp_base}, indices_int={indices_int_base}",
                 )
             )
-            if packed_policy is not None and emit_policy_config:
+            if packed_policy is not None:
                 # C_SET_TOPK_REG is sticky, but hoisting it out of the per-token loop
                 # would mean tracking the live register value across every other
                 # emitter that can run in between; two scalar instructions are cheap.
@@ -744,7 +640,6 @@ class ProgramRoutedMoeMixin:
         gp_offset: int,
         gp_base: int,
         name: str,
-        expert_gp_source: int | None = None,
     ) -> None:
         """Emit the shared true-expert-id -> HBM-base address calculation."""
         if per_expert_stride <= 0:
@@ -755,12 +650,10 @@ class ProgramRoutedMoeMixin:
                 f"{name}: pair={pair_idx}, table_base={table_base}, stride={per_expert_stride}",
             )
         )
-        if expert_gp_source is None:
-            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
-            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
-        resolved_expert_gp = gp_expert if expert_gp_source is None else expert_gp_source
+        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+        asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
         asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), per_expert_stride)
-        asm.instr("S_MUL_INT", gp(gp_offset), gp(resolved_expert_gp), gp(gp_stride))
+        asm.instr("S_MUL_INT", gp(gp_offset), gp(gp_expert), gp(gp_stride))
         asm.instr("S_ADDI_INT", gp(gp_base), gp(0), table_base)
         asm.instr("S_ADD_INT", gp(gp_base), gp(gp_base), gp(gp_offset))
         asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(0), gp(gp_base))
@@ -777,7 +670,6 @@ class ProgramRoutedMoeMixin:
         gp_expert: int,
         gp_base: int,
         name: str,
-        expert_gp_source: int | None = None,
     ) -> None:
         """Emit expert-id -> HBM-base lookup through an IntSRAM base table."""
         asm.comment(
@@ -786,11 +678,9 @@ class ProgramRoutedMoeMixin:
                 f"{name}: table lookup pair={pair_idx}, base_table_int={expert_base_table_int_base}",
             )
         )
-        if expert_gp_source is None:
-            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
-            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
-        resolved_expert_gp = gp_expert if expert_gp_source is None else expert_gp_source
-        asm.instr("S_LD_INT", gp(gp_base), gp(resolved_expert_gp), expert_base_table_int_base)
+        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+        asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
+        asm.instr("S_LD_INT", gp(gp_base), gp(gp_expert), expert_base_table_int_base)
         asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(0), gp(gp_base))
 
     def moe_expert_id_to_weight_base_v0(
@@ -844,22 +734,11 @@ class ProgramRoutedMoeMixin:
         mram_start_addr: int | None = None,
         k_block_start: int = 0,
         k_block_count: int | None = None,
-        expert_gp: int | None = None,
         name: str = "gpt_oss_dynamic_weight_load",
     ) -> None:
-        """Load one weight column tile using runtime true expert id addressing.
-
-        ``table_base`` and ``per_expert_stride`` are byte addresses. In affine
-        mode each stride must cover the template's complete element, scale, and
-        padding footprint; larger strides may be used for table alignment.
-        """
+        """Load one weight column tile using runtime true expert id addressing."""
         self._ensure_hbm_sub_matrix_registered(weight_template)
         layout = self.get_hbm_layout(weight_template.name)
-        if expert_base_table_int_base is None and per_expert_stride < layout.hbm_size:
-            raise ValueError(
-                f"{name}: per_expert_stride={per_expert_stride} bytes is smaller than "
-                f"{weight_template.name} HBM footprint={layout.hbm_size} bytes"
-            )
         num_row_blocks = layout.num_row_blocks
         block_size = self.mlen * self.mlen
         effective_count = k_block_count if k_block_count is not None else num_row_blocks
@@ -894,7 +773,6 @@ class ProgramRoutedMoeMixin:
                     gp_offset=gp_expert_offset,
                     gp_base=gp_base,
                     name=name,
-                    expert_gp_source=expert_gp,
                 )
             else:
                 self._emit_expert_id_to_weight_base_table_v0(
@@ -907,18 +785,7 @@ class ProgramRoutedMoeMixin:
                     gp_expert=gp_expert,
                     gp_base=gp_base,
                     name=name,
-                    expert_gp_source=expert_gp,
                 )
-            # Address selection has its own stage marker. Hand attribution back
-            # before setup and H_PREFETCH_M so transfer cycles and bytes are not
-            # silently charged to ``expert_weight_address``.
-            asm.comment(
-                moe_stage_marker(
-                    "expert_weight_prefetch",
-                    f"issue dynamic HBM weight tile: template={weight_template.name}, "
-                    f"pair={pair_idx}, col={col_idx}",
-                )
-            )
             self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
             self._emit_hbm_subblock_sequence(
                 asm,
@@ -954,7 +821,6 @@ class ProgramRoutedMoeMixin:
         auto_reset_mram: bool = True,
         k_block_start: int = 0,
         k_block_count: int | None = None,
-        expert_gp: int | None = None,
         name: str = "gpt_oss_dynamic_projection",
     ) -> None:
         """Projection tile where the HBM weight base comes from V_TOPK expert id."""
@@ -975,7 +841,6 @@ class ProgramRoutedMoeMixin:
             expert_base_table_int_base=expert_base_table_int_base,
             k_block_start=k_block_start,
             k_block_count=k_block_count,
-            expert_gp=expert_gp,
             name=name,
         )
         # The helper above marked `expert_weight_prefetch`; hand the stage back
@@ -1009,31 +874,10 @@ class ProgramRoutedMoeMixin:
         table_base: int,
         per_expert_stride: int,
         expert_base_table_int_base: int | None = None,
-        expert_gp: int | None = None,
         name: str,
         physical_shape: tuple[int, int] | None = None,
-        reuse_weight_across_row_blocks: bool = False,
-        weight_panel_mode: str = "blocking",
-        panel_k_tiles: int | None = None,
     ) -> VRAMMatrixVar:
-        """Tiled linear projection with runtime expert-id weight selection.
-
-        ``reuse_weight_across_row_blocks`` is the fixed-route grouped-execution
-        contract.  A weight column tile is loaded into Matrix SRAM once and is
-        consumed by every token-row block belonging to the same expert before
-        the next tile replaces it.  The default remains the historical
-        load-per-row-block behavior so existing programs are unchanged.
-
-        ``weight_panel_mode="pingpong"`` reserves two disjoint Matrix-SRAM
-        panels. It emits the next fill before consuming the current panel and
-        reuses a slot only after its previous panel has been consumed.
-        Functional execution remains dependency-safe; a dependency-aware
-        simulator may overlap a pending fill with work on the ready panel.
-        """
-        if weight_panel_mode not in ("blocking", "pingpong"):
-            raise ValueError(f"unsupported weight_panel_mode={weight_panel_mode!r}")
-        if weight_panel_mode != "blocking" and not reuse_weight_across_row_blocks:
-            raise ValueError("buffered weight panels require grouped row-block reuse")
+        """Tiled linear projection with runtime expert-id weight selection."""
         mlen = self.mlen
         rows, _k_total = input_var.shape
         _weight_rows, out_features = weight_template.shape
@@ -1055,13 +899,7 @@ class ProgramRoutedMoeMixin:
         num_row_blocks = math.ceil(physical_rows / mlen)
         num_col_blocks = math.ceil(physical_out_features / mlen)
         num_k_tiles = math.ceil(physical_k / mlen)
-        max_k_tiles = self.mram_tile_capacity if panel_k_tiles is None else int(panel_k_tiles)
-        if max_k_tiles <= 0:
-            raise ValueError(f"panel_k_tiles must be positive, got {max_k_tiles}")
-        if max_k_tiles > self.mram_tile_capacity:
-            raise ValueError(
-                f"panel_k_tiles={max_k_tiles} exceeds mram_tile_capacity={self.mram_tile_capacity}"
-            )
+        max_k_tiles = self.mram_tile_capacity
 
         output = self.alloc(
             name,
@@ -1071,158 +909,28 @@ class ProgramRoutedMoeMixin:
             physical_shape=(physical_rows, physical_out_features),
         )
 
-        if weight_panel_mode != "blocking":
-            panel_tiles = 4 if panel_k_tiles is None else int(panel_k_tiles)
-            if panel_tiles <= 0:
-                raise ValueError(f"panel_k_tiles must be positive, got {panel_tiles}")
-            panel_depth = 2
-            if panel_depth * panel_tiles > self.mram_tile_capacity:
-                raise ValueError(
-                    "buffered panels exceed Matrix-SRAM capacity: "
-                    f"{panel_depth}*{panel_tiles} > mram_tile_capacity={self.mram_tile_capacity}"
-                )
-
-            super().reset_mram()
-            panel_elems = panel_tiles * mlen * mlen
-            panel_bases = tuple(
-                self.mram_allocator.allocate(f"{name}_panel{slot}", panel_elems)
-                for slot in range(panel_depth)
-            )
-            panels = []
-            for k_chunk_idx, k_block_start in enumerate(range(0, num_k_tiles, panel_tiles)):
-                k_block_count = min(panel_tiles, num_k_tiles - k_block_start)
-                for col_idx in range(num_col_blocks):
-                    panels.append((k_chunk_idx, k_block_start, k_block_count, col_idx))
-
-            def prefetch_panel(panel, mram_start_addr: int) -> None:
-                _chunk_idx, k_block_start, k_block_count, col_idx = panel
-                self._moe_dynamic_load_sub_matrix_col_v0(
-                    weight_template=weight_template,
-                    col_idx=col_idx,
-                    expert_indices_int_base=expert_indices_int_base,
-                    pair_idx=pair_idx,
-                    table_base=table_base,
-                    per_expert_stride=per_expert_stride,
-                    expert_base_table_int_base=expert_base_table_int_base,
-                    expert_gp=expert_gp,
-                    mram_start_addr=mram_start_addr,
-                    k_block_start=k_block_start,
-                    k_block_count=k_block_count,
-                    name=f"{name}_pair{pair_idx}_pingpong",
-                )
-
-            def consume_panel(
-                panel,
-                mram_start_addr: int,
-                target: VRAMMatrixVar,
-                row_idx: int,
-                target_row_idx: int,
-                target_col_idx: int,
-            ) -> None:
-                _chunk_idx, k_block_start, k_block_count, col_idx = panel
-                self._emit(
-                    IsaBuilder().comment(
-                        moe_stage_marker(
-                            "expert_projection",
-                            f"{name}: pingpong resident weight pair={pair_idx}, col={col_idx}, "
-                            f"row_block={row_idx}, mram={mram_start_addr}",
-                        )
-                    )
-                )
-                super(ProgramRoutedMoeMixin, self).vram_sub_projection_to(
-                    vram_mat_name=input_var.name,
-                    vram_row_idx=row_idx,
-                    mram_mat_name=weight_template.name,
-                    mram_col_idx=col_idx,
-                    target_matrix=target.name,
-                    target_row_idx=target_row_idx,
-                    target_col_idx=target_col_idx,
-                    k_block_start=k_block_start,
-                    k_block_count=k_block_count,
-                    resident_mram_start_addr=mram_start_addr,
-                )
-
-            temp = self.alloc(f"{name}_temp", mlen, mlen) if num_k_tiles > panel_tiles else None
-            initial_fill = min(panel_depth, len(panels))
-            for panel_idx in range(initial_fill):
-                prefetch_panel(panels[panel_idx], panel_bases[panel_idx])
-            for panel_idx, panel in enumerate(panels):
-                current_base = panel_bases[panel_idx % panel_depth]
-                k_chunk_idx, _k_start, _k_count, col_idx = panel
-                for row_idx in range(num_row_blocks):
-                    if k_chunk_idx == 0:
-                        consume_panel(panel, current_base, output, row_idx, row_idx, col_idx)
-                    else:
-                        assert temp is not None
-                        consume_panel(panel, current_base, temp, row_idx, 0, 0)
-                        self.vram_block_add_to(output, row_idx, col_idx, temp, 0, 0, output, row_idx, col_idx)
-                next_panel_idx = panel_idx + panel_depth
-                if next_panel_idx < len(panels):
-                    prefetch_panel(panels[next_panel_idx], current_base)
-            if temp is not None:
-                self.free_tensor(temp)
-            return output
-
-        def emit_projection(
-            row_idx,
-            col_idx,
-            target,
-            target_row_idx,
-            target_col_idx,
-            *,
-            load_weight: bool,
-            **k_split,
-        ) -> None:
-            if load_weight:
-                self.moe_dynamic_vram_sub_projection_to_v0(
-                    input_var,
-                    row_idx,
-                    weight_template,
-                    col_idx,
-                    target,
-                    target_row_idx,
-                    target_col_idx,
-                    expert_indices_int_base=expert_indices_int_base,
-                    pair_idx=pair_idx,
-                    table_base=table_base,
-                    per_expert_stride=per_expert_stride,
-                    expert_base_table_int_base=expert_base_table_int_base,
-                    expert_gp=expert_gp,
-                    name=f"{name}_pair{pair_idx}",
-                    **k_split,
-                )
-                return
-
-            self._emit(
-                IsaBuilder().comment(
-                    moe_stage_marker(
-                        "expert_projection",
-                        f"{name}: resident weight pair={pair_idx}, col={col_idx}, row_block={row_idx}",
-                    )
-                )
-            )
-            super(ProgramRoutedMoeMixin, self).vram_sub_projection_to(
-                vram_mat_name=input_var.name,
-                vram_row_idx=row_idx,
-                mram_mat_name=weight_template.name,
-                mram_col_idx=col_idx,
-                target_matrix=target.name,
-                target_row_idx=target_row_idx,
-                target_col_idx=target_col_idx,
+        def emit_projection(row_idx, col_idx, target, target_row_idx, target_col_idx, **k_split) -> None:
+            self.moe_dynamic_vram_sub_projection_to_v0(
+                input_var,
+                row_idx,
+                weight_template,
+                col_idx,
+                target,
+                target_row_idx,
+                target_col_idx,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=pair_idx,
+                table_base=table_base,
+                per_expert_stride=per_expert_stride,
+                expert_base_table_int_base=expert_base_table_int_base,
+                name=f"{name}_pair{pair_idx}",
                 **k_split,
             )
 
         if num_k_tiles <= max_k_tiles:
             for col_idx in range(num_col_blocks):
                 for row_idx in range(num_row_blocks):
-                    emit_projection(
-                        row_idx,
-                        col_idx,
-                        output,
-                        row_idx,
-                        col_idx,
-                        load_weight=not reuse_weight_across_row_blocks or row_idx == 0,
-                    )
+                    emit_projection(row_idx, col_idx, output, row_idx, col_idx)
             return output
 
         temp = self.alloc(f"{name}_temp", mlen, mlen)
@@ -1232,25 +940,9 @@ class ProgramRoutedMoeMixin:
             for col_idx in range(num_col_blocks):
                 for row_idx in range(num_row_blocks):
                     if k_chunk_idx == 0:
-                        emit_projection(
-                            row_idx,
-                            col_idx,
-                            output,
-                            row_idx,
-                            col_idx,
-                            load_weight=not reuse_weight_across_row_blocks or row_idx == 0,
-                            **k_split,
-                        )
+                        emit_projection(row_idx, col_idx, output, row_idx, col_idx, **k_split)
                     else:
-                        emit_projection(
-                            row_idx,
-                            col_idx,
-                            temp,
-                            0,
-                            0,
-                            load_weight=not reuse_weight_across_row_blocks or row_idx == 0,
-                            **k_split,
-                        )
+                        emit_projection(row_idx, col_idx, temp, 0, 0, **k_split)
                         self.vram_block_add_to(output, row_idx, col_idx, temp, 0, 0, output, row_idx, col_idx)
         self.free_tensor(temp)
         return output
@@ -1264,7 +956,6 @@ class ProgramRoutedMoeMixin:
         pair_idx: int,
         rows: int,
         width: int,
-        expert_gp: int | None = None,
         name: str = "gpt_oss_dynamic_bias",
     ) -> None:
         """Add BF16 bias selected by true expert id from a VRAM bias table."""
@@ -1275,6 +966,7 @@ class ProgramRoutedMoeMixin:
         self._ensure_vram_sub_matrix_registered(dst)
         self._ensure_vram_sub_matrix_registered(bias_table)
         num_col_blocks = width // self.mlen
+        bias_rows = bias_table.physical_shape[0]
         expert_row_stride = self.blen * self.mlen
 
         gp_table, gp_expert, gp_stride, gp_expert_offset, gp_src_base, gp_src, gp_dst = self._reg.allocate_gp(7)
@@ -1282,12 +974,10 @@ class ProgramRoutedMoeMixin:
             asm = IsaBuilder().comment(
                 moe_stage_marker("expert_bias", f"dynamic expert bias add {name}: pair={pair_idx}, rows={rows}")
             )
-            if expert_gp is None:
-                asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
-                asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
-            resolved_expert_gp = gp_expert if expert_gp is None else expert_gp
+            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
             asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), expert_row_stride)
-            asm.instr("S_MUL_INT", gp(gp_expert_offset), gp(resolved_expert_gp), gp(gp_stride))
+            asm.instr("S_MUL_INT", gp(gp_expert_offset), gp(gp_expert), gp(gp_stride))
             for col_block in range(num_col_blocks):
                 src_col_base = self._vram_matrix_row_addr(bias_table, 0, col_block)
                 for row_idx in range(rows):
@@ -1425,114 +1115,6 @@ class ProgramRoutedMoeMixin:
             self._reg.free_gp([gp_dst, gp_fp])
         return route
 
-    def moe_dynamic_expert_ffn_v0(
-        self,
-        x: VRAMMatrixVar,
-        weights: ExpertWeights,
-        *,
-        weight_table_bases: tuple[int, int, int],
-        weight_table_strides: tuple[int, int, int],
-        expert_indices_int_base: int,
-        pair_idx: int,
-        bias_tables: ExpertBiases | None,
-        rows: int,
-        intermediate: int,
-        constants: GptOssFPConstants,
-        expert_gp: int | None = None,
-        policy_name: str = "gpt_oss",
-        activation_policy: str = "gpt_oss_clamp_gated",
-        name: str = "moe_dynamic_expert_ffn",
-    ) -> VRAMMatrixVar:
-        """Run gate/up/activation/down for one runtime-selected expert.
-
-        ``expert_gp`` selects the dispatcher-driven expert-major path. When it is
-        omitted, the existing token-major path loads ``pair_idx`` from INT SRAM.
-        Route-weight multiplication intentionally remains outside this helper.
-        """
-        w_gate, w_up, w_down = weights
-        gate_bias_table, up_bias_table, down_bias_table = bias_tables or (None, None, None)
-        gate_base, up_base, down_base = weight_table_bases
-        gate_stride, up_stride, down_stride = weight_table_strides
-        projection_rows = max(self.mlen, x.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
-
-        gate = self.moe_dynamic_linear_projection_v0(
-            x,
-            w_gate,
-            expert_indices_int_base=expert_indices_int_base,
-            pair_idx=pair_idx,
-            table_base=gate_base,
-            per_expert_stride=gate_stride,
-            expert_gp=expert_gp,
-            name=f"{name}_gate",
-            physical_shape=(projection_rows, w_gate.physical_shape[1]),
-        )
-        up = self.moe_dynamic_linear_projection_v0(
-            x,
-            w_up,
-            expert_indices_int_base=expert_indices_int_base,
-            pair_idx=pair_idx,
-            table_base=up_base,
-            per_expert_stride=up_stride,
-            expert_gp=expert_gp,
-            name=f"{name}_up",
-            physical_shape=(projection_rows, w_up.physical_shape[1]),
-        )
-        if gate_bias_table is not None:
-            self.moe_add_dynamic_expert_bias_v0(
-                gate,
-                gate_bias_table,
-                expert_indices_int_base=expert_indices_int_base,
-                pair_idx=pair_idx,
-                rows=rows,
-                width=intermediate,
-                expert_gp=expert_gp,
-                name=f"{name}_gate_bias",
-            )
-        if up_bias_table is not None:
-            self.moe_add_dynamic_expert_bias_v0(
-                up,
-                up_bias_table,
-                expert_indices_int_base=expert_indices_int_base,
-                pair_idx=pair_idx,
-                rows=rows,
-                width=intermediate,
-                expert_gp=expert_gp,
-                name=f"{name}_up_bias",
-            )
-        hidden = self.moe_expert_activation_v0(
-            gate,
-            up,
-            rows=rows,
-            intermediate=intermediate,
-            constants=constants,
-            activation_policy=activation_policy,
-            stage="expert_activation",
-            name=name,
-        )
-        out = self.moe_dynamic_linear_projection_v0(
-            hidden,
-            w_down,
-            expert_indices_int_base=expert_indices_int_base,
-            pair_idx=pair_idx,
-            table_base=down_base,
-            per_expert_stride=down_stride,
-            expert_gp=expert_gp,
-            name=f"{name}_out",
-            physical_shape=(projection_rows, w_down.physical_shape[1]),
-        )
-        if down_bias_table is not None:
-            self.moe_add_dynamic_expert_bias_v0(
-                out,
-                down_bias_table,
-                expert_indices_int_base=expert_indices_int_base,
-                pair_idx=pair_idx,
-                rows=rows,
-                width=w_down.physical_shape[1],
-                expert_gp=expert_gp,
-                name=f"{name}_down_bias",
-            )
-        return out
-
     def moe_dynamic_expert_pair_v0(
         self,
         x: VRAMMatrixVar,
@@ -1553,27 +1135,88 @@ class ProgramRoutedMoeMixin:
         activation_policy: str = "gpt_oss_clamp_gated",
         name: str = "moe_dynamic_expert_pair",
     ) -> VRAMMatrixVar:
-        """Run one routed pair and multiply by its device V_TOPK weight."""
-        out = self.moe_dynamic_expert_ffn_v0(
+        """Run one routed pair using true expert id from device V_TOPK output."""
+        w_gate, w_up, w_down = weights
+        gate_bias_table, up_bias_table, down_bias_table = bias_tables or (None, None, None)
+        gate_base, up_base, down_base = weight_table_bases
+        gate_stride, up_stride, down_stride = weight_table_strides
+        projection_rows = max(self.mlen, x.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
+
+        gate = self.moe_dynamic_linear_projection_v0(
             x,
-            weights,
-            weight_table_bases=weight_table_bases,
-            weight_table_strides=weight_table_strides,
+            w_gate,
             expert_indices_int_base=expert_indices_int_base,
             pair_idx=pair_idx,
-            bias_tables=bias_tables,
+            table_base=gate_base,
+            per_expert_stride=gate_stride,
+            name=f"{name}_gate",
+            physical_shape=(projection_rows, w_gate.physical_shape[1]),
+        )
+        up = self.moe_dynamic_linear_projection_v0(
+            x,
+            w_up,
+            expert_indices_int_base=expert_indices_int_base,
+            pair_idx=pair_idx,
+            table_base=up_base,
+            per_expert_stride=up_stride,
+            name=f"{name}_up",
+            physical_shape=(projection_rows, w_up.physical_shape[1]),
+        )
+        if gate_bias_table is not None:
+            self.moe_add_dynamic_expert_bias_v0(
+                gate,
+                gate_bias_table,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=pair_idx,
+                rows=rows,
+                width=intermediate,
+                name=f"{name}_gate_bias",
+            )
+        if up_bias_table is not None:
+            self.moe_add_dynamic_expert_bias_v0(
+                up,
+                up_bias_table,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=pair_idx,
+                rows=rows,
+                width=intermediate,
+                name=f"{name}_up_bias",
+            )
+        hidden = self.moe_expert_activation_v0(
+            gate,
+            up,
             rows=rows,
             intermediate=intermediate,
             constants=constants,
-            policy_name=policy_name,
             activation_policy=activation_policy,
+            stage="expert_activation",
             name=name,
         )
+        out = self.moe_dynamic_linear_projection_v0(
+            hidden,
+            w_down,
+            expert_indices_int_base=expert_indices_int_base,
+            pair_idx=pair_idx,
+            table_base=down_base,
+            per_expert_stride=down_stride,
+            name=f"{name}_out",
+            physical_shape=(projection_rows, w_down.physical_shape[1]),
+        )
+        if down_bias_table is not None:
+            self.moe_add_dynamic_expert_bias_v0(
+                out,
+                down_bias_table,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=pair_idx,
+                rows=rows,
+                width=w_down.physical_shape[1],
+                name=f"{name}_down_bias",
+            )
         route = self.moe_materialize_topk_route_weight_v0(
             weights_fp_base=weights_fp_base,
             pair_idx=pair_idx,
             rows=rows,
-            hidden=weights[2].physical_shape[1],
+            hidden=w_down.physical_shape[1],
             zero_row=zero_row,
             fp_scratch=route_fp_scratch,
             policy_name=policy_name,
@@ -1583,174 +1226,6 @@ class ProgramRoutedMoeMixin:
         self._emit(IsaBuilder().comment(moe_stage_marker("expert_route_weight", f"[{policy_name}] apply {name}")))
         self.vram_mul(out, route, num_rows=rows)
         return out
-
-    def moe_apply_batch4_route_weight_v0(
-        self,
-        output: VRAMMatrixVar,
-        *,
-        rows: int,
-        policy_name: str = "gpt_oss",
-        name: str = "moe_batch4_route_weight",
-    ) -> None:
-        """Apply the dispatcher's current expert context to four output rows."""
-        if self.blen != 4 or rows != 4:
-            raise ValueError(f"{name}: route dispatcher v0 requires rows=BLEN=4")
-        if output.shape[0] < rows:
-            raise ValueError(f"{name}: output has {output.shape[0]} rows, expected at least {rows}")
-        if output.shape[1] % self.mlen != 0:
-            raise ValueError(f"{name}: output width={output.shape[1]} must be divisible by MLEN={self.mlen}")
-
-        gp_dst = self._reg.allocate_gp(1)[0]
-        try:
-            asm = IsaBuilder().comment(
-                moe_stage_marker(
-                    "expert_route_weight",
-                    f"[{policy_name}] apply dispatcher route weights to {output.name}",
-                )
-            )
-            for col_block in range(output.shape[1] // self.mlen):
-                for token_idx in range(rows):
-                    dst_addr = self._vram_matrix_row_addr(output, token_idx, col_block)
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
-                    asm.instr("V_ROUTE_MUL", gp(gp_dst), gp(gp_dst), gp(0), token_idx)
-            self._emit(asm)
-        finally:
-            self._reg.free_gp([gp_dst])
-
-    def moe_dynamic_batch4_expert_major_v0(
-        self,
-        x: VRAMMatrixVar,
-        router_logits: VRAMMatrixVar,
-        weights: ExpertWeights,
-        *,
-        weight_table_bases: tuple[int, int, int],
-        weight_table_strides: tuple[int, int, int],
-        expert_indices_int_base: int,
-        weights_fp_base: int,
-        num_experts: int,
-        top_k: int,
-        bias_tables: ExpertBiases | None,
-        rows: int,
-        intermediate: int,
-        constants: GptOssFPConstants,
-        policy_name: str = "gpt_oss",
-        activation_policy: str = "gpt_oss_clamp_gated",
-        name: str = "moe_batch4_expert_major",
-    ) -> VRAMMatrixVar:
-        """Execute one four-token MoE batch once per unique selected expert.
-
-        Four token-major ``V_TOPK`` results are captured by the route dispatcher.
-        Its dynamic loop then exposes one expert ID and four route weights at a
-        time. The FFN runs over all four rows; ``V_ROUTE_MUL`` replaces inactive
-        rows with exact zero before accumulation.
-        """
-        if self.blen != 4 or rows != 4:
-            raise ValueError(f"{name}: route dispatcher v0 supports exactly four token rows")
-        policy_rmask, packed_policy = _route_dispatch_policy(num_experts, top_k)
-        route_entries = rows * top_k
-        # These depths are architectural constants in doc/configuration.svh and
-        # src/definitions/configuration.svh. Keep the check next to the lowering
-        # until the compiler exposes SRAM depths as constructor parameters.
-        if expert_indices_int_base < 0 or expert_indices_int_base + route_entries > 32:
-            raise ValueError(f"{name}: route indices exceed the RTL 32-entry INT SRAM")
-        if weights_fp_base < 0 or weights_fp_base + route_entries > 512:
-            raise ValueError(f"{name}: route weights exceed the RTL 512-entry FP SRAM")
-
-        output_width = weights[2].shape[1]
-        physical_rows = max(self.mlen, x.physical_shape[0])
-        combined = self.alloc(
-            f"{name}_combined",
-            rows=rows,
-            cols=output_width,
-            strict=False,
-            physical_shape=(physical_rows, weights[2].physical_shape[1]),
-        )
-        zero_row = self.fp_var(f"{name}_zero_row", size=self.mlen)
-        zero_addresses = range(zero_row.address, zero_row.address + zero_row.size)
-        route_fp_range = range(weights_fp_base, weights_fp_base + route_entries)
-        if any(address in route_fp_range for address in zero_addresses):
-            raise ValueError(f"{name}: route weights overlap the dedicated true-zero FP row")
-        self.moe_true_zero_vram_rows_v0(
-            combined,
-            rows=range(rows),
-            hidden=output_width,
-            zero_row=zero_row,
-            policy_name=policy_name,
-            stage="accumulator_init",
-            name=f"{name}_combined_zero",
-        )
-
-        gp_expert, gp_indices, gp_weights = self._reg.allocate_gp(3)
-        try:
-            asm = IsaBuilder().comment(
-                moe_stage_marker(
-                    "router_topk",
-                    f"[{policy_name}] configure batch4 expert-major dispatch: "
-                    f"experts={num_experts}, top_k={top_k}",
-                )
-            )
-            if packed_policy is not None:
-                asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), packed_policy)
-                asm.instr("C_SET_TOPK_REG", gp(gp_weights))
-            asm.instr("S_ADDI_INT", gp(gp_indices), gp(0), expert_indices_int_base)
-            asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), weights_fp_base)
-            asm.instr(
-                "C_ROUTE_BEGIN",
-                gp(gp_expert),
-                gp(gp_indices),
-                gp(gp_weights),
-                policy_rmask,
-            )
-            self._emit(asm)
-
-            for token_idx in range(rows):
-                self.moe_router_select_v0(
-                    router_logits,
-                    token_idx=token_idx,
-                    weights_fp_base=weights_fp_base + token_idx * top_k,
-                    indices_int_base=expert_indices_int_base + token_idx * top_k,
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    emit_policy_config=False,
-                    policy_name=policy_name,
-                    name=f"{name}_token{token_idx}_topk",
-                )
-
-            self._emit(IsaBuilder().instr("C_ROUTE_LOOP_START"))
-            expert_out = self.moe_dynamic_expert_ffn_v0(
-                x,
-                weights,
-                weight_table_bases=weight_table_bases,
-                weight_table_strides=weight_table_strides,
-                expert_indices_int_base=expert_indices_int_base,
-                pair_idx=0,
-                bias_tables=bias_tables,
-                rows=rows,
-                intermediate=intermediate,
-                constants=constants,
-                expert_gp=gp_expert,
-                policy_name=policy_name,
-                activation_policy=activation_policy,
-                name=f"{name}_expert",
-            )
-            self.moe_apply_batch4_route_weight_v0(
-                expert_out,
-                rows=rows,
-                policy_name=policy_name,
-                name=f"{name}_route",
-            )
-            self._emit(
-                IsaBuilder().comment(
-                    moe_stage_marker("scatter_combine", f"[{policy_name}] accumulate {name} current expert")
-                )
-            )
-            self.vram_add(combined, expert_out, num_rows=rows)
-            self.free_tensor(expert_out)
-            self._emit(IsaBuilder().instr("C_ROUTE_LOOP_END"))
-        finally:
-            self._reg.free_gp([gp_expert, gp_indices, gp_weights])
-
-        return combined
 
     def moe_gather_token_rows_from_hbm_v0(
         self,
@@ -1926,77 +1401,6 @@ class ProgramRoutedMoeMixin:
         finally:
             self._reg.free_gp([gp_dst, gp_src])
 
-        return gathered
-
-    def moe_gather_token_rows_compact_from_vram_v0(
-        self,
-        x: VRAMMatrixVar,
-        *,
-        token_indices: Sequence[int],
-        hidden: int,
-        zero_row: FPVar | None = None,
-        policy_name: str = "gpt_oss",
-        name: str = "moe_grouped_x_vram",
-    ) -> VRAMMatrixVar:
-        """Gather one expert's token rows densely for weight-reuse execution.
-
-        Unlike :meth:`moe_gather_token_rows_from_vram_v0`, which reserves one
-        BLEN-row slot per routed pair, this mapping places token ``j`` at row
-        ``j``.  Padding is restricted to the final BLEN tile, so one resident
-        expert weight tile serves all valid rows in the group.
-        """
-        self._ensure_vram_sub_matrix_registered(x)
-        if hidden % self.mlen != 0:
-            raise ValueError(f"compact gather hidden={hidden} must be divisible by MLEN={self.mlen}")
-        if hidden > x.shape[1]:
-            raise ValueError(f"compact gather hidden={hidden} exceeds x width={x.shape[1]}")
-
-        token_list = [int(token) for token in token_indices]
-        if not token_list:
-            raise ValueError("compact gather token_indices must be non-empty")
-        if len(set(token_list)) != len(token_list):
-            raise ValueError("compact gather requires unique token rows for one expert")
-        if min(token_list) < 0 or max(token_list) >= x.physical_shape[0]:
-            raise ValueError(f"compact gather token_indices {token_list} exceed x physical rows={x.physical_shape[0]}")
-
-        rows = len(token_list)
-        physical_rows = max(self.blen, math.ceil(rows / self.blen) * self.blen)
-        gathered = self.alloc(
-            name,
-            rows=rows,
-            cols=hidden,
-            strict=False,
-            physical_shape=(physical_rows, hidden),
-        )
-        self.moe_true_zero_vram_rows_v0(
-            gathered,
-            rows=list(range(physical_rows)),
-            hidden=hidden,
-            zero_row=zero_row,
-            policy_name=policy_name,
-            stage="gather",
-            name=f"{name}_zero",
-        )
-
-        num_col_blocks = hidden // self.mlen
-        gp_dst, gp_src = self._reg.allocate_gp(2)
-        try:
-            asm = IsaBuilder().comment(
-                moe_stage_marker(
-                    "gather",
-                    f"[{policy_name}] compact expert-major VRAM gather: rows={rows}, hidden={hidden}",
-                )
-            )
-            for active_row, token_idx in enumerate(token_list):
-                for col_block in range(num_col_blocks):
-                    dst_addr = self._vram_matrix_row_addr(gathered, active_row, col_block)
-                    src_addr = self._vram_matrix_row_addr(x, token_idx, col_block)
-                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
-                    asm.instr("S_ADDI_INT", gp(gp_src), gp(0), src_addr)
-                    asm.instr("V_ADD_VV", gp(gp_dst), gp(gp_dst), gp(gp_src), 0)
-            self._emit(asm)
-        finally:
-            self._reg.free_gp([gp_dst, gp_src])
         return gathered
 
     def moe_true_zero_vram_rows_v0(
@@ -2341,629 +1745,6 @@ class ProgramRoutedMoeMixin:
             f"{activation_policy!r}"
         )
 
-    def _gpt_oss_dynamic_load_sub_matrix_col_v0(self, *, weight_template: InputVar, col_idx: int, expert_indices_int_base: int, pair_idx: int, table_base: int, per_expert_stride: int, expert_base_table_int_base: int | None=None, mram_start_addr: int | None=None, k_block_start: int=0, k_block_count: int | None=None, name: str='gpt_oss_dynamic_weight_load') -> None:
-        """Load one weight column tile using runtime true expert id addressing.
-
-            ``table_base`` and ``per_expert_stride`` are byte addresses. In affine
-            mode each stride must cover the template's complete element, scale, and
-            padding footprint; larger strides may be used for table alignment.
-            """
-        self._ensure_hbm_sub_matrix_registered(weight_template)
-        layout = self.get_hbm_layout(weight_template.name)
-        if expert_base_table_int_base is None and per_expert_stride < layout.hbm_size:
-            raise ValueError(f'{name}: per_expert_stride={per_expert_stride} bytes is smaller than {weight_template.name} HBM footprint={layout.hbm_size} bytes')
-        num_row_blocks = layout.num_row_blocks
-        block_size = self.mlen * self.mlen
-        effective_count = k_block_count if k_block_count is not None else num_row_blocks
-        if mram_start_addr is None:
-            mram_start_addr = self.mram_allocator.allocate(f'{name}_{weight_template.name}_pair{pair_idx}_col{col_idx}', effective_count * block_size)
-        gp_table, gp_expert, gp_expert_stride, gp_expert_offset, gp_base, gp_scale, gp_stride, gp_mram = self._reg.allocate_gp(8)
-        addr_reg = self._reg.allocate_addr(1)[0]
-        try:
-            asm = IsaBuilder().comment(f'GPT-OSS dynamic HBM weight prefetch: template={weight_template.name}, pair={pair_idx}, col={col_idx}')
-            if expert_base_table_int_base is None:
-                self._emit_expert_id_to_weight_base_v0(asm, expert_indices_int_base=expert_indices_int_base, pair_idx=pair_idx, table_base=table_base, per_expert_stride=per_expert_stride, addr_reg=addr_reg, gp_table=gp_table, gp_expert=gp_expert, gp_stride=gp_expert_stride, gp_offset=gp_expert_offset, gp_base=gp_base, name=name)
-            else:
-                self._emit_expert_id_to_weight_base_table_v0(asm, expert_indices_int_base=expert_indices_int_base, expert_base_table_int_base=expert_base_table_int_base, pair_idx=pair_idx, addr_reg=addr_reg, gp_table=gp_table, gp_expert=gp_expert, gp_base=gp_base, name=name)
-            self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
-            self._emit_hbm_subblock_sequence(asm, layout, ((row_idx, col_idx) for row_idx in range(k_block_start, k_block_start + effective_count)), mram_start_addr, addr_reg, gp_scale, gp_mram)
-            self._emit(asm)
-        finally:
-            self._reg.free_gp([gp_table, gp_expert, gp_expert_stride, gp_expert_offset, gp_base, gp_scale, gp_stride, gp_mram])
-            self._reg.free_addr([addr_reg])
-
-    def gpt_oss_dynamic_expert_ffn_v0(self, x: VRAMMatrixVar, weights: ExpertWeights, *, weight_table_bases: tuple[int, int, int], weight_table_strides: tuple[int, int, int], expert_indices_int_base: int, pair_idx: int, bias_tables: ExpertBiases | None, rows: int, intermediate: int, constants: GptOssFPConstants, activation_policy: str='gpt_oss_clamp_gated', name: str='gpt_oss_dynamic_expert_ffn') -> VRAMMatrixVar:
-        """Run gate/up/activation/down for one device-selected expert.
-
-            This helper stops before routing-weight multiplication so the expert
-            FFN and weighted-combine stages can be validated independently.
-            """
-        w_gate, w_up, w_down = weights
-        gate_bias_table, up_bias_table, down_bias_table = bias_tables or (None, None, None)
-        gate_base, up_base, down_base = weight_table_bases
-        gate_stride, up_stride, down_stride = weight_table_strides
-        projection_rows = max(self.mlen, x.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
-        gate = self.gpt_oss_dynamic_linear_projection_v0(x, w_gate, expert_indices_int_base=expert_indices_int_base, pair_idx=pair_idx, table_base=gate_base, per_expert_stride=gate_stride, name=f'{name}_gate', physical_shape=(projection_rows, w_gate.physical_shape[1]))
-        up = self.gpt_oss_dynamic_linear_projection_v0(x, w_up, expert_indices_int_base=expert_indices_int_base, pair_idx=pair_idx, table_base=up_base, per_expert_stride=up_stride, name=f'{name}_up', physical_shape=(projection_rows, w_up.physical_shape[1]))
-        if gate_bias_table is not None:
-            self.gpt_oss_add_dynamic_expert_bias_v0(gate, gate_bias_table, expert_indices_int_base=expert_indices_int_base, pair_idx=pair_idx, rows=rows, width=intermediate, name=f'{name}_gate_bias')
-        if up_bias_table is not None:
-            self.gpt_oss_add_dynamic_expert_bias_v0(up, up_bias_table, expert_indices_int_base=expert_indices_int_base, pair_idx=pair_idx, rows=rows, width=intermediate, name=f'{name}_up_bias')
-        hidden = self.moe_expert_activation_v0(gate, up, rows=rows, intermediate=intermediate, constants=constants, activation_policy=activation_policy, name=name, stage='expert_activation')
-        out = self.gpt_oss_dynamic_linear_projection_v0(hidden, w_down, expert_indices_int_base=expert_indices_int_base, pair_idx=pair_idx, table_base=down_base, per_expert_stride=down_stride, name=f'{name}_out', physical_shape=(projection_rows, w_down.physical_shape[1]))
-        if down_bias_table is not None:
-            self.gpt_oss_add_dynamic_expert_bias_v0(out, down_bias_table, expert_indices_int_base=expert_indices_int_base, pair_idx=pair_idx, rows=rows, width=w_down.physical_shape[1], name=f'{name}_down_bias')
-        return out
-
-    def gpt_oss_apply_topk_route_weight_v0(self, output: VRAMMatrixVar, *, weights_fp_base: int, pair_idx: int, rows: int, name: str='gpt_oss_apply_route_weight') -> None:
-        """Multiply active expert rows directly by one scalar TopK weight."""
-        if rows <= 0 or rows > output.shape[0]:
-            raise ValueError(f'{name}: rows={rows} must be within output rows={output.shape[0]}')
-        if output.shape[1] % self.mlen != 0:
-            raise ValueError(f'{name}: width={output.shape[1]} must be divisible by MLEN={self.mlen}')
-        gp_registers: list[int] = []
-        fp_registers: list[int] = []
-        try:
-            gp_registers = self._reg.allocate_gp(2)
-            fp_registers = self.allocate_fp_reg(1)
-            gp_dst, gp_weight = gp_registers
-            fp_weight = fp_registers[0]
-            asm = IsaBuilder().comment(f'GPT-OSS apply route weight pair={pair_idx} from scalar FP SRAM')
-            asm.instr('S_ADDI_INT', gp(gp_weight), gp(0), weights_fp_base)
-            asm.instr('S_LD_FP', fp(fp_weight), gp(gp_weight), pair_idx)
-            for col_block in range(output.shape[1] // self.mlen):
-                for row_idx in range(rows):
-                    dst_addr = self._vram_matrix_row_addr(output, row_idx, col_block)
-                    asm.instr('S_ADDI_INT', gp(gp_dst), gp(0), dst_addr)
-                    asm.instr('V_MUL_VF', gp(gp_dst), gp(gp_dst), fp(fp_weight), 0)
-            self._emit(asm)
-        finally:
-            self.free_fp_reg(fp_registers)
-            self._reg.free_gp(gp_registers)
-
-    def gpt_oss_dynamic_moe_v0(self, x: VRAMMatrixVar, weights: ExpertWeights, *, weight_table_bases: tuple[int, int, int], weight_table_strides: tuple[int, int, int], expert_indices_int_base: int, weights_fp_base: int, pair_count: int, bias_tables: ExpertBiases | None, rows: int, intermediate: int, constants: GptOssFPConstants, activation_policy: str='gpt_oss_clamp_gated', name: str='gpt_oss_dynamic_moe') -> VRAMMatrixVar:
-        """Run, weight, and sum all device-selected experts in TopK order."""
-        if pair_count <= 0:
-            raise ValueError(f'{name}: pair_count must be positive, got {pair_count}')
-        combined: VRAMMatrixVar | None = None
-        for pair_idx in range(pair_count):
-            expert_out = self.gpt_oss_dynamic_expert_pair_v0(x, weights, weight_table_bases=weight_table_bases, weight_table_strides=weight_table_strides, expert_indices_int_base=expert_indices_int_base, weights_fp_base=weights_fp_base, pair_idx=pair_idx, bias_tables=bias_tables, rows=rows, intermediate=intermediate, constants=constants, activation_policy=activation_policy, name=f'{name}_expert{pair_idx}')
-            if combined is None:
-                combined = expert_out
-            else:
-                self.vram_add(combined, expert_out, num_rows=rows)
-                self.free_tensor(expert_out)
-        assert combined is not None
-        return combined
-
-    def _emit_tile_major_expert_tiles_v0(
-        self,
-        asm: IsaBuilder,
-        *,
-        layout,
-        block_coords,
-        expert_indices_int_base: int,
-        pair_idx: int,
-        table_base: int,
-        num_experts: int,
-        tile_group_stride: int,
-        mram_start_addr: int,
-        addr_reg: int,
-        gp_table: int,
-        gp_expert: int,
-        gp_expert_stride: int,
-        gp_expert_offset: int,
-        gp_base: int,
-        gp_scale: int,
-        gp_stride: int,
-        gp_mram: int,
-        name: str,
-        pair_index_gp: int | None = None,
-    ) -> None:
-        """Load runtime-selected expert tiles through static 64-bit groups."""
-        block_size = self.mlen * self.mlen
-        tile_hbm_stride = self.hbm_tensor_size(block_size)
-        if tile_group_stride < num_experts * tile_hbm_stride:
-            raise ValueError("tile-major expert group is smaller than its live tiles")
-        if tile_group_stride > 1 << 32 or tile_group_stride & (tile_group_stride - 1):
-            raise ValueError("tile-major expert group must be a power of two <= 4 GiB")
-        if table_base % tile_group_stride:
-            raise ValueError("tile-major expert table base must be group-aligned")
-
-        asm.comment(
-            moe_stage_marker(
-                "expert_weight_address",
-                f"{name}: tile-major pair={pair_idx}, experts={num_experts}, group={tile_group_stride}",
-            )
-        )
-        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
-        if pair_index_gp is None:
-            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
-        else:
-            asm.instr("S_ADD_INT", gp(gp_table), gp(gp_table), gp(pair_index_gp))
-            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), 0)
-        asm.instr(
-            "S_ADDI_INT", gp(gp_expert_stride), gp(0), tile_hbm_stride
-        )
-        asm.instr(
-            "S_MUL_INT",
-            gp(gp_expert_offset),
-            gp(gp_expert),
-            gp(gp_expert_stride),
-        )
-        asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), block_size)
-        asm.instr("C_SET_SCALE_REG", gp(gp_scale))
-        asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), self.mlen)
-        asm.instr("C_SET_STRIDE_REG", gp(gp_stride))
-
-        mram_addr = mram_start_addr
-        for row_idx, col_idx in block_coords:
-            sub_block = layout.get_sub_block(row_idx, col_idx)
-            tile_index = row_idx * layout.num_col_blocks + col_idx
-            group_base = table_base + tile_index * tile_group_stride
-            low = group_base & 0xFFFF_FFFF
-            if low + num_experts * tile_hbm_stride > 1 << 32:
-                raise ValueError("tile-major expert group crosses a 4-GiB window")
-            asm.comment(
-                f"tile-major expert block [{row_idx}][{col_idx}] group={group_base}"
-            )
-            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), group_base >> 32)
-            asm.instr("S_ADDI_INT", gp(gp_base), gp(0), low)
-            asm.instr(
-                "S_ADD_INT", gp(gp_base), gp(gp_base), gp(gp_expert_offset)
-            )
-            asm.instr(
-                "C_SET_ADDR_REG", areg(addr_reg), gp(gp_table), gp(gp_base)
-            )
-            asm.instr("S_ADDI_INT", gp(gp_mram), gp(0), mram_addr)
-            asm.instr("S_ADDI_INT", gp(gp_scale), gp(0), 0)
-            asm.instr(
-                "H_PREFETCH_M", gp(gp_mram), gp(gp_scale), areg(addr_reg), 1, 0
-            )
-            self.bind_mram_subblock(sub_block, mram_addr)
-            mram_addr += block_size
-
-
-    def _moe_compact_tile_major_projection_v0(
-        self,
-        input_var: VRAMMatrixVar,
-        weight_template: InputVar,
-        output: VRAMMatrixVar,
-        *,
-        expert_indices_int_base: int,
-        pair_index_gp: int,
-        table_base: int,
-        tile_group_stride: int,
-        num_experts: int,
-        name: str,
-    ) -> VRAMMatrixVar:
-        """Roll output-column and K-tile traversal for one dynamic expert GEMM.
-
-        Expert weights are stored as self-contained MX tiles. A tile group holds
-        the same ``(K, N)`` tile for every expert, so the runtime term is only
-        ``expert_id * tile_hbm_stride``. Column loops are split whenever any K
-        row crosses a 4-GiB HBM high-word boundary; this keeps every loop-carried
-        add 32-bit without pretending the ISA has a carry flag.
-        """
-        self._ensure_vram_sub_matrix_registered(input_var)
-        self._ensure_hbm_sub_matrix_registered(weight_template)
-        self._ensure_vram_sub_matrix_registered(output)
-
-        mlen = self.mlen
-        block_size = mlen * mlen
-        tile_hbm_stride = self.hbm_tensor_size(block_size)
-        if tile_group_stride < num_experts * tile_hbm_stride:
-            raise ValueError("tile-major expert group is smaller than its live tiles")
-        if tile_group_stride > 1 << 32 or tile_group_stride & (tile_group_stride - 1):
-            raise ValueError("tile-major expert group must be a power of two <= 4 GiB")
-        if table_base % tile_group_stride:
-            raise ValueError("tile-major expert table base must be group-aligned")
-
-        input_stride = input_var.physical_shape[0] * mlen
-        output_stride = output.physical_shape[0] * mlen
-        num_k_tiles = weight_template.physical_shape[0] // mlen
-        num_col_tiles = weight_template.physical_shape[1] // mlen
-        if num_k_tiles * mlen != weight_template.physical_shape[0]:
-            raise ValueError("compact expert K dimension must be MLEN-aligned")
-        if num_col_tiles * mlen != weight_template.physical_shape[1]:
-            raise ValueError("compact expert N dimension must be MLEN-aligned")
-
-        scratch = None
-        if num_k_tiles > self.mram_tile_capacity:
-            scratch = self.alloc(
-                f"{name}_compact_k_scratch",
-                rows=output.shape[0],
-                cols=output.shape[1],
-                strict=False,
-                physical_shape=output.physical_shape,
-            )
-
-        # Two GP registers are already live in the enclosing Top-K C_LOOP. The
-        # remaining thirteen are sufficient because address/setup registers are
-        # deliberately reused after each prefetch phase.
-        regs = self._reg.allocate_gp(13)
-        (
-            gp_table_outer,
-            gp_expert_micro,
-            gp_stride_kloop,
-            gp_expert_offset,
-            gp_col_offset,
-            gp_base,
-            gp_high,
-            gp_mram,
-            gp_act,
-            gp_mat,
-            gp_out,
-            gp_target_base,
-            gp_work,
-        ) = regs
-        addr_reg = self._reg.allocate_addr(1)[0]
-        try:
-            super().reset_mram()
-            asm = IsaBuilder().comment(
-                moe_stage_marker(
-                    "expert_weight_address",
-                    f"{name}: compact tile-major dynamic projection",
-                )
-            )
-            asm.instr(
-                "S_ADDI_INT", gp(gp_table_outer), gp(0), expert_indices_int_base
-            )
-            asm.instr(
-                "S_ADD_INT",
-                gp(gp_table_outer),
-                gp(gp_table_outer),
-                gp(pair_index_gp),
-            )
-            asm.instr("S_LD_INT", gp(gp_expert_micro), gp(gp_table_outer), 0)
-            asm.instr("S_ADDI_INT", gp(gp_stride_kloop), gp(0), tile_hbm_stride)
-            asm.instr(
-                "S_MUL_INT",
-                gp(gp_expert_offset),
-                gp(gp_expert_micro),
-                gp(gp_stride_kloop),
-            )
-            asm.instr("S_ADDI_INT", gp(gp_base), gp(0), block_size)
-            asm.instr("C_SET_SCALE_REG", gp(gp_base))
-            asm.instr("S_ADDI_INT", gp(gp_base), gp(0), mlen)
-            asm.instr("C_SET_STRIDE_REG", gp(gp_base))
-
-            chunks = tuple(
-                (start, min(self.mram_tile_capacity, num_k_tiles - start))
-                for start in range(0, num_k_tiles, self.mram_tile_capacity)
-            )
-            for chunk_index, (k_start, k_count) in enumerate(chunks):
-                target = output if chunk_index == 0 else scratch
-                assert target is not None
-                # Split columns whenever the tuple of HBM high words changes for
-                # this K chunk. Within one segment every low word advances by the
-                # same tile_group_stride and cannot carry into the next window.
-                segments: list[tuple[int, int, tuple[int, ...]]] = []
-                segment_start = 0
-                segment_highs: tuple[int, ...] | None = None
-                for col_idx in range(num_col_tiles):
-                    highs = tuple(
-                        (
-                            table_base
-                            + (row_idx * num_col_tiles + col_idx)
-                            * tile_group_stride
-                        )
-                        >> 32
-                        for row_idx in range(k_start, k_start + k_count)
-                    )
-                    if segment_highs is None:
-                        segment_highs = highs
-                    elif highs != segment_highs:
-                        segments.append(
-                            (segment_start, col_idx - segment_start, segment_highs)
-                        )
-                        segment_start = col_idx
-                        segment_highs = highs
-                assert segment_highs is not None
-                segments.append(
-                    (segment_start, num_col_tiles - segment_start, segment_highs)
-                )
-
-                for col_start, col_count, high_words in segments:
-                    asm.comment(
-                        moe_stage_marker(
-                            "expert_projection",
-                            f"{name}: K[{k_start}:{k_start + k_count}] "
-                            f"Ntiles[{col_start}:{col_start + col_count}]",
-                        )
-                    )
-                    asm.instr("S_ADDI_INT", gp(gp_col_offset), gp(0), 0)
-                    asm.instr(
-                        "S_ADDI_INT",
-                        gp(gp_target_base),
-                        gp(0),
-                        self._vram_matrix_row_addr(target, 0, col_start),
-                    )
-                    asm.instr("C_LOOP_START", gp(gp_table_outer), col_count)
-
-                    for local_k, row_idx in enumerate(
-                        range(k_start, k_start + k_count)
-                    ):
-                        group_base = (
-                            table_base
-                            + (row_idx * num_col_tiles + col_start)
-                            * tile_group_stride
-                        )
-                        low = group_base & 0xFFFF_FFFF
-                        if low + num_experts * tile_hbm_stride > 1 << 32:
-                            raise ValueError(
-                                "tile-major expert group crosses a 4-GiB window"
-                            )
-                        asm.instr("S_ADDI_INT", gp(gp_high), gp(0), high_words[local_k])
-                        asm.instr("S_ADDI_INT", gp(gp_base), gp(0), low)
-                        asm.instr(
-                            "S_ADD_INT", gp(gp_base), gp(gp_base), gp(gp_col_offset)
-                        )
-                        asm.instr(
-                            "S_ADD_INT",
-                            gp(gp_base),
-                            gp(gp_base),
-                            gp(gp_expert_offset),
-                        )
-                        asm.instr(
-                            "C_SET_ADDR_REG",
-                            areg(addr_reg),
-                            gp(gp_high),
-                            gp(gp_base),
-                        )
-                        asm.instr(
-                            "S_ADDI_INT",
-                            gp(gp_mram),
-                            gp(0),
-                            local_k * block_size,
-                        )
-                        asm.instr(
-                            "H_PREFETCH_M",
-                            gp(gp_mram),
-                            gp(0),
-                            areg(addr_reg),
-                            1,
-                            0,
-                        )
-
-                    asm.instr("S_ADDI_INT", gp(gp_mram), gp(0), 0)
-                    asm.instr("S_ADDI_INT", gp(gp_out), gp(gp_target_base), 0)
-                    asm.instr("C_LOOP_START", gp(gp_expert_micro), mlen // self.blen)
-                    asm.instr(
-                        "S_ADDI_INT",
-                        gp(gp_act),
-                        gp(0),
-                        self._vram_matrix_row_addr(input_var, 0, k_start),
-                    )
-                    asm.instr("S_ADDI_INT", gp(gp_mat), gp(gp_mram), 0)
-                    asm.instr("C_LOOP_START", gp(gp_stride_kloop), k_count)
-                    asm.instr("M_MM", 0, gp(gp_mat), gp(gp_act))
-                    asm.instr(
-                        "S_ADDI_INT", gp(gp_act), gp(gp_act), input_stride
-                    )
-                    asm.instr("S_ADDI_INT", gp(gp_mat), gp(gp_mat), block_size)
-                    asm.instr("C_LOOP_END", gp(gp_stride_kloop))
-                    asm.instr("M_MM_WO", gp(gp_out), gp(0), 0)
-                    asm.instr(
-                        "S_ADDI_INT",
-                        gp(gp_mram),
-                        gp(gp_mram),
-                        self.blen * mlen,
-                    )
-                    asm.instr("S_ADDI_INT", gp(gp_out), gp(gp_out), self.blen)
-                    asm.instr("C_LOOP_END", gp(gp_expert_micro))
-
-                    if chunk_index:
-                        assert scratch is not None
-                        delta = (
-                            self._vram_matrix_row_addr(output, 0, col_start)
-                            - self._vram_matrix_row_addr(scratch, 0, col_start)
-                        ) & 0xFFFF_FFFF
-                        asm.instr("S_ADDI_INT", gp(gp_base), gp(0), delta)
-                        asm.instr(
-                            "S_ADD_INT",
-                            gp(gp_high),
-                            gp(gp_target_base),
-                            gp(gp_base),
-                        )
-                        asm.instr("S_ADDI_INT", gp(gp_out), gp(gp_target_base), 0)
-                        asm.instr("C_LOOP_START", gp(gp_stride_kloop), self.blen)
-                        asm.instr(
-                            "V_ADD_VV", gp(gp_high), gp(gp_high), gp(gp_out), 0
-                        )
-                        asm.instr("S_ADDI_INT", gp(gp_high), gp(gp_high), mlen)
-                        asm.instr("S_ADDI_INT", gp(gp_out), gp(gp_out), mlen)
-                        asm.instr("C_LOOP_END", gp(gp_stride_kloop))
-
-                    asm.instr(
-                        "S_ADDI_INT",
-                        gp(gp_target_base),
-                        gp(gp_target_base),
-                        output_stride,
-                    )
-                    asm.instr(
-                        "S_ADDI_INT", gp(gp_work), gp(0), tile_group_stride
-                    )
-                    asm.instr(
-                        "S_ADD_INT",
-                        gp(gp_col_offset),
-                        gp(gp_col_offset),
-                        gp(gp_work),
-                    )
-                    asm.instr("C_LOOP_END", gp(gp_table_outer))
-
-            self._emit(asm)
-        finally:
-            self._reg.free_gp(regs)
-            self._reg.free_addr([addr_reg])
-        if scratch is not None:
-            self.free_tensor(scratch)
-        return output
-
-
-    def kimi_situ_activation_v0(
-        self,
-        gate: VRAMMatrixVar,
-        up: VRAMMatrixVar,
-        *,
-        rows: int,
-        intermediate: int,
-        constants: KimiSituFPConstants,
-        name: str,
-    ) -> VRAMMatrixVar:
-        """Emit Kimi SiTU: ``beta*tanh(g/beta)*sigmoid(g)`` times bounded up.
-
-        The up branch is ``linear_beta*tanh(up/linear_beta)``.  Tanh is
-        evaluated as ``(1-exp(-2x))/(1+exp(-2x))`` using the existing vector
-        exp/reciprocal substrate, so this adds no model-specific arithmetic
-        opcode.
-        """
-        for var in (
-            constants.one,
-            constants.neg_one,
-            constants.beta,
-            constants.neg_two_over_beta,
-            constants.linear_beta,
-            constants.neg_two_over_linear_beta,
-        ):
-            if var.size < rows:
-                raise ValueError(
-                    f"SiTU FPVar {var.name} size={var.size} is smaller than rows={rows}"
-                )
-        if constants.zero.address != 0:
-            raise ValueError("SiTU zero constant must occupy FPRAM address 0")
-
-        active_rows = list(range(rows))
-        physical_rows = max(self.mlen, math.ceil(rows / self.mlen) * self.mlen)
-        num_col_blocks = math.ceil(intermediate / self.mlen)
-
-        gate_exp = self.vram_copy(gate, name=f"{name}_gate_tanh_exp", num_rows=rows)
-        gate_denom = self.vram_copy(gate, name=f"{name}_gate_tanh_denom", num_rows=rows)
-        gate_sigmoid = self.vram_copy(gate, name=f"{name}_gate_sigmoid", num_rows=rows)
-        up_exp = self.vram_copy(up, name=f"{name}_up_tanh_exp", num_rows=rows)
-        up_denom = self.vram_copy(up, name=f"{name}_up_tanh_denom", num_rows=rows)
-
-        for col_block in range(num_col_blocks):
-            # gate tanh numerator/denominator
-            self.tile_row_mul_fp(
-                gate_exp,
-                constants.neg_two_over_beta,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_exp(gate_exp, rows=active_rows, tile_col_idx=col_block)
-            self.vram_copy_region(
-                gate_denom,
-                gate_exp,
-                num_rows=rows,
-                num_cols=self.mlen,
-                dst_col_offset=col_block * self.mlen,
-                src_col_offset=col_block * self.mlen,
-            )
-            self.tile_row_add_fp(
-                gate_denom,
-                constants.one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_reci(gate_denom, rows=active_rows, tile_col_idx=col_block)
-            self.tile_row_mul_fp(
-                gate_exp,
-                constants.neg_one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_add_fp(
-                gate_exp,
-                constants.one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-
-            # sigmoid(gate)
-            self.tile_row_mul_fp(
-                gate_sigmoid,
-                constants.neg_one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_exp(gate_sigmoid, rows=active_rows, tile_col_idx=col_block)
-            self.tile_row_add_fp(
-                gate_sigmoid,
-                constants.one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_reci(gate_sigmoid, rows=active_rows, tile_col_idx=col_block)
-
-            # bounded up branch
-            self.tile_row_mul_fp(
-                up_exp,
-                constants.neg_two_over_linear_beta,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_exp(up_exp, rows=active_rows, tile_col_idx=col_block)
-            self.vram_copy_region(
-                up_denom,
-                up_exp,
-                num_rows=rows,
-                num_cols=self.mlen,
-                dst_col_offset=col_block * self.mlen,
-                src_col_offset=col_block * self.mlen,
-            )
-            self.tile_row_add_fp(
-                up_denom,
-                constants.one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_reci(up_denom, rows=active_rows, tile_col_idx=col_block)
-            self.tile_row_mul_fp(
-                up_exp,
-                constants.neg_one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-            self.tile_row_add_fp(
-                up_exp,
-                constants.one,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-
-        self.vram_mul(gate_exp, gate_denom, num_rows=rows)
-        self.vram_mul(gate_exp, gate_sigmoid, num_rows=rows)
-        for col_block in range(num_col_blocks):
-            self.tile_row_mul_fp(
-                gate_exp,
-                constants.beta,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-        self.vram_mul(up_exp, up_denom, num_rows=rows)
-        for col_block in range(num_col_blocks):
-            self.tile_row_mul_fp(
-                up_exp,
-                constants.linear_beta,
-                rows=active_rows,
-                tile_col_idx=col_block,
-            )
-        self.vram_mul(up_exp, gate_exp, num_rows=rows)
-
-        for scratch in (gate_exp, gate_denom, gate_sigmoid, up_denom):
-            self.free_tensor(scratch)
-
-        # Keep the returned tensor's physical shape tied to the projection
-        # contract even when rows is one decode token.
-        if up_exp.physical_shape != (physical_rows, intermediate):
-            raise AssertionError(
-                f"unexpected SiTU physical shape {up_exp.physical_shape}, "
-                f"expected {(physical_rows, intermediate)}"
-            )
-        return up_exp
-
-
 
 # ============================================================================
 # Deprecated aliases
@@ -2973,14 +1754,10 @@ class ProgramRoutedMoeMixin:
 #: bring-up tests that predate the rename) keep working. The ``moe_*`` defaults
 #: preserve GPT-OSS behaviour.
 _DEPRECATED_METHOD_ALIASES = {
-    "router_logits_matrix_mx_rowpacked_v0": "moe_router_logits_matrix_mx_rowpacked_v0",
     "gpt_oss_router_logits_bf16_v0": "moe_router_logits_bf16_v0",
     "gpt_oss_router_topk_softmax_v0": "moe_router_select_v0",
     "gpt_oss_expert_v0": "moe_expert_v0",
-    "gpt_oss_dynamic_expert_ffn_v0": "moe_dynamic_expert_ffn_v0",
     "gpt_oss_dynamic_expert_pair_v0": "moe_dynamic_expert_pair_v0",
-    "gpt_oss_apply_batch4_route_weight_v0": "moe_apply_batch4_route_weight_v0",
-    "gpt_oss_dynamic_moe_batch4_expert_major_v0": ("moe_dynamic_batch4_expert_major_v0"),
     "gpt_oss_dynamic_linear_projection_v0": "moe_dynamic_linear_projection_v0",
     "gpt_oss_dynamic_vram_sub_projection_to_v0": "moe_dynamic_vram_sub_projection_to_v0",
     "gpt_oss_expert_id_to_weight_base_v0": "moe_expert_id_to_weight_base_v0",

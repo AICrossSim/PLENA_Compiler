@@ -103,6 +103,9 @@ jobs:
       - name: Run the KDA stage-marker contract guard
         run: PYTHONPATH=. python3 -m pytest aten/tests/test_kda_stage_contract.py -v
 
+      - name: Run fixed-route expert-grouping compiler guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_expert_grouping.py -v
+
   unit-tests:
     name: Generator unit tests
     runs-on: ubuntu-latest

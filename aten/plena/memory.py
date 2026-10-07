@@ -154,7 +154,9 @@ class MatrixBlockLayout:
     """
     Block layout information for large matrices.
 
-    HBM storage: [rows, cols] row-major contiguous, stride=cols per row.
+    HBM storage is either row-major or tile-major. In tile-major mode each
+    ``block_size x block_size`` tile is contiguous and tiles are ordered by
+    ``(row_block, col_block)``.
     MRAM storage: [batch, mlen, hidden/mlen] column-block major.
     """
 
@@ -162,6 +164,7 @@ class MatrixBlockLayout:
     full_shape: tuple[int, int]  # Logical matrix shape (rows, cols)
     block_size: int = MLEN  # Sub-block size (default 64)
     physical_shape: tuple[int, int] | None = None  # Backing storage shape, if padded
+    storage_order: str = "row_major"
 
     num_row_blocks: int = 0
     num_col_blocks: int = 0
@@ -184,12 +187,24 @@ class MatrixBlockLayout:
         self.physical_shape = (physical_rows, physical_cols)
         self.num_row_blocks = math.ceil(physical_rows / self.block_size)
         self.num_col_blocks = math.ceil(physical_cols / self.block_size)
+        if self.storage_order not in ("row_major", "tile_major"):
+            raise ValueError(f"Unsupported HBM matrix storage order: {self.storage_order!r}")
+        if self.storage_order == "tile_major" and (
+            physical_rows % self.block_size != 0 or physical_cols % self.block_size != 0
+        ):
+            raise ValueError(
+                "tile_major HBM storage requires physical rows and columns to be "
+                f"multiples of block_size={self.block_size}, got {self.physical_shape}"
+            )
 
         # Create information for all sub-blocks (pre-calculate addresses)
         for r in range(self.num_row_blocks):
             for c in range(self.num_col_blocks):
-                # HBM offset (row-major): sub-block (r,c) starts at r*block_size*cols + c*block_size
-                hbm_offset = r * self.block_size * physical_cols + c * self.block_size
+                if self.storage_order == "tile_major":
+                    tile_index = r * self.num_col_blocks + c
+                    hbm_offset = tile_index * self.block_size * self.block_size
+                else:
+                    hbm_offset = r * self.block_size * physical_cols + c * self.block_size
                 valid_rows = max(0, min(self.block_size, rows - r * self.block_size))
                 valid_cols = max(0, min(self.block_size, cols - c * self.block_size))
 
@@ -203,6 +218,13 @@ class MatrixBlockLayout:
                     mram_addr=None,
                 )
                 self.sub_blocks[(r, c)] = sub_info
+
+    @property
+    def hbm_row_stride_elements(self) -> int:
+        """Element stride between rows while loading one matrix tile."""
+        if self.storage_order == "tile_major":
+            return self.block_size
+        return self.physical_shape[1]
 
     def get_sub_block(self, row_idx: int, col_idx: int) -> SubMatrixInfo:
         """Get specified sub-block"""
