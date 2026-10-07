@@ -1,0 +1,347 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2a19f95..a066e55 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -171,6 +171,8 @@ jobs:
+             aten/tests/test_kda_precision_campaign.py \
+             aten/tests/test_kda_official_layer.py \
+             aten/tests/test_l_stream_cfg.py \
++            aten/tests/test_ltile_v2.py \
++            aten/tests/test_prepared_vector_recurrence.py \
+             aten/tests/test_layout_planner.py \
+             aten/tests/test_lstream_lowering.py \
+             aten/tests/test_lstream_packet_lowering.py \
+diff --git a/assembler/tests/test_l_mview.py b/assembler/tests/test_l_mview.py
+index a0a35bd..5e953ef 100644
+--- a/assembler/tests/test_l_mview.py
++++ b/assembler/tests/test_l_mview.py
+@@ -40,7 +40,7 @@ def test_exec_uses_0x3f_and_a_distinct_funct(
+ def test_exec_rejects_a_reserved_primitive() -> None:
+     with pytest.raises(ValueError, match="reserved L_TILE primitive"):
+         _assembler()._convert_to_binary(
+-            Instruction("L_TILE_EXEC", 4, 5, 6, 3, None, None)
++            Instruction("L_TILE_EXEC", 4, 5, 6, 9, None, None)
+         )
+ 
+ 
+diff --git a/aten/plena/ltile_v2.py b/aten/plena/ltile_v2.py
+new file mode 100644
+index 0000000..60a6d83
+--- /dev/null
++++ b/aten/plena/ltile_v2.py
+@@ -0,0 +1,160 @@
++"""Executable v2 lowering; no analytic packet timing is used here.
++
++The ordinary-control arm shares new arithmetic interfaces with the walker.
++It is explicitly NOT an unchanged-old-ISA hardware baseline. Address reuse,
++hardware scalar loops, placement and coefficient preparation are shared.
++"""
++from dataclasses import dataclass, replace
++from compiler.asm_templates._imm import load_large_int
++from compiler.aten.plena.mview import (
++    LTilePrimitive as Op, MatrixViewDescriptor as Descriptor,
++    MatrixViewShape as Shape, MatrixViewMap as Map, MatrixViewFlags as Flag,
++    MatrixViewAllocation, validate_disjoint_matrix_views,
++)
++
++@dataclass(frozen=True)
++class Options:
++    kind: str
++    control: str = "fsm"
++    phased: bool = True
++    broadcast: bool = True
++    resident: bool = True
++    group_values: int = 2048
++
++    @property
++    def width(self): return 64 if self.kind == "mamba" else 128
++    @property
++    def heads(self): return self.group_values // self.width
++    @property
++    def chunk_rows(self):
++        if not self.phased: return 2 if self.kind == "mamba" else 4
++        return 128 if self.broadcast else 32
++
++@dataclass(frozen=True)
++class View:
++    base: int
++    descriptor: Descriptor
++
++def views(o: Options) -> dict[str, View]:
++    assert o.kind in ("mamba", "kda") and o.control in ("row", "fsm")
++    assert o.group_values == 2048
++    h, w, r = o.heads, o.width, o.chunk_rows
++    state = View(0, Descriptor(Shape(r,w,h), Map(0, w//32) if o.phased else Map(r)))
++    state_rows = r if o.phased else r*h
++    cb = state_rows*2048
++    scalar_cols = ((2*h+31)//32)*32
++    cols = scalar_cols if o.broadcast else 2*h*w
++    coeff = View(cb, Descriptor(Shape(r,cols), Map(r, flags=Flag.BROADCAST_MINOR if o.broadcast else Flag(0))))
++    vb = cb+scalar_cols if o.broadcast else cb+2*r*2048
++    vector = lambda index: View(vb+index*w, Descriptor(Shape(1,w,h), Map(w//32)))
++    beta = View(vb+3*w, Descriptor(Shape(1,scalar_cols), Map(1, flags=Flag.BROADCAST_MINOR)))
++    result = {"state": state, "coeff": coeff, "input": vector(0), "output": vector(1), "scratch": vector(2), "scalar": beta}
++    # Capacity and aliasing are checked against the exact fixed-diagonal map.
++    allocations = [MatrixViewAllocation(name, v.base, v.descriptor) for name,v in result.items()]
++    validate_disjoint_matrix_views(allocations, mlen=2048, banks=64, bank_width=32, depth_rows=256)
++    return result
++
++class Emitter:
++    def __init__(self):
++        self.lines = []
++        self.gp = {}
++        self.config = {}
++
++    def address(self, reg, value):
++        if self.gp.get(reg) != value:
++            self.lines.extend(load_large_int(reg, value))
++            self.gp[reg] = value
++
++    def view(self, slot, descriptor):
++        words = descriptor.shape.pack(), descriptor.mapping.pack()
++        if self.config.get(slot) != words:
++            self.address(12, words[0]); self.address(13, words[1])
++            self.lines.append(f"L_TILE_CFG {slot}, gp12, gp13")
++            self.config[slot] = words
++
++    def dma(self, v, hbm, store=False):
++        self.view(3, v.descriptor)
++        self.address(9,v.base); self.address(10,hbm)
++        self.lines.append(f"H_{'STORE' if store else 'PREFETCH'}_V.MV gp9, gp10, a0, 0, 2, 3")
++
++    def execute(self, primitive, dst, src, coeff, *, row_control=False):
++        operands = [dst,src,coeff]
++        rows = src.descriptor.shape.rows if primitive in (Op.REDUCE_ACC, Op.DECAY_REDUCE_ACC) else dst.descriptor.shape.rows
++        loop = row_control and rows > 1
++        strides = []
++        for slot, (reg, v) in enumerate(zip((9,10,11), operands)):
++            d = v.descriptor
++            stride = 2048*((d.shape.cols+2047)//2048) if d.shape.rows > 1 else 0
++            if loop and stride:
++                d = replace(d, shape=replace(d.shape, rows=1))
++            self.view(slot,d); self.address(reg,v.base)
++            strides.append(stride)
++        if loop: self.lines.append(f"C_LOOP_START gp15, {rows}")
++        self.lines.append(f"L_TILE_EXEC gp9, gp10, gp11, {int(primitive)}")
++        if loop:
++            for reg, stride in zip((9,10,11),strides):
++                if stride:
++                    self.lines.append(f"S_ADDI_INT gp{reg}, gp{reg}, {stride}")
++                    self.gp.pop(reg,None)
++            self.lines.append("C_LOOP_END gp15")
++
++def lower_group(o: Options, memory: dict, emitter: Emitter | None = None) -> Emitter:
++    """Lower one head group/token using caller-owned, private HBM addresses.
++
++    memory: states/update/dot lists (one entry per row chunk), input/scalar/
++    skip/output addresses, optional snapshots list. All data is BF16 and all
++    arrays are prepacked to the selected views. No dynamic queues or models
++    are encoded in the hardware instruction.
++    """
++    e = emitter or Emitter()
++    v = views(o)
++    state, coeff, x, out, scratch, scalar = (v[n] for n in ("state","coeff","input","output","scratch","scalar"))
++    chunks = 128//o.chunk_rows
++    assert len(memory["states"]) == len(memory["update"]) == len(memory["dot"]) == chunks
++    row = o.control == "row"
++    def run(op,d,s,c): e.execute(op,d,s,c,row_control=row)
++    def saved(chunk):
++        e.dma(state,memory["states"][chunk],True)
++        if "snapshots" in memory: e.dma(state,memory["snapshots"][chunk],True)
++
++    e.dma(x,memory["input"])
++    e.dma(scalar,memory["scalar"])
++    if o.kind == "mamba":
++        # BF16(dt*x), then fused state update, BF16 final output and skip.
++        run(Op.SCALE_ACCUM,scratch,x,scalar)
++        run(Op.REDUCE_BEGIN,out,out,scalar)
++        for chunk in range(chunks):
++            e.dma(state,memory["states"][chunk])
++            e.dma(coeff,memory["update"][chunk])
++            run(Op.DELTA_UPDATE,state,scratch,coeff)
++            if not o.resident:
++                saved(chunk); e.dma(state,memory["states"][chunk])
++            e.dma(coeff,memory["dot"][chunk])
++            run(Op.REDUCE_ACC,out,state,coeff)
++            if o.resident: saved(chunk)
++        run(Op.REDUCE_WRITE,out,out,scalar)
++        e.dma(scalar,memory["skip"])
++        run(Op.SCALE_ACCUM,out,x,scalar)
++    else:
++        # Prediction consumes the original BF16 tile without a decayed BF16
++        # intermediate; residual is BF16 before the second state scan.
++        run(Op.REDUCE_BEGIN,out,out,scalar)
++        for chunk in range(chunks):
++            e.dma(state,memory["states"][chunk])
++            e.dma(coeff,memory["update"][chunk])
++            run(Op.DECAY_REDUCE_ACC,out,state,coeff)
++        run(Op.RESIDUAL_WRITE,scratch,x,scalar)
++        run(Op.REDUCE_BEGIN,out,out,scalar)
++        for chunk in range(chunks):
++            if not (o.resident and chunks == 1):
++                e.dma(state,memory["states"][chunk])
++                e.dma(coeff,memory["update"][chunk])
++            run(Op.DELTA_UPDATE,state,scratch,coeff)
++            if not o.resident:
++                saved(chunk); e.dma(state,memory["states"][chunk])
++            e.dma(coeff,memory["dot"][chunk])
++            run(Op.REDUCE_ACC,out,state,coeff)
++            if o.resident: saved(chunk)
++        run(Op.REDUCE_WRITE,out,out,scalar)
++    e.dma(out,memory["output"],True)
++    return e
+diff --git a/aten/plena/matrix_access_packets.py b/aten/plena/matrix_access_packets.py
+index 59a49b7..15cda23 100644
+--- a/aten/plena/matrix_access_packets.py
++++ b/aten/plena/matrix_access_packets.py
+@@ -813,6 +813,11 @@ def _l_tile_exec_packets(
+         ) from error
+     dst, source, scales = descriptors
+     primitive = LTilePrimitive(int(operands[3], 0))
++    if int(primitive) >= int(LTilePrimitive.DELTA_UPDATE):
++        raise ValueError(
++            "DELTA_UPDATE requires the v2 Rust lane/service model; "
++            "legacy analytic packet timing is not valid for this primitive"
++        )
+     axis_mask = int(operands[4], 0) if len(operands) == 5 else 0
+     if not 0 <= axis_mask <= 3:
+         raise ValueError("L_TILE_EXEC axis mask must be in [0, 3]")
+diff --git a/aten/plena/mview.py b/aten/plena/mview.py
+index 5663cbf..ebcc0b2 100644
+--- a/aten/plena/mview.py
++++ b/aten/plena/mview.py
+@@ -76,6 +76,19 @@ class LTilePrimitive(IntEnum):
+     # generic outer/rank-1 update used by linear recurrences.
+     OUTER_UPDATE = 2
+ 
++    # v2 fused delta update: dst - delta*dst + b*src. Scale pairs are
++    # BF16 (delta, b), every input is BF16, internal operations are FP32.
++    # The state store alone rounds to BF16. This does not change forms 0-2.
++    DELTA_UPDATE = 3
++
++    # Explicit, bounded reduction lifetime. These interfaces are shared by
++    # scalar row control and the descriptor walker in the v2 comparison.
++    REDUCE_BEGIN = 4
++    REDUCE_ACC = 5
++    DECAY_REDUCE_ACC = 6
++    REDUCE_WRITE = 7
++    RESIDUAL_WRITE = 8
++
+ 
+ class MatrixViewAxis(IntEnum):
+     """Logical line direction selected by an ``L_TILE.EXEC`` operand.
+diff --git a/aten/plena/prepared_vector_recurrence.py b/aten/plena/prepared_vector_recurrence.py
+index 869b374..03f8a7a 100644
+--- a/aten/plena/prepared_vector_recurrence.py
++++ b/aten/plena/prepared_vector_recurrence.py
+@@ -119,8 +119,8 @@ def lower_prepared_vector_recurrence(
+     if pairwise_bf16_dot:
+         if experimental_fp32_dot:
+             raise ValueError("pairwise BF16 and experimental FP32 are exclusive")
+-        if spec.kind is not RecurrenceKind.KDA or spec.recurrence_rows != 128:
+-            raise ValueError("pairwise BF16 control requires the 128-row KDA geometry")
++        if spec.recurrence_rows != 128:
++            raise ValueError("pairwise BF16 control requires a 128-row geometry")
+         if vector_sram_rows < 15:
+             raise ValueError("pairwise BF16 control must reserve 15 existing Vector SRAM rows")
+     if experimental_fp32_dot and spec.kind is not RecurrenceKind.KDA:
+@@ -130,6 +130,11 @@ def lower_prepared_vector_recurrence(
+     if len(groups) != spec.heads // (mlen // spec.row_elements):
+         raise ValueError("prepared Vector group count differs from model shape")
+     out = _Emitter(mlen, static_address_reuse)
++    # Tree levels own rows 8..14. Keeping the Mamba decay row simultaneously
++    # requires row 15; never silently alias it with the first partial sum.
++    decay_row = 15 if pairwise_bf16_dot else 8
++    if mamba_decay_row_invariant and vector_sram_rows <= decay_row:
++        raise ValueError("Mamba tree plus cached decay requires 16 Vector SRAM rows")
+     out.lines.append("; @stage=prepared_vector_recurrence")
+     row_bytes = mlen * 2
+     for group in groups:
+@@ -143,20 +148,23 @@ def lower_prepared_vector_recurrence(
+             out.binary("MUL", 3, 2, 1)
+             out.binary("ADD", 4, 7, 7)
+             if mamba_decay_row_invariant:
+-                out.transfer(8, f["a"])
++                out.transfer(decay_row, f["a"])
+             for row in range(spec.recurrence_rows):
+                 offset = row * row_bytes
+                 out.transfer(0, group.state_base + offset)
+                 if not mamba_decay_row_invariant:
+                     out.transfer(1, f["a"] + offset)
+-                out.binary("MUL", 0, 0, 8 if mamba_decay_row_invariant else 1)
++                out.binary("MUL", 0, 0, decay_row if mamba_decay_row_invariant else 1)
+                 out.transfer(1, f["b"] + offset)
+                 out.binary("MUL", 5, 3, 1)
+                 out.binary("ADD", 0, 0, 5)
+                 out.transfer(0, group.state_base + offset, store=True)
+                 out.transfer(1, f["c"] + offset)
+-                out.binary("MUL", 5, 0, 1)
+-                out.binary("ADD", 4, 4, 5)
++                if pairwise_bf16_dot:
++                    out.pairwise_product(row, spec.recurrence_rows, 4)
++                else:
++                    out.binary("MUL", 5, 0, 1)
++                    out.binary("ADD", 4, 4, 5)
+             out.transfer(1, f["d"])
+             out.binary("MUL", 5, 2, 1)
+             out.binary("ADD", 4, 4, 5)
+diff --git a/aten/tests/test_ltile_v2.py b/aten/tests/test_ltile_v2.py
+new file mode 100644
+index 0000000..3364331
+--- /dev/null
++++ b/aten/tests/test_ltile_v2.py
+@@ -0,0 +1,21 @@
++"""V2 placement and common-control regression gates."""
++from itertools import product
++import pytest
++from compiler.aten.plena.ltile_v2 import Options,views,lower_group
++
++@pytest.mark.parametrize('kind,phase,broadcast',product(('mamba','kda'),(True,False),(True,False)))
++def test_all_ablation_placements_fit_without_aliases(kind,phase,broadcast):
++    o=Options(kind,phased=phase,broadcast=broadcast)
++    placed=views(o) # Performs exact physical capacity and collision checks.
++    assert placed['state'].descriptor.shape.rows == o.chunk_rows
++
++@pytest.mark.parametrize('kind',('mamba','kda'))
++def test_row_control_uses_scalar_loop_and_identical_memory_transfers(kind):
++    memory=dict(states=[0],update=[1<<20],dot=[2<<20],input=3<<20,scalar=4<<20,skip=5<<20,output=6<<20)
++    arms={control:lower_group(Options(kind,control),memory).lines for control in ('row','fsm')}
++    for instructions in arms.values():
++        assert all('V_DOT_' not in x for x in instructions)
++    assert sum(x.startswith('C_LOOP_START') for x in arms['row']) == (2 if kind=='mamba' else 3)
++    assert not any(x.startswith('C_LOOP_START') for x in arms['fsm'])
++    # No diagnostic store, no additional state buffer in the row control.
++    assert [x for x in arms['row'] if x.startswith('H_')] == [x for x in arms['fsm'] if x.startswith('H_')]
+diff --git a/aten/tests/test_mview_contract.py b/aten/tests/test_mview_contract.py
+index 689f69b..8bb8dbb 100644
+--- a/aten/tests/test_mview_contract.py
++++ b/aten/tests/test_mview_contract.py
+@@ -142,7 +142,7 @@ def test_l_tile_exec_carries_explicit_source_and_scale_axes() -> None:
+ def test_l_tile_exec_rejects_reserved_primitives_and_high_bits() -> None:
+     with pytest.raises(ValueError, match="reserved L_TILE primitive"):
+         encode_l_tile_exec(
+-            dst_register=1, src1_register=2, src2_register=3, primitive=3
++            dst_register=1, src1_register=2, src2_register=3, primitive=9
+         )
+     valid = encode_l_tile_exec(
+         dst_register=1,
+diff --git a/aten/tests/test_prepared_vector_recurrence.py b/aten/tests/test_prepared_vector_recurrence.py
+index a095c12..6932a5b 100644
+--- a/aten/tests/test_prepared_vector_recurrence.py
++++ b/aten/tests/test_prepared_vector_recurrence.py
+@@ -53,3 +53,15 @@ def test_invariant_mamba_decay_reuses_one_existing_row_and_preserves_arithmetic(
+     from compiler.aten.plena.matrix_recurrence_lowering import KIMI_KDA
+     with pytest.raises(ValueError, match="Mamba producer"):
+         lower_prepared_vector_recurrence(KIMI_KDA, groups, mamba_decay_row_invariant=True)
++
++
++def test_mamba_tree_does_not_alias_cached_decay_with_partial_sum():
++    fields = {name: (i+2)*1048576 for i,name in enumerate(("x","a","b","c","d","dt","zero","output"))}
++    groups = tuple(PreparedVectorGroup(i*524288,fields) for i in range(2))
++    options = dict(pairwise_bf16_dot=True,mamba_decay_row_invariant=True,static_address_reuse=True)
++    with pytest.raises(ValueError,match="16 Vector SRAM rows"):
++        lower_prepared_vector_recurrence(NEMOTRON_MAMBA,groups,vector_sram_rows=15,**options)
++    asm=lower_prepared_vector_recurrence(NEMOTRON_MAMBA,groups,vector_sram_rows=16,**options)
++    assert 'S_ADDI_INT gp1, gp0, 30720' in asm
++    assert asm.count('V_ADD_VV') == 2*(1+128+127+1)
++    assert 'L_TILE' not in asm and 'V_DOT' not in asm

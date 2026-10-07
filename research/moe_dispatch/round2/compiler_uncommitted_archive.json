@@ -1,0 +1,72 @@
+[
+  {
+    "source": "/scratch/shared/mcl123/plena/artifacts/L_TILE_ARCHITECTURE_20260914/v2/E/compiler",
+    "archived": "research/moe_dispatch/archive/research/ltile-microarch-v2/uncommitted/tracked_changes.patch",
+    "bytes": 16813,
+    "sha256": "e779eb456e51e661fb739c612863b51d53fa08f0ed97cc2310e816e6ce4eb7fe",
+    "kind": "tracked_diff"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/artifacts/L_TILE_ARCHITECTURE_20260914/v2/E2/full_layer_20260921/implementation_20260922/compiler",
+    "archived": "research/moe_dispatch/archive/research/ltile-layer-service/uncommitted/tracked_changes.patch",
+    "bytes": 13250,
+    "sha256": "2f95b8878421e335f445f38bbfef6b2d9f416a831512fd4d27406c9b57e84173",
+    "kind": "tracked_diff"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/artifacts/L_TILE_ARCHITECTURE_20260914/v2/E2/full_layer_20260921/implementation_20260922/compiler/aten/plena/ltile_native.py",
+    "archived": "research/moe_dispatch/archive/research/ltile-layer-service/uncommitted/files/aten/plena/ltile_native.py",
+    "bytes": 5177,
+    "sha256": "489c273ac2b735f2fd5d08f5efa0e0d71e24d42c623dc806a0fedd9a4e675427",
+    "kind": "untracked_file"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/artifacts/L_TILE_ARCHITECTURE_20260914/v2/E2/projection_pipeline_20260928/compiler",
+    "archived": "research/moe_dispatch/archive/research/projection-pipeline-20260928/uncommitted/tracked_changes.patch",
+    "bytes": 21748,
+    "sha256": "edf61584fb0de05f274b31b9c47ed14be150b4b4ff21cd1d5fe21fa3945031e3",
+    "kind": "tracked_diff"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/artifacts/L_TILE_ARCHITECTURE_20260914/v2/E2/projection_pipeline_20260928/compiler/aten/plena/vector_recurrence_candidate.py",
+    "archived": "research/moe_dispatch/archive/research/projection-pipeline-20260928/uncommitted/files/aten/plena/vector_recurrence_candidate.py",
+    "bytes": 10570,
+    "sha256": "e33bcb86e8d01e5d52607668658908f251146f62dabf63c74d7fd58814567cfc",
+    "kind": "untracked_file"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/repos/integration_20260810/PLENA_Compiler",
+    "archived": "research/moe_dispatch/archive/local/shared-deps-20260810/uncommitted/tracked_changes.patch",
+    "bytes": 5417,
+    "sha256": "d1566753e732e036a99e016d87b8b1fb63a1574ebd8c66c63140fb8f2b163ff6",
+    "kind": "tracked_diff"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/repos/organized_20260727/compiler_moe_batch4_dispatch",
+    "archived": "research/moe_dispatch/archive/local/compiler-moe-batch4-dispatch-20260730/uncommitted/tracked_changes.patch",
+    "bytes": 26329,
+    "sha256": "caa1e65ccea444f3b3a818327ce7efd5e19044742c92ae87015461892af622e5",
+    "kind": "tracked_diff"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/repos/organized_20260727/compiler_moe_batch4_dispatch/aten/tests/test_batch4_route_codegen.py",
+    "archived": "research/moe_dispatch/archive/local/compiler-moe-batch4-dispatch-20260730/uncommitted/files/aten/tests/test_batch4_route_codegen.py",
+    "bytes": 5873,
+    "sha256": "f53832472ca1766f013be91ce66703121cda7ee0e48ae02088acf54a7f0cef67",
+    "kind": "untracked_file"
+  },
+  {
+    "source": "/scratch/shared/mcl123/plena/repos/organized_20260727/review_compiler_pr69",
+    "archived": "research/moe_dispatch/archive/detached_311561e9f3bd/uncommitted/tracked_changes.patch",
+    "bytes": 11380,
+    "sha256": "2d8515be4d450fae5d499fb10ec2425c676a77dda542523c2d73fcd0d50d700a",
+    "kind": "tracked_diff"
+  },
+  {
+    "source": "/tmp/plena-joint-compiler",
+    "archived": "research/moe_dispatch/archive/detached_b8de6fe73bcd/uncommitted/tracked_changes.patch",
+    "bytes": 9344,
+    "sha256": "43c4d1e8d05aa1bfcebead2418620c4a1995174e84622d18676082eefaa9d82f",
+    "kind": "tracked_diff"
+  }
+]

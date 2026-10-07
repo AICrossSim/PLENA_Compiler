@@ -1,0 +1,267 @@
+diff --git a/assembler/assembly_to_binary.py b/assembler/assembly_to_binary.py
+index 21b46d4..915d8d9 100644
+--- a/assembler/assembly_to_binary.py
++++ b/assembler/assembly_to_binary.py
+@@ -5,6 +5,7 @@ from compiler.aten.plena.mview import (
+     encode_matrix_view_dma_word,
+     encode_l_tile_exec,
+     encode_l_tile_cfg,
++    encode_l_tile_ccfg,
+     validate_matrix_view_dominance,
+ )
+ 
+@@ -70,6 +71,7 @@ _PSEUDO_OPCODE_ALIASES = {
+     "V_FMA_VF": "V_MUL_VF",
+     "L_CFG": "L_TILE",
+     "L_TILE_CFG": "L_TILE",
++    "L_TILE_CCFG": "L_TILE",
+     "L_TILE_EXEC": "L_TILE",
+     "V_ADD_VV.MV": "V_ADD_VV",
+     "V_SUB_VV.MV": "V_SUB_VV",
+@@ -221,7 +223,11 @@ class AssemblyToBinary:
+         # With the old ordering a masked V_EXP_V silently executed on the whole
+         # tile: no diagnostic, wrong answer. rmask == 0 encodes identically under
+         # either ordering, so this is a no-op for every unmasked call site.
+-        if mnemonic == "L_TILE_CFG":
++        if mnemonic == "L_TILE_CCFG":
++            if rd is None or not 0 <= rd < 3 or rs1 is None or rs2 is None:
++                raise ValueError("L_TILE_CCFG requires slot 0..2, low register, high register")
++            binary_instruction = encode_l_tile_ccfg(slot=rd, low_register=rs1, high_register=rs2)
++        elif mnemonic == "L_TILE_CFG":
+             # Text: L_TILE_CFG slot, gp_shape, gp_map.
+             slot = rd
+             shape_register = rs1
+diff --git a/assembler/tests/test_l_mview.py b/assembler/tests/test_l_mview.py
+index 5e953ef..80a8801 100644
+--- a/assembler/tests/test_l_mview.py
++++ b/assembler/tests/test_l_mview.py
+@@ -40,7 +40,7 @@ def test_exec_uses_0x3f_and_a_distinct_funct(
+ def test_exec_rejects_a_reserved_primitive() -> None:
+     with pytest.raises(ValueError, match="reserved L_TILE primitive"):
+         _assembler()._convert_to_binary(
+-            Instruction("L_TILE_EXEC", 4, 5, 6, 9, None, None)
++            Instruction("L_TILE_EXEC", 4, 5, 6, 12, None, None)
+         )
+ 
+ 
+diff --git a/aten/plena/ltile_v2.py b/aten/plena/ltile_v2.py
+index 60a6d83..ddfc94d 100644
+--- a/aten/plena/ltile_v2.py
++++ b/aten/plena/ltile_v2.py
+@@ -106,6 +106,9 @@ def lower_group(o: Options, memory: dict, emitter: Emitter | None = None) -> Emi
+     arrays are prepacked to the selected views. No dynamic queues or models
+     are encoded in the hardware instruction.
+     """
++    if "native" in memory:
++        from compiler.aten.plena.ltile_native import lower_native_group
++        return lower_native_group(o, memory, emitter)
+     e = emitter or Emitter()
+     v = views(o)
+     state, coeff, x, out, scratch, scalar = (v[n] for n in ("state","coeff","input","output","scratch","scalar"))
+diff --git a/aten/plena/mview.py b/aten/plena/mview.py
+index ebcc0b2..a323dfc 100644
+--- a/aten/plena/mview.py
++++ b/aten/plena/mview.py
+@@ -89,6 +89,11 @@ class LTilePrimitive(IntEnum):
+     REDUCE_WRITE = 7
+     RESIDUAL_WRITE = 8
+ 
++    # Same arithmetic, explicit native-coefficient descriptor operands.
++    NATIVE_DELTA_UPDATE = 9
++    NATIVE_REDUCE_ACC = 10
++    NATIVE_DECAY_REDUCE_ACC = 11
++
+ 
+ class MatrixViewAxis(IntEnum):
+     """Logical line direction selected by an ``L_TILE.EXEC`` operand.
+@@ -346,6 +351,15 @@ def encode_l_tile_cfg(*, slot: int, shape_register: int, map_register: int) -> i
+     )
+ 
+ 
++def encode_l_tile_ccfg(*, slot: int, low_register: int, high_register: int) -> int:
++    """L_TILE form2: coefficient descriptor from two GP registers."""
++    if type(slot) is not int or not 0 <= slot < 3:
++        raise ValueError("coefficient slot must be 0..2")
++    _require_register(low_register, "low_register")
++    _require_register(high_register, "high_register")
++    return L_MVIEW_OPCODE | low_register << 6 | high_register << 10 | slot << 14 | 2 << 22
++
++
+ def encode_l_tile_exec(
+     *,
+     dst_register: int,
+@@ -542,9 +556,13 @@ def validate_matrix_view_dominance(assembly: str) -> None:
+ 
+     def transfer(state: State, opcode: str, operands: list[str]) -> State:
+         result = set(state)
++        if opcode == "L_TILE_CCFG":
++            if len(operands) != 3 or not 0 <= int(operands[0], 0) < 3:
++                raise ValueError("invalid coefficient configuration")
++            result.add(("coefficient", int(operands[0], 0)))
+         if opcode == "L_TILE_CFG":
+             slot = int(operands[0], 0)
+-            result.difference_update({token for token in result if token[1] == slot})
++            result.difference_update({token for token in result if token[1] == slot and token[0] != "coefficient"})
+             result.update({("shape", slot), ("mapping", slot), ("configured", slot)})
+         return frozenset(result)
+ 
+@@ -578,7 +596,12 @@ def validate_matrix_view_dominance(assembly: str) -> None:
+         if opcode == "L_TILE_EXEC":
+             if len(operands) not in {4, 5}:
+                 raise ValueError(f"line {line_number}: malformed L_TILE_EXEC")
+-            LTilePrimitive(int(operands[3], 0))
++            primitive = LTilePrimitive(int(operands[3], 0))
++            native_slots = (2,) if primitive == LTilePrimitive.NATIVE_REDUCE_ACC else ((0, 1)
++                if primitive in (LTilePrimitive.NATIVE_DELTA_UPDATE, LTilePrimitive.NATIVE_DECAY_REDUCE_ACC) else ())
++            for slot in native_slots:
++                if ("coefficient", slot) not in state:
++                    raise ValueError(f"native EXEC without dominating coefficient slot {slot}")
+             if len(operands) == 5:
+                 axis_mask = int(operands[4], 0)
+                 if not 0 <= axis_mask <= 0b11:
+diff --git a/aten/plena/recurrent_coefficients.py b/aten/plena/recurrent_coefficients.py
+index dcf714f..e1afbd1 100644
+--- a/aten/plena/recurrent_coefficients.py
++++ b/aten/plena/recurrent_coefficients.py
+@@ -756,6 +756,62 @@ def _lower_cached_gather(sources, destination, zero, one_hot, mlen):
+     return "\n".join(e.lines) + "\n"
+ 
+ 
++def packed_append_edits(k, n, *, column):
++    """Compile-time destination rows and source indices for BLEN32 storage."""
++    if type(k) is not int or type(n) is not int or min(k, n) < 1:
++        raise ValueError("positive integer append dimensions required")
++    pk = (k + 31) // 32 * 32
++    edits = {}
++    for i in range(k if column else n):
++        r, c = (i, n - 1) if column else (k - 1, i)
++        index = (c // 32) * pk * 32 + r * 32 + c % 32
++        edits.setdefault(index // 2048, {})[index % 2048] = i
++    return edits
++
++
++def lower_packed_matrix_append(base, k, n, source, zero, one_hot, scratch, *, column, keep_masks):
++    """Append the last column/row of BLEN32-packed BF16 storage.
++
++    Read/modify/write complete owned Vector rows with ordinary ISA. Scratch
++    is one disjoint Vector row; no 64-byte arbitrary lane-write is assumed.
++    Caller owns padded K/N packets plus a trailing Vector row for reads.
++    keep_masks maps each changed row to an immutable 2048-element BF16
++    constant: one at preserved positions, zero at updated positions. These
++    compile-time masks are loaded and charged, never generated for free at
++    runtime. Only new values require gather; existing data remains in place.
++    Inputs must be finite. As with ordinary BF16 add/mul, signed zero is not
++    guaranteed to retain its sign through the merge.
++    """
++    edits = packed_append_edits(k, n, column=column)
++    if set(keep_masks) != set(edits):
++        raise ValueError("one preservation mask is required for each changed row")
++    span = ((k + 31) // 32 * 32) * ((n + 31) // 32 * 32) * 2 + 4096
++    regions = [(base, span), (source, (((k if column else n) + 2047) // 2048) * 4096),
++               (zero, 4096), (one_hot, 4096), (scratch, 4096)]
++    regions += [(address, 4096) for address in set(keep_masks.values())]
++    for i, (address, size) in enumerate(regions):
++        if type(address) is not int or address < 0 or address % 64 or address + size > 2**32:
++            raise ValueError("append allocation exceeds aligned 32-bit byte ABI")
++        if any(address < other + count and other < address + size for other, count in regions[:i]):
++            raise ValueError("append allocations overlap")
++    code = []
++    for row, replacements in sorted(edits.items()):
++        address = base + row * 4096
++        mapping = [None] * 2048
++        for index, i in replacements.items():
++            mapping[index] = (source + (i // 2048) * 4096, i % 2048)
++        code.append(lower_bf16_gather(mapping, scratch, zero, one_hot, strategy="cached"))
++        e = _Emitter(2048, True)
++        e.transfer(0, address)
++        e.transfer(1, keep_masks[row])
++        e.binary("MUL", 0, 0, 1)
++        e.transfer(2, scratch)
++        e.binary("ADD", 0, 0, 2)
++        e.transfer(0, address, store=True)
++        code.append("\n".join(e.lines) + "\n")
++    return "".join(code)
++
++
+ def lower_global_rms(
+     input_base,
+     weight_base,
+diff --git a/aten/tests/test_connected_layer_lowering.py b/aten/tests/test_connected_layer_lowering.py
+index a5fdaa5..0141121 100644
+--- a/aten/tests/test_connected_layer_lowering.py
++++ b/aten/tests/test_connected_layer_lowering.py
+@@ -90,3 +90,21 @@ def test_pointwise_exact_inplace_is_safe_but_partial_overlap_is_not():
+         lower_pointwise_rows(
+             65536, 81920, 4096, 1, sigmoid_input=True, constants_base=0
+         )
++
++
++def test_packed_kv_append_rejects_live_aliases_and_missing_masks():
++    from compiler.aten.plena.recurrent_coefficients import lower_packed_matrix_append, packed_append_edits
++
++    edits = packed_append_edits(65, 257, column=True)
++    # The 65th key channel is in a second Vector row; a final partial
++    # packet still needs its own preservation mask and RMW ownership.
++    assert sum(map(len, edits.values())) == 65
++    masks = {row: 0x100000 + i * 4096 for i, row in enumerate(edits)}
++    args = (0, 65, 257, 0x20000, 0x30000, 0x40000, 0x50000)
++    lower_packed_matrix_append(*args, column=True, keep_masks=masks)
++    with pytest.raises(ValueError, match="preservation mask"):
++        lower_packed_matrix_append(*args, column=True, keep_masks={})
++    with pytest.raises(ValueError, match="overlap"):
++        lower_packed_matrix_append(*args[:-1], 0, column=True, keep_masks=masks)
++    with pytest.raises(ValueError, match="32-bit"):
++        lower_packed_matrix_append(*args, column=True, keep_masks={row: 2**32 for row in edits})
+diff --git a/aten/tests/test_ltile_v2.py b/aten/tests/test_ltile_v2.py
+index 3364331..7e0ecb4 100644
+--- a/aten/tests/test_ltile_v2.py
++++ b/aten/tests/test_ltile_v2.py
+@@ -19,3 +19,35 @@ def test_row_control_uses_scalar_loop_and_identical_memory_transfers(kind):
+     assert not any(x.startswith('C_LOOP_START') for x in arms['fsm'])
+     # No diagnostic store, no additional state buffer in the row control.
+     assert [x for x in arms['row'] if x.startswith('H_')] == [x for x in arms['fsm'] if x.startswith('H_')]
++
++
++def test_native_descriptor_encoding_and_bounds():
++    from compiler.aten.plena.ltile_native import CoefficientView
++    from compiler.aten.plena.mview import encode_l_tile_ccfg
++    d = CoefficientView(300032, 128, 1, 3, 32, 512)
++    assert d.address(127, 31) == 300543
++    assert d.address(17, 0) == d.address(17, 7)
++    assert d.pack() == 300032 | 128 << 19 | 1 << 32 | 3 << 41 | 31 << 44 | 511 << 50
++    assert encode_l_tile_ccfg(slot=2, low_register=12, high_register=13) == 0x808000 | 12 << 6 | 13 << 10 | 0x3f
++    with pytest.raises(ValueError):
++        d.address(128, 31)
++    with pytest.raises(ValueError):
++        CoefficientView(524287, 1, 0, 0, 32, 32)
++    with pytest.raises(ValueError):
++        encode_l_tile_ccfg(slot=3, low_register=1, high_register=2)
++
++
++@pytest.mark.parametrize('kind', ('mamba', 'kda'))
++def test_native_requires_explicit_dominating_configuration(kind):
++    from compiler.aten.plena.mview import validate_matrix_view_dominance
++    native = ([(0x800000, 0, 1, 0, 0), (0x801000, 0, 128, 1, 3),
++               (0x801000, 1024, 128, 1, 3)] if kind == 'mamba' else
++              [(0x800000+i*4096, 0, 128, 1, 0) for i in range(3)])
++    mem = dict(native=native, states=[0], input=0x900000, scalar=0x901000,
++               skip=0x902000, output=0x903000)
++    text = '\n'.join(lower_group(Options(kind), mem).lines)
++    validate_matrix_view_dominance(text)
++    with pytest.raises(ValueError, match='coefficient'):
++        validate_matrix_view_dominance('\n'.join(x for x in text.splitlines() if not x.startswith('L_TILE_CCFG')))
++    with pytest.raises(ValueError, match='FSM'):
++        lower_group(Options(kind, 'row'), mem)
+diff --git a/aten/tests/test_mview_contract.py b/aten/tests/test_mview_contract.py
+index 8bb8dbb..adc0427 100644
+--- a/aten/tests/test_mview_contract.py
++++ b/aten/tests/test_mview_contract.py
+@@ -142,7 +142,7 @@ def test_l_tile_exec_carries_explicit_source_and_scale_axes() -> None:
+ def test_l_tile_exec_rejects_reserved_primitives_and_high_bits() -> None:
+     with pytest.raises(ValueError, match="reserved L_TILE primitive"):
+         encode_l_tile_exec(
+-            dst_register=1, src1_register=2, src2_register=3, primitive=9
++            dst_register=1, src1_register=2, src2_register=3, primitive=12
+         )
+     valid = encode_l_tile_exec(
+         dst_register=1,

@@ -1,0 +1,280 @@
+diff --git a/aten/plena/program_moe_shared.py b/aten/plena/program_moe_shared.py
+index 62708a7..7d74bff 100644
+--- a/aten/plena/program_moe_shared.py
++++ b/aten/plena/program_moe_shared.py
+@@ -81,7 +81,7 @@ def fused_shared_intermediate(moe_intermediate_size: int, n_shared_experts: int)
+ class ProgramMoeSharedMixin:
+     """Shared-expert emit helpers layered on the routed-MoE substrate."""
+ 
+-    def moe_shared_gate_v0(
++    def _moe_shared_gate_scalars_v0(
+         self,
+         x: VRAMMatrixVar,
+         gate_weight_row: VRAMMatrixVar,
+@@ -90,22 +90,16 @@ class ProgramMoeSharedMixin:
+         hidden: int,
+         constants: GptOssFPConstants,
+         gate_fp_scratch: FPVar | None = None,
+-        zero_row: FPVar | None = None,
+         policy_name: str = "qwen2_moe",
+         name: str = "moe_shared_gate",
+-    ) -> VRAMMatrixVar:
+-        """Emit Qwen2-MoE's ``sigmoid(x @ w_gate)`` shared-expert gate.
++    ) -> FPVar:
++        """Emit Qwen2-MoE's gate and return one sigmoid scalar per token.
+ 
+         ``gate_weight_row`` holds the ``[hidden, 1]`` gate projection stored as a
+         single BF16 VRAM row of length ``hidden``, so the per-token projection is a
+         dot product rather than a matmul. Going through the matrix path would mean
+         padding a one-column weight out to MLEN and discarding 63/64 of the result.
+ 
+-        Returns a ``[rows, hidden]`` VRAM matrix holding each token's scalar gate
+-        broadcast across the hidden axis, ready to multiply the shared expert
+-        output. That is the same shape and mechanism the routed branch uses for
+-        route weights, so the two are combined identically downstream.
+-
+         The sigmoid is evaluated in the scalar FP unit
+         (``S_SUB_FP`` / ``S_EXP_FP`` / ``S_ADD_FP`` / ``S_RECI_FP``) on one value
+         per token, not as a vector pass over a broadcast row -- there is exactly one
+@@ -177,6 +171,101 @@ class ProgramMoeSharedMixin:
+         finally:
+             self.free_fp_reg([fp_acc, fp_one, fp_tmp])
+             self._reg.free_gp([gp_x, gp_w, gp_scratch, gp_out, gp_loop])
++        return gate_scalars
++
++    def _moe_scale_rows_by_fp_v0(
++        self,
++        matrix: VRAMMatrixVar,
++        row_scalars: FPVar,
++        *,
++        rows: int,
++        policy_name: str,
++        name: str,
++    ) -> VRAMMatrixVar:
++        """Scale every physical column block in each active row by one FP scalar."""
++        if rows < 1:
++            raise ValueError(f"{name}: rows must be positive, got {rows}")
++        if rows > matrix.physical_shape[0]:
++            raise ValueError(
++                f"{name}: rows={rows} exceeds matrix physical rows={matrix.physical_shape[0]}"
++            )
++        if row_scalars.size < rows:
++            raise ValueError(
++                f"{name}: scalar count={row_scalars.size} is smaller than rows={rows}"
++            )
++        physical_width = matrix.physical_shape[1]
++        if physical_width % self.mlen != 0:
++            raise ValueError(
++                f"{name}: physical width={physical_width} must be divisible by MLEN={self.mlen}"
++            )
++
++        gp_scalar, gp_row = self._reg.allocate_gp(2)
++        (fp_scale,) = self.allocate_fp_reg(1)
++        try:
++            asm = IsaBuilder().comment(
++                moe_stage_marker(
++                    "shared_expert_gate",
++                    f"[{policy_name}] {name}: rows={rows}, hidden={matrix.shape[1]}",
++                )
++            )
++            for token_idx in range(rows):
++                asm.comment(f"scale shared output token {token_idx}")
++                asm.instr(
++                    "S_ADDI_INT",
++                    gp(gp_scalar),
++                    gp(0),
++                    row_scalars.address + token_idx,
++                )
++                asm.instr("S_LD_FP", fp(fp_scale), gp(gp_scalar), 0)
++                for tile_col_idx in range(physical_width // self.mlen):
++                    asm.instr(
++                        "S_ADDI_INT",
++                        gp(gp_row),
++                        gp(0),
++                        self._vram_matrix_row_addr(matrix, token_idx, tile_col_idx),
++                    )
++                    asm.instr(
++                        "V_MUL_VF",
++                        gp(gp_row),
++                        gp(gp_row),
++                        fp(fp_scale),
++                        0,
++                    )
++            self._emit(asm)
++        finally:
++            self.free_fp_reg([fp_scale])
++            self._reg.free_gp([gp_scalar, gp_row])
++        return matrix
++
++    def moe_shared_gate_v0(
++        self,
++        x: VRAMMatrixVar,
++        gate_weight_row: VRAMMatrixVar,
++        *,
++        rows: int,
++        hidden: int,
++        constants: GptOssFPConstants,
++        gate_fp_scratch: FPVar | None = None,
++        zero_row: FPVar | None = None,
++        policy_name: str = "qwen2_moe",
++        name: str = "moe_shared_gate",
++    ) -> VRAMMatrixVar:
++        """Return Qwen2-MoE's per-token sigmoid gate broadcast in VRAM.
++
++        This public compatibility helper retains the original matrix-returning
++        contract. Shared-expert execution itself uses the scalar result directly
++        and avoids materializing this temporary matrix.
++        """
++        gate_scalars = self._moe_shared_gate_scalars_v0(
++            x,
++            gate_weight_row,
++            rows=rows,
++            hidden=hidden,
++            constants=constants,
++            gate_fp_scratch=gate_fp_scratch,
++            policy_name=policy_name,
++            name=name,
++        )
+ 
+         # Broadcasting one FP scalar per row across `hidden` is exactly what the
+         # routed branch does with V_TOPK route weights, so reuse that emitter
+@@ -286,18 +375,23 @@ class ProgramMoeSharedMixin:
+             self.vram_add(out, down_bias, num_rows=rows)
+ 
+         if gate_weight_row is not None:
+-            gate_matrix = self.moe_shared_gate_v0(
++            gate_scalars = self._moe_shared_gate_scalars_v0(
+                 x,
+                 gate_weight_row,
+                 rows=rows,
+                 hidden=w_down.physical_shape[1],
+                 constants=constants,
+                 gate_fp_scratch=gate_fp_scratch,
+-                zero_row=zero_row,
+                 policy_name=policy_name,
+                 name=f"{name}_gate_sigmoid",
+             )
+-            self.vram_mul(out, gate_matrix, num_rows=rows)
++            self._moe_scale_rows_by_fp_v0(
++                out,
++                gate_scalars,
++                rows=rows,
++                policy_name=policy_name,
++                name=f"{name}_gate_scale",
++            )
+         return out
+ 
+     def moe_combine_shared_and_routed_v0(
+diff --git a/aten/tests/test_plena_compiler.py b/aten/tests/test_plena_compiler.py
+index c902e9f..6d259aa 100644
+--- a/aten/tests/test_plena_compiler.py
++++ b/aten/tests/test_plena_compiler.py
+@@ -139,6 +139,78 @@ def test_vram_add_all_column_blocks():
+     print("  PASS test_vram_add_all_column_blocks")
+ 
+ 
++def test_shared_expert_gate_scales_rows_without_materializing_a_matrix():
++    """Qwen shared-expert output should consume gate scalars through V_MUL_VF."""
++    from compiler.aten.plena import PlenaCompiler
++
++    prog = PlenaCompiler(mlen=8, blen=4, unroll_loops=True, mram_tile_capacity=1)
++    constants = tuple(
++        prog.fp_var(name, size=4)
++        for name in ("zero", "unused_pos", "unused_neg", "one", "neg_one")
++    )
++    gate_scalars = prog.fp_var("shared_gate_scalars", size=4)
++    zero_row = prog.fp_var("zero_row", size=16)
++    x_input = prog.input("X", shape=(4, 16), physical_shape=(8, 16))
++    gate_row_input = prog.input("W_shared_gate_row", shape=(1, 16), physical_shape=(8, 16))
++    weights = (
++        prog.input("W_gate", shape=(16, 16)),
++        prog.input("W_up", shape=(16, 16)),
++        prog.input("W_down", shape=(16, 16)),
++    )
++    x = prog.load_batch(x_input, name="X")
++    gate_row = prog.load_batch(gate_row_input, name="W_shared_gate_row")
++    prog.moe_shared_expert_v0(
++        x,
++        weights,
++        rows=4,
++        intermediate=16,
++        constants=constants,
++        gate_weight_row=gate_row,
++        gate_fp_scratch=gate_scalars,
++        zero_row=zero_row,
++        policy_name="qwen2_moe",
++    )
++    code = prog.get_code()
++
++    assert "S_MAP_V_FP" not in code
++    assert "scale shared output token 0" in code
++    assert code.count("scale shared output token") == 4
++    # Four active rows across two MLEN-wide column blocks.
++    assert code.count("V_MUL_VF") >= 8
++    print("  PASS test_shared_expert_gate_scales_rows_without_materializing_a_matrix")
++
++
++def test_shared_gate_public_api_still_materializes_a_vram_matrix():
++    """Keep the PR's public matrix-returning gate helper backward compatible."""
++    from compiler.aten.plena import PlenaCompiler
++
++    prog = PlenaCompiler(mlen=8, blen=4, unroll_loops=True)
++    constants = tuple(
++        prog.fp_var(name, size=4)
++        for name in ("zero", "unused_pos", "unused_neg", "one", "neg_one")
++    )
++    gate_scalars = prog.fp_var("shared_gate_scalars", size=4)
++    zero_row = prog.fp_var("zero_row", size=8)
++    x_input = prog.input("X", shape=(4, 8), physical_shape=(8, 8))
++    gate_row_input = prog.input("W_shared_gate_row", shape=(1, 8), physical_shape=(8, 8))
++    x = prog.load_batch(x_input, name="X")
++    gate_row = prog.load_batch(gate_row_input, name="W_shared_gate_row")
++
++    gate_matrix = prog.moe_shared_gate_v0(
++        x,
++        gate_row,
++        rows=4,
++        hidden=8,
++        constants=constants,
++        gate_fp_scratch=gate_scalars,
++        zero_row=zero_row,
++    )
++
++    assert gate_matrix.shape == (4, 8)
++    assert "S_MAP_V_FP" in prog.get_code()
++    print("  PASS test_shared_gate_public_api_still_materializes_a_vram_matrix")
++
++
+ def test_stage_checkpoint_recorder_emits_stable_vram_copy_metadata():
+     """Debug checkpoints should preserve source tensors at new VRAM addresses."""
+     from compiler.aten.plena import PlenaCompiler
+@@ -345,7 +417,7 @@ def test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts():
+     assert code.count("M_MM 0,") == microcols * num_k_tiles
+     assert code.count("M_MM_WO") == microcols
+     assert code.count("V_ADD_VF") >= rows * output_blocks
+-    assert "Qwen router packed-skinny logits pack" in code
++    assert "@stage=router_topk [gpt_oss] packed-skinny logits pack" in code
+ 
+     print("  PASS test_qwen_packed_skinny_router_rowpacked_compiles_for_128_experts")
+ 
+@@ -987,6 +1059,8 @@ if __name__ == "__main__":
+         test_hbm_load_helper_uses_typed_legalization,
+         test_vram_fill_zero_all_column_blocks,
+         test_vram_add_all_column_blocks,
++        test_shared_expert_gate_scales_rows_without_materializing_a_matrix,
++        test_shared_gate_public_api_still_materializes_a_vram_matrix,
+         test_stage_checkpoint_recorder_emits_stable_vram_copy_metadata,
+         test_alloc_at_correct_address,
+         test_mram_allocator_scales_with_runtime_mlen,
+diff --git a/pyproject.toml b/pyproject.toml
+index 2b60e1f..c36df97 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -5,6 +5,7 @@ description = "PLENA assembly compiler and code generation"
+ readme = "README.md"
+ requires-python = ">=3.10"
+ dependencies = [
++    "PyYAML>=6.0,<7",
+     "torch>=2.0.0",
+ ]
+ 

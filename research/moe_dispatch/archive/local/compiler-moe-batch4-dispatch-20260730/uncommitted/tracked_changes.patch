@@ -1,0 +1,599 @@
+diff --git a/assembler/assembly_to_binary.py b/assembler/assembly_to_binary.py
+index 17a3c43..3a62f5c 100644
+--- a/assembler/assembly_to_binary.py
++++ b/assembler/assembly_to_binary.py
+@@ -21,8 +21,11 @@ _RMASK_VECTOR_OPS = frozenset(
+         "V_MAX_VF",
+         "V_MIN_VF",
+         "V_TOPK",
++        "C_ROUTE_BEGIN",
++        "V_ROUTE_MUL",
+     }
+ )
++_NO_OPERAND_OPS = frozenset({"C_BREAK", "C_ROUTE_LOOP_START", "C_ROUTE_LOOP_END"})
+ _IMM_RS1_RD_OPS = frozenset(
+     {
+         "S_ADDI_INT",
+@@ -39,7 +42,9 @@ _IMM_RS1_RD_OPS = frozenset(
+ )
+ _IMM_RD_OPS = frozenset({"S_LUI_INT", "M_MV_WO", "M_BMM_WO", "M_BMV_WO"})
+ _RS1_RD_OPS = frozenset({"S_MV_FP", "S_RECI_FP", "S_EXP_FP", "S_SQRT_FP", "V_EXP_V", "V_RED_SUM"})
+-_RD_ONLY_OPS = frozenset({"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_LOOP_END"})
++_RD_ONLY_OPS = frozenset(
++    {"C_SET_SCALE_REG", "C_SET_STRIDE_REG", "C_SET_V_MASK_REG", "C_SET_TOPK_REG", "C_LOOP_END"}
++)
+ _FUNCT_RSTRIDE_OPS = frozenset({"H_PREFETCH_M", "H_PREFETCH_V", "H_STORE_V", "V_SUB_VF"})
+ _RS2_RS1_RD_OPS = frozenset(
+     {
+@@ -105,13 +110,24 @@ class AssemblyToBinary:
+             # Treat omitted rmask deterministically as "mask disabled" instead of crashing on None << ...
+             rmask = 0
+ 
++        if instruction.opcode == "C_ROUTE_BEGIN" and rmask not in (0, 1, 15):
++            raise ValueError(
++                "C_ROUTE_BEGIN policy must be 0 (32 experts/top-4) or "
++                "1 (128 experts/top-8), or 15 (C_SET_TOPK_REG)"
++            )
++        if instruction.opcode == "V_ROUTE_MUL":
++            if rs2 != 0:
++                raise ValueError("V_ROUTE_MUL reserves rs2 and requires gp0")
++            if rmask not in range(4):
++                raise ValueError("V_ROUTE_MUL token must be in the batch4 range [0, 4)")
++
+         if instruction.opcode in _IMM_RS1_RD_OPS:
+             binary_instruction = (imm << (opw + 2 * ow)) + (rs1 << (opw + ow)) + (rd << opw) + opcode
+         elif instruction.opcode in _IMM_RD_OPS:
+             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
+         elif instruction.opcode in _RS1_RD_OPS:
+             binary_instruction = (rs1 << (opw + ow)) + (rd << opw) + opcode
+-        elif instruction.opcode == "C_BREAK":
++        elif instruction.opcode in _NO_OPERAND_OPS:
+             binary_instruction = opcode
+         elif instruction.opcode in _RD_ONLY_OPS:
+             binary_instruction = (rd << opw) + opcode
+diff --git a/assembler/parser.py b/assembler/parser.py
+index 527561c..26144db 100644
+--- a/assembler/parser.py
++++ b/assembler/parser.py
+@@ -99,7 +99,17 @@ _REG_PREFIXES = ("gp", "f", "a")
+ # .asm (millions of times for large programs), which dominated sim_env re-parse time.
+ vector_masked_unary_or_reduction_ops = frozenset({"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"})
+ vector_masked_binary_ops = frozenset(
+-    {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_MAX_VF", "V_MIN_VF", "V_TOPK"}
++    {
++        "V_ADD_VV",
++        "V_ADD_VF",
++        "V_MUL_VV",
++        "V_SUB_VV",
++        "V_MUL_VF",
++        "V_MAX_VF",
++        "V_MIN_VF",
++        "V_TOPK",
++        "V_ROUTE_MUL",
++    }
+ )
+ 
+ 
+diff --git a/assembler/tests/test_vector_rmask_handling.py b/assembler/tests/test_vector_rmask_handling.py
+index db78323..e8bdb8b 100644
+--- a/assembler/tests/test_vector_rmask_handling.py
++++ b/assembler/tests/test_vector_rmask_handling.py
+@@ -77,6 +77,47 @@ class TestVectorRmaskHandling(unittest.TestCase):
+             words = self.asm.generate_binary(str(asm_path), str(output_path))
+             self.assertEqual(words, [0x0000C877, 0x0004C877])
+ 
++    def test_batch4_route_control_and_scale_encodings(self):
++        with TemporaryDirectory() as tmpdir:
++            asm_path = Path(tmpdir) / "batch4_route.asm"
++            output_path = Path(tmpdir) / "batch4_route.mem"
++            asm_path.write_text(
++                "C_SET_TOPK_REG gp6\n"
++                "C_ROUTE_BEGIN gp1, gp2, gp3, 1\n"
++                "C_ROUTE_LOOP_START\n"
++                "V_ROUTE_MUL gp4, gp5, gp0, 3\n"
++                "C_ROUTE_LOOP_END\n"
++            )
++
++            parsed = parse_asm_file(str(asm_path))
++            self.assertEqual(
++                [item.opcode for item in parsed],
++                [
++                    "C_SET_TOPK_REG",
++                    "C_ROUTE_BEGIN",
++                    "C_ROUTE_LOOP_START",
++                    "V_ROUTE_MUL",
++                    "C_ROUTE_LOOP_END",
++                ],
++            )
++            words = self.asm.generate_binary(str(asm_path), str(output_path))
++
++        self.assertEqual(
++            words,
++            [0x000001B8, 0x0004C879, 0x0000003A, 0x000C153C, 0x0000003B],
++        )
++
++    def test_batch4_route_encoder_rejects_unsupported_fields(self):
++        invalid = (
++            Instruction("C_ROUTE_BEGIN", 1, 2, 3, 2, None, None, None),
++            Instruction("V_ROUTE_MUL", 1, 2, 1, 0, None, None, None),
++            Instruction("V_ROUTE_MUL", 1, 2, 0, 4, None, None, None),
++        )
++
++        for instruction in invalid:
++            with self.subTest(instruction=instruction), self.assertRaises(ValueError):
++                self.asm._convert_to_binary(instruction)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/aten/plena/program_routed_moe.py b/aten/plena/program_routed_moe.py
+index 6d0cd9c..36039ab 100644
+--- a/aten/plena/program_routed_moe.py
++++ b/aten/plena/program_routed_moe.py
+@@ -12,6 +12,31 @@ GptOssFPConstants = tuple[FPVar, FPVar, FPVar, FPVar, FPVar]
+ ExpertWeights = tuple[InputVar, InputVar, InputVar]
+ ExpertBiases = tuple[VRAMMatrixVar | None, VRAMMatrixVar | None, VRAMMatrixVar | None]
+ 
++_TOPK_POLICY_REGISTER_RMASK = 15
++_TOPK_POLICY_EXPERT_SHIFT = 8
++_RTL_TOPK_MAX_EXPERTS = 256
++_RTL_TOPK_MAX_K = 8
++
++
++def _pack_rtl_topk_policy(num_experts: int, top_k: int) -> int:
++    """Pack the sticky RTL TopK policy after enforcing implemented limits."""
++    if not 0 < top_k <= num_experts:
++        raise ValueError(f"top_k={top_k} must be in [1, num_experts={num_experts}]")
++    if num_experts > _RTL_TOPK_MAX_EXPERTS or top_k > _RTL_TOPK_MAX_K:
++        raise NotImplementedError(
++            "RTL V_TOPK currently supports at most "
++            f"{_RTL_TOPK_MAX_EXPERTS} experts/top-{_RTL_TOPK_MAX_K}; "
++            f"got {num_experts}/top-{top_k}"
++        )
++    return (num_experts << _TOPK_POLICY_EXPERT_SHIFT) | top_k
++
++
++def _rtl_topk_policy(num_experts: int, top_k: int) -> tuple[int, int | None]:
++    fixed = {(32, 4): 0, (128, 8): 1}.get((num_experts, top_k))
++    if fixed is not None:
++        return fixed, None
++    return _TOPK_POLICY_REGISTER_RMASK, _pack_rtl_topk_policy(num_experts, top_k)
++
+ 
+ class ProgramRoutedMoeMixin:
+     """Routed-MoE v0 emit helpers used by GPT-OSS and Qwen bring-up.
+@@ -420,6 +445,7 @@ class ProgramRoutedMoeMixin:
+         indices_int_base: int,
+         num_experts: int = 32,
+         top_k: int = 4,
++        emit_policy_config: bool = True,
+         name: str = "gpt_oss_router_topk",
+     ) -> None:
+         """Emit V_TOPK for one router-logit row.
+@@ -444,9 +470,7 @@ class ProgramRoutedMoeMixin:
+                 f"V_TOPK expects token {token_idx} to occupy {expert_blocks} contiguous logit rows, "
+                 f"got logits shape={logits.shape}"
+             )
+-        policy_rmask = {(32, 4): 0, (128, 8): 1}.get((num_experts, top_k))
+-        if policy_rmask is None:
+-            raise NotImplementedError(f"V_TOPK policy unsupported for num_experts={num_experts}, top_k={top_k}")
++        policy_rmask, packed_policy = _rtl_topk_policy(num_experts, top_k)
+ 
+         gp_weights, gp_logits, gp_indices = self._reg.allocate_gp(3)
+         try:
+@@ -454,6 +478,9 @@ class ProgramRoutedMoeMixin:
+                 f"Routed-MoE V_TOPK {name}: token={token_idx}, experts={num_experts}, top_k={top_k}, "
+                 f"weights_fp={weights_fp_base}, indices_int={indices_int_base}"
+             )
++            if packed_policy is not None and emit_policy_config:
++                asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), packed_policy)
++                asm.instr("C_SET_TOPK_REG", gp(gp_weights))
+             asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), weights_fp_base)
+             asm.instr(
+                 "S_ADDI_INT",
+@@ -482,6 +509,7 @@ class ProgramRoutedMoeMixin:
+         gp_offset: int,
+         gp_base: int,
+         name: str,
++        expert_gp_source: int | None = None,
+     ) -> None:
+         """Emit the shared true-expert-id -> HBM-base address calculation."""
+         if per_expert_stride <= 0:
+@@ -490,10 +518,12 @@ class ProgramRoutedMoeMixin:
+             f"{name}: expert_id_to_weight_base pair={pair_idx}, "
+             f"table_base={table_base}, stride={per_expert_stride}"
+         )
+-        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+-        asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
++        if expert_gp_source is None:
++            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
++            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
++        resolved_gp_expert = gp_expert if expert_gp_source is None else expert_gp_source
+         asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), per_expert_stride)
+-        asm.instr("S_MUL_INT", gp(gp_offset), gp(gp_expert), gp(gp_stride))
++        asm.instr("S_MUL_INT", gp(gp_offset), gp(resolved_gp_expert), gp(gp_stride))
+         asm.instr("S_ADDI_INT", gp(gp_base), gp(0), table_base)
+         asm.instr("S_ADD_INT", gp(gp_base), gp(gp_base), gp(gp_offset))
+         asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(0), gp(gp_base))
+@@ -510,15 +540,18 @@ class ProgramRoutedMoeMixin:
+         gp_expert: int,
+         gp_base: int,
+         name: str,
++        expert_gp_source: int | None = None,
+     ) -> None:
+         """Emit expert-id -> HBM-base lookup through an IntSRAM base table."""
+         asm.comment(
+             f"{name}: expert_id_to_weight_base_table pair={pair_idx}, "
+             f"base_table_int={expert_base_table_int_base}"
+         )
+-        asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+-        asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
+-        asm.instr("S_LD_INT", gp(gp_base), gp(gp_expert), expert_base_table_int_base)
++        if expert_gp_source is None:
++            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
++            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
++        resolved_gp_expert = gp_expert if expert_gp_source is None else expert_gp_source
++        asm.instr("S_LD_INT", gp(gp_base), gp(resolved_gp_expert), expert_base_table_int_base)
+         asm.instr("C_SET_ADDR_REG", areg(addr_reg), gp(0), gp(gp_base))
+ 
+     def gpt_oss_expert_id_to_weight_base_v0(
+@@ -572,6 +605,7 @@ class ProgramRoutedMoeMixin:
+         mram_start_addr: int | None = None,
+         k_block_start: int = 0,
+         k_block_count: int | None = None,
++        expert_gp: int | None = None,
+         name: str = "gpt_oss_dynamic_weight_load",
+     ) -> None:
+         """Load one weight column tile using runtime true expert id addressing.
+@@ -619,6 +653,7 @@ class ProgramRoutedMoeMixin:
+                     gp_offset=gp_expert_offset,
+                     gp_base=gp_base,
+                     name=name,
++                    expert_gp_source=expert_gp,
+                 )
+             else:
+                 self._emit_expert_id_to_weight_base_table_v0(
+@@ -631,6 +666,7 @@ class ProgramRoutedMoeMixin:
+                     gp_expert=gp_expert,
+                     gp_base=gp_base,
+                     name=name,
++                    expert_gp_source=expert_gp,
+                 )
+             self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
+             self._emit_hbm_subblock_sequence(
+@@ -667,6 +703,7 @@ class ProgramRoutedMoeMixin:
+         auto_reset_mram: bool = True,
+         k_block_start: int = 0,
+         k_block_count: int | None = None,
++        expert_gp: int | None = None,
+         name: str = "gpt_oss_dynamic_projection",
+     ) -> None:
+         """Projection tile where the HBM weight base comes from V_TOPK expert id."""
+@@ -687,6 +724,7 @@ class ProgramRoutedMoeMixin:
+             expert_base_table_int_base=expert_base_table_int_base,
+             k_block_start=k_block_start,
+             k_block_count=k_block_count,
++            expert_gp=expert_gp,
+             name=name,
+         )
+         super().vram_sub_projection_to(
+@@ -711,6 +749,7 @@ class ProgramRoutedMoeMixin:
+         table_base: int,
+         per_expert_stride: int,
+         expert_base_table_int_base: int | None = None,
++        expert_gp: int | None = None,
+         name: str,
+         physical_shape: tuple[int, int] | None = None,
+     ) -> VRAMMatrixVar:
+@@ -760,6 +799,7 @@ class ProgramRoutedMoeMixin:
+                 table_base=table_base,
+                 per_expert_stride=per_expert_stride,
+                 expert_base_table_int_base=expert_base_table_int_base,
++                expert_gp=expert_gp,
+                 name=f"{name}_pair{pair_idx}",
+                 **k_split,
+             )
+@@ -793,6 +833,7 @@ class ProgramRoutedMoeMixin:
+         pair_idx: int,
+         rows: int,
+         width: int,
++        expert_gp: int | None = None,
+         name: str = "gpt_oss_dynamic_bias",
+     ) -> None:
+         """Add BF16 bias selected by true expert id from a VRAM bias table."""
+@@ -808,10 +849,12 @@ class ProgramRoutedMoeMixin:
+         gp_table, gp_expert, gp_stride, gp_expert_offset, gp_src_base, gp_src, gp_dst = self._reg.allocate_gp(7)
+         try:
+             asm = IsaBuilder().comment(f"GPT-OSS dynamic expert bias add {name}: pair={pair_idx}, rows={rows}")
+-            asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
+-            asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
++            if expert_gp is None:
++                asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
++                asm.instr("S_LD_INT", gp(gp_expert), gp(gp_table), pair_idx)
++            resolved_gp_expert = gp_expert if expert_gp is None else expert_gp
+             asm.instr("S_ADDI_INT", gp(gp_stride), gp(0), expert_row_stride)
+-            asm.instr("S_MUL_INT", gp(gp_expert_offset), gp(gp_expert), gp(gp_stride))
++            asm.instr("S_MUL_INT", gp(gp_expert_offset), gp(resolved_gp_expert), gp(gp_stride))
+             for col_block in range(num_col_blocks):
+                 src_col_base = self._vram_matrix_row_addr(bias_table, 0, col_block)
+                 for row_idx in range(rows):
+@@ -967,6 +1010,7 @@ class ProgramRoutedMoeMixin:
+         rows: int,
+         intermediate: int,
+         constants: GptOssFPConstants,
++        expert_gp: int | None = None,
+         activation_policy: str = "gpt_oss_clamp_gated",
+         name: str = "gpt_oss_dynamic_expert_ffn",
+     ) -> VRAMMatrixVar:
+@@ -988,6 +1032,7 @@ class ProgramRoutedMoeMixin:
+             pair_idx=pair_idx,
+             table_base=gate_base,
+             per_expert_stride=gate_stride,
++            expert_gp=expert_gp,
+             name=f"{name}_gate",
+             physical_shape=(projection_rows, w_gate.physical_shape[1]),
+         )
+@@ -998,6 +1043,7 @@ class ProgramRoutedMoeMixin:
+             pair_idx=pair_idx,
+             table_base=up_base,
+             per_expert_stride=up_stride,
++            expert_gp=expert_gp,
+             name=f"{name}_up",
+             physical_shape=(projection_rows, w_up.physical_shape[1]),
+         )
+@@ -1009,6 +1055,7 @@ class ProgramRoutedMoeMixin:
+                 pair_idx=pair_idx,
+                 rows=rows,
+                 width=intermediate,
++                expert_gp=expert_gp,
+                 name=f"{name}_gate_bias",
+             )
+         if up_bias_table is not None:
+@@ -1019,6 +1066,7 @@ class ProgramRoutedMoeMixin:
+                 pair_idx=pair_idx,
+                 rows=rows,
+                 width=intermediate,
++                expert_gp=expert_gp,
+                 name=f"{name}_up_bias",
+             )
+         hidden = self.moe_expert_activation_v0(
+@@ -1037,6 +1085,7 @@ class ProgramRoutedMoeMixin:
+             pair_idx=pair_idx,
+             table_base=down_base,
+             per_expert_stride=down_stride,
++            expert_gp=expert_gp,
+             name=f"{name}_out",
+             physical_shape=(projection_rows, w_down.physical_shape[1]),
+         )
+@@ -1048,6 +1097,7 @@ class ProgramRoutedMoeMixin:
+                 pair_idx=pair_idx,
+                 rows=rows,
+                 width=w_down.physical_shape[1],
++                expert_gp=expert_gp,
+                 name=f"{name}_down_bias",
+             )
+         return out
+@@ -1189,6 +1239,141 @@ class ProgramRoutedMoeMixin:
+         assert combined is not None
+         return combined
+ 
++    def gpt_oss_apply_batch4_route_weight_v0(
++        self,
++        output: VRAMMatrixVar,
++        *,
++        rows: int,
++        name: str = "gpt_oss_batch4_route_weight",
++    ) -> None:
++        """Apply the active expert's four-token route context to one FFN output."""
++        if rows != self.blen or self.blen != 4:
++            raise ValueError(f"{name}: hardware route v0 requires rows=BLEN=4")
++        if output.shape[1] % self.mlen != 0:
++            raise ValueError(f"{name}: output width must be divisible by MLEN")
++
++        gp_dst = self._reg.allocate_gp(1)[0]
++        try:
++            asm = IsaBuilder().comment(f"Batch4 route weight multiply for {output.name}")
++            for col_block in range(output.shape[1] // self.mlen):
++                for token in range(4):
++                    dst_addr = self._vram_matrix_row_addr(output, token, col_block)
++                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), dst_addr)
++                    asm.instr("V_ROUTE_MUL", gp(gp_dst), gp(gp_dst), gp(0), token)
++            self._emit(asm)
++        finally:
++            self._reg.free_gp([gp_dst])
++
++    def gpt_oss_dynamic_moe_batch4_expert_major_v0(
++        self,
++        x: VRAMMatrixVar,
++        router_logits: VRAMMatrixVar,
++        weights: ExpertWeights,
++        *,
++        weight_table_bases: tuple[int, int, int],
++        weight_table_strides: tuple[int, int, int],
++        expert_indices_int_base: int,
++        weights_fp_base: int,
++        num_experts: int,
++        top_k: int,
++        bias_tables: ExpertBiases | None,
++        rows: int,
++        intermediate: int,
++        constants: GptOssFPConstants,
++        activation_policy: str = "gpt_oss_clamp_gated",
++        name: str = "gpt_oss_batch4_expert_major",
++    ) -> VRAMMatrixVar:
++        """Run one four-token MoE batch once per unique runtime-selected expert."""
++        if self.blen != 4 or rows != 4:
++            raise ValueError(f"{name}: v0 supports exactly four token rows")
++        policy, packed_policy = _rtl_topk_policy(num_experts, top_k)
++        route_entries = rows * top_k
++        if expert_indices_int_base < 0 or expert_indices_int_base + route_entries > 32:
++            raise ValueError(f"{name}: route indices exceed the RTL 32-entry INT SRAM")
++        if weights_fp_base < 0 or weights_fp_base + route_entries > 512:
++            raise ValueError(f"{name}: route weights exceed the RTL 512-entry FP SRAM")
++
++        output_width = weights[2].shape[1]
++        physical_rows = max(self.mlen, x.physical_shape[0])
++        combined = self.alloc(
++            f"{name}_combined",
++            rows=rows,
++            cols=output_width,
++            strict=False,
++            physical_shape=(physical_rows, weights[2].physical_shape[1]),
++        )
++        zero_row = self.fp_var(f"{name}_zero_row", size=self.mlen)
++        route_fp_range = range(weights_fp_base, weights_fp_base + route_entries)
++        if any(address in route_fp_range for address in range(zero_row.address, zero_row.address + zero_row.size)):
++            raise ValueError(f"{name}: route weights overlap the dedicated true-zero FP row")
++        self.gpt_oss_true_zero_vram_rows_v0(
++            combined,
++            rows=range(rows),
++            hidden=output_width,
++            zero_row=zero_row,
++            name=f"{name}_combined_zero",
++        )
++
++        gp_expert, gp_indices, gp_weights = self._reg.allocate_gp(3)
++        try:
++            asm = IsaBuilder().comment(
++                f"Batch4 expert-major route begin: experts={num_experts}, top_k={top_k}"
++            )
++            if packed_policy is not None:
++                asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), packed_policy)
++                asm.instr("C_SET_TOPK_REG", gp(gp_weights))
++            asm.instr("S_ADDI_INT", gp(gp_indices), gp(0), expert_indices_int_base)
++            asm.instr("S_ADDI_INT", gp(gp_weights), gp(0), weights_fp_base)
++            asm.instr(
++                "C_ROUTE_BEGIN",
++                gp(gp_expert),
++                gp(gp_indices),
++                gp(gp_weights),
++                policy,
++            )
++            self._emit(asm)
++
++            for token in range(rows):
++                self.gpt_oss_router_topk_softmax_v0(
++                    router_logits,
++                    token_idx=token,
++                    weights_fp_base=weights_fp_base + token * top_k,
++                    indices_int_base=expert_indices_int_base + token * top_k,
++                    num_experts=num_experts,
++                    top_k=top_k,
++                    emit_policy_config=False,
++                    name=f"{name}_token{token}_topk",
++                )
++            self._emit(IsaBuilder().instr("C_ROUTE_LOOP_START"))
++
++            expert_out = self.gpt_oss_dynamic_expert_ffn_v0(
++                x,
++                weights,
++                weight_table_bases=weight_table_bases,
++                weight_table_strides=weight_table_strides,
++                expert_indices_int_base=expert_indices_int_base,
++                pair_idx=0,
++                bias_tables=bias_tables,
++                rows=rows,
++                intermediate=intermediate,
++                constants=constants,
++                expert_gp=gp_expert,
++                activation_policy=activation_policy,
++                name=f"{name}_expert",
++            )
++            self.gpt_oss_apply_batch4_route_weight_v0(
++                expert_out,
++                rows=rows,
++                name=f"{name}_route",
++            )
++            self.vram_add(combined, expert_out, num_rows=rows)
++            self.free_tensor(expert_out)
++            self._emit(IsaBuilder().instr("C_ROUTE_LOOP_END"))
++        finally:
++            self._reg.free_gp([gp_expert, gp_indices, gp_weights])
++
++        return combined
++
+     def gpt_oss_gather_token_rows_from_hbm_v0(
+         self,
+         x_input: InputVar,
+diff --git a/doc/operation.svh b/doc/operation.svh
+index 694d2da..65d12cb 100644
+--- a/doc/operation.svh
++++ b/doc/operation.svh
+@@ -179,7 +179,12 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
+     C_BREAK                = 6'h34,
+     V_MAX_VF               = 6'h35,
+     V_MIN_VF               = 6'h36,
+-    V_TOPK                 = 6'h37
++    V_TOPK                 = 6'h37,
++    C_SET_TOPK_REG         = 6'h38,
++    C_ROUTE_BEGIN          = 6'h39,
++    C_ROUTE_LOOP_START     = 6'h3A,
++    C_ROUTE_LOOP_END       = 6'h3B,
++    V_ROUTE_MUL            = 6'h3C
+ } CUSTOM_ISA_OPCODE;
+ 
+ typedef enum logic [2:0] {
+diff --git a/doc/plena_isa_spec.md b/doc/plena_isa_spec.md
+index 2caa4f9..cc3090c 100644
+--- a/doc/plena_isa_spec.md
++++ b/doc/plena_isa_spec.md
+@@ -325,6 +325,8 @@ routed-MoE policy:
+   `FP_MEM[gp_reg<rd> + 0..3]` / `INT_MEM[gp_reg<rs2> + 0..3]`.
+ - `rmask=1`: scan 128 logits, select top-8, and write weights/indices to
+   `FP_MEM[gp_reg<rd> + 0..7]` / `INT_MEM[gp_reg<rs2> + 0..7]`.
++- `rmask=15`: use the sticky shape written by `C_SET_TOPK_REG`. RTL accepts
++  `1..256` experts and `1..8` selected experts, with `top_k <= num_experts`.
+ 
+ Logits are ranked numerically in descending order. NaNs are treated as
+ unavailable (`-Inf`), `+0` and `-0` compare equal, and every tie is broken by
+@@ -337,6 +339,50 @@ unavailable/`-Inf`, all weights are zero. Weights are written in the hardware
+ This is a correctness-first v0 linear scan. Bitonic/performance top-k remains a
+ future optimization.
+ 
++### C_SET_TOPK_REG
++
++**Format:** `C_SET_TOPK_REG rd`
++
++**Operation:** Read `gp_reg<rd>` and store a sticky routed-MoE shape. Bits
++`[16:8]` contain `num_experts` and bits `[7:0]` contain `top_k`; all other bits
++must be zero. The configuration is consumed only when `V_TOPK` or
++`C_ROUTE_BEGIN` uses policy 15. Fixed policies 0 and 1 ignore this register.
++Invalid or missing policy-15 configuration is a hard program error.
++
++### C_ROUTE_BEGIN
++
++**Format:** `C_ROUTE_BEGIN expert_rd, indices_rs1, weights_rs2, policy`
++
++**Operation:** Start one fixed four-token route collection. The instruction
++snapshots the INT-SRAM base in `gp_reg<indices_rs1>`, the FP-SRAM base in
++`gp_reg<weights_rs2>`, the GP register selected by `expert_rd`, and the same
++policy values used by `V_TOPK` (`0` = 32/top-4, `1` = 128/top-8,
++`15` = `C_SET_TOPK_REG`).
++
++Exactly four `V_TOPK` instructions then write compact token-major results at
++`base + token * top_k`. The dispatcher validates bounds, matching INT/FP
++addresses, expert ranges, and duplicate experts within one token.
++
++### C_ROUTE_LOOP_START / C_ROUTE_LOOP_END
++
++**Format:** `C_ROUTE_LOOP_START` / `C_ROUTE_LOOP_END`
++
++These delimit a dynamic expert-major loop. At loop start, the hardware writes
++the smallest pending expert ID to the GP register selected by
++`C_ROUTE_BEGIN`. At loop end it advances to the next unique expert and jumps
++to the loop body, or exits after the final expert. Normal fixed-count
++`C_LOOP_START` loops may be nested inside this body.
++
++### V_ROUTE_MUL
++
++**Format:** `V_ROUTE_MUL rd, rs1, gp0, token`
++
++Multiply one vector row by the current expert's selected route weight for
++token slot `0..3`. If that token did not select the current expert, the source
++is replaced with exact FP zero before multiplication; this also prevents NaNs
++in an inactive row from leaking into the combined output. The third register
++field is reserved and must be `gp0`.
++
+ ### V_EXP_V
+ 
+ **Format:** `V_EXP_V rd, rs1, rmask`
