@@ -14,6 +14,7 @@ from aten.kda.scheduler import KIMI_K3_KDA_LAYERS, KdaScheduleConfig
 from aten.kimi3.program import MlaWidths, build_kimi_k3_program, mla_layer_ids
 from aten.kimi3.scheduler import KimiK3Architecture
 from aten.mamba.scheduler import SchedulePhase
+from aten.plena import validate_symbolic_hbm_bindings
 
 
 def test_mla_layers_are_the_complement_of_the_kda_schedule() -> None:
@@ -61,7 +62,18 @@ def test_context_must_fit_the_staged_kv_tile() -> None:
         build_kimi_k3_program(config, context_length=4096, heads=2)
 
 
-def test_full_scale_connected_program_fails_fast_until_matrix_and_heads_are_looped() -> None:
+@pytest.mark.slow
+def test_full_scale_connected_program_fits_the_machine_code_budget() -> None:
     config = KdaScheduleConfig(phase=SchedulePhase.DECODE, decode_tokens=1)
-    with pytest.raises(NotImplementedError, match="100,221,916 instructions"):
-        build_kimi_k3_program(config)
+    program = build_kimi_k3_program(config)
+
+    validate_symbolic_hbm_bindings(program)
+    assert program.layer_counts == {
+        "kda": 69,
+        "mla": 24,
+        "latent_moe": 92,
+        "dense_ffn": 1,
+    }
+    assert program.instruction_count * 4 <= 64 * 1024 * 1024
+    assert len(program.symbolic_hbm_bindings) == 2713
+    assert all(count > 0 for count in program.stage_instruction_counts.values())

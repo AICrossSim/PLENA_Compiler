@@ -9,7 +9,7 @@ from compiler.aten.plena.mview import (
     validate_matrix_view_dominance,
 )
 
-from .parser import load_isa_definitions, parse_asm_file
+from .parser import load_isa_definitions, parse_asm_file, parse_asm_lines
 
 
 # Opcode groups for binary encoding. Module-level frozensets so they are not rebuilt
@@ -431,3 +431,19 @@ class AssemblyToBinary:
         # Write the binary instructions to a file
         self.write_binary_to_file(binary_instructions, output_file)
         return binary_instructions
+
+    def generate_binary_streaming(self, asm_file: str, output_file: str) -> int:
+        """Encode a large assembly file without retaining instructions or words."""
+        with open(asm_file) as assembly:
+            return self.generate_binary_streaming_lines(assembly, output_file)
+
+    def generate_binary_streaming_lines(self, lines, output_file: str) -> int:
+        """Encode an iterable of assembly lines directly into a hex memory file."""
+        count = 0
+        with open(output_file, "w") as output:
+            for instruction in parse_asm_lines(lines):
+                output.write(f"0x{self._convert_to_binary(instruction):08X}\n")
+                count += 1
+        return count
+
+

@@ -15,11 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from compiler.aten.plena import (
+    DecodeCacheTensor,
     ExpertWeightTable,
     FPVar,
     InputVar,
     PlenaCompiler,
     VRAMMatrixVar,
+    allocate_decode_cache_tensor,
 )
 from compiler.aten.plena.program_routed_moe import moe_end_marker, moe_stage_marker
 
@@ -57,6 +59,57 @@ class NemotronAttentionWeights:
     k: InputVar
     v: InputVar
     out: InputVar
+
+
+@dataclass(frozen=True)
+class NemotronGqaDecodeCache:
+    """Persistent per-KV-head K/V tensors for incremental GQA decode."""
+
+    keys: tuple[DecodeCacheTensor, ...]
+    values: tuple[DecodeCacheTensor, ...]
+    max_tokens: int
+
+    @property
+    def persistent_bytes(self) -> int:
+        return sum(cache.byte_capacity for cache in (*self.keys, *self.values))
+
+    @property
+    def backings(self) -> tuple[InputVar, ...]:
+        return tuple(cache.backing for cache in (*self.keys, *self.values))
+
+
+def allocate_nemotron_gqa_decode_cache(
+    prog: PlenaCompiler,
+    *,
+    shape: NemotronAttentionShape,
+    max_tokens: int,
+    name: str = "nemotron_gqa_cache",
+) -> NemotronGqaDecodeCache:
+    """Allocate BF16 row-major cache tensors for all Nemotron K/V heads."""
+    shape.validate(prog.mlen)
+    keys = tuple(
+        allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_k_head{head}",
+            max_tokens=max_tokens,
+            width=shape.head_dim,
+        )
+        for head in range(shape.kv_heads)
+    )
+    values = tuple(
+        allocate_decode_cache_tensor(
+            prog,
+            name=f"{name}_v_head{head}",
+            max_tokens=max_tokens,
+            width=shape.head_dim,
+        )
+        for head in range(shape.kv_heads)
+    )
+    return NemotronGqaDecodeCache(
+        keys=keys,
+        values=values,
+        max_tokens=max_tokens,
+    )
 
 
 @dataclass(frozen=True)
@@ -133,12 +186,15 @@ def emit_nemotron_attention_block(
     weights: NemotronAttentionWeights,
     rows: int = 1,
     name: str = "nemotron_attention",
+    cache: NemotronGqaDecodeCache | None = None,
+    token_index: int | None = None,
+    causal: bool = False,
 ) -> VRAMMatrixVar:
-    """Emit connected single-token GQA and return the mixer output.
+    """Emit connected GQA and return the mixer output.
 
-    The current proof path deliberately supports ``rows == kv_seq_len`` only.
-    Persistent K/V cache append/read is a later system feature and is not
-    represented as pre-staged fake K/V tensors here.
+    With ``cache=None`` this preserves the scratch path.  With a cache, decode
+    appends one row while prefill appends prompt chunks at their global token
+    offsets. The attention mask shifts its diagonal for every later chunk.
     """
     shape.validate(prog.mlen)
     if rows < 1 or rows > hidden.shape[0]:
@@ -147,6 +203,16 @@ def emit_nemotron_attention_block(
         raise ValueError(
             f"{name}: hidden width={hidden.shape[1]} does not match {shape.hidden}"
         )
+    if (cache is None) != (token_index is None):
+        raise ValueError(f"{name}: cache and token_index must be provided together")
+    if cache is not None:
+        if len(cache.keys) != shape.kv_heads or len(cache.values) != shape.kv_heads:
+            raise ValueError(f"{name}: cache head count does not match shape.kv_heads")
+        if token_index + rows > cache.max_tokens:
+            raise ValueError(
+                f"{name}: token range [{token_index}, {token_index + rows}) "
+                f"exceeds cache capacity={cache.max_tokens}"
+            )
 
     prog.emit(f"; {moe_end_marker(f'{name} non-MoE region')}\n")
     projection_rows = max(prog.mlen, hidden.physical_shape[0])
@@ -192,12 +258,34 @@ def emit_nemotron_attention_block(
             col_offset=kv_head * shape.head_dim,
             width=shape.head_dim,
         )
-        kv_inputs.append(
-            (
-                prog.store(k_head, name=f"{name}_k_scratch{kv_head}"),
-                prog.store(v_head, name=f"{name}_v_scratch{kv_head}"),
+        if cache is None:
+            kv_inputs.append(
+                (
+                    prog.store(k_head, name=f"{name}_k_scratch{kv_head}"),
+                    prog.store(v_head, name=f"{name}_v_scratch{kv_head}"),
+                )
             )
-        )
+        else:
+            cache.keys[kv_head].append_rows(
+                prog,
+                k_head,
+                token_index=token_index,
+                rows=rows,
+                name=f"{name}_k_append_head{kv_head}",
+            )
+            cache.values[kv_head].append_rows(
+                prog,
+                v_head,
+                token_index=token_index,
+                rows=rows,
+                name=f"{name}_v_append_head{kv_head}",
+            )
+            kv_inputs.append(
+                (
+                    cache.keys[kv_head].prefix(token_index + rows),
+                    cache.values[kv_head].prefix(token_index + rows),
+                )
+            )
         prog.free_tensor(k_head)
         prog.free_tensor(v_head)
 
@@ -216,9 +304,14 @@ def emit_nemotron_attention_block(
             k_input,
             v_input,
             scale=shape.head_dim**-0.5,
+            causal_mask=causal,
             batch_size=1,
             seq_len=rows,
-            kv_seq_len=rows,
+            kv_seq_len=rows if cache is None else token_index + rows,
+            k_matrix_precision="weights" if cache is None else "keyvalue",
+            v_matrix_precision="weights" if cache is None else "keyvalue",
+            k_hbm_element_bytes=1 if cache is None else 2,
+            v_hbm_element_bytes=1 if cache is None else 2,
         )
         prog.vram_copy_region(
             attention,
@@ -376,12 +469,18 @@ def emit_nemotron_moe_block(
             policy_name="nemotron3",
             name=f"{name}_token{token_idx}",
         )
-    prog.fpvar_mul(
-        topk_weights,
-        constants.routed_scale,
-        topk_weights,
-        count=rows * shape.top_k,
-    )
+    if constants.routed_scale.size < shape.top_k:
+        raise ValueError("routed_scale must provide one value per selected expert")
+    for token_idx in range(rows):
+        route_offset = token_idx * shape.top_k
+        prog.fpvar_mul_region(
+            topk_weights,
+            constants.routed_scale,
+            topk_weights,
+            count=shape.top_k,
+            src1_offset=route_offset,
+            dst_offset=route_offset,
+        )
 
     accumulator = prog.alloc(
         f"{name}_routed_accumulator",

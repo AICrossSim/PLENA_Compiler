@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "contract_name": "plena-hybrid-pre-rtl-isa-freeze-v1",
+  "status": "compiler_simulator_frozen_rtl_not_started",
+  "opcode_width_bits": 6,
+  "implemented_opcodes": {
+    "V_MAX_VF": 53,
+    "V_MIN_VF": 54,
+    "V_TOPK": 55,
+    "C_SET_TOPK_REG": 56,
+    "X_STATE": 61,
+    "L_SCATTER_M": 63
+  },
+  "reserved_not_implemented": {
+    "C_ROUTE_BEGIN": 57,
+    "C_ROUTE_LOOP_START": 58,
+    "C_ROUTE_LOOP_END": 59,
+    "V_ROUTE_MUL": 60
+  },
+  "unallocated_opcodes": [62],
+  "topk_register_targets": {
+    "POLICY": 0,
+    "CORRECTION_BIAS_VRAM_ADDRESS": 1
+  },
+  "contracts": {
+    "x_state": {
+      "spec": "spec/x_state_v2.json",
+      "sha256": "2edcd9b6ceb22428680f27c9262b4c16015b07f30a26b6b4f23b83625b81b3fc",
+      "golden": "spec/x_state_v2_golden.json",
+      "golden_sha256": "90289340661b443529dc70c8611ab8535313d2645c935e465dc233043c31e085",
+      "descriptor_size_bytes": 256,
+      "descriptor_alignment_bytes": 64,
+      "reserved_instruction_bits": [26, 31]
+    },
+    "l_scatter_m": {
+      "spec": "spec/l_scatter_m_v1.json",
+      "sha256": "17efd863aa103d8b0c092c0fc211f45a4baa4ee76df75884e29194ccb153fa1c",
+      "golden": "spec/l_scatter_m_v1_golden.json",
+      "golden_sha256": "751695ae801c9ec2b2bc888e4657ac34d6ac98bfae574dda489cbe1d693eed86",
+      "descriptor_size_bytes": 256,
+      "descriptor_alignment_bytes": 64,
+      "reserved_instruction_bits": [26, 31]
+    }
+  },
+  "canonical_encoding": {
+    "reserved_instruction_bits_must_be_zero": true,
+    "topk_target_values_2_through_15_are_invalid": true,
+    "x_state_fence_descriptor_operands_must_be_zero": true,
+    "unknown_subop_or_layout_mode_is_invalid": true,
+    "descriptor_magic_version_size_alignment_are_checked_before_side_effects": true
+  },
+  "completion_status_values": {
+    "EMPTY": 0,
+    "SUCCESS": 1,
+    "INVALID_DESCRIPTOR": 2,
+    "UNSUPPORTED_ALGORITHM": 3,
+    "ADDRESS_ERROR": 4,
+    "STATE_HAZARD": 5,
+    "UNSUPPORTED_PRECISION": 6,
+    "INTERNAL_ERROR": 255
+  },
+  "scope": {
+    "compiler": "implemented",
+    "transactional_simulator": "implemented",
+    "rtl": "not_started",
+    "route_extension": "opcode_space_reserved_only"
+  }
+}

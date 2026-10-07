@@ -191,6 +191,7 @@ class PlenaCompiler(
         blen: int = 4,
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
+        compact_matrix_loops: bool = False,
         mram_tile_capacity: int | None = None,
         hbm_v_prefetch_amount: int | None = None,
         hbm_v_writeback_amount: int | None = None,
@@ -271,6 +272,7 @@ class PlenaCompiler(
             raise ValueError(
                 f"hbm_v_writeback_amount must be > 0, got {hbm_v_writeback_amount}"
             )
+        self.compact_matrix_loops = compact_matrix_loops
         self.hbm_v_prefetch_amount = hbm_v_prefetch_amount
         self.hbm_v_writeback_amount = hbm_v_writeback_amount
         self.hlen = _behavior_config_value("HLEN", mlen, mlen)

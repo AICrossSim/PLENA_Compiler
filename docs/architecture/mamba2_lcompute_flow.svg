@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="760" viewBox="0 0 1800 760" role="img" aria-labelledby="title desc">
+  <title id="title">Nemotron 3 Mamba-2 decode through L-Compute and X_STATE</title>
+  <desc id="desc">A paper-ready dataflow for one real-shape Nemotron 3 Mamba-2 decode token, highlighting compiler-guided projection co-layout, sixteen-bank Matrix SRAM, recurrent state update, gate bypass, output projection, and residual addition.</desc>
+  <defs>
+    <marker id="f-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#217346"/></marker>
+    <marker id="f-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#007f7b"/></marker>
+    <marker id="f-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#aa6a00"/></marker>
+    <style>
+      text { font-family: 'Liberation Sans', Helvetica, Arial, sans-serif; fill: #1e2930; }
+      .matrix { fill: #e8f3f8; stroke: #295064; stroke-width: 1.8; }
+      .vector { fill: #eef6ef; stroke: #2f6842; stroke-width: 1.8; }
+      .plain { fill: #fffaf0; stroke: #26343c; stroke-width: 1.6; }
+      .ext { fill: #e5f5f2; stroke: #007f7b; stroke-width: 2; stroke-dasharray: 7 5; }
+      .state { fill: #fff2da; stroke: #aa6a00; stroke-width: 2; stroke-dasharray: 7 5; }
+      .title { font-size: 27px; font-weight: 700; }
+      .section { font-size: 14px; font-weight: 700; fill: #52636b; }
+      .head { font-size: 21px; font-weight: 700; }
+      .label { font-size: 16px; }
+      .small { font-size: 13px; }
+      .tiny { font-size: 11px; }
+      .teal { fill: #006d69; }
+      .amber { fill: #925900; }
+      .green-flow { fill: none; stroke: #217346; stroke-width: 2.6; marker-end: url(#f-green); }
+      .teal-flow { fill: none; stroke: #007f7b; stroke-width: 2.8; marker-end: url(#f-teal); }
+      .amber-bi { fill: none; stroke: #aa6a00; stroke-width: 2.8; marker-start: url(#f-amber); marker-end: url(#f-amber); }
+    </style>
+  </defs>
+
+  <rect width="1800" height="760" fill="#ffffff"/>
+  <text class="title" x="45" y="48">Nemotron 3 Mamba-2 Decode: Producer–Consumer Co-Layout</text>
+  <text class="small" x="45" y="73">One token · hidden size 2,688 · 64 heads · head dimension 64 · state dimension 128 · 8 B/C groups</text>
+  <line x1="45" y1="91" x2="1755" y2="91" stroke="#9aa9af" stroke-width="1.2"/>
+
+  <!-- Existing front end -->
+  <text class="section" x="45" y="116">EXISTING PLENA FRONT END</text>
+  <rect class="vector" x="45" y="135" width="120" height="115"/>
+  <text class="head" text-anchor="middle" x="105" y="178">Hidden</text>
+  <text class="label" text-anchor="middle" x="105" y="207">1 × 2,688</text>
+  <text class="small" text-anchor="middle" x="105" y="229">BF16</text>
+
+  <rect class="vector" x="195" y="135" width="120" height="115"/>
+  <text class="head" text-anchor="middle" x="255" y="178">RMSNorm</text>
+  <text class="small" text-anchor="middle" x="255" y="215">Vector Unit</text>
+  <path d="M165 192h30" class="green-flow"/>
+
+  <rect class="matrix" x="345" y="125" width="190" height="135"/>
+  <text class="head" text-anchor="middle" x="440" y="165">Input Projection</text>
+  <text class="label" text-anchor="middle" x="440" y="198">2,688 → 10,304</text>
+  <text class="small" text-anchor="middle" x="440" y="228">Matrix Unit</text>
+  <path d="M315 192h30" class="green-flow"/>
+
+  <!-- Packed logical record; the displayed field widths are not to scale. -->
+  <text class="section" x="575" y="116">LOGICAL PROJECTION RECORD</text>
+  <rect class="plain" x="575" y="125" width="300" height="150"/>
+  <text class="head" text-anchor="middle" x="725" y="158">10,304 BF16 Values</text>
+  <g>
+    <rect x="595" y="178" width="95" height="46" fill="#dcebd7" stroke="#2f6842" stroke-width="1.3"/>
+    <rect x="690" y="178" width="95" height="46" fill="#ccefea" stroke="#007f7b" stroke-width="1.3"/>
+    <rect x="785" y="178" width="31" height="46" fill="#a9e1d9" stroke="#007f7b" stroke-width="1.3"/>
+    <rect x="816" y="178" width="31" height="46" fill="#82d1c7" stroke="#007f7b" stroke-width="1.3"/>
+    <rect x="847" y="178" width="10" height="46" fill="#4ab8ad" stroke="#007f7b" stroke-width="1.3"/>
+    <text class="label" text-anchor="middle" x="642" y="207">gate</text>
+    <text class="label" text-anchor="middle" x="737" y="207">x</text>
+    <text class="small" text-anchor="middle" x="800" y="207">B</text>
+    <text class="small" text-anchor="middle" x="831" y="207">C</text>
+    <text class="tiny" text-anchor="middle" transform="translate(853 202) rotate(-90)">dt</text>
+  </g>
+  <text class="small" text-anchor="middle" x="642" y="246">4,096</text>
+  <text class="small" text-anchor="middle" x="737" y="246">4,096</text>
+  <text class="tiny" text-anchor="middle" x="821" y="265">B/C: 1,024 each · dt: 64</text>
+  <path d="M535 192h40" class="green-flow"/>
+
+  <!-- New writeback layout engine -->
+  <text class="section teal" x="915" y="116">L-COMPUTE WRITEBACK</text>
+  <rect class="ext" x="915" y="130" width="170" height="140"/>
+  <text class="head teal" text-anchor="middle" x="1000" y="165">L-Compute</text>
+  <text class="label teal" text-anchor="middle" x="1000" y="191">L_SCATTER_M</text>
+  <line x1="938" y1="205" x2="1062" y2="205" stroke="#007f7b" stroke-width="1.3"/>
+  <text class="small" text-anchor="middle" x="1000" y="229">MAMBA_SKEW</text>
+  <text class="small" text-anchor="middle" x="1000" y="251">64-value FIFO</text>
+  <path d="M875 202h40" class="teal-flow"/>
+  <text class="tiny teal" x="882" y="190">x/B/C/dt</text>
+
+  <!-- Sixteen-bank SRAM region -->
+  <text class="section" x="1125" y="116">16-BANK MATRIX SRAM</text>
+  <rect class="matrix" x="1125" y="125" width="315" height="165"/>
+  <text class="small" text-anchor="middle" x="1282" y="154">group-major placement + local skew</text>
+  <g stroke="#295064" stroke-width="1">
+    <rect x="1147" y="174" width="17" height="58" fill="#ccefea"/><rect x="1164" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <rect x="1181" y="174" width="17" height="58" fill="#ccefea"/><rect x="1198" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <rect x="1215" y="174" width="17" height="58" fill="#ccefea"/><rect x="1232" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <rect x="1249" y="174" width="17" height="58" fill="#ccefea"/><rect x="1266" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <rect x="1283" y="174" width="17" height="58" fill="#ccefea"/><rect x="1300" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <rect x="1317" y="174" width="17" height="58" fill="#ccefea"/><rect x="1334" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <rect x="1351" y="174" width="17" height="58" fill="#ccefea"/><rect x="1368" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <rect x="1385" y="174" width="17" height="58" fill="#ccefea"/><rect x="1402" y="174" width="17" height="58" fill="#8fd6cc"/>
+    <line x1="1147" y1="203" x2="1419" y2="203" stroke="#ffffff" stroke-width="1.4"/>
+  </g>
+  <text class="small teal" text-anchor="middle" x="1282" y="262">32-value consumer packet → 2 accesses per bank</text>
+  <path d="M1085 202h40" class="teal-flow"/>
+
+  <!-- X_STATE recurrent core -->
+  <text class="section teal" x="1480" y="116">RECURRENT CORE</text>
+  <rect class="ext" x="1480" y="125" width="190" height="225"/>
+  <text class="head teal" text-anchor="middle" x="1575" y="161">X_STATE · STEP</text>
+  <line x1="1503" y1="178" x2="1647" y2="178" stroke="#007f7b" stroke-width="1.3"/>
+  <text class="small" text-anchor="middle" x="1575" y="204">short Conv1D + dt/exp</text>
+  <text class="small" text-anchor="middle" x="1575" y="231">state update</text>
+  <text class="small" text-anchor="middle" x="1575" y="258">C reduction</text>
+  <text class="small" text-anchor="middle" x="1575" y="285">B/C broadcast</text>
+  <text class="small" text-anchor="middle" x="1575" y="315">8 heads share each B/C group</text>
+  <text class="tiny" text-anchor="middle" x="1575" y="337">FP32 update and reduction baseline</text>
+  <path d="M1440 202h40" class="teal-flow"/>
+
+  <!-- Independent state cache -->
+  <rect class="state" x="1480" y="385" width="190" height="150"/>
+  <text class="head amber" text-anchor="middle" x="1575" y="420">Persistent State SRAM</text>
+  <text class="small" text-anchor="middle" x="1575" y="449">64 × 64 × 128 FP32 state</text>
+  <text class="small" text-anchor="middle" x="1575" y="475">+ 96 KiB conv state/layer</text>
+  <text class="small" text-anchor="middle" x="1575" y="501">2.09375 MiB/layer</text>
+  <text class="tiny" text-anchor="middle" x="1575" y="522">PRELOAD · COMMIT · EVICT</text>
+  <path d="M1575 350v35" class="amber-bi"/>
+
+  <!-- Existing post-processing path -->
+  <text class="section" x="895" y="425">EXISTING VECTOR + MATRIX POST-PROCESSING</text>
+  <rect class="vector" x="895" y="440" width="180" height="115"/>
+  <text class="head" text-anchor="middle" x="985" y="477">Gated Group</text>
+  <text class="head" text-anchor="middle" x="985" y="503">RMSNorm</text>
+  <text class="small" text-anchor="middle" x="985" y="533">state output × saved gate</text>
+
+  <rect class="matrix" x="1110" y="440" width="180" height="115"/>
+  <text class="head" text-anchor="middle" x="1200" y="480">Output Projection</text>
+  <text class="label" text-anchor="middle" x="1200" y="511">4,096 → 2,688</text>
+  <text class="small" text-anchor="middle" x="1200" y="535">Matrix Unit</text>
+
+  <rect class="vector" x="1325" y="440" width="125" height="115"/>
+  <text class="head" text-anchor="middle" x="1387" y="480">Residual</text>
+  <text class="head" text-anchor="middle" x="1387" y="506">Add</text>
+  <text class="small" text-anchor="middle" x="1387" y="534">next layer</text>
+  <path d="M1075 497h35" class="green-flow"/>
+  <path d="M1290 497h35" class="green-flow"/>
+
+  <!-- Output and bypass lifetimes -->
+  <path d="M1480 315h-55V410H985v30" class="teal-flow"/>
+  <path d="M642 224v165h243v108h10" class="green-flow"/>
+  <text class="small" x="674" y="378">gate remains live in Vector SRAM</text>
+  <path d="M105 250v345h1282v-40" class="green-flow"/>
+  <text class="small" x="240" y="584">original hidden token retained for residual</text>
+
+  <!-- Reproducible local result -->
+  <line x1="45" y1="640" x2="1755" y2="640" stroke="#9aa9af" stroke-width="1.2"/>
+  <text class="head" x="45" y="682">Projection-buffer service</text>
+  <text class="label" x="305" y="682">ROW_MAJOR</text>
+  <text class="head" x="420" y="682" fill="#a43f3f">53,176 cycles</text>
+  <path d="M575 674h95" class="teal-flow"/>
+  <text class="label teal" x="695" y="682">MAMBA_SKEW</text>
+  <text class="head teal" x="835" y="682">14,904 cycles</text>
+  <text class="head" x="1010" y="682">3.568× local</text>
+  <text class="label" x="1160" y="682">236,992 values exact</text>
+  <text class="label" x="1395" y="682">bank stalls: 0</text>
+  <text class="label" x="1550" y="682">HBM repack: 0 B</text>
+  <text class="tiny" x="45" y="718">The reported speedup is the verified Matrix-SRAM consumer service time for 23 Mamba layers (B1 decode), not end-to-end model speedup.</text>
+</svg>

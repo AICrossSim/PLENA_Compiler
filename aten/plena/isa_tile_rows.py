@@ -1666,6 +1666,48 @@ class IsaTileRowMixin:
         self,
         vram_addr: int,
         rows: list[int],
+        zero_row_addr: int | None = None,
+    ) -> str:
+        """
+        VRAM Fill Zero: fill specified rows with 0.
+
+        For each row_idx in rows:
+            VRAM[row] = 0
+        """
+        if zero_row_addr is None:
+            return self._vram_fill_zero_legacy_asm(vram_addr, rows)
+        if not rows:
+            return self._emit(IsaBuilder().comment(f"=== VRAM Fill Zero: VRAM[{vram_addr}] rows [] = 0 ==="))
+
+        gp_regs = self._reg.allocate_gp(3)
+        gp_dst, gp_zero, gp_loop = gp_regs
+        try:
+            asm = IsaBuilder().comment(f"=== VRAM Fill Zero: VRAM[{vram_addr}] rows {rows} = 0 ===")
+            prog = self._row_progression(rows)
+            asm.instr("S_ADDI_INT", gp(gp_zero), gp(0), zero_row_addr)
+
+            if prog is not None:
+                row_start, row_count, row_step = prog
+                asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), vram_addr + row_start * self.mlen)
+                asm.instr("C_LOOP_START", gp(gp_loop), row_count)
+                asm.instr("S_MAP_V_FP", gp(gp_dst), gp(gp_zero), 0)
+                asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), row_step * self.mlen)
+                asm.instr("C_LOOP_END", gp(gp_loop))
+            else:
+                for row_idx in rows:
+                    row_addr = vram_addr + row_idx * self.mlen
+                    asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), row_addr)
+                    asm.instr("S_MAP_V_FP", gp(gp_dst), gp(gp_zero), 0)
+
+            return self._emit(asm)
+        finally:
+            self._reg.free_gp(gp_regs)
+
+
+    def _vram_fill_zero_legacy_asm(
+        self,
+        vram_addr: int,
+        rows: list[int],
     ) -> str:
         """
         VRAM Fill Zero: fill specified rows with 0.

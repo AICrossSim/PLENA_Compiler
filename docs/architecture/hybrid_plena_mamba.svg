@@ -1,0 +1,217 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="850" viewBox="0 0 1800 850" role="img" aria-labelledby="title desc">
+  <title id="title">Mamba-enabled PLENA architecture</title>
+  <desc id="desc">The original PLENA scalar, matrix, vector, SRAM, and HBM organization extended with an L-Compute scatter-on-write engine, an X_STATE recurrent engine, and a persistent state SRAM for Nemotron 3 Mamba-2.</desc>
+  <defs>
+    <marker id="m-black" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#26343c"/></marker>
+    <marker id="m-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#217346"/></marker>
+    <marker id="m-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#007f7b"/></marker>
+    <marker id="m-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#2b6594"/></marker>
+    <marker id="m-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#aa6a00"/></marker>
+    <style>
+      text { font-family: 'Liberation Sans', Helvetica, Arial, sans-serif; fill: #1e2930; }
+      .boundary { fill: none; stroke: #217346; stroke-width: 2.2; stroke-dasharray: 5 4; }
+      .unit { fill: #eef0f2; stroke: #26343c; stroke-width: 1.8; }
+      .sub { fill: #fffaf0; stroke: #26343c; stroke-width: 1.5; }
+      .mem { fill: #e8f3f8; stroke: #295064; stroke-width: 1.8; }
+      .ext { fill: #e5f5f2; stroke: #007f7b; stroke-width: 2; stroke-dasharray: 7 5; }
+      .state-mem { fill: #fff2da; stroke: #aa6a00; stroke-width: 2; stroke-dasharray: 7 5; }
+      .host { fill: #e5e7e9; stroke: #26343c; stroke-width: 1.8; }
+      .brand { font-size: 30px; font-weight: 700; }
+      .unit-title { font-size: 23px; font-weight: 700; }
+      .block-title { font-size: 18px; font-weight: 700; }
+      .label { font-size: 16px; }
+      .small { font-size: 14px; }
+      .tiny { font-size: 12px; }
+      .teal { fill: #006d69; }
+      .amber { fill: #925900; }
+      .black-line { fill: none; stroke: #26343c; stroke-width: 2; marker-end: url(#m-black); }
+      .green-line { fill: none; stroke: #217346; stroke-width: 2.5; marker-end: url(#m-green); }
+      .green-bi { fill: none; stroke: #217346; stroke-width: 2.5; marker-start: url(#m-green); marker-end: url(#m-green); }
+      .teal-line { fill: none; stroke: #007f7b; stroke-width: 2.8; marker-end: url(#m-teal); }
+      .blue-line { fill: none; stroke: #2b6594; stroke-width: 2.2; marker-end: url(#m-blue); }
+      .amber-bi { fill: none; stroke: #aa6a00; stroke-width: 2.8; marker-start: url(#m-amber); marker-end: url(#m-amber); }
+      .control { fill: none; stroke: #d64545; stroke-width: 2; stroke-dasharray: 4 4; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="850" fill="#ffffff"/>
+  <rect class="boundary" x="105" y="38" width="1590" height="775"/>
+  <text class="brand" x="138" y="82">PLENA</text>
+  <text class="label" x="138" y="107">Shared Matrix/Vector Fabric with Mamba-2 State Extension</text>
+
+  <!-- Compact paper legend -->
+  <path d="M1250 67h45" class="green-line"/><text class="small" x="1307" y="72">activation</text>
+  <path d="M1400 67h45" class="teal-line"/><text class="small" x="1457" y="72">projection layout</text>
+  <path d="M1250 94h45" class="amber-bi"/><text class="small" x="1307" y="99">recurrent state</text>
+  <path d="M1400 94h45" class="control"/><text class="small" x="1457" y="99">control</text>
+
+  <!-- External host -->
+  <rect class="host" x="18" y="300" width="68" height="250"/>
+  <text class="block-title" text-anchor="middle" transform="translate(58 425) rotate(-90)">Host CPU · PCIe</text>
+  <path d="M86 425h42V180h32" class="black-line"/>
+
+  <!-- Instruction/control column -->
+  <rect class="unit" x="160" y="135" width="190" height="82"/>
+  <text class="block-title" text-anchor="middle" x="255" y="168">Instruction Buffer</text>
+  <text class="small" text-anchor="middle" x="255" y="193">32-bit PLENA ISA</text>
+  <path d="M255 217v35" class="black-line"/>
+  <rect class="unit" x="160" y="252" width="190" height="74"/>
+  <text class="unit-title" text-anchor="middle" x="255" y="297">Decoder</text>
+
+  <!-- Scalar unit -->
+  <rect class="unit" x="135" y="420" width="240" height="270"/>
+  <text class="unit-title" x="155" y="454">Scalar Unit</text>
+  <rect class="sub" x="155" y="485" width="86" height="170"/>
+  <text class="block-title" text-anchor="middle" x="198" y="522">Integer</text>
+  <text class="label" text-anchor="middle" x="198" y="563">+  −</text>
+  <text class="label" text-anchor="middle" x="198" y="593">×  ÷</text>
+  <rect class="sub" x="258" y="485" width="96" height="170"/>
+  <text class="block-title" text-anchor="middle" x="306" y="522">FP / LUT</text>
+  <text class="label" text-anchor="middle" x="306" y="563">exp · √x</text>
+  <text class="label" text-anchor="middle" x="306" y="593">+ − × ÷</text>
+  <path d="M375 570h35" class="blue-line"/>
+
+  <!-- Clean control trunk in the whitespace between columns -->
+  <path class="control" d="M350 289h35V200h25"/>
+  <path class="control" d="M385 289v220h25"/>
+  <path class="control" d="M255 326v64h-15v30"/>
+
+  <!-- Existing Matrix Unit -->
+  <rect class="unit" x="410" y="125" width="610" height="260"/>
+  <text class="unit-title" x="432" y="159">Matrix Unit</text>
+  <text class="small" x="432" y="182">Mamba · Attn · MoE</text>
+
+  <rect class="sub" x="438" y="218" width="82" height="102"/>
+  <text class="block-title" text-anchor="middle" x="479" y="261">Buffer</text>
+  <text class="label" text-anchor="middle" x="479" y="287">(X)</text>
+
+  <rect class="sub" x="575" y="145" width="180" height="45"/>
+  <text class="block-title" text-anchor="middle" x="665" y="174">Buffer (W)</text>
+  <rect class="sub" x="777" y="145" width="110" height="45"/>
+  <text class="small" text-anchor="middle" x="832" y="173">Inverse HT</text>
+
+  <rect class="sub" x="548" y="205" width="270" height="135"/>
+  <text class="block-title" text-anchor="middle" x="683" y="266">Flattened Systolic Array</text>
+  <text class="small" text-anchor="middle" x="683" y="294">BLEN × MLEN</text>
+  <g fill="none" stroke="#d5d1c5" stroke-width="2">
+    <rect x="574" y="223" width="35" height="28"/><rect x="620" y="223" width="35" height="28"/>
+    <rect x="666" y="223" width="35" height="28"/><rect x="712" y="223" width="35" height="28"/>
+    <rect x="758" y="223" width="35" height="28"/>
+  </g>
+  <rect class="sub" x="842" y="218" width="48" height="102"/>
+  <text class="small" text-anchor="middle" transform="translate(871 269) rotate(-90)">Adder</text>
+  <rect class="sub" x="915" y="218" width="48" height="102"/>
+  <text class="small" text-anchor="middle" transform="translate(944 269) rotate(-90)">Buffer Y</text>
+  <path d="M520 269h28" class="black-line"/>
+  <path d="M665 190v15" class="black-line"/>
+  <path d="M818 269h24" class="black-line"/>
+  <path d="M890 269h25" class="black-line"/>
+
+  <!-- L-Compute is attached to Matrix result writeback, not a separate datapath. -->
+  <rect class="ext" x="1040" y="178" width="125" height="170"/>
+  <text class="block-title teal" text-anchor="middle" x="1102" y="210">L-Compute</text>
+  <text class="small teal" text-anchor="middle" x="1102" y="234">L_SCATTER_M</text>
+  <line x1="1058" y1="246" x2="1147" y2="246" stroke="#007f7b" stroke-width="1.5"/>
+  <text class="small" text-anchor="middle" x="1102" y="270">64-value FIFO</text>
+  <text class="small" text-anchor="middle" x="1102" y="294">scatter-on-write</text>
+  <text class="small" text-anchor="middle" x="1102" y="320">MAMBA_SKEW</text>
+  <path d="M963 280h77" class="teal-line"/>
+
+  <!-- Existing Vector Unit -->
+  <rect class="unit" x="410" y="445" width="610" height="255"/>
+  <text class="unit-title" x="432" y="479">Vector Unit</text>
+  <text class="small" x="432" y="502">RMSNorm / gate · softmax / Top-K · residual / elementwise</text>
+  <rect class="sub" x="435" y="535" width="48" height="120"/>
+  <text class="small" text-anchor="middle" transform="translate(464 595) rotate(-90)">Scalar Buffer</text>
+  <rect class="sub" x="515" y="525" width="190" height="140"/>
+  <text class="block-title" text-anchor="middle" x="610" y="600">Reduction Unit</text>
+  <rect class="sub" x="730" y="525" width="190" height="140"/>
+  <text class="block-title" text-anchor="middle" x="825" y="587">Elementwise Unit</text>
+  <text class="small" text-anchor="middle" x="825" y="614">gate · norm · activation</text>
+  <rect class="sub" x="945" y="535" width="48" height="120"/>
+  <text class="small" text-anchor="middle" transform="translate(974 595) rotate(-90)">Vector Buffer</text>
+  <path d="M483 595h32" class="blue-line"/>
+  <path d="M705 595h25" class="green-line"/>
+  <path d="M920 595h25" class="green-line"/>
+
+  <!-- X_STATE owns only Conv1D, recurrence, and C reduction. -->
+  <rect class="ext" x="1040" y="470" width="125" height="195"/>
+  <text class="block-title teal" text-anchor="middle" x="1102" y="502">State Engine</text>
+  <text class="small teal" text-anchor="middle" x="1102" y="526">X_STATE</text>
+  <line x1="1058" y1="538" x2="1147" y2="538" stroke="#007f7b" stroke-width="1.5"/>
+  <text class="small" text-anchor="middle" x="1102" y="563">Conv1D + dt/exp</text>
+  <text class="small" text-anchor="middle" x="1102" y="589">state update</text>
+  <text class="small" text-anchor="middle" x="1102" y="615">C reduction</text>
+  <text class="small" text-anchor="middle" x="1102" y="641">B/C broadcast</text>
+
+  <!-- On-chip memory column -->
+  <rect class="mem" x="1190" y="135" width="180" height="225"/>
+  <text class="unit-title" text-anchor="middle" x="1280" y="169">Matrix SRAM</text>
+  <text class="small" text-anchor="middle" x="1280" y="191">1R / 1W</text>
+  <rect x="1210" y="211" width="140" height="55" fill="#f4f9fb" stroke="#295064" stroke-width="1.5"/>
+  <text class="block-title" text-anchor="middle" x="1280" y="236">MX Store</text>
+  <text class="small" text-anchor="middle" x="1280" y="256">weights / KV</text>
+  <rect x="1210" y="283" width="140" height="58" fill="#e5f5f2" stroke="#007f7b" stroke-width="1.7" stroke-dasharray="6 4"/>
+  <text class="small teal" text-anchor="middle" x="1280" y="305" font-weight="700">16-bank region</text>
+  <text class="small" text-anchor="middle" x="1280" y="327">x · B · C · dt</text>
+
+  <rect class="mem" x="1190" y="405" width="180" height="210"/>
+  <text class="unit-title" text-anchor="middle" x="1280" y="439">Vector SRAM</text>
+  <text class="small" text-anchor="middle" x="1280" y="461">2RW</text>
+  <rect x="1210" y="480" width="140" height="77" fill="#f4f9fb" stroke="#295064" stroke-width="1.5"/>
+  <text class="block-title" text-anchor="middle" x="1280" y="508">FP Store</text>
+  <text class="small" text-anchor="middle" x="1280" y="531">hidden · gate · output</text>
+  <text class="small" text-anchor="middle" x="1280" y="550">BF16 baseline</text>
+  <rect x="1210" y="570" width="140" height="28" fill="#f4f9fb" stroke="#295064" stroke-width="1.3"/>
+  <text class="small" text-anchor="middle" x="1280" y="589">Quantize / Dequantize</text>
+
+  <rect class="state-mem" x="1190" y="650" width="180" height="137"/>
+  <text class="block-title amber" text-anchor="middle" x="1280" y="680">Persistent State SRAM</text>
+  <text class="small" text-anchor="middle" x="1280" y="706">FP32 recurrent state</text>
+  <text class="small" text-anchor="middle" x="1280" y="729">64 heads × 64 × 128</text>
+  <text class="tiny" text-anchor="middle" x="1280" y="752">PRELOAD / COMMIT / EVICT</text>
+  <text class="tiny" text-anchor="middle" x="1280" y="775">48.16 MiB / request (23 layers)</text>
+
+  <!-- Uncluttered data paths around the compute/memory boundary -->
+  <path d="M1165 312h45" class="teal-line"/>
+  <path d="M1210 312h-28v143h-80v15" class="teal-line"/>
+  <path d="M1165 652h18v-112h27" class="teal-line"/>
+  <path d="M1190 465h-165v130h-32" class="green-bi"/>
+  <path d="M963 280h35v92h177v146h15" class="green-line"/>
+  <text class="small" x="1008" y="365">normal result + gate</text>
+  <path d="M1190 405h-15H479v-85" class="green-line"/>
+  <text class="small" x="690" y="398">activation feed</text>
+  <path d="M1165 620h12v98h13" class="amber-bi"/>
+
+  <!-- HBM controller -->
+  <rect class="host" x="1410" y="155" width="220" height="570"/>
+  <text class="unit-title" text-anchor="middle" x="1520" y="190">HBM Controller</text>
+  <rect class="sub" x="1432" y="215" width="176" height="130"/>
+  <text class="block-title" text-anchor="middle" x="1520" y="250">Matrix Read</text>
+  <text class="small" text-anchor="middle" x="1520" y="278">weights and KV</text>
+  <text class="small" text-anchor="middle" x="1520" y="302">kept in MX format</text>
+  <rect class="sub" x="1432" y="378" width="176" height="130"/>
+  <text class="block-title" text-anchor="middle" x="1520" y="413">Vector Read/Write</text>
+  <text class="small" text-anchor="middle" x="1520" y="441">activations and results</text>
+  <text class="small" text-anchor="middle" x="1520" y="465">quantize / dequantize</text>
+  <rect x="1432" y="541" width="176" height="140" fill="#fff2da" stroke="#aa6a00" stroke-width="1.7" stroke-dasharray="6 4"/>
+  <text class="block-title amber" text-anchor="middle" x="1520" y="578">State DMA</text>
+  <text class="small" text-anchor="middle" x="1520" y="606">resident fill / commit</text>
+  <text class="small" text-anchor="middle" x="1520" y="630">streaming fallback</text>
+  <text class="small" text-anchor="middle" x="1520" y="654">capacity-aware transfer</text>
+  <path d="M1432 280h-62" class="green-line"/>
+  <path d="M1432 443h-62" class="green-bi"/>
+  <path d="M1432 611h-42v108h-20" class="amber-bi"/>
+
+  <!-- External HBM link -->
+  <rect class="host" x="1715" y="300" width="62" height="250"/>
+  <text class="block-title" text-anchor="middle" transform="translate(1753 425) rotate(-90)">HBM TileLink</text>
+  <path d="M1608 280h62v80h45" class="green-bi"/>
+  <path d="M1608 443h107" class="green-bi"/>
+  <path d="M1608 611h62v-108h45" class="amber-bi"/>
+
+  <!-- Visual key for additions, without implementation-status prose inside the figure -->
+  <rect x="138" y="760" width="20" height="16" class="ext"/>
+  <text class="small" x="170" y="774">Mamba-2 extension</text>
+  <text class="small" x="410" y="774">Existing PLENA Matrix/Vector units are reused for projections, gate/norm, Attention, and MoE.</text>
+</svg>

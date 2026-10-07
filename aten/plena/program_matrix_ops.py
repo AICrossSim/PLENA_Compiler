@@ -821,6 +821,21 @@ class ProgramMatrixOpsMixin:
 
         # When rows is not a multiple of mlen the hardware still operates on
         # full tiles; only the first `rows` rows contain valid output.
+        if self.compact_matrix_loops and rows <= self.blen and matrix_view_descriptor is None and output_layout is None:
+            return self._compact_row_major_linear_projection(
+                input_var,
+                weight_var,
+                output_col_offset=0,
+                output_features=out_features,
+                name=name,
+                physical_shape=(physical_rows, physical_out_features),
+                matrix_precision=matrix_precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
+            )
+
+        # When rows is not a multiple of mlen the hardware still operates on
+        # full tiles; only the first `rows` rows contain valid output.
         output = self.alloc(
             name,
             rows,
@@ -954,6 +969,15 @@ class ProgramMatrixOpsMixin:
         num_col_blocks = math.ceil(physical_out_features / mlen)
         num_k_tiles = math.ceil(physical_k / mlen)
         max_tiles = self.mram_tile_capacity if max_k_tiles is None else max_k_tiles
+
+        if self.compact_matrix_loops and rows <= self.blen:
+            return self._compact_row_major_stream_k_accum_projection(
+                input_var,
+                weight_var,
+                name=name,
+                physical_shape=(physical_rows, physical_out_features),
+                max_k_tiles=max_tiles,
+            )
 
         output = self.alloc(
             name,
@@ -1276,6 +1300,19 @@ class ProgramMatrixOpsMixin:
                 f"logical output {(rows, output_features)}"
             )
 
+        if self.compact_matrix_loops and rows <= self.blen:
+            return self._compact_row_major_linear_projection(
+                input_var,
+                weight_var,
+                output_col_offset=output_col_offset,
+                output_features=output_features,
+                name=name,
+                physical_shape=(physical_rows, physical_out_features),
+                matrix_precision=matrix_precision,
+                set_scale=set_scale,
+                hbm_element_bytes=hbm_element_bytes,
+            )
+
         output = self.alloc(
             name,
             rows,
@@ -1451,6 +1488,494 @@ class ProgramMatrixOpsMixin:
             num_rows=rows,
             num_cols=src.shape[1],
         )
+
+    def _compact_projection_vram_addr(
+        self,
+        matrix: VRAMMatrixVar,
+        *,
+        row_idx: int = 0,
+        tile_col_idx: int = 0,
+    ) -> int:
+        """Return one logical-row address in the column-major VRAM tile layout."""
+        row_block = row_idx // self.mlen
+        row_in_block = row_idx % self.mlen
+        return (
+            self.get_vram_tile_addr(matrix.name, row_block, tile_col_idx)
+            + row_in_block * self.mlen
+        )
+
+    def _compact_row_major_linear_projection(
+        self,
+        input_var: VRAMMatrixVar,
+        weight_var: InputVar,
+        *,
+        output_col_offset: int,
+        output_features: int,
+        name: str,
+        physical_shape: tuple[int, int],
+        matrix_precision: str | int,
+        set_scale: bool,
+        hbm_element_bytes: int,
+    ) -> VRAMMatrixVar:
+        """Emit a size-bounded decode GEMM with runtime output-column loops.
+
+        K chunks stay static because each chunk has at most the MRAM tile
+        capacity. The potentially very wide N traversal is represented by a
+        ``C_LOOP``. HBM keeps the existing row-major tensor format, so this is
+        binary compaction rather than a new weight layout.
+        """
+        input_var = self._require_var(input_var, VRAMMatrixVar, "input_var")
+        weight_var = self._require_var(weight_var, InputVar, "weight_var")
+        rows, _ = input_var.shape
+        physical_rows, physical_out_features = physical_shape
+        if rows < 1 or rows > self.blen:
+            raise NotImplementedError(
+                f"{name}: compact Matrix loops support decode rows in [1, BLEN={self.blen}], got {rows}"
+            )
+        if physical_rows < rows or physical_rows > self.mlen:
+            raise ValueError(
+                f"{name}: physical rows must cover the logical rows and fit one MLEN tile, "
+                f"got logical={rows}, physical={physical_rows}, MLEN={self.mlen}"
+            )
+        if hbm_element_bytes not in (1, 2):
+            raise ValueError(
+                f"{name}: compact Matrix loops support 1- or 2-byte HBM elements, "
+                f"got {hbm_element_bytes}"
+            )
+        if output_col_offset < 0 or output_col_offset % self.mlen:
+            raise ValueError(
+                f"{name}: output_col_offset={output_col_offset} must be a non-negative MLEN multiple"
+            )
+        if output_features <= 0 or output_features % self.mlen:
+            raise ValueError(
+                f"{name}: output_features={output_features} must be a positive MLEN multiple"
+            )
+        if physical_out_features < output_features or physical_out_features % self.mlen:
+            raise ValueError(
+                f"{name}: physical output width={physical_out_features} must cover "
+                f"{output_features} and be MLEN-aligned"
+            )
+        if output_col_offset + output_features > weight_var.physical_shape[1]:
+            raise ValueError(
+                f"{name}: requested columns [{output_col_offset}, "
+                f"{output_col_offset + output_features}) exceed weight physical width "
+                f"{weight_var.physical_shape[1]}"
+            )
+
+        physical_k = max(input_var.physical_shape[1], weight_var.physical_shape[0])
+        weight_rows, weight_cols = weight_var.physical_shape
+        if physical_k != weight_rows or physical_k % self.mlen:
+            raise ValueError(
+                f"{name}: compact Matrix K must be identical and MLEN-aligned across "
+                f"activation/weight storage, got activation={input_var.physical_shape[1]}, "
+                f"weight={weight_rows}"
+            )
+        if weight_cols % self.mlen:
+            raise ValueError(
+                f"{name}: weight physical width={weight_cols} must be MLEN-aligned"
+            )
+        data_plane_bytes = weight_rows * weight_cols * hbm_element_bytes
+        if data_plane_bytes > 1 << 32:
+            raise NotImplementedError(
+                f"{name}: one row-major weight data plane must fit the 32-bit H_PREFETCH_M "
+                f"offset, got {data_plane_bytes} bytes"
+            )
+        row_stride_bytes = weight_cols * hbm_element_bytes
+        if row_stride_bytes >= 1 << 32:
+            raise ValueError(f"{name}: HBM row stride does not fit 32 bits")
+        if set_scale and weight_rows * weight_cols >= 1 << 32:
+            raise ValueError(f"{name}: MX scale-plane offset does not fit 32 bits")
+
+        self._ensure_vram_sub_matrix_registered(input_var)
+        self._ensure_hbm_sub_matrix_registered(weight_var)
+        output = self.alloc(
+            name,
+            rows,
+            output_features,
+            strict=False,
+            physical_shape=physical_shape,
+        )
+        self._ensure_vram_sub_matrix_registered(output)
+
+        num_k_tiles = physical_k // self.mlen
+        num_col_tiles = output_features // self.mlen
+        chunks = tuple(_iter_k_chunks(num_k_tiles, self.mram_tile_capacity))
+        scratch = None
+        if len(chunks) > 1:
+            scratch = self.alloc(
+                f"{name}_compact_k_scratch",
+                rows=rows,
+                cols=self.mlen,
+                strict=False,
+                physical_shape=(physical_rows, self.mlen),
+            )
+            self._ensure_vram_sub_matrix_registered(scratch)
+
+        # VRAM/MRAM addresses are element addresses; HBM offsets are bytes.
+        input_stride = input_var.physical_shape[0] * self.mlen
+        output_stride = output.physical_shape[0] * self.mlen
+        block_size = self.mlen * self.mlen
+        precision = _matrix_precision_code(matrix_precision)
+
+        regs = self._reg.allocate_gp(12)
+        (
+            gp_col_loop,
+            gp_micro_loop,
+            gp_k_loop,
+            gp_col_offset,
+            gp_prefetch_offset,
+            gp_mram,
+            gp_act,
+            gp_mat,
+            gp_target,
+            gp_target_base,
+            gp_accum,
+            gp_work,
+        ) = regs
+        addr_reg = self._reg.allocate_addr(1)[0]
+        try:
+            super().reset_mram()
+            asm = IsaBuilder().comment(
+                f"compact row-major Matrix projection {name}: "
+                f"Ktiles={num_k_tiles}, Ntiles={num_col_tiles}"
+            )
+            asm.extend(load_large_int(gp_work, weight_var.hbm_addr >> 32))
+            asm.extend(
+                load_large_int(gp_prefetch_offset, weight_var.hbm_addr & 0xFFFF_FFFF)
+            )
+            asm.instr(
+                "C_SET_ADDR_REG",
+                areg(addr_reg),
+                gp(gp_work),
+                gp(gp_prefetch_offset),
+            )
+            if set_scale:
+                asm.extend(load_large_int(gp_work, weight_rows * weight_cols))
+                asm.instr("C_SET_SCALE_REG", gp(gp_work))
+            asm.extend(load_large_int(gp_work, row_stride_bytes))
+            asm.instr("C_SET_STRIDE_REG", gp(gp_work))
+
+            first_col_offset = output_col_offset * hbm_element_bytes
+            for chunk_index, (k_start, k_count) in enumerate(chunks):
+                target = output if chunk_index == 0 else scratch
+                assert target is not None
+                asm.comment(
+                    f"compact K chunk {chunk_index}: tiles [{k_start}, {k_start + k_count})"
+                )
+                asm.extend(load_large_int(gp_col_offset, first_col_offset))
+                if chunk_index == 0:
+                    asm.extend(
+                        load_large_int(
+                            gp_target_base,
+                            self._compact_projection_vram_addr(output),
+                        )
+                    )
+                else:
+                    asm.extend(
+                        load_large_int(
+                            gp_target_base,
+                            self._compact_projection_vram_addr(target),
+                        )
+                    )
+                    asm.extend(
+                        load_large_int(
+                            gp_accum,
+                            self._compact_projection_vram_addr(output),
+                        )
+                    )
+
+                asm.instr("C_LOOP_START", gp(gp_col_loop), num_col_tiles)
+                for local_k, row_idx in enumerate(range(k_start, k_start + k_count)):
+                    row_base = row_idx * self.mlen * row_stride_bytes
+                    asm.extend(load_large_int(gp_prefetch_offset, row_base))
+                    asm.instr(
+                        "S_ADD_INT",
+                        gp(gp_prefetch_offset),
+                        gp(gp_prefetch_offset),
+                        gp(gp_col_offset),
+                    )
+                    asm.extend(load_large_int(gp_mram, local_k * block_size))
+                    asm.instr(
+                        "H_PREFETCH_M",
+                        gp(gp_mram),
+                        gp(gp_prefetch_offset),
+                        areg(addr_reg),
+                        1,
+                        precision,
+                    )
+
+                asm.instr("S_ADDI_INT", gp(gp_mram), gp(0), 0)
+                asm.instr("S_ADDI_INT", gp(gp_target), gp(gp_target_base), 0)
+                asm.instr(
+                    "C_LOOP_START",
+                    gp(gp_micro_loop),
+                    self.mlen // self.blen,
+                )
+                asm.extend(
+                    load_large_int(
+                        gp_act,
+                        self._compact_projection_vram_addr(
+                            input_var,
+                            tile_col_idx=k_start,
+                        ),
+                    )
+                )
+                asm.instr("S_ADDI_INT", gp(gp_mat), gp(gp_mram), 0)
+                asm.instr("C_LOOP_START", gp(gp_k_loop), k_count)
+                asm.instr("M_MM", 0, gp(gp_mat), gp(gp_act))
+                asm.instr("S_ADDI_INT", gp(gp_act), gp(gp_act), input_stride)
+                asm.instr("S_ADDI_INT", gp(gp_mat), gp(gp_mat), block_size)
+                asm.instr("C_LOOP_END", gp(gp_k_loop))
+                asm.instr("M_MM_WO", gp(gp_target), gp(0), 0)
+                asm.instr(
+                    "S_ADDI_INT",
+                    gp(gp_mram),
+                    gp(gp_mram),
+                    self.blen * self.mlen,
+                )
+                asm.instr("S_ADDI_INT", gp(gp_target), gp(gp_target), self.blen)
+                asm.instr("C_LOOP_END", gp(gp_micro_loop))
+
+                if chunk_index:
+                    asm.instr("S_ADDI_INT", gp(gp_target), gp(gp_target_base), 0)
+                    asm.instr("C_LOOP_START", gp(gp_k_loop), rows)
+                    asm.instr(
+                        "V_ADD_VV",
+                        gp(gp_accum),
+                        gp(gp_accum),
+                        gp(gp_target),
+                        0,
+                    )
+                    asm.instr("S_ADDI_INT", gp(gp_accum), gp(gp_accum), self.mlen)
+                    asm.instr("S_ADDI_INT", gp(gp_target), gp(gp_target), self.mlen)
+                    asm.instr("C_LOOP_END", gp(gp_k_loop))
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_accum),
+                        gp(gp_accum),
+                        output_stride - rows * self.mlen,
+                    )
+                else:
+                    asm.instr(
+                        "S_ADDI_INT",
+                        gp(gp_target_base),
+                        gp(gp_target_base),
+                        output_stride,
+                    )
+
+                asm.instr(
+                    "S_ADDI_INT",
+                    gp(gp_col_offset),
+                    gp(gp_col_offset),
+                    self.mlen * hbm_element_bytes,
+                )
+                asm.instr("C_LOOP_END", gp(gp_col_loop))
+
+            self._emit(asm)
+        finally:
+            self._reg.free_gp(regs)
+            self._reg.free_addr([addr_reg])
+        if scratch is not None:
+            self.free_tensor(scratch)
+        return output
+
+    def _compact_row_major_stream_k_accum_projection(
+        self,
+        input_var: VRAMMatrixVar,
+        weight_var: InputVar,
+        *,
+        name: str,
+        physical_shape: tuple[int, int],
+        max_k_tiles: int,
+    ) -> VRAMMatrixVar:
+        """Compact BF16 decode GEMM that writes once after all K chunks.
+
+        Router logits are sensitive to a BF16 round-trip between K chunks.
+        This lowering reloads MRAM for each output micro-column but preserves
+        the Matrix FP32 accumulator until every K tile has contributed. Both N
+        and the output micro-column traversal are hardware loops.
+        """
+        input_var = self._require_var(input_var, VRAMMatrixVar, "input_var")
+        weight_var = self._require_var(weight_var, InputVar, "weight_var")
+        rows, _ = input_var.shape
+        out_features = weight_var.shape[1]
+        physical_rows, physical_out_features = physical_shape
+        if rows < 1 or rows > self.blen:
+            raise NotImplementedError(
+                f"{name}: compact stream-K projection supports rows in "
+                f"[1, BLEN={self.blen}], got {rows}"
+            )
+        if physical_rows < rows or physical_rows > self.mlen:
+            raise ValueError(
+                f"{name}: physical rows={physical_rows} must cover {rows} rows "
+                f"and fit one MLEN tile"
+            )
+        if physical_out_features < out_features or physical_out_features % self.mlen:
+            raise ValueError(
+                f"{name}: physical output width={physical_out_features} must cover "
+                f"{out_features} and be MLEN-aligned"
+            )
+        if max_k_tiles <= 0 or max_k_tiles > self.mram_tile_capacity:
+            raise ValueError(
+                f"{name}: max_k_tiles={max_k_tiles} must be in "
+                f"[1, MRAM capacity={self.mram_tile_capacity}]"
+            )
+
+        weight_rows, weight_cols = weight_var.physical_shape
+        if input_var.physical_shape[1] != weight_rows or weight_rows % self.mlen:
+            raise ValueError(
+                f"{name}: activation K={input_var.physical_shape[1]} and weight "
+                f"K={weight_rows} must match and be MLEN-aligned"
+            )
+        if weight_cols != physical_out_features:
+            raise ValueError(
+                f"{name}: compact stream-K requires output storage to match the "
+                f"weight physical width, got output={physical_out_features}, weight={weight_cols}"
+            )
+        data_plane_bytes = weight_rows * weight_cols * 2
+        if data_plane_bytes > 1 << 32:
+            raise NotImplementedError(
+                f"{name}: BF16 weight data plane exceeds the 32-bit prefetch offset"
+            )
+        row_stride_bytes = weight_cols * 2
+
+        self._ensure_vram_sub_matrix_registered(input_var)
+        self._ensure_hbm_sub_matrix_registered(weight_var)
+        output = self.alloc(
+            name,
+            rows,
+            out_features,
+            strict=False,
+            physical_shape=physical_shape,
+        )
+        self._ensure_vram_sub_matrix_registered(output)
+
+        num_k_tiles = weight_rows // self.mlen
+        num_col_tiles = weight_cols // self.mlen
+        chunks = tuple(_iter_k_chunks(num_k_tiles, max_k_tiles))
+        input_stride = input_var.physical_shape[0] * self.mlen
+        output_stride = output.physical_shape[0] * self.mlen
+        block_size = self.mlen * self.mlen
+
+        regs = self._reg.allocate_gp(12)
+        (
+            gp_col_loop,
+            gp_micro_loop,
+            gp_k_loop,
+            gp_col_offset,
+            gp_prefetch_offset,
+            gp_mram,
+            gp_act,
+            gp_mat,
+            gp_target,
+            gp_target_base,
+            gp_micro_offset,
+            gp_work,
+        ) = regs
+        addr_reg = self._reg.allocate_addr(1)[0]
+        try:
+            super().reset_mram()
+            asm = IsaBuilder().comment(
+                f"compact BF16 stream-K Matrix projection {name}: "
+                f"Ktiles={num_k_tiles}, Ntiles={num_col_tiles}"
+            )
+            asm.extend(load_large_int(gp_work, weight_var.hbm_addr >> 32))
+            asm.extend(
+                load_large_int(gp_prefetch_offset, weight_var.hbm_addr & 0xFFFF_FFFF)
+            )
+            asm.instr(
+                "C_SET_ADDR_REG",
+                areg(addr_reg),
+                gp(gp_work),
+                gp(gp_prefetch_offset),
+            )
+            asm.extend(load_large_int(gp_work, row_stride_bytes))
+            asm.instr("C_SET_STRIDE_REG", gp(gp_work))
+            asm.instr("S_ADDI_INT", gp(gp_col_offset), gp(0), 0)
+            asm.extend(
+                load_large_int(
+                    gp_target_base,
+                    self._compact_projection_vram_addr(output),
+                )
+            )
+            asm.instr("C_LOOP_START", gp(gp_col_loop), num_col_tiles)
+            asm.instr("S_ADDI_INT", gp(gp_micro_offset), gp(0), 0)
+            asm.instr("S_ADDI_INT", gp(gp_target), gp(gp_target_base), 0)
+            asm.instr(
+                "C_LOOP_START",
+                gp(gp_micro_loop),
+                self.mlen // self.blen,
+            )
+
+            for chunk_index, (k_start, k_count) in enumerate(chunks):
+                asm.comment(
+                    f"stream-K chunk {chunk_index}: tiles [{k_start}, {k_start + k_count})"
+                )
+                for local_k, row_idx in enumerate(range(k_start, k_start + k_count)):
+                    row_base = row_idx * self.mlen * row_stride_bytes
+                    asm.extend(load_large_int(gp_prefetch_offset, row_base))
+                    asm.instr(
+                        "S_ADD_INT",
+                        gp(gp_prefetch_offset),
+                        gp(gp_prefetch_offset),
+                        gp(gp_col_offset),
+                    )
+                    asm.extend(load_large_int(gp_mram, local_k * block_size))
+                    asm.instr(
+                        "H_PREFETCH_M",
+                        gp(gp_mram),
+                        gp(gp_prefetch_offset),
+                        areg(addr_reg),
+                        1,
+                        1,
+                    )
+
+                asm.extend(
+                    load_large_int(
+                        gp_act,
+                        self._compact_projection_vram_addr(
+                            input_var,
+                            tile_col_idx=k_start,
+                        ),
+                    )
+                )
+                asm.instr("S_ADDI_INT", gp(gp_mat), gp(gp_micro_offset), 0)
+                asm.instr("C_LOOP_START", gp(gp_k_loop), k_count)
+                asm.instr("M_MM", 0, gp(gp_mat), gp(gp_act))
+                asm.instr("S_ADDI_INT", gp(gp_act), gp(gp_act), input_stride)
+                asm.instr("S_ADDI_INT", gp(gp_mat), gp(gp_mat), block_size)
+                asm.instr("C_LOOP_END", gp(gp_k_loop))
+
+            asm.instr("M_MM_WO", gp(gp_target), gp(0), 0)
+            asm.instr(
+                "S_ADDI_INT",
+                gp(gp_micro_offset),
+                gp(gp_micro_offset),
+                self.blen * self.mlen,
+            )
+            asm.instr("S_ADDI_INT", gp(gp_target), gp(gp_target), self.blen)
+            asm.instr("C_LOOP_END", gp(gp_micro_loop))
+            asm.instr(
+                "S_ADDI_INT",
+                gp(gp_col_offset),
+                gp(gp_col_offset),
+                self.mlen * 2,
+            )
+            asm.instr(
+                "S_ADDI_INT",
+                gp(gp_target_base),
+                gp(gp_target_base),
+                output_stride,
+            )
+            asm.instr("C_LOOP_END", gp(gp_col_loop))
+            self._emit(asm)
+        finally:
+            self._reg.free_gp(regs)
+            self._reg.free_addr([addr_reg])
+        return output
+
+
+
 
 
 

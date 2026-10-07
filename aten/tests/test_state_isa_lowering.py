@@ -8,6 +8,9 @@ from aten.kda.scheduler import KdaScheduleConfig, KimiK3KdaScheduler
 from aten.mamba.scheduler import MambaScheduleConfig, Nemotron3MambaScheduler, SchedulePhase
 from aten.state.isa_lowering import (
     KdaLayerMemoryMap,
+    STATE_FPRAM_BACKUP_EPS,
+    STATE_FPRAM_BACKUP_ONE,
+    STATE_FPRAM_BACKUP_RECIPROCAL,
     lower_kda_trace_to_existing_isa,
     lower_mamba_trace_to_existing_isa,
 )
@@ -61,7 +64,14 @@ def test_physical_memory_map_fits_the_configured_vector_sram() -> None:
         memory.normalization_scratch_vram_addr + 64 <= config.vector_sram_elements
         for memory in memories
     )
-    assert program.fpram_constants == ((1, 1.0e-5), (2, 1.0 / 512.0), (5, 1.0))
+    assert program.fpram_constants == (
+        (STATE_FPRAM_BACKUP_EPS, 1.0e-5),
+        (STATE_FPRAM_BACKUP_RECIPROCAL, 1.0 / 512.0),
+        (STATE_FPRAM_BACKUP_ONE, 1.0),
+    )
+    assert program.assembly.count(
+        "restore state constants after shared Attention FPRAM workspace"
+    ) == 23
 
 
 def test_real_kda_layer_lowers_all_official_projections_to_existing_isa(tmp_path) -> None:
@@ -83,6 +93,14 @@ def test_real_kda_layer_lowers_all_official_projections_to_existing_isa(tmp_path
     assert program.to_dict()["descriptor_count"] == 1
     assert program.instruction_count < 10_000
     assert assembly.count("rolled per-head KDA RMSNorm") == 1
+    assert assembly.count(
+        "restore state constants after shared Attention FPRAM workspace"
+    ) == 1
+    assert program.fpram_constants == (
+        (STATE_FPRAM_BACKUP_EPS, 1.0e-5),
+        (STATE_FPRAM_BACKUP_RECIPROCAL, 1.0 / 128.0),
+        (STATE_FPRAM_BACKUP_ONE, 1.0),
+    )
     for stage in (
         "KDA_Q_PROJECTION",
         "KDA_K_PROJECTION",
