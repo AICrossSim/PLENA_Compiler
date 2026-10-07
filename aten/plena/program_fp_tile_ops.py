@@ -631,25 +631,13 @@ class ProgramFPTileOpsMixin:
                 f"vram_fill_zero rows out of bounds for {matrix.name}: shape={matrix.shape}, rows={resolved_rows}"
             )
 
-        # A real zero copy must clear NaNs as well. Initialize one private,
-        # counted FPRAM row per program and reuse it; do not rebuild it for
-        # every scratch clear inside an unrolled kernel.
-        zero_row = getattr(self, "_vram_zero_fpram_row", None)
-        if zero_row is None or self._fp_vars.get(zero_row.name) is not zero_row:
-            # Report builders may construct the base ISA allocator first and
-            # attach high-level registries without invoking this mixin's full
-            # constructor. The row still uses the real finite FPRAM allocator.
-            self._scratch_serial = getattr(self, "_scratch_serial", 0) + 1
-            zero_row = self.fp_var(
-                f"_vram_true_zero_row_{self._scratch_serial}", size=self.mlen
-            )
-            super().fpvar_zero_asm(zero_row.address, self.mlen)
-            self._vram_zero_fpram_row = zero_row
+        # Shift the whole row out through the existing zero-fill shifter.
+        # Unlike multiply-by-zero this clears NaNs/Inf, and it needs no
+        # VLEN-wide FPRAM allocation (VLEN may exceed all scalar SRAM).
         num_col_blocks = (cols + self.mlen - 1) // self.mlen
         for col_block in range(num_col_blocks):
             super().vram_fill_zero(
                 matrix.name, resolved_rows, tile_col_idx=col_block,
-                zero_row_addr=zero_row.address,
             )
 
 

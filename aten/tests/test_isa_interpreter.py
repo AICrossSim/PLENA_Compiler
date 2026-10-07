@@ -30,6 +30,35 @@ def _machine() -> Machine:
     return Machine(vlen=VLEN, vram_words=256, fpram_words=64)
 
 
+def test_vector_shift_copies_unshifted_lanes_and_zero_fills_the_prefix():
+    m = _machine()
+    m.vram[4:8] = [1.0, float("nan"), 3.0, 4.0]
+    m.run("S_ADDI_INT gp1, gp0, 12\nS_ADDI_INT gp2, gp0, 4\n"
+          "S_ADDI_INT gp3, gp0, 2\nV_SHFT_V gp1, gp2, gp3\n")
+    assert m.vram[12:15] == [0.0, 0.0, 1.0]
+    assert m.vram[15] != m.vram[15]  # The source NaN is copied, not coerced.
+
+
+@pytest.mark.parametrize("width", [4, 512, 2048])
+def test_true_zero_fill_clears_nan_inf_without_scalar_sram_scratch(width):
+    from compiler.aten.plena import PlenaCompiler
+
+    p = PlenaCompiler(mlen=width, blen=1, vram_total_size=4 * width)
+    matrix = p.alloc("zero_target", 2, width, strict=False)
+    fp_before = p.fpram_allocator.next_free
+    p.vram_fill_zero(matrix, rows=[1])
+    assert p.fpram_allocator.next_free == fp_before
+    m = Machine(vlen=width, vram_words=4 * width, fpram_words=512)
+    base = p.get_vram_layout(matrix.name).vram_base_addr
+    m.vram[base:base + width] = [7.0] * width
+    m.vram[base + width:base + 2 * width] = [float("nan")] * width
+    m.vram[base + width] = float("inf")
+    m.vram[base + width + 1] = -float("inf")
+    m.run(p.get_code())
+    assert m.vram[base:base + width] == [7.0] * width
+    assert m.vram[base + width:base + 2 * width] == [0.0] * width
+
+
 # ---------------------------------------------------------------------------
 # Vector ops -- out of place, so dst and src cannot be confused
 # ---------------------------------------------------------------------------

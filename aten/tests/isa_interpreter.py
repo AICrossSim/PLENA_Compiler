@@ -94,6 +94,7 @@ _OPS = frozenset(
         "S_ADDI_INT",
         "S_LD_FP",
         "V_MUL_VF",
+        "V_SHFT_V",
         "V_FMA_VF",
         "V_ADD_VF",
         "V_SUB_VF",
@@ -214,6 +215,18 @@ class Machine:
                     )
                 # Accumulates: dispatch.rs seeds reduce_sum with the current f[rd].
                 self._set_fp(fd, self.fp[fd] + sum(self.vram[src : src + self.vlen]))
+            elif op == "V_SHFT_V":
+                rd, rs1, rs2 = (_reg(arg, "gp") for arg in args)
+                dst, src, shift = self._gp(rd), self._gp(rs1), self._gp(rs2)
+                if src % self.vlen or dst % self.vlen:
+                    raise UnsupportedInstruction("V_SHFT_V addresses must be vector rows")
+                if min(src, dst, shift) < 0 or max(src, dst) + self.vlen > len(self.vram):
+                    raise UnsupportedInstruction("V_SHFT_V operand is out of bounds")
+                source = self.vram[src : src + self.vlen]
+                values = [0.0] * self.vlen if shift >= self.vlen else (
+                    [0.0] * shift + source[:self.vlen - shift]
+                )
+                self.vram[dst : dst + self.vlen] = values
             elif op.startswith("V_"):
                 self._vector(op, args)
             elif op == "S_MAP_V_FP":

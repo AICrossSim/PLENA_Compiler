@@ -1729,12 +1729,16 @@ class IsaTileRowMixin:
                 )
             )
 
-        gp_regs = self._reg.allocate_gp(2)
-        gp_dst, gp_loop = gp_regs
+        gp_regs = self._reg.allocate_gp(3)
+        gp_dst, gp_loop, gp_shift = gp_regs
         try:
             asm = IsaBuilder().comment(
                 f"=== VRAM Fill Zero: VRAM[{vram_addr}] rows {rows} = 0 ==="
             )
+            # Existing V_SHFT_V writes zero into all shifted-out lanes.
+            # A shift of VLEN clears every lane, including NaN/Inf values,
+            # with no scalar/Vector zero-row storage or new opcode.
+            asm.instr("S_ADDI_INT", gp(gp_shift), gp(0), self.mlen)
             prog = self._row_progression(rows)
 
             if prog is not None:
@@ -1743,14 +1747,14 @@ class IsaTileRowMixin:
                     "S_ADDI_INT", gp(gp_dst), gp(0), vram_addr + row_start * self.mlen
                 )
                 asm.instr("C_LOOP_START", gp(gp_loop), row_count)
-                asm.instr("V_MUL_VF", gp(gp_dst), gp(gp_dst), fp(0), 0)
+                asm.instr("V_SHFT_V", gp(gp_dst), gp(gp_dst), gp(gp_shift))
                 asm.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), row_step * self.mlen)
                 asm.instr("C_LOOP_END", gp(gp_loop))
             else:
                 for row_idx in rows:
                     row_addr = vram_addr + row_idx * self.mlen
                     asm.instr("S_ADDI_INT", gp(gp_dst), gp(0), row_addr)
-                    asm.instr("V_MUL_VF", gp(gp_dst), gp(gp_dst), fp(0), 0)
+                    asm.instr("V_SHFT_V", gp(gp_dst), gp(gp_dst), gp(gp_shift))
 
             return self._emit(asm)
         finally:

@@ -42,6 +42,7 @@ _PHASE0_OPCODES = frozenset(
         "S_ST_FP",
         "S_ADD_FP",
         "V_MUL_VF",
+        "V_SHFT_V",  # Existing zero-fill shifter; no new physical opcode.
         "V_ADD_VF",
         "V_SUB_VF",
         "V_ADD_VV",
