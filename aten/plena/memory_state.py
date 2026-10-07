@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 from compiler.aten.plena.constants import BLEN, MLEN
 from compiler.aten.plena.memory import (
     FPRAMAllocator,
@@ -11,7 +9,6 @@ from compiler.aten.plena.memory import (
     MRAMAllocator,
     MatrixBlockLayout,
     MemoryObjectInfo,
-    SubMatrixInfo,
     VRAMAllocator,
     VRAMMatrixBlockLayout,
     VRAMSubMatrixInfo,
@@ -31,14 +28,11 @@ class MemoryStateMixin:
         hbm_element_width: int = 8,
         hbm_block_size: int = 8,
         hbm_scale_width: int = 8,
-        vram_total_size: int = 0,
     ):
         if mlen <= 0:
             raise ValueError(f"mlen must be > 0, got {mlen}")
         if mram_tile_capacity <= 0:
             raise ValueError(f"mram_tile_capacity must be > 0, got {mram_tile_capacity}")
-        if vram_total_size < 0:
-            raise ValueError(f"vram_total_size must be >= 0, got {vram_total_size}")
 
         self.mlen = mlen
         self.blen = blen
@@ -62,16 +56,9 @@ class MemoryStateMixin:
         # Matrix ops consume VRAM in MLEN x MLEN tiles. Row-only alignment is
         # enough for vector reads/writes, but a matrix result can become the
         # next layer's M_MM input, so keep VRAM allocations tile-aligned.
-        self.vram_allocator = VRAMAllocator(
-            alignment=mlen * mlen,
-            total_size=vram_total_size,
-        )
+        self.vram_allocator = VRAMAllocator(alignment=mlen * mlen)
         self.mram_allocator = MRAMAllocator(mlen=mlen, tile_capacity=mram_tile_capacity)
         self.fpram_allocator = FPRAMAllocator()
-        # At most ``mram_tile_capacity`` HBM tiles can be live in MRAM.  Tracking
-        # those bindings avoids scanning every tile of every registered model
-        # weight on each MRAM reset, which is quadratic for full-model lowering.
-        self._mram_bound_subblocks: list[SubMatrixInfo] = []
 
     def __contains__(self, name: str) -> bool:
         return name in self.hbm_matrices or name in self.vram_matrices or name in self.fpram_matrices
@@ -227,25 +214,32 @@ class MemoryStateMixin:
         self.fpram_matrices.pop(name, None)
         return info
 
-    def hbm_tensor_size(
-        self,
-        num_elements: int,
-        real_data_ratio: float | None = None,
-    ) -> int:
+    def hbm_tensor_size(self, num_elements: int, real_data_ratio: float | None = None, *, hbm_element_bytes: int | None = None) -> int:
         """Row-aligned HBM byte footprint of one tensor: element rows + scale rows,
         each padded up to hbm_row_width, matching the stager (create_mem_for_sim /
         plena_utils.calculate_instr_storage_offset_from_shapes). Replaces the packed
         `int(size * real_data_ratio)` estimate, which ignored per-tensor row padding
         and mislaid every following tensor whenever a region was not naturally
-        row-aligned (weights/K/V read zeros; common at small MLEN)."""
+        row-aligned (weights/K/V read zeros; common at small MLEN).
+
+        Pass `hbm_element_bytes` for a Plain (non-MX) tensor -- a BF16 write-back,
+        for instance -- so the region is sized from the width actually written
+        rather than from the MX layout."""
         row_bits = self.hbm_row_width
-        bytes_per_row = row_bits // 8
-        if real_data_ratio is not None and not math.isclose(
-            real_data_ratio, 1.125
-        ):
+        if hbm_element_bytes is None and real_data_ratio is not None and not math.isclose(real_data_ratio, 1.125):
+            bytes_per_row = row_bits // 8
             payload_bytes = math.ceil(num_elements * real_data_ratio)
             return math.ceil(payload_bytes / bytes_per_row) * bytes_per_row
+        if hbm_element_bytes is not None and hbm_element_bytes * 8 != self.hbm_element_width:
+            # A Plain (non-MX) tensor: no scale stream, and a wider element than the
+            # MX layout assumes. Sizing such a tensor with the MX formula under-reserves
+            # it -- a BF16 write-back needs 2 bytes per element against the MX layout's
+            # 1.125 -- and the overrun silently lands on whatever tensor follows.
+            bytes_per_row = row_bits // 8
+            total_bytes = num_elements * hbm_element_bytes
+            return -(-total_bytes // bytes_per_row) * bytes_per_row
         ew, bs, sw = self.hbm_element_width, self.hbm_block_size, self.hbm_scale_width
+        bytes_per_row = row_bits // 8
         elements_per_row = (row_bits // (ew * bs)) * bs
         element_rows = -(-num_elements // elements_per_row) if elements_per_row > 0 else 0
         num_scales = num_elements // bs
@@ -263,6 +257,7 @@ class MemoryStateMixin:
         strict: bool = True,
     ) -> MatrixBlockLayout:
         """Register an HBM matrix and derive its mlen block layout."""
+        del real_data_ratio  # HBM size is now row-aligned (see hbm_tensor_size)
         rows, cols = shape
         physical_rows, physical_cols = physical_shape or shape
 
@@ -273,7 +268,7 @@ class MemoryStateMixin:
                 raise ValueError(f"Matrix physical cols ({physical_cols}) must be multiple of mlen ({self.mlen})")
 
         size = physical_rows * physical_cols
-        hbm_size = self.hbm_tensor_size(size, real_data_ratio)
+        hbm_size = self.hbm_tensor_size(size)
 
         layout = MatrixBlockLayout(
             name=name,
@@ -340,21 +335,11 @@ class MemoryStateMixin:
             raise KeyError(f"VRAM matrix '{name}' not registered")
         return self.vram_matrices[name].get_sub_block(row_idx, col_idx)
 
-    def bind_mram_subblock(self, sub_block: SubMatrixInfo, mram_addr: int) -> None:
-        """Record one currently resident HBM tile.
-
-        A tile can be rebound before reset, but it must appear only once in the
-        live list so reset work remains bounded by physical MRAM capacity.
-        """
-        if sub_block.mram_addr is None:
-            self._mram_bound_subblocks.append(sub_block)
-        sub_block.mram_addr = mram_addr
-
     def clear_mram_bindings(self) -> None:
-        """Clear only HBM tiles that were actually bound into MRAM."""
-        for sub_block in self._mram_bound_subblocks:
-            sub_block.mram_addr = None
-        self._mram_bound_subblocks.clear()
+        """Clear cached MRAM addresses on all HBM sub-blocks."""
+        for layout in self.hbm_matrices.values():
+            for sub_block in layout.sub_blocks.values():
+                sub_block.mram_addr = None
 
     def reset(self):
         """Reset manager state."""

@@ -300,8 +300,26 @@ def test_packed_skinny_stream_k_probe_compiles_cap8_under_cap4_mram():
     assert code.count("M_MM 0,") == tiles_per_mlen * num_k_tiles
     assert code.count("M_MM_WO") == tiles_per_mlen
     assert "VRAM Sub Projection packed skinny microtile" in code
-    for offset in range(0, max_k_tiles_per_packed_tile * blen, blen):
-        assert f"S_ADDI_INT gp2, gp0, {offset}" in code
+    # Follow actual emitted GP values at each M_MM, then decode the
+    # row-granular Matrix address. The packed slices must select distinct
+    # BLEN-wide columns, not repeat column zero or use unaligned addresses.
+    gp = [0] * 16
+    columns = []
+    for line in code.splitlines():
+        fields = line.replace(",", "").split()
+        if not fields:
+            continue
+        if fields[0] == "S_ADDI_INT":
+            gp[int(fields[1][2:])] = gp[int(fields[2][2:])] + int(fields[3])
+        elif fields[0] == "S_LUI_INT":
+            gp[int(fields[1][2:])] = int(fields[2]) << 12
+        elif fields[0] == "M_MM":
+            offset = gp[int(fields[2][2:])] % (mlen * mlen)
+            assert offset % mlen == 0
+            columns.append(offset // mlen)
+    assert columns == list(range(0, max_k_tiles_per_packed_tile * blen, blen)) * (
+        tiles_per_mlen * num_groups
+    )
 
     print("  PASS test_packed_skinny_stream_k_probe_compiles_cap8_under_cap4_mram")
 

@@ -167,6 +167,7 @@ call into these.
 | `store_act_asm.py` | Activation store-back to HBM |
 | `reset_reg_asm.py` | Register reset helpers |
 | `_imm.py`, `_k_split.py` | Large immediate + K-split utilities |
+| `mamba_conv1d_asm.py` | Mamba-2 causal depthwise conv1d + SSD scan (generator path) |
 
 ### `assembler/` -- ASM text to binary
 
@@ -217,3 +218,38 @@ call into these.
 5. **MXFP8 quantization**: Generator tests that do load weights
    (`_build_hbm_from_hf_weights`) apply quantization, but the standard
    codegen path has no weight awareness at all.
+
+6. **Mamba-2 SSD values are approximate on this path.** The generator emits
+   structurally valid, correctly-costed ISA for the chunked scan, but three
+   pieces are marked `; APPROX:` inline: the `(chunk, chunk)` segment-sum mask is
+   applied per row because no outer-product primitive exists, tail chunks are
+   emitted at full chunk width, and the `dt` pointer is not advanced with `X`.
+   Instruction count and memory traffic are right; the numbers are not. Use the
+   ATen path (`aten/plena/program_ssd.py`, verified bit-exact against
+   `aten/models/mamba2/`) for anything numerical.
+
+7. **The ATen Mamba-2 path is MLEN-bound, and not usable at the target config.**
+   `Mamba2Shape.validate` requires `chunk_size == head_dim == state_size == MLEN`
+   because `tile_row_*` works within one MLEN column block and one `S_MAP_FP_V`
+   moves exactly MLEN scalars. `ssd_decay_mask_v0` additionally holds a whole `cs`
+   row in the 1024-slot FPRAM, capping MLEN near 1017 -- so the SSD prefill path
+   does not compile at the ANALYTIC `MLEN=VLEN=2048` that `plena_settings.toml`
+   declares active. The analytic cost model
+   (`analytic_models/performance/mamba2_model.py`) models the unrestricted shape
+   family instead, so **the analytic numbers and the compilable shapes are
+   currently disjoint**. Lifting this means looping `tile_col_idx` in every
+   emitter and blocking the cs row.
+
+8. **The Mamba spill path needs a Plain BF16 KV precision, which no shipped
+   config provides.** `SPILLED_ACTIVATION` selects the `keyvalue` precision
+   *class*; the width comes from the active TOML, where both KV types are MX-FP8.
+   Under that config `hbm_element_bytes=2` only doubles the address stride while
+   the data still decodes as e4m3 plus a scale stream. Call
+   `ProgramSSDMixin.require_bf16_kv_precision` to turn that into a hard failure,
+   or configure the build's KV types as Plain Fp(8,7). This is the same
+   requirement `linear_projection_bf16` already states.
+
+9. **VRAM residency is not modelled for Mamba.** `_mamba_vram_regions` keeps the
+   whole sequence resident, which exceeds `VECTOR_SRAM_DEPTH * VLEN` even at
+   seq 64. The other generator paths address VRAM the same unbounded way, so this
+   is not new, but a runnable Mamba lowering needs sequence tiling.

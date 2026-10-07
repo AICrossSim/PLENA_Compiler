@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  # Stacked branches target a parent branch rather than main, so the
+  # pull_request trigger below never fires for them. Manual dispatch is what
+  # lets a stacked PR's guards be run before it retargets main.
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    name: Python syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check all Python files parse
+        run: |
+          errors=0
+          for f in $(find . -name '*.py' -not -path './__pycache__/*' -not -path './.omc/*' -not -path './venv/*'); do
+            if ! python3 -c "import ast; ast.parse(open('$f').read())" 2>/dev/null; then
+              echo "SYNTAX ERROR: $f"
+              python3 -c "import ast; ast.parse(open('$f').read())"
+              errors=$((errors + 1))
+            fi
+          done
+          if [ $errors -gt 0 ]; then
+            echo "$errors file(s) with syntax errors"
+            exit 1
+          fi
+          echo "All Python files parse OK"
+
+  # Deliberately not `needs: syntax-check`: this reads sources with `ast` and
+  # finishes in seconds, so there is no reason to queue it behind anything.
+  moe-stage-guard:
+    name: MoE stage-attribution guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # No torch and no checkpoint: the guard only parses source. pyyaml is
+      # needed solely because collecting anything under `aten/tests/` imports
+      # `aten/__init__.py`, which pulls in the op registry.
+      - name: Install dependencies
+        run: pip install pytest pyyaml
+      - name: Run the stage-attribution guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_attribution.py -v
+
+      - name: Run the top-k policy encoding guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_topk_policy_encoding.py -v
+      - name: Run the stage-terminator guard
+        run: PYTHONPATH=. python3 -m pytest aten/tests/test_moe_stage_terminator.py -v
+      - name: Run common-state compiler guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -v -m "not slow" \
+            assembler/tests/test_c_set_topk_reg_encoding.py \
+            assembler/tests/test_l_scatter_m_encoding.py \
+            assembler/tests/test_x_state_encoding.py \
+            aten/tests/test_kda_scheduler.py \
+            aten/tests/test_kimi_k3_full_program.py \
+            aten/tests/test_kimi_k3_hybrid.py \
+            aten/tests/test_layout_contract.py \
+            aten/tests/test_mamba_scheduler.py \
+            aten/tests/test_mla_attention.py \
+            aten/tests/test_mram_binding_tracking.py \
+            aten/tests/test_nemotron3_blocks.py \
+            aten/tests/test_nemotron3_full_program.py \
+            aten/tests/test_nemotron3_hybrid.py \
+            aten/tests/test_projection_scatter.py \
+            aten/tests/test_state_contract.py \
+            aten/tests/test_state_isa_lowering.py \
+            aten/tests/test_state_lowering.py \
+            aten/tests/test_state_memory_image.py \
+            aten/tests/test_state_residency.py
+
+  unit-tests:
+    name: Generator unit tests
+    runs-on: ubuntu-latest
+    needs: syntax-check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers
+      - name: Run parser tests
+        run: |
+          PYTHONPATH=. python3 generator/tests/test_llm_parser.py
+      - name: Run VLM parser tests
+        run: |
+          PYTHONPATH=. python3 generator/tests/test_vlm_parser.py
+      - name: Run embedding codegen test
+        run: |
+          PYTHONPATH=. python3 generator/tests/test_embedding_code_gen.py
+      - name: Run VLM codegen tests
+        run: |
+          PYTHONPATH=. python3 generator/tests/test_vlm_code_gen.py
+      - name: Run batch4 route codegen tests
+        run: |
+          PYTHONPATH=. python3 -m pytest aten/tests/test_batch4_route_codegen.py -v
+
+  codegen-smoke:
+    name: Codegen + assembler smoke
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers
+      - name: Codegen clm-60m (text model)
+        run: |
+          PYTHONPATH=. python3 -m generator.runner codegen AICrossSim/clm-60m /tmp/clm60m.asm --seq-len 32 --num-layers 1
+          echo "clm-60m ASM: $(wc -c < /tmp/clm60m.asm) bytes"
+      - name: Assemble clm-60m
+        run: |
+          PYTHONPATH=. python3 -c "
+          from assembler import AssemblyToBinary
+          asm = AssemblyToBinary('doc/operation.svh', 'doc/configuration.svh')
+          asm.generate_binary('/tmp/clm60m.asm', '/tmp/clm60m.mem')
+          print('clm-60m assembled OK')
+          "
+      - name: Verify no u32 overflow in .mem
+        run: |
+          python3 -c "
+          overflows = 0
+          with open('/tmp/clm60m.mem') as f:
+              for i, line in enumerate(f, 1):
+                  val = int(line.strip(), 16)
+                  if val > 0xFFFFFFFF:
+                      print(f'OVERFLOW at line {i}: {line.strip()}')
+                      overflows += 1
+          if overflows > 0:
+              raise SystemExit(f'{overflows} instruction(s) overflow u32')
+          print('No u32 overflows')
+          "
+      - name: Codegen SmolVLM2 (vision-language model)
+        run: |
+          PYTHONPATH=. python3 -m generator.runner codegen HuggingFaceTB/SmolVLM2-256M-Video-Instruct /tmp/smolvlm2.asm --seq-len 32 --num-layers 1
+          echo "SmolVLM2 ASM: $(wc -c < /tmp/smolvlm2.asm) bytes"
+      - name: Assemble SmolVLM2
+        run: |
+          PYTHONPATH=. python3 -c "
+          from assembler import AssemblyToBinary
+          asm = AssemblyToBinary('doc/operation.svh', 'doc/configuration.svh')
+          asm.generate_binary('/tmp/smolvlm2.asm', '/tmp/smolvlm2.mem')
+          print('SmolVLM2 assembled OK')
+          "

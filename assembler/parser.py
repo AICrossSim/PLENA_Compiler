@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import re
-from pathlib import Path
 
 
 def load_isa_definitions(file_path: str) -> dict:
@@ -88,7 +86,6 @@ class Instruction:
         self.funct1 = funct1
         self.funct2 = funct2
         self.imm = imm
-        self.rflag = rflag
         self.rmask = rstride
 
     def __repr__(self):
@@ -98,14 +95,22 @@ class Instruction:
 _REG_PREFIXES = ("gp", "f", "a")
 # Hoisted to module scope: these were previously re-created for every line of the
 # .asm (millions of times for large programs), which dominated sim_env re-parse time.
-vector_masked_unary_or_reduction_ops = frozenset({"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"})
+vector_masked_unary_or_reduction_ops = frozenset(
+    {"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX", "V_SOFTPLUS_V"}
+)
 vector_masked_binary_ops = frozenset(
     {
+        "V_DOT_RESET",
+        "V_DOT_ACC",
+        "V_DOT_WRITE",
         "V_ADD_VV",
         "V_ADD_VF",
         "V_MUL_VV",
         "V_SUB_VV",
         "V_MUL_VF",
+        # V_FMA_VF parses like V_MUL_VF -- rd, rs1, fp2, rmask. That rd is also a
+        # source is invisible here; it only matters in execution.
+        "V_FMA_VF",
         "V_MAX_VF",
         "V_MIN_VF",
         "V_TOPK",
@@ -188,7 +193,19 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
             funct2 = None
             imm = None
 
-            if len(operands) == 1:
+            if opcode == "M_MM.P":
+                # Explicit bounded projection mode. The fourth operand is a
+                # GP configuration register, unlike legacy Matrix view syntax.
+                if len(operands) != 5 or not all(
+                    re.fullmatch(r"gp\d+", operand) for operand in operands[:4]
+                ):
+                    raise ValueError("M_MM.P requires four GP registers and a view slot")
+                rd, rs1, rs2, rstride = map(_parse_operand, operands[:4])
+                try:
+                    funct1 = int(operands[4], 0)
+                except ValueError as error:
+                    raise ValueError("M_MM.P requires an integer view slot") from error
+            elif len(operands) == 1:
                 operand_0 = operands[0]
                 rd = _parse_operand(operand_0)
             elif len(operands) == 2:
@@ -321,11 +338,12 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
 
 
 if __name__ == "__main__":
-    import argparse
+    # Example usage
+    # file_path = '/home/george/Coprocessor_for_Llama/src/definitions/operation.svh'
+    # enum_dict = load_isa_definitions(file_path)
+    # print(enum_dict)
 
-    argument_parser = argparse.ArgumentParser(description="Parse a PLENA assembly file")
-    argument_parser.add_argument("asm_file", help="path to the assembly input")
-    args = argument_parser.parse_args()
-    loaded_instr = parse_asm_file(args.asm_file)
+    asm_file_path = "/home/george/Coprocessor_for_Llama/src/system/test/benchmarks/fixed.asm"
+    loaded_instr = parse_asm_file(asm_file_path)
     for instr in loaded_instr:
         print(instr)

@@ -396,9 +396,81 @@ class MRAMAllocator(MemoryAllocatorBase):
         if total_size is None:
             total_size = self.tile_elems * tile_capacity
         super().__init__(total_size=total_size, alignment=self.tile_elems, mem_name="MRAM")
+        self._reserved: dict[str, MemoryBlock] = {}
 
     def allocate(self, name: str, size: int) -> int:
         return self._vmm.allocate(name, size)
+
+    @property
+    def reserved_blocks(self) -> tuple[MemoryBlock, ...]:
+        """Static allocations that remain occupied after a weight reset."""
+
+        return tuple(self._reserved.values())
+
+    @property
+    def capacity_after_reset(self) -> int:
+        """Contiguous elements the reset allocator can use for weight tiles.
+
+        Reset preserves the original addresses and starts its bump pointer
+        after the last reservation; holes before that point are not reused.
+        """
+
+        end = max((block.addr + block.size for block in self._reserved.values()), default=0)
+        return self.total_size - end
+
+    def free(self, name: str, strict: bool = True) -> MemoryBlock | None:
+        if name in self._reserved:
+            raise ValueError(f"MRAM reservation {name!r} cannot be freed as a transient weight")
+        return super().free(name, strict=strict)
+
+    def reserve(self, name: str, size: int, *, required_tail: int = 0) -> int:
+        """Reserve compiler-managed Matrix scratch across allocator resets.
+
+        This is an explicit static allocation, not a cache.  Its address is
+        fixed in the generated program and it has no tag, lookup, replacement,
+        or runtime ownership state. ``required_tail`` checks weight capacity
+        after the resulting reset before changing any allocation.
+        """
+
+        if required_tail < 0:
+            raise ValueError("required_tail must be non-negative")
+        if name in self._reserved:
+            block = self._reserved[name]
+            if self._vmm._align(size) != block.size:
+                raise ValueError(
+                    f"MRAM reservation {name!r} already has size {block.size}, "
+                    f"not {self._vmm._align(size)}"
+                )
+            if self.capacity_after_reset < required_tail:
+                raise ValueError("MRAM reservation leaves insufficient room for weight tiles")
+            return block.addr
+        if any(block.name == name for block in self._vmm.used_stack):
+            raise ValueError(f"MRAM reservation {name!r} conflicts with a live allocation")
+        aligned_size = self._vmm._align(size)
+        best = min(
+            ((block.size - aligned_size, i) for i, block in enumerate(self._vmm.free_stack)
+             if block.size >= aligned_size),
+            default=None,
+        )
+        address = (
+            self._vmm.free_stack[best[1]].addr
+            if best is not None else self._vmm._align(self.next_free)
+        )
+        reserved_end = self.total_size - self.capacity_after_reset
+        if required_tail and self.total_size - max(reserved_end, address + aligned_size) < required_tail:
+            raise ValueError("MRAM reservation leaves insufficient room for weight tiles")
+        addr = self._vmm.allocate(name, size)
+        block = next(block for block in self._vmm.used_stack if block.name == name)
+        self._reserved[name] = block
+        return addr
+
+    def reset(self):
+        """Release transient weight tiles while retaining static reservations."""
+
+        reserved = tuple(self._reserved.values())
+        self._vmm.reset()
+        for block in sorted(reserved, key=lambda item: item.addr):
+            self._vmm.mark_used(block.addr, block.size, block.name)
 
 
 class VRAMAllocator(MemoryAllocatorBase):
