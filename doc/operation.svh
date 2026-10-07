@@ -180,7 +180,8 @@ typedef enum logic [instruction_pkg::OPCODE_WIDTH - 1:0] {
     V_MAX_VF               = 6'h35,
     V_MIN_VF               = 6'h36,
     V_TOPK                 = 6'h37,
-    C_SET_TOPK_REG         = 6'h38
+    C_SET_TOPK_REG         = 6'h38,
+    X_MAMBA                = 6'h39
 } CUSTOM_ISA_OPCODE;
 
 typedef enum logic [2:0] {

@@ -57,3 +57,4 @@ All conflicting blobs archived under `research/moe_dispatch/archive/local/compil
 
 - `aten/plena/program_routed_moe.py`: 0 conflict block(s), chose current. Keep newer stage-correct routed implementation and version-aware reference tests; preserve new historical standalone expert-FFN, scalar route-weight and dynamic-combine methods alongside it, adding required modern stage arguments without changing current methods.
 - `aten/tests/test_gpt_oss_moe_reference.py`: 2 conflict block(s), chose current. Keep newer stage-correct routed implementation and version-aware reference tests; preserve new historical standalone expert-FFN, scalar route-weight and dynamic-combine methods alongside it, adding required modern stage arguments without changing current methods.
+- `feat/nemotron3-mamba2-system` (`dc6ea46db2ed2287a57d233bec3cf14dfae1ffb9`): merged with `--no-ff`, no conflicts.
