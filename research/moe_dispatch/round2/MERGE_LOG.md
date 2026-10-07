@@ -27,3 +27,4 @@ Three-stage conflicting blobs preserved under `research/moe_dispatch/archive/fea
 All conflicting blobs archived under `research/moe_dispatch/archive/codex/moe-e2e-sync/conflicts`. Non-conflicting edits are retained.
 
 - `aten/plena/program_routed_moe.py`: 2 conflict block(s), chose current. Retain newer sticky router stage markers and arbitrary runtime top-k policy; keep non-conflicting Qwen label and vector-format documentation updates.
+- `fix/portable-developer-paths` (`29fdbc17a8877d44bf54ad58bc2d538449a263c3`): merged with `--no-ff`, no conflicts.
