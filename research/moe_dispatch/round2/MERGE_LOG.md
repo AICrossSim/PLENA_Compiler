@@ -43,3 +43,10 @@ All conflicting blobs archived under `research/moe_dispatch/archive/local/archiv
 
 - `assembler/assembly_to_binary.py`: 1 conflict block(s), chose current. Retain C_SET_TOPK_REG opcode and masked-vector TOPK encoding; incoming archive predates programmable routing and would restore the obsolete funct/rstride encoding.
 - `doc/operation.svh`: 1 conflict block(s), chose current. Retain C_SET_TOPK_REG opcode and masked-vector TOPK encoding; incoming archive predates programmable routing and would restore the obsolete funct/rstride encoding.
+
+## Merge `local/candidate-compiler-topk-contract-20260726` (`71ba7ff4f1d697d5a444f85da6bc8e4484090772`)
+
+All conflicting blobs archived under `research/moe_dispatch/archive/local/candidate-compiler-topk-contract-20260726/conflicts`. Non-conflicting edits are retained.
+
+- `aten/plena/program_routed_moe.py`: 2 conflict block(s), chose current. Retain stage attribution and programmable TOPK policies supporting DeepSeek 64/top-6; old contract documentation lacks those later extensions.
+- `doc/plena_isa_spec.md`: 1 conflict block(s), chose current. Retain stage attribution and programmable TOPK policies supporting DeepSeek 64/top-6; old contract documentation lacks those later extensions.
