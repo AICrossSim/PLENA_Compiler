@@ -80,6 +80,16 @@ jobs:
             aten/tests/test_compact_matrix_loops.py \
             aten/tests/test_hybrid_substrate.py \
             aten/tests/test_mram_binding_tracking.py
+      - name: Run recovered current Matrix and routed-MoE compiler guards
+        run: |
+          PYTHONPATH=. python3 -m pytest -v \
+            aten/tests/test_batch4_route_codegen.py \
+            aten/tests/test_lcompute.py \
+            aten/tests/test_matrix_view.py \
+            aten/tests/test_nemotron3_mamba2_extract.py \
+            aten/tests/test_nemotron3_mamba2_lowering.py \
+            aten/tests/test_nemotron3_mamba2_reference.py
+
       - name: Run Nemotron 3 hybrid compiler guards
         run: |
           PYTHONPATH=. python3 -m pytest -v -m "not slow" \

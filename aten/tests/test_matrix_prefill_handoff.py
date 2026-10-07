@@ -37,10 +37,11 @@ def test_prefill_and_decode_use_opposite_axes_without_moving_values() -> None:
 def test_real_kimi_shape_measures_the_emitted_identity_gemm() -> None:
     report = build_prefill_handoff_report()
     legacy = report["legacy_identity_gemm"]
-    assert legacy["static_instructions"] == 49
+    # Count the explicit shift-length load for NaN-safe zero filling.
+    assert legacy["static_instructions"] == 50
     # The report pins its transfer granularity explicitly instead of inheriting
     # whatever plena_settings.toml happens to be visible from the caller's cwd.
-    assert legacy["dynamic_issued_instructions_per_head"] == 41_432
+    assert legacy["dynamic_issued_instructions_per_head"] == 41_433
     assert legacy["dynamic_opcode_census_per_head"]["H_STORE_V"] == 128
     assert legacy["dynamic_opcode_census_per_head"]["M_TMM"] == 4_096
     assert legacy["dynamic_opcode_census_per_head"]["M_MM_WO"] == 4_096
@@ -68,7 +69,7 @@ value = 1
 
     report = build_prefill_handoff_report()
     legacy = report["legacy_identity_gemm"]
-    assert legacy["dynamic_issued_instructions_per_head"] == 41_432
+    assert legacy["dynamic_issued_instructions_per_head"] == 41_433
     assert legacy["dynamic_opcode_census_per_head"]["H_STORE_V"] == 128
 
 

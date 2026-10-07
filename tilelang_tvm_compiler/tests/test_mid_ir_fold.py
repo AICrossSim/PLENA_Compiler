@@ -71,10 +71,11 @@ def test_fold_dma() -> int:
     f16 = "float16"
     Q_hbm = tir.decl_buffer([1, 64, 4, 16], dtype=f16, name="Q_hbm", scope="global")
     Q_sh = tir.decl_buffer([64, 16], dtype=f16, name="Q_sh", scope="shared.dyn")
+    by = tir.Var("by", "int32")
     body = tir.Evaluate(
         _extern(
             "tl.tileop.copy",
-            _region(Q_hbm, [_ii(0), _ii(0), tir.Var("by", "int32"), _ii(0)], [_ii(1), _ii(64), _ii(1), _ii(16)]),
+            _region(Q_hbm, [_ii(0), _ii(0), by, _ii(0)], [_ii(1), _ii(64), _ii(1), _ii(16)]),
             _region(Q_sh, [_ii(0), _ii(0)], [_ii(64), _ii(16)]),
         )
     )
@@ -94,7 +95,7 @@ def test_fold_dma() -> int:
         )
         # src has extents [1,64,1,16], buffer shape [1,64,4,16] → axes
         # 0 and 1 and 3 cover full dim; axis 2 is sliced (extent 1, start `by`).
-        failures += _check("src indices[2]", dma.src.indices[2], "by")
+        failures += _check("src indices[2] preserves variable identity", dma.src.indices[2], ir.VarRef(by))
     else:
         print(f"  [FAIL] body[0] is not Dma: {mid.body}")
         failures += 1
@@ -218,14 +219,13 @@ def test_fold_parallel_add() -> int:
     func = _wrap(outer)
     mid = fold_run(func)
     failures = 0
-    # Walk: outer For(row) → body has the fused Elementwise.
+    # A whole-buffer elementwise op absorbs the serial row loop; its
+    # axis metadata retains the exact row fanout and SIMD column extent.
     if (
         mid.body
-        and isinstance(mid.body[0], ir.For)
-        and mid.body[0].body
-        and isinstance(mid.body[0].body[0], ir.Elementwise)
+        and isinstance(mid.body[0], ir.Elementwise)
     ):
-        ew = mid.body[0].body[0]
+        ew = mid.body[0]
         failures += _check("op", ew.op, ir.BinOp.ADD)
         failures += _check("# srcs", len(ew.srcs), 2)
         failures += _check(
@@ -233,8 +233,10 @@ def test_fold_parallel_add() -> int:
             all(isinstance(s, ir.BufferRef) for s in ew.srcs),
             True,
         )
+        failures += _check("batch row extent", ew.dst_axes[0], ir.AxisInfo(ir.AxisRole.BATCH, 64))
+        failures += _check("SIMD column extent", ew.dst_axes[1], ir.AxisInfo(ir.AxisRole.SIMD, 16))
     else:
-        print(f"  [FAIL] expected For(row) → Elementwise, got {mid.body}")
+        print(f"  [FAIL] expected whole-buffer Elementwise, got {mid.body}")
         failures += 1
     return failures
 
@@ -256,8 +258,8 @@ def test_fold_parallel_zero() -> int:
     func = _wrap(outer)
     mid = fold_run(func)
     failures = 0
-    if mid.body and isinstance(mid.body[0], ir.For) and isinstance(mid.body[0].body[0], ir.Elementwise):
-        ew = mid.body[0].body[0]
+    if mid.body and isinstance(mid.body[0], ir.Elementwise):
+        ew = mid.body[0]
         failures += _check("op (zero is COPY w/ srcs=[])", ew.op, ir.UnaryOp.COPY)
         failures += _check("# srcs (zero sentinel)", len(ew.srcs), 0)
     else:
@@ -286,8 +288,8 @@ def test_fold_parallel_exp() -> int:
     func = _wrap(outer)
     mid = fold_run(func)
     failures = 0
-    if mid.body and isinstance(mid.body[0], ir.For) and isinstance(mid.body[0].body[0], ir.Elementwise):
-        ew = mid.body[0].body[0]
+    if mid.body and isinstance(mid.body[0], ir.Elementwise):
+        ew = mid.body[0]
         failures += _check("op", ew.op, ir.UnaryOp.EXP)
         failures += _check("# srcs", len(ew.srcs), 1)
     else:
@@ -422,9 +424,8 @@ def test_fold_broadcast_left_operand() -> int:
 
 def test_fold_conv2d_zero_pad_init() -> int:
     """conv2d's ``for k: in_FP_padded[MLEN + k] = 0`` — the dst index is
-    a compound expression, not a bare loop var. fold can't express this
-    as Elementwise (it's not a whole-axis cover); the For + RawStore
-    must survive."""
+    affine, so keep the three-iteration For and its indexed scalar zero.
+    This must never become a zero of the entire 67-element buffer."""
     print("test_fold_conv2d_zero_pad_init — for k: padded[MLEN + k] = 0")
     f16 = "float16"
     padded = tir.decl_buffer([67], dtype=f16, name="in_FP_padded", scope="local.fragment")
@@ -446,10 +447,15 @@ def test_fold_conv2d_zero_pad_init() -> int:
     failures += _check("loop var", f.loop_var, "k")
     failures += _check("extent", f.extent, 3)
     failures += _check(
-        "body is one RawStore",
-        len(f.body) == 1 and isinstance(f.body[0], ir.RawStore),
+        "body is one indexed scalar Elementwise",
+        len(f.body) == 1 and isinstance(f.body[0], ir.Elementwise),
         True,
     )
+    if f.body and isinstance(f.body[0], ir.Elementwise):
+        ew = f.body[0]
+        failures += _check("zero sentinel", (ew.op, ew.srcs, ew.size), (ir.UnaryOp.COPY, [], 1))
+        failures += _check("affine destination preserves offset and variable", ew.dst.indices,
+                           [{"op": "add", "args": [64, ir.VarRef(k)]}])
     return failures
 
 
@@ -483,8 +489,8 @@ def test_fold_conv2d_serial_copy() -> int:
 
 def test_fold_conv2d_shifted_copy() -> int:
     """conv2d's ``for m in T.serial(MLEN): shift_FP[m] = in_FP_padded[m + kw_idx]``
-    — the src index has a compound expression that doesn't match dst.
-    fold can't express this as Elementwise; For + RawStore preserved."""
+    — the FPRAM scalar-copy path preserves the affine source expression
+    and the 64-element extent for later scalar unrolling."""
     print("test_fold_conv2d_shifted_copy — for m: shift[m] = padded[m + kw]")
     f16 = "float16"
     shift = tir.decl_buffer([64], dtype=f16, name="shift_FP", scope="local.fragment")
@@ -501,16 +507,14 @@ def test_fold_conv2d_shifted_copy() -> int:
     func = _wrap(body)
     mid = fold_run(func)
     failures = 0
-    if not (mid.body and isinstance(mid.body[0], ir.For)):
-        print(f"  [FAIL] expected For, got {mid.body}")
+    if not (mid.body and isinstance(mid.body[0], ir.Elementwise)):
+        print(f"  [FAIL] expected FPRAM Elementwise copy, got {mid.body}")
         return 1
-    f = mid.body[0]
-    failures += _check("loop var", f.loop_var, "m")
-    failures += _check(
-        "body is one RawStore",
-        len(f.body) == 1 and isinstance(f.body[0], ir.RawStore),
-        True,
-    )
+    ew = mid.body[0]
+    failures += _check("scalar-copy extent", (ew.op, ew.size), (ir.UnaryOp.COPY, 64))
+    failures += _check("destination variable identity", ew.dst.indices, [ir.VarRef(m)])
+    failures += _check("shifted source variable identities", ew.srcs[0].indices,
+                       [{"op": "add", "args": [ir.VarRef(m), ir.VarRef(kw)]}])
     return failures
 
 
@@ -647,5 +651,18 @@ def main() -> int:
     return 1
 
 
+def test_all_legacy_fold_checks_return_success():
+    # The original CLI helpers return a failure count; pytest otherwise
+    # ignores a nonzero return value. Keep the CLI and pytest contracts equal.
+    assert main() == 0
+
+
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_unknown_evaluate_call_is_not_silently_dropped():
+    import pytest
+    from tilelang_tvm_compiler.frontend.mid_ir.passes.fold import FoldError
+    with pytest.raises(FoldError, match="unsupported Evaluate call"):
+        fold_run(_wrap(tir.Evaluate(_extern("plena.unimplemented_side_effect"))))

@@ -107,7 +107,7 @@ def test_unused_mapping_flag_bits_are_reserved(reserved_flag: int) -> None:
 def test_l_tile_exec_rejects_reserved_primitives_and_high_bits() -> None:
     with pytest.raises(ValueError, match="reserved L_TILE primitive"):
         encode_l_tile_exec(
-            dst_register=1, src1_register=2, src2_register=3, primitive=3
+            dst_register=1, src1_register=2, src2_register=3, primitive=12
         )
     valid = encode_l_tile_exec(
         dst_register=1,

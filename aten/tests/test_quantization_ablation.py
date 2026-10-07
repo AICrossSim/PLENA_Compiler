@@ -1,16 +1,9 @@
-"""Ablation study proving HF-vs-golden accuracy gap is from MXFP8 weight quantization.
+"""Measure weight quantization and BF16 intermediate error independently.
 
-Runs compile_native_hf_decoder in four precision modes and compares golden output
-against the HF float32 ground truth. Expected result:
-
-    hardware       (MXFP8 + BF16)  ~52% allclose  ← full HW gap
-    no_weight_quant (fp32 + BF16)  ~99% allclose  ← removing MXFP8 closes it
-    no_bf16        (MXFP8 + fp32)  ~52% allclose  ← BF16 doesn't matter
-    fp32           (fp32 + fp32)   ~99% allclose  ← confirms quantization is sole cause
-
-Usage:
-    pytest aten/tests/test_quantization_ablation.py -v -s
-    python3 aten/tests/test_quantization_ablation.py [--layers N]
+Four precision modes use the same checkpoint, seed, input and five layers.
+The prior sole-gap claim assumed BF16 was numerically irrelevant. Current
+scheduled-reference measurements show it contributes measurable error; this
+ablation reports both components and checks the actual quantization effect.
 """
 
 import argparse
@@ -53,36 +46,25 @@ def _run_ablation(num_layers: int) -> dict[str, dict]:
 
 
 @pytest.mark.slow
-def test_mxfp8_is_sole_gap_source():
-    """Prove MXFP8 weight quantization accounts for the full HF-vs-golden gap."""
+def test_precision_ablation_measures_both_error_sources():
+    """Verify the float32 baseline and measure each isolated precision cost."""
+    import math
     results = _run_ablation(DEFAULT_LAYERS)
-
-    hw = results["hardware"]["allclose"]
-    no_q = results["no_weight_quant"]["allclose"]
-    no_bf = results["no_bf16"]["allclose"]
-    fp = results["fp32"]["allclose"]
-
-    # BF16 intermediates contribute nothing: hardware ≈ no_bf16
-    assert abs(hw - no_bf) < 2.0, f"BF16 should not matter: hardware={hw:.1f}% vs no_bf16={no_bf:.1f}%"
-
-    # Removing MXFP8 closes the gap: no_weight_quant ≈ fp32 ≈ ~99%
-    assert no_q > 95.0, f"no_weight_quant should be >95%: got {no_q:.1f}%"
-    assert fp > 95.0, f"fp32 should be >95%: got {fp:.1f}%"
-    assert abs(no_q - fp) < 3.0, f"no_weight_quant ≈ fp32: {no_q:.1f}% vs {fp:.1f}%"
-
-    # The gap is real: hardware should be meaningfully lower
-    assert hw < no_q - 10.0, f"MXFP8 should cause >10% gap: hardware={hw:.1f}% vs no_quant={no_q:.1f}%"
-
-    print(f"\n{'=' * 60}")
-    print(f"  QUANTIZATION ABLATION PROOF ({DEFAULT_LAYERS} layers)")
-    print(f"{'=' * 60}")
-    print(f"  {'Mode':<20} {'allclose%':>12} {'MSE':>15}")
-    print(f"  {'-' * 20} {'-' * 12} {'-' * 15}")
+    for mode, metrics in results.items():
+        assert 0 <= metrics["allclose"] <= 100
+        assert math.isfinite(metrics["mse"]) and metrics["mse"] >= 0
+    # The same scheduled float32 calculation must agree with the independent
+    # float32 reference. No BF16 mode is assigned that float32 tolerance.
+    assert results["fp32"]["allclose"] > 99.0
+    assert results["fp32"]["mse"] < results["no_weight_quant"]["mse"]
+    assert results["fp32"]["mse"] < results["no_bf16"]["mse"]
+    # On this frozen five-layer workload, removing MX weight quantization
+    # reduces MSE in the BF16-intermediate comparison. Report the BF16 cost
+    # separately instead of claiming it is zero or the whole gap is MXFP8.
+    assert results["no_weight_quant"]["mse"] < results["hardware"]["mse"]
+    print(f"\nPrecision ablation ({DEFAULT_LAYERS} layers, seed=42, {MODEL_ID})")
     for mode in MODES:
-        r = results[mode]
-        print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print("\n  MXFP8 weight quantization = 100% of the gap")
-    print("  BF16 intermediate precision = 0% of the gap")
+        print(f"  {mode:<20} allclose={results[mode]['allclose']:.2f}% MSE={results[mode]['mse']:.6e}")
 
 
 if __name__ == "__main__":
@@ -100,5 +82,4 @@ if __name__ == "__main__":
     for mode in MODES:
         r = results[mode]
         print(f"  {mode:<20} {r['allclose']:>11.2f}% {r['mse']:>15.6e}")
-    print("\n  Conclusion: MXFP8 weight quantization = 100% of the gap")
-    print("  BF16 intermediate precision = 0% of the gap")
+    print("\nBoth weight quantization and BF16 intermediates contribute measurable error.")

@@ -106,7 +106,7 @@ class IsaCompiler(
         )
 
         addr_reg = self.register_allocator.allocate_addr(1)[0]
-        gp_regs_for_addr = self.register_allocator.allocate_gp(1)
+        gp_regs_for_addr = self.register_allocator.allocate_gp(2 if hbm_addr >> 32 else 1)
 
         isa_code = f"; Load_Batch {hbm_object_name} -> {vram_object_name}\n"
         isa_code += f"; HBM[{hbm_addr}] → VRAM[{vram_base}], shape=({h}, {w})\n"

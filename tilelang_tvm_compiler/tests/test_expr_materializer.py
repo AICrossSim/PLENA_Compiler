@@ -27,24 +27,32 @@ def _new_materializer():
     return ExprMaterializer(shim, symbol_table={}), shim
 
 
+def _emitted(shim, value):
+    # The maintained materializer emits eagerly so later auto-spills cannot
+    # reorder/clobber earlier operands. The old lazy ISA field must be empty;
+    # validate the same exact opcodes/immediates against the real output stream.
+    assert value.isa == ""
+    return shim.compiler.generated_code
+
+
 # ---------------------------------------------------------------------------
 # Test 1: literal int
 # ---------------------------------------------------------------------------
 def test_literal_int_small():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     m = mat.materialize(tir.IntImm("int32", 42))
     assert m.owns_register, "expected fresh reg for literal"
-    assert "S_ADDI_INT" in m.isa and ", 42" in m.isa, f"bad isa: {m.isa!r}"
-    print(f"[ok] literal small: reg=gp{m.register}, isa={m.isa.strip()}")
+    assert "S_ADDI_INT" in _emitted(shim, m) and ", 42" in _emitted(shim, m), f"bad isa: {_emitted(shim, m)!r}"
+    print(f"[ok] literal small: reg=gp{m.register}, isa={_emitted(shim, m).strip()}")
 
 
 def test_literal_int_large():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     m = mat.materialize(tir.IntImm("int32", 1234567))  # > 262143
-    assert "S_LUI_INT" in m.isa and "S_ADDI_INT" in m.isa, f"bad isa: {m.isa!r}"
+    assert "S_LUI_INT" in _emitted(shim, m) and "S_ADDI_INT" in _emitted(shim, m), f"bad isa: {_emitted(shim, m)!r}"
     upper = 1234567 >> 12
     lower = 1234567 & 0xFFF
-    assert f", {upper}" in m.isa and f", {lower}" in m.isa
+    assert f", {upper}" in _emitted(shim, m) and f", {lower}" in _emitted(shim, m)
     print(f"[ok] literal large: reg=gp{m.register}, two-instr load")
 
 
@@ -57,13 +65,13 @@ def test_var_lookup_uses_bound_register():
     mat = ExprMaterializer(shim, symbol_table={v: 7})  # pretend gp7 already holds it
     m = mat.materialize(v)
     assert m.register == 7
-    assert m.isa == ""
+    assert _emitted(shim, m) == ""
     assert not m.owns_register
     print(f"[ok] var lookup: reg=gp{m.register} (no isa, no alloc)")
 
 
 def test_var_unbound_raises():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     raised = None
     try:
         mat.materialize(tir.Var("oops", "int32"))
@@ -78,18 +86,18 @@ def test_var_unbound_raises():
 # Test 3: constant folding
 # ---------------------------------------------------------------------------
 def test_constant_fold_add():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     expr = tir.Add(tir.IntImm("int32", 64), tir.IntImm("int32", 16))
     m = mat.materialize(expr)
-    assert ", 80" in m.isa and "S_ADD_INT" not in m.isa, f"expected folded literal 80, got: {m.isa!r}"
+    assert ", 80" in _emitted(shim, m) and "S_ADD_INT" not in _emitted(shim, m), f"expected folded literal 80, got: {_emitted(shim, m)!r}"
     print("[ok] constant fold: 64+16=80 in single S_ADDI_INT")
 
 
 def test_constant_fold_mul():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     expr = tir.Mul(tir.IntImm("int32", 4), tir.IntImm("int32", 64))
     m = mat.materialize(expr)
-    assert ", 256" in m.isa and "S_MUL_INT" not in m.isa
+    assert ", 256" in _emitted(shim, m) and "S_MUL_INT" not in _emitted(shim, m)
     print("[ok] constant fold: 4*64=256 in single S_ADDI_INT")
 
 
@@ -99,7 +107,7 @@ def test_mul_by_one_identity():
     mat = ExprMaterializer(shim, symbol_table={v: 5})
     m = mat.materialize(tir.Mul(v, tir.IntImm("int32", 1)))
     assert m.register == 5  # passed through, no S_MUL_INT
-    assert "S_MUL_INT" not in m.isa
+    assert "S_MUL_INT" not in _emitted(shim, m)
     print(f"[ok] x * 1 identity: returns same reg gp{m.register}")
 
 
@@ -117,14 +125,14 @@ def test_compound_loop_offset():
     m = mat.materialize(expr)
     print(f"[compound] reg=gp{m.register}")
     print("[compound] isa:")
-    for line in m.isa.strip().split("\n"):
+    for line in _emitted(shim, m).strip().split("\n"):
         print(f"           {line}")
     # `kv * 64` strength-reduces to S_SLLI_INT (since 64 is a power of 2),
     # and `(kv<<6) + 16` collapses into one S_ADDI_INT (immediate fits).
-    assert "S_SLLI_INT" in m.isa, f"kv*64 should use SLLI, got: {m.isa!r}"
-    assert "S_MUL_INT" not in m.isa, "should not need a multiplier here"
-    assert "S_ADDI_INT" in m.isa, "expected S_ADDI_INT for (kv<<6) + 16"
-    assert "S_ADD_INT" not in m.isa, "non-immediate add should not appear here"
+    assert "S_SLLI_INT" in _emitted(shim, m), f"kv*64 should use SLLI, got: {_emitted(shim, m)!r}"
+    assert "S_MUL_INT" not in _emitted(shim, m), "should not need a multiplier here"
+    assert "S_ADDI_INT" in _emitted(shim, m), "expected S_ADDI_INT for (kv<<6) + 16"
+    assert "S_ADD_INT" not in _emitted(shim, m), "non-immediate add should not appear here"
     print("[ok] compound: kv * 64 + 16 lowered correctly (uses SLLI + ADDI fast-path)")
 
 
@@ -164,18 +172,18 @@ def test_compound_release_frees_all():
 # Test 6: FloorDiv / FloorMod -- fold when possible, raise when not
 # ---------------------------------------------------------------------------
 def test_floordiv_constant_fold():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     expr = tir.FloorDiv(tir.IntImm("int32", 256), tir.IntImm("int32", 64))
     m = mat.materialize(expr)
-    assert ", 4" in m.isa, f"expected literal 4, got {m.isa!r}"
+    assert ", 4" in _emitted(shim, m), f"expected literal 4, got {_emitted(shim, m)!r}"
     print("[ok] FloorDiv fold: 256 // 64 = 4")
 
 
 def test_floormod_constant_fold():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     expr = tir.FloorMod(tir.IntImm("int32", 100), tir.IntImm("int32", 64))
     m = mat.materialize(expr)
-    assert ", 36" in m.isa
+    assert ", 36" in _emitted(shim, m)
     print("[ok] FloorMod fold: 100 % 64 = 36")
 
 
@@ -185,7 +193,7 @@ def test_floordiv_by_one_identity():
     mat = ExprMaterializer(shim, symbol_table={v: 5})
     m = mat.materialize(tir.FloorDiv(v, tir.IntImm("int32", 1)))
     assert m.register == 5
-    assert "S_DIV" not in m.isa
+    assert "S_DIV" not in _emitted(shim, m)
     print(f"[ok] x // 1 identity: returns same reg gp{m.register}")
 
 
@@ -208,7 +216,7 @@ def test_floordiv_runtime_non_pow2_raises():
 
 
 def test_floordiv_div_by_zero_raises():
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     expr = tir.FloorDiv(tir.IntImm("int32", 5), tir.IntImm("int32", 0))
     raised = None
     try:
@@ -228,10 +236,10 @@ def test_mul_by_pow2_uses_slli():
     v = tir.Var("kv_block", "int32")
     mat = ExprMaterializer(shim, symbol_table={v: 7})
     m = mat.materialize(tir.Mul(v, tir.IntImm("int32", 64)))
-    assert "S_SLLI_INT" in m.isa, f"expected SLLI, got: {m.isa!r}"
-    assert "S_MUL_INT" not in m.isa
-    assert ", 6" in m.isa, f"expected shift amount 6 (=log2(64)): {m.isa!r}"
-    print(f"[ok] kv_block * 64 -> SLLI 6: {m.isa.strip()}")
+    assert "S_SLLI_INT" in _emitted(shim, m), f"expected SLLI, got: {_emitted(shim, m)!r}"
+    assert "S_MUL_INT" not in _emitted(shim, m)
+    assert ", 6" in _emitted(shim, m), f"expected shift amount 6 (=log2(64)): {_emitted(shim, m)!r}"
+    print(f"[ok] kv_block * 64 -> SLLI 6: {_emitted(shim, m).strip()}")
 
 
 def test_mul_by_pow2_when_lhs_is_const():
@@ -240,17 +248,17 @@ def test_mul_by_pow2_when_lhs_is_const():
     v = tir.Var("x", "int32")
     mat = ExprMaterializer(shim, symbol_table={v: 5})
     m = mat.materialize(tir.Mul(tir.IntImm("int32", 4), v))
-    assert "S_SLLI_INT" in m.isa and ", 2" in m.isa
-    print(f"[ok] 4 * x -> SLLI 2: {m.isa.strip()}")
+    assert "S_SLLI_INT" in _emitted(shim, m) and ", 2" in _emitted(shim, m)
+    print(f"[ok] 4 * x -> SLLI 2: {_emitted(shim, m).strip()}")
 
 
 def test_mul_by_pow2_two_literals_still_folds():
     """Both-literal mul still folds, doesn't use SLLI."""
-    mat, _ = _new_materializer()
+    mat, shim = _new_materializer()
     m = mat.materialize(tir.Mul(tir.IntImm("int32", 4), tir.IntImm("int32", 64)))
-    assert "S_SLLI_INT" not in m.isa
-    assert "S_MUL_INT" not in m.isa
-    assert ", 256" in m.isa
+    assert "S_SLLI_INT" not in _emitted(shim, m)
+    assert "S_MUL_INT" not in _emitted(shim, m)
+    assert ", 256" in _emitted(shim, m)
     print("[ok] 4 * 64 still folds to literal 256")
 
 
@@ -260,23 +268,37 @@ def test_floordiv_by_pow2_uses_srli():
     v = tir.Var("idx", "int32")
     mat = ExprMaterializer(shim, symbol_table={v: 9})
     m = mat.materialize(tir.FloorDiv(v, tir.IntImm("int32", 8)))
-    assert "S_SRLI_INT" in m.isa
-    assert ", 3" in m.isa, f"expected shift amount 3 (=log2(8)): {m.isa!r}"
-    print(f"[ok] idx // 8 -> SRLI 3: {m.isa.strip()}")
+    assert "S_SRLI_INT" in _emitted(shim, m)
+    assert ", 3" in _emitted(shim, m), f"expected shift amount 3 (=log2(8)): {_emitted(shim, m)!r}"
+    print(f"[ok] idx // 8 -> SRLI 3: {_emitted(shim, m).strip()}")
 
 
-def test_floormod_by_pow2_still_raises():
-    """x % 2^k requires AND, which PLENA doesn't have. Must still error."""
+def test_floormod_by_pow2_uses_existing_shift_and_subtract():
+    """Check the real eager-emitted arithmetic against integer modulo."""
     shim = make_shim(mlen=64, blen=4, btmm_lane_count=4, btmm_hlen=16)
     v = tir.Var("idx", "int32")
     mat = ExprMaterializer(shim, symbol_table={v: 9})
-    raised = None
-    try:
-        mat.materialize(tir.FloorMod(v, tir.IntImm("int32", 8)))
-    except ExprMaterializeError as e:
-        raised = e
-    assert raised is not None
-    print(f"[ok] x % 8 still raises (no AND): {str(raised)[:60]}...")
+    result = mat.materialize(tir.FloorMod(v, tir.IntImm("int32", 8)))
+    code = _emitted(shim, result)
+    assert "S_SRLI_INT" in code and "S_SLLI_INT" in code and "S_SUB_INT" in code
+    assert "S_DIV" not in code and "S_AND" not in code
+    for value in (0, 7, 8, 15, 126, 2**31 + 5):
+        gp_values = [0] * 16
+        gp_values[9] = value
+        for line in code.splitlines():
+            if not line.strip() or line.lstrip().startswith(";"):
+                continue
+            opcode, *args = line.replace(",", " ").split()
+            rd, rs1 = (int(arg.removeprefix("gp")) for arg in args[:2])
+            if opcode == "S_SRLI_INT":
+                gp_values[rd] = gp_values[rs1] >> int(args[2])
+            elif opcode == "S_SLLI_INT":
+                gp_values[rd] = (gp_values[rs1] << int(args[2])) & 0xFFFFFFFF
+            elif opcode == "S_SUB_INT":
+                gp_values[rd] = (gp_values[rs1] - gp_values[int(args[2][2:])]) & 0xFFFFFFFF
+            else:
+                raise AssertionError(f"unexpected modulo instruction: {line}")
+        assert gp_values[result.register] == value % 8
 
 
 def test_mul_by_non_pow2_still_uses_mul():
@@ -285,8 +307,8 @@ def test_mul_by_non_pow2_still_uses_mul():
     v = tir.Var("x", "int32")
     mat = ExprMaterializer(shim, symbol_table={v: 5})
     m = mat.materialize(tir.Mul(v, tir.IntImm("int32", 7)))
-    assert "S_MUL_INT" in m.isa
-    assert "S_SLLI_INT" not in m.isa
+    assert "S_MUL_INT" in _emitted(shim, m)
+    assert "S_SLLI_INT" not in _emitted(shim, m)
     print("[ok] x * 7 (non-pow2) uses S_MUL_INT")
 
 
@@ -296,7 +318,7 @@ def test_shift_by_zero_is_identity():
     v = tir.Var("x", "int32")
     mat = ExprMaterializer(shim, symbol_table={v: 5})
     m = mat.materialize(tir.Mul(v, tir.IntImm("int32", 1)))
-    assert "S_SLLI_INT" not in m.isa
+    assert "S_SLLI_INT" not in _emitted(shim, m)
     assert m.register == 5
     print("[ok] x * 1 is identity (not SLLI 0)")
 
@@ -323,7 +345,7 @@ def main() -> int:
         test_mul_by_pow2_when_lhs_is_const,
         test_mul_by_pow2_two_literals_still_folds,
         test_floordiv_by_pow2_uses_srli,
-        test_floormod_by_pow2_still_raises,
+        test_floormod_by_pow2_uses_existing_shift_and_subtract,
         test_mul_by_non_pow2_still_uses_mul,
         test_shift_by_zero_is_identity,
     ]

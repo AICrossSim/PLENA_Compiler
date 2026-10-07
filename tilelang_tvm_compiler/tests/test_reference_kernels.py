@@ -4,6 +4,9 @@ errors, and the resulting ISA must contain the expected hardware opcodes.
 """
 
 from __future__ import annotations
+import pytest
+pytest.skip("Retired legacy graph-IR/demo profile: kernels/API removed by commit 0259583; active mid_ir tests remain enabled", allow_module_level=True)
+
 
 import re
 

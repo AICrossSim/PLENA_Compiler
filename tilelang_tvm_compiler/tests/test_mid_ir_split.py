@@ -241,19 +241,19 @@ def test_split_for_serial_preserved() -> int:
         params=[],
         allocs=[Q],
         body=[
-            ir.For(
+            _block_idx("by", LANE, [ir.For(
                 loop_var="oc",
                 extent=4,
                 body=[
                     ir.Dma(src=_slice_ref(Q), dst=_slice_ref(Q)),
                 ],
-            )
+            )])
         ],
         lane_axes=["by"],
     )
     fn = mark_run(fn)
     out = split_run(fn)
-    f = out.body[0]
+    f = out.body[0].body[0].body[0]
     return (
         _check("type", type(f).__name__, "For")
         + _check("loop_var", f.loop_var, "oc")

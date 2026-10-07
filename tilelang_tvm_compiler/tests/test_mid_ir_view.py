@@ -17,6 +17,7 @@ Run:
 from __future__ import annotations
 
 import sys
+import tvm
 
 from tilelang_tvm_compiler.frontend.mid_ir import ir
 from tilelang_tvm_compiler.frontend.mid_ir.passes.view import (
@@ -26,10 +27,14 @@ from tilelang_tvm_compiler.frontend.mid_ir.passes.view import (
 
 
 LANE = 4
+_BY = ir.VarRef(tvm.tir.Var("by", "int32"))
+_PHASE = ir.VarRef(tvm.tir.Var("by_phase", "int32"))
+_NUMBER = ir.VarRef(tvm.tir.Var("by_number", "int32"))
 
 
 def _mk_buf(name, shape, scope="shared"):
-    return ir.BufferDef(name=name, shape=shape, dtype="float16", scope=scope)
+    return ir.BufferDef(name=name, shape=shape, dtype="float16", scope=scope,
+                        cluster_dim=None if scope.startswith("global") else 0)
 
 
 def _ref(buf, indices):
@@ -58,6 +63,7 @@ def _cluster(body):
         kind=ir.ParallelKind.CLUSTER,
         thread_tag=None,
         parent_grid_axis_name="by_number",
+        original_axis_name="by", axis_var=_PHASE, original_axis_var=_BY,
     )
 
 
@@ -67,7 +73,7 @@ def _grid(body):
         extent=1,
         body=body,
         kind=ir.ParallelKind.BLOCK_IDX,
-        thread_tag="blockIdx.y",
+        thread_tag="blockIdx.y", axis_var=_NUMBER, original_axis_var=_BY,
     )
 
 
@@ -98,7 +104,7 @@ def test_dma_lane_ref_bshd() -> int:
                     _cluster(
                         [
                             ir.Dma(
-                                src=_ref(Q_hbm, [0, ir.Slice(), "by", ir.Slice()]),
+                                src=_ref(Q_hbm, [0, ir.Slice(), _BY, ir.Slice()]),
                                 dst=_slice_ref(Q_sh, n=2),
                                 marker=ir.Marker.DMA,
                                 can_async=True,
@@ -114,7 +120,7 @@ def test_dma_lane_ref_bshd() -> int:
     dma = out.body[0].body[0].body[0]
     failures = 0
     # On-chip dst: prepended phase, BSHD perm = [1, 0, 2]
-    failures += _check("Q_sh indices", dma.dst.indices, ["by_phase", ir.Slice(), ir.Slice()])
+    failures += _check("Q_sh indices", dma.dst.indices, [_PHASE, ir.Slice(), ir.Slice()])
     failures += _check("Q_sh view_perm (BSHD)", dma.dst.view_perm, [1, 0, 2])
     return failures
 
@@ -202,7 +208,7 @@ def test_hbm_ref_lane_var_subst() -> int:
                     _cluster(
                         [
                             ir.Dma(
-                                src=_ref(Q_hbm, [0, ir.Slice(), "by", ir.Slice()]),
+                                src=_ref(Q_hbm, [0, ir.Slice(), _BY, ir.Slice()]),
                                 dst=_slice_ref(Q_sh, 2),
                             ),
                         ]
@@ -219,7 +225,7 @@ def test_hbm_ref_lane_var_subst() -> int:
     failures += _check("HBM view_perm None", src.view_perm, None)
     expected_by = {
         "op": "add",
-        "args": ["by_phase", {"op": "mul", "args": ["by_number", LANE]}],
+        "args": [_PHASE, {"op": "mul", "args": [_NUMBER, LANE]}],
     }
     failures += _check("HBM[2] composite", src.indices[2], expected_by)
     return failures
@@ -258,10 +264,9 @@ def test_broadcast_dims_shift() -> int:
     out = view_run(fn)
     ew = out.body[0].body[0].body[0]
     failures = 0
-    failures += _check("dst[0] prepended", ew.dst.indices[0], "by_phase")
-    # Elementwise with a Broadcast src → BHSD (matches the BTMM
-    # output it usually consumes); no permute needed.
-    failures += _check("dst view_perm BHSD identity", ew.dst.view_perm, [0, 1, 2])
+    failures += _check("dst[0] prepended", ew.dst.indices[0], _PHASE)
+    # Sub-MLEN D forces column packing, including standalone broadcast ops.
+    failures += _check("dst view_perm sub-MLEN BSHD", ew.dst.view_perm, [1, 0, 2])
     bcast = ew.srcs[1]
     failures += _check("Broadcast preserved", type(bcast).__name__, "Broadcast")
     failures += _check("broadcast_dims shifted", bcast.broadcast_dims, [2])
@@ -273,8 +278,11 @@ def test_global_consistency_conflict() -> int:
     """Same buffer used as Gemm[btmm].c (BHSD) AND Gemm[btmm].a (BSHD)
     — conflict, raises."""
     print("test_global_consistency_conflict")
-    X = _mk_buf("X", [LANE, 64, 16], scope="fragment")
-    K = _mk_buf("K", [LANE, 64, 16], scope="shared")
+    X = _mk_buf("X", [LANE, 64, 64], scope="fragment")
+    # Full-width X permits incompatible role-directed layouts. A separate
+    # narrow buffer keeps the cluster guard enabled in this mixed kernel.
+    K = _mk_buf("K", [LANE, 64, 64], scope="shared")
+    narrow = _mk_buf("narrow", [LANE, 64, 16], scope="shared")
     fn = _wrap(
         [
             _grid(
@@ -294,7 +302,7 @@ def test_global_consistency_conflict() -> int:
                 ]
             )
         ],
-        allocs=[X, K],
+        allocs=[X, K, narrow],
     )
     try:
         view_run(fn)
@@ -384,6 +392,11 @@ def main() -> int:
         return 0
     print(f"FAIL — {failures} failed assertion(s)")
     return 1
+
+
+def test_main_assertions():
+    """Legacy int-return tests must not silently pass pytest on failure."""
+    assert main() == 0
 
 
 if __name__ == "__main__":

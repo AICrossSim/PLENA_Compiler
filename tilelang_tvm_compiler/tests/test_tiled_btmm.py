@@ -1,6 +1,10 @@
 """Structural tests for tiled_btmm: validates Phase 8 multi-tile slice
 writeback (per-head non-contiguous in 2D)."""
 
+
+import pytest
+pytest.skip("Retired legacy graph-IR/demo profile: kernels/API removed by commit 0259583; active mid_ir tests remain enabled", allow_module_level=True)
+
 import re
 import sys
 

@@ -400,6 +400,11 @@ class ProgramRoutedMoeMixin:
         finally:
             self.free_fp_reg([fp_acc])
             self._reg.free_gp([gp_x, gp_w, gp_scratch, gp_fp, gp_out, gp_loop])
+            # All scratch consumers are emitted before returning; only logits
+            # escape to callers. Retain neither FPRAM nor VRAM scratch across
+            # the hundreds of score-router calls in a connected model.
+            self.free_fp_var(fp_scratch)
+            self.free_tensor(scratch)
 
         return logits
 
@@ -832,12 +837,10 @@ class ProgramRoutedMoeMixin:
         """Emit the shared true-expert-id -> HBM-base address calculation."""
         if per_expert_stride <= 0:
             raise ValueError(f"{name}: per_expert_stride must be positive, got {per_expert_stride}")
-        if per_expert_stride <= 0:
-            raise ValueError(f"{name}: per_expert_stride must be positive")
         asm.comment(
             moe_stage_marker(
                 "expert_weight_address",
-                f"{name}: pair={pair_idx}, table_base={table_base}, stride={per_expert_stride}",
+                f"{name}: expert_id_to_weight_base pair={pair_idx}, table_base={table_base}, stride={per_expert_stride}",
             )
         )
         asm.instr("S_ADDI_INT", gp(gp_table), gp(0), expert_indices_int_base)
@@ -948,6 +951,8 @@ class ProgramRoutedMoeMixin:
         """Load one weight column tile using runtime true expert id addressing."""
         self._ensure_hbm_sub_matrix_registered(weight_template)
         layout = self.get_hbm_layout(weight_template.name)
+        if expert_base_table_int_base is None and tile_group_stride is None and per_expert_stride < layout.hbm_size:
+            raise ValueError(f"{name}: per_expert_stride={per_expert_stride} bytes is smaller than {weight_template.name} HBM footprint={layout.hbm_size} bytes")
         num_row_blocks = layout.num_row_blocks
         block_size = self.mlen * self.mlen
         effective_count = k_block_count if k_block_count is not None else num_row_blocks
@@ -1030,6 +1035,7 @@ class ProgramRoutedMoeMixin:
                     expert_gp_source=expert_gp,
                 )
             if tile_group_stride is None:
+                asm.comment(moe_stage_marker("expert_weight_prefetch", f"{name}: issue resolved weight requests pair={pair_idx}"))
                 self._emit_hbm_prefetch_setup(asm, layout, gp_scale, gp_stride)
                 self._emit_hbm_subblock_sequence(
                     asm,
@@ -1456,12 +1462,17 @@ class ProgramRoutedMoeMixin:
         fp_scratch: FPVar | None = None,
         policy_name: str = "gpt_oss",
         name: str = "gpt_oss_device_route_weight",
+        pair_index_gp: int | None = None,
     ) -> VRAMMatrixVar:
         """Expand device V_TOPK scalar weight into a VRAM route matrix."""
         if rows > self.blen:
             raise ValueError(f"{name}: v0 expects one routed pair slot (rows<=BLEN), got rows={rows}")
         if hidden % self.mlen != 0:
             raise ValueError(f"{name}: hidden={hidden} must be divisible by MLEN={self.mlen}")
+        selected_fp = weights_fp_base + pair_idx
+        for scratch in (zero_row, fp_scratch):
+            if scratch is not None and scratch.address <= selected_fp < scratch.address + scratch.size:
+                raise ValueError(f"{name}: {scratch.name} overlaps TopK weight at FPRAM[{selected_fp}]")
         route = self.alloc(name, rows=rows, cols=hidden, strict=False, physical_shape=(self.blen, hidden))
         self.moe_true_zero_vram_rows_v0(
             route,
@@ -1473,11 +1484,34 @@ class ProgramRoutedMoeMixin:
             name=f"{name}_zero",
         )
         fp_scratch = fp_scratch or self.fp_var(f"{name}_fp_row", size=self.mlen)
-        gp_dst, gp_fp = self._reg.allocate_gp(2)
+        gp_count = 4 if pair_index_gp is not None else 2
+        gp_regs = self._reg.allocate_gp(gp_count)
+        gp_dst, gp_fp = gp_regs[:2]
+        fp_tmp: int | None = None
         try:
             # The scalar route weight depends only on pair_idx, so broadcast it into
             # fp_scratch once; S_MAP_V_FP only reads fp_scratch and never mutates it.
-            self.fpvar_fill_from_fpram_asm(fp_scratch.address, weights_fp_base + pair_idx, self.mlen)
+            if pair_index_gp is None:
+                self.fpvar_fill_from_fpram_asm(
+                    fp_scratch.address, weights_fp_base + pair_idx, self.mlen
+                )
+            else:
+                gp_src, gp_loop = gp_regs[2:]
+                fp_tmp = self.allocate_fp_reg(1)[0]
+                fill = IsaBuilder().comment(
+                    f"Dynamic route weight: FPRAM[{weights_fp_base} + gp{pair_index_gp}]"
+                )
+                fill.instr("S_ADDI_INT", gp(gp_src), gp(0), weights_fp_base)
+                fill.instr(
+                    "S_ADD_INT", gp(gp_src), gp(gp_src), gp(pair_index_gp)
+                )
+                fill.instr("S_LD_FP", fp(fp_tmp), gp(gp_src), 0)
+                fill.instr("S_ADDI_INT", gp(gp_dst), gp(0), fp_scratch.address)
+                fill.instr("C_LOOP_START", gp(gp_loop), self.mlen)
+                fill.instr("S_ST_FP", fp(fp_tmp), gp(gp_dst), 0)
+                fill.instr("S_ADDI_INT", gp(gp_dst), gp(gp_dst), 1)
+                fill.instr("C_LOOP_END", gp(gp_loop))
+                self._emit(fill)
             for col_block in range(hidden // self.mlen):
                 asm = IsaBuilder().comment(
                     moe_stage_marker(
@@ -1490,7 +1524,9 @@ class ProgramRoutedMoeMixin:
                 asm.instr("S_MAP_V_FP", gp(gp_dst), gp(gp_fp), 0)
                 self._emit(asm)
         finally:
-            self._reg.free_gp([gp_dst, gp_fp])
+            if fp_tmp is not None:
+                self.free_fp_reg([fp_tmp])
+            self._reg.free_gp(gp_regs)
         return route
 
     def moe_materialize_route_weights_for_active_rows_v0(
@@ -1577,6 +1613,9 @@ class ProgramRoutedMoeMixin:
         *,
         weight_table_bases: tuple[int, int, int],
         weight_table_strides: tuple[int, int, int],
+        weight_tile_group_strides: tuple[int | None, int | None, int | None] | None = None,
+        num_experts: int | None = None,
+        pair_index_gp: int | None = None,
         expert_indices_int_base: int,
         pair_idx: int,
         bias_tables: ExpertBiases | None,
@@ -1598,6 +1637,9 @@ class ProgramRoutedMoeMixin:
         gate_bias_table, up_bias_table, down_bias_table = bias_tables or (None, None, None)
         gate_base, up_base, down_base = weight_table_bases
         gate_stride, up_stride, down_stride = weight_table_strides
+        gate_group, up_group, down_group = weight_tile_group_strides or (None, None, None)
+        if pair_index_gp is not None and any(bias is not None for bias in (gate_bias_table, up_bias_table, down_bias_table)):
+            raise NotImplementedError("looped routed experts do not yet support dynamic expert bias tables")
         projection_rows = max(self.mlen, x.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
 
         gate = self.moe_dynamic_linear_projection_v0(
@@ -1607,6 +1649,9 @@ class ProgramRoutedMoeMixin:
             pair_idx=pair_idx,
             table_base=gate_base,
             per_expert_stride=gate_stride,
+            num_experts=num_experts,
+            tile_group_stride=gate_group,
+            pair_index_gp=pair_index_gp,
             expert_gp=expert_gp,
             name=f"{name}_gate",
             physical_shape=(projection_rows, w_gate.physical_shape[1]),
@@ -1618,6 +1663,9 @@ class ProgramRoutedMoeMixin:
             pair_idx=pair_idx,
             table_base=up_base,
             per_expert_stride=up_stride,
+            num_experts=num_experts,
+            tile_group_stride=up_group,
+            pair_index_gp=pair_index_gp,
             expert_gp=expert_gp,
             name=f"{name}_up",
             physical_shape=(projection_rows, w_up.physical_shape[1]),
@@ -1661,6 +1709,9 @@ class ProgramRoutedMoeMixin:
             pair_idx=pair_idx,
             table_base=down_base,
             per_expert_stride=down_stride,
+            num_experts=num_experts,
+            tile_group_stride=down_group,
+            pair_index_gp=pair_index_gp,
             expert_gp=expert_gp,
             name=f"{name}_out",
             physical_shape=(projection_rows, w_down.physical_shape[1]),
@@ -1685,6 +1736,9 @@ class ProgramRoutedMoeMixin:
         *,
         weight_table_bases: tuple[int, int, int],
         weight_table_strides: tuple[int, int, int],
+        weight_tile_group_strides: tuple[int | None, int | None, int | None] | None = None,
+        num_experts: int | None = None,
+        pair_index_gp: int | None = None,
         expert_indices_int_base: int,
         weights_fp_base: int,
         pair_idx: int,
@@ -1704,6 +1758,9 @@ class ProgramRoutedMoeMixin:
             weights,
             weight_table_bases=weight_table_bases,
             weight_table_strides=weight_table_strides,
+            weight_tile_group_strides=weight_tile_group_strides,
+            num_experts=num_experts,
+            pair_index_gp=pair_index_gp,
             expert_indices_int_base=expert_indices_int_base,
             pair_idx=pair_idx,
             bias_tables=bias_tables,
@@ -1716,6 +1773,7 @@ class ProgramRoutedMoeMixin:
         )
         route = self.moe_materialize_topk_route_weight_v0(
             weights_fp_base=weights_fp_base,
+            pair_index_gp=pair_index_gp,
             pair_idx=pair_idx,
             rows=rows,
             hidden=weights[2].physical_shape[1],
@@ -1725,9 +1783,171 @@ class ProgramRoutedMoeMixin:
             name=f"{name}_route",
         )
         # Re-mark: `vram_mul` is a general-purpose helper with no marker of its own.
-        self._emit(IsaBuilder().comment(moe_stage_marker("expert_route_weight", f"[{policy_name}] apply {name}")))
+        self._emit(IsaBuilder().comment(moe_stage_marker("expert_route_weight", f"[{policy_name}] apply route weight pair={pair_idx}: {name}")))
         self.vram_mul(out, route, num_rows=rows)
         return out
+
+    def moe_dynamic_expert_group_v0(
+        self,
+        x: VRAMMatrixVar,
+        weights: ExpertWeights,
+        *,
+        weight_table_bases: tuple[int, int, int],
+        weight_table_strides: tuple[int, int, int],
+        expert_indices_int_base: int,
+        weights_fp_base: int,
+        pair_indices: Sequence[int],
+        bias_tables: ExpertBiases | None,
+        rows: int,
+        intermediate: int,
+        constants: GptOssFPConstants,
+        zero_row: FPVar | None = None,
+        route_fp_scratch: FPVar | None = None,
+        policy_name: str = "gpt_oss",
+        activation_policy: str = "gpt_oss_clamp_gated",
+        weight_panel_mode: str = "blocking",
+        panel_k_tiles: int | None = None,
+        name: str = "moe_dynamic_expert_group",
+    ) -> VRAMMatrixVar:
+        """Run one fixed-route expert for a compact group of token rows.
+
+        The caller guarantees that every entry in ``pair_indices`` names the
+        same expert in integer SRAM.  The first pair resolves the expert's HBM
+        base once; its gate/up/down tiles remain in Matrix SRAM while all
+        compact token rows consume them.  Distinct per-pair route weights are
+        then materialized row by row before scatter-add.
+
+        This helper intentionally does not sort device-selected routing.  It is
+        legal for fixed-route/trace replay where grouping is known at compile
+        time; a runtime router needs a separate sort/segment mechanism before
+        it may call the same execution primitive.
+        """
+        pair_list = [int(pair) for pair in pair_indices]
+        if rows <= 0:
+            raise ValueError(f"{name}: rows must be positive")
+        if len(pair_list) != rows:
+            raise ValueError(f"{name}: pair_indices={len(pair_list)} must equal rows={rows}")
+        if len(set(pair_list)) != len(pair_list) or min(pair_list) < 0:
+            raise ValueError(f"{name}: pair_indices must be distinct non-negative values")
+        if x.shape[0] != rows:
+            raise ValueError(f"{name}: compact x rows={x.shape[0]} must equal rows={rows}")
+        if bias_tables is not None and rows > self.blen:
+            raise ValueError(
+                f"{name}: grouped execution with expert bias supports at most "
+                f"BLEN={self.blen} rows, got rows={rows}"
+            )
+
+        representative_pair = pair_list[0]
+        w_gate, w_up, w_down = weights
+        gate_bias_table, up_bias_table, down_bias_table = bias_tables or (None, None, None)
+        gate_base, up_base, down_base = weight_table_bases
+        gate_stride, up_stride, down_stride = weight_table_strides
+        projection_rows = max(self.mlen, x.physical_shape[0], math.ceil(rows / self.blen) * self.blen)
+
+        def project(input_var, weight, table_base, stride, suffix, output_shape):
+            return self.moe_dynamic_linear_projection_v0(
+                input_var,
+                weight,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=representative_pair,
+                table_base=table_base,
+                per_expert_stride=stride,
+                name=f"{name}_{suffix}",
+                physical_shape=output_shape,
+                reuse_weight_across_row_blocks=True,
+                weight_panel_mode=weight_panel_mode,
+                panel_k_tiles=panel_k_tiles,
+            )
+
+        gate = project(
+            x,
+            w_gate,
+            gate_base,
+            gate_stride,
+            "gate",
+            (projection_rows, w_gate.physical_shape[1]),
+        )
+        up = project(
+            x,
+            w_up,
+            up_base,
+            up_stride,
+            "up",
+            (projection_rows, w_up.physical_shape[1]),
+        )
+        if gate_bias_table is not None:
+            self.moe_add_dynamic_expert_bias_v0(
+                gate,
+                gate_bias_table,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=representative_pair,
+                rows=rows,
+                width=intermediate,
+                name=f"{name}_gate_bias",
+            )
+        if up_bias_table is not None:
+            self.moe_add_dynamic_expert_bias_v0(
+                up,
+                up_bias_table,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=representative_pair,
+                rows=rows,
+                width=intermediate,
+                name=f"{name}_up_bias",
+            )
+
+        hidden = self.moe_expert_activation_v0(
+            gate,
+            up,
+            rows=rows,
+            intermediate=intermediate,
+            constants=constants,
+            activation_policy=activation_policy,
+            stage="expert_activation",
+            name=name,
+        )
+        out = project(
+            hidden,
+            w_down,
+            down_base,
+            down_stride,
+            "out",
+            (projection_rows, w_down.physical_shape[1]),
+        )
+        if down_bias_table is not None:
+            self.moe_add_dynamic_expert_bias_v0(
+                out,
+                down_bias_table,
+                expert_indices_int_base=expert_indices_int_base,
+                pair_idx=representative_pair,
+                rows=rows,
+                width=w_down.physical_shape[1],
+                name=f"{name}_down_bias",
+            )
+
+        route = self.moe_materialize_route_weights_for_active_rows_v0(
+            weights_fp_base=weights_fp_base,
+            pair_indices=pair_list,
+            active_rows=list(range(rows)),
+            rows=rows,
+            hidden=w_down.physical_shape[1],
+            zero_row=zero_row,
+            fp_scratch=route_fp_scratch,
+            policy_name=policy_name,
+            stage="expert_route_weight",
+            name=f"{name}_route",
+        )
+        self._emit(
+            IsaBuilder().comment(
+                moe_stage_marker(
+                    "expert_route_weight",
+                    f"[{policy_name}] apply grouped route weights: rows={rows}, representative_pair={representative_pair}",
+                )
+            )
+        )
+        self.vram_mul(out, route, num_rows=rows)
+        return out
+
 
     def moe_apply_batch4_route_weight_v0(
         self,

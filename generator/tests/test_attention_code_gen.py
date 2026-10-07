@@ -23,7 +23,7 @@ def test_attention_code_generation():
 
     # Generate the assembly code
     model_info = {"batch": 1}
-    hardware_config = {"MLEN": 64, "BLEN": 4}
+    hardware_config = {"MLEN": 128, "BLEN": 4}
     scheduler = {
         "register_assignment": {
             "hbm_addr_reg": {

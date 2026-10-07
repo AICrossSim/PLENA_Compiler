@@ -140,6 +140,7 @@ def test_grouped_narrow_v2h_slice_writes_back_as_single_tile():
         shape=(1, 64, 4, 16),
         dtype="float16",
         address=4096,
+        tile_layout=_hlir.make_tile_layout(shape=(1, 64, 4, 16), mlen=64, hlen=16),
     )
     mod = _hlir.HLIRModule(
         name="grouped_narrow_v2h",
@@ -160,7 +161,8 @@ def test_grouped_narrow_v2h_slice_writes_back_as_single_tile():
     )
     emitter_pass._emit_dma_v2h_slice(mod, op)
     asm = shim.compiler.generated_code
-    assert "grouped narrow writeback as one logical mlen*mlen tile" in asm, asm
+    assert "grid d_tiles=1, s_tiles=1, h_groups=1, b=1" in asm, asm
+    assert "H_STORE_V" in asm, asm
     assert "; ... tile h=" not in asm, asm
     print("[ok] grouped narrow v2h_slice writes back one packed 64x64 tile")
 

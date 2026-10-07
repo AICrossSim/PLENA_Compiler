@@ -2,7 +2,7 @@
 
 Date: 2026-10-07. Existing branch: `research/moe-supply-first-v3`.
 
-Pre-integration HEAD: `480d558c72f8fce19572b2408eb02a1ae52c40eb`. Inventory HEAD before final validation/document commit: `272b20fbad791808f6e4f9a5a913c3df81695f7a`.
+Pre-integration HEAD: `480d558c72f8fce19572b2408eb02a1ae52c40eb`. Inventory HEAD before final validation/document commit: `52b417b3268cb31485e69845dc90aadc80ab1924`.
 
 **All 33 unique owned candidate heads are ancestors of the integrated HEAD.** 23 heads were joined by explicit `--no-ff` merge commits; remaining heads became ancestors through those merges. No local branch or worktree was created/deleted/rewritten. Canonical dirty worktrees were not edited.
 

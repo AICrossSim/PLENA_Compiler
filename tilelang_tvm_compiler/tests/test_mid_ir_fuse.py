@@ -31,7 +31,11 @@ LANE = 4
 
 
 def _mk_buf(name, shape, scope="shared"):
-    return ir.BufferDef(name=name, shape=shape, dtype="float16", scope=scope)
+    # These fixtures are constructed after split/view: their leading axis
+    # already represents the cluster lane. Global caches are not expanded.
+    cluster_dim = None if scope == "global" or scope.startswith("global.") else 0
+    return ir.BufferDef(name=name, shape=shape, dtype="float16", scope=scope,
+                        cluster_dim=cluster_dim)
 
 
 def _ref(buf, indices):
@@ -457,6 +461,12 @@ def main() -> int:
         return 0
     print(f"FAIL — {failures} failed assertion(s)")
     return 1
+
+
+def test_all_legacy_fuse_checks_return_success():
+    # The original CLI helpers return a failure count; pytest otherwise
+    # ignores a nonzero return value. Keep the CLI and pytest contracts equal.
+    assert main() == 0
 
 
 if __name__ == "__main__":

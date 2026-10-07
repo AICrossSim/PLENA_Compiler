@@ -60,6 +60,7 @@ class PlenaCodegen:
         # name-keyed lookup for diagnostic messages
         self._buffers_by_name: dict[str, _BufferInfo] = {}
         self._isa_lines: list[str] = []
+        self._explicit_cluster_buffers: set[str] = set()
 
     # ------------------------------------------------------------------
     # public API
@@ -105,6 +106,8 @@ class PlenaCodegen:
         # Walk the body and collect Op stream.
         ops: list[_hlir.Op] = []
         self._collect_ops(self.func.body, ops)
+        for buffer_name in self._explicit_cluster_buffers:
+            hlir_buffers[buffer_name].cluster_dim = 2
 
         return _hlir.HLIRModule(
             name=self.name,
@@ -338,6 +341,29 @@ class PlenaCodegen:
                 si += 1
         self._verify_scopes(spec, name, ordered_scopes)
 
+        if kind.startswith("row_") and kind.endswith("_at"):
+            # Explicit-intrinsic ABI carries logical (row, head) coordinates.
+            # Convert once to the current typed-region backend ABI.
+            row, head = scalar_args[-2:]
+            scalar_args = scalar_args[:-2]
+            regions = []
+            for buffer_name in buffer_args:
+                info = self._buffers_by_name[buffer_name]
+                if len(info.shape) != 4:
+                    raise CodegenError(f"{name}: row intrinsic requires a 4D buffer, got {info.shape}")
+                regions.append(_hlir.VramRegion(
+                    parent=buffer_name, starts=(0, row, head, 0),
+                    extents=(1, 1, 1, int(info.shape[3])),
+                ))
+            buffer_args = regions
+            # Explicit BSHD row/head coordinates identify packed heads even
+            # without a TileLang cluster-splitting pass.
+            for region in regions:
+                info = self._buffers_by_name[region.parent]
+                if len(info.shape) == 4 and int(info.shape[2]) > 1:
+                    self._explicit_cluster_buffers.add(region.parent)
+            if not kind.startswith("row_reduce_"):
+                kind = kind[:-3]  # maintained HLIR row_exp/row_sub_fp/etc.
         ops.append(
             _hlir.Op(
                 kind=kind,

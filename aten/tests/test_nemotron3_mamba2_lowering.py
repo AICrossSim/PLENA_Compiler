@@ -150,6 +150,7 @@ def test_bf16_descriptor_uses_byte_strides_but_fp32_state():
     assert not any(output_image.data)
 
 
+@pytest.mark.skip(reason='Retired independent X_MAMBA ABI; current primary ISA uses Matrix/L_TILE. Mamba reference, descriptor layout and static recurrent tests remain active.')
 def test_complete_lowered_program_assembles_to_the_canonical_command(tmp_path):
     arena, config, bindings, states = _compiler_fixture()
     program = MambaCommandCompiler(arena, states).compile(

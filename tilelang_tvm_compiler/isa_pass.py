@@ -1889,6 +1889,32 @@ class IsaEmitterPass:
         """
         if len(op.buffer_args) != 3:
             raise IsaEmissionError(f"plena.matmul expects 3 buffer_args (a/b/c regions); got {len(op.buffer_args)}")
+        # The earlier public intrinsic passed three buffer names and seven
+        # static tile parameters. Preserve that explicit interface through the
+        # same maintained arithmetic emitter; the typed-region ABI follows.
+        if all(isinstance(value, str) for value in op.buffer_args):
+            if len(op.scalar_args) != 7 or not all(
+                isinstance(value, (int, tir.IntImm)) for value in op.scalar_args
+            ):
+                raise IsaEmissionError("legacy plena.matmul requires seven static integer tile parameters")
+            lhs, rhs, dst = (mod.get_buffer(value) for value in op.buffer_args)
+            _check_scope(lhs, _scope.VRAM, op.kind, "lhs")
+            _check_scope(rhs, _scope.MRAM, op.kind, "rhs")
+            _check_scope(dst, _scope.VRAM, op.kind, "dst")
+            m_tiles, k_tiles, n_cols, lhs_off, rhs_off, dst_off, row_stride = (
+                int(value) for value in op.scalar_args
+            )
+            if min(lhs_off, rhs_off, dst_off, row_stride) < 0:
+                raise IsaEmissionError("legacy plena.matmul offsets and row stride must be nonnegative")
+            self.emitter.emit_matmul_general(
+                M_tiles=m_tiles, K_tiles=k_tiles, N=n_cols,
+                lhs_vram_base=lhs.address, lhs_offset=lhs_off,
+                rhs_mram_base=rhs.address, rhs_offset=rhs_off,
+                dst_vram_base=dst.address, dst_offset=dst_off,
+                dst_row_stride=row_stride or None,
+                task_id=op.annotations.get("intrinsic", "matmul"),
+            )
+            return
         a_reg, b_reg, c_reg = op.buffer_args
         if not isinstance(a_reg, _hlir.VramRegion):
             raise IsaEmissionError(f"plena.matmul a: expected VramRegion, got {type(a_reg).__name__}")

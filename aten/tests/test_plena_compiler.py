@@ -116,10 +116,9 @@ def test_vram_fill_zero_all_column_blocks():
     prog.vram_fill_zero(x)
     code = prog.get_code()
 
-    # 384/64 = 6 column blocks, each must be overwritten from a true-zero row.
-    assert code.count("S_MAP_V_FP") >= 6, (
-        f"Expected >= 6 S_MAP_V_FP (one per column block), got {code.count('S_MAP_V_FP')}"
-    )
+    # 384/64 = 6 column blocks, each gets one full-row zero-fill loop.
+    assert code.count("V_SHFT_V") == 6
+    assert "S_ADDI_INT gp3, gp0, 64" in code
     assert "V_MUL_VF" not in code
     print("  PASS test_vram_fill_zero_all_column_blocks")
 
@@ -583,7 +582,7 @@ def test_gpt_oss_dynamic_expert_pair_preserves_route_weight_stage():
 
     assert output.shape == (1, 8)
     assert code.count("expert_id_to_weight_base pair=3") == 3
-    assert "GPT-OSS apply route weight pair=3" in code
+    assert "[gpt_oss] apply route weight pair=3" in code
     assert "S_LD_FP" in code
     assert "V_MUL_VF" in code
     assert code.count("V_MUL_VV") >= 2
@@ -637,7 +636,7 @@ def test_gpt_oss_dynamic_moe_weights_and_combines_every_topk_pair():
 
     assert output.shape == (1, 8)
     assert code.count("expert_id_to_weight_base pair=") == 12
-    assert code.count("GPT-OSS apply route weight pair=") == 4
+    assert code.count("[gpt_oss] apply route weight pair=") == 4
     assert code.count("S_LD_INT") == 12
     assert code.count("S_MUL_INT") == 12
     assert code.count("H_PREFETCH_M") == 12
@@ -649,7 +648,7 @@ def test_gpt_oss_dynamic_moe_weights_and_combines_every_topk_pair():
     ]
     for pair_idx in range(4):
         assert f"expert_id_to_weight_base pair={pair_idx}" in code
-        assert f"GPT-OSS apply route weight pair={pair_idx}" in code
+        assert f"[gpt_oss] apply route weight pair={pair_idx}" in code
     print("  PASS test_gpt_oss_dynamic_moe_weights_and_combines_every_topk_pair")
 
 
@@ -1301,3 +1300,33 @@ if __name__ == "__main__":
     print(f"{passed} passed, {failed} failed")
     if failed > 0:
         sys.exit(1)
+
+
+def test_bf16_router_releases_local_fp_and_vector_scratch():
+    from compiler.aten.plena import PlenaCompiler
+    prog = PlenaCompiler(mlen=8, blen=4)
+    x = prog.alloc("router_x", 1, 8, strict=False, physical_shape=(4, 8))
+    weight = prog.alloc("router_weight", 1, 8, strict=False, physical_shape=(4, 8))
+    # More iterations than the physical 1024-entry FPRAM could fit if leaked.
+    for index in range(140):
+        logits = prog.moe_router_logits_bf16_v0(x, weight, rows=1, hidden=8, num_experts=1, name=f"score{index}")
+        prog.free_tensor(logits)
+    assert not any("fp_scratch" in name for name in prog._fp_vars)
+    assert not any("dot_scratch" in block.name for block in prog.vram_allocator._vmm.used_stack)
+
+
+def test_load_batch_materializes_full_64bit_hbm_address(tmp_path):
+    from compiler.aten.plena import PlenaCompiler
+    from compiler.assembler.assembly_to_binary import AssemblyToBinary
+    from pathlib import Path
+    prog = PlenaCompiler(mlen=8, blen=4)
+    weight = prog.input("high_hbm_x", shape=(4, 8), physical_shape=(4, 8), hbm_addr=0x100000040)
+    prog.load_batch(weight, name="high_hbm_loaded")
+    asm = prog.compile()
+    assert "S_ADDI_INT gp2, gp0, 1" in asm
+    assert "C_SET_ADDR_REG a0, gp2, gp1" in asm
+    root = Path(__file__).parents[2]
+    source = tmp_path / "high.asm"
+    source.write_text(asm)
+    words = AssemblyToBinary(str(root/"doc/operation.svh"), str(root/"doc/configuration.svh")).generate_binary(str(source),str(tmp_path/"high.hex"))
+    assert words

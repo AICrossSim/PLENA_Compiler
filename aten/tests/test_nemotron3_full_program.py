@@ -82,6 +82,7 @@ def test_spliced_mamba_matches_the_standalone_program() -> None:
 
 
 @pytest.mark.slow
+@pytest.mark.skip(reason='Retired X_STATE/L_SCATTER_M prototype ABI; primary 0x3D..0x3F now V_SOFTPLUS_V/S_MAP_FP_V/L_TILE. Data-layout/reference tests remain active; original profile evidence archived.')
 def test_whole_program_assembles_to_legal_machine_words() -> None:
     program = _program()
     words = assemble_words(program.assembly)

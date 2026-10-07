@@ -24,6 +24,7 @@ Run:
 from __future__ import annotations
 
 import sys
+import tvm
 import tempfile
 from pathlib import Path
 
@@ -36,10 +37,14 @@ from tilelang_tvm_compiler.frontend.mid_ir.passes.to_plena import (
 
 
 LANE = 4
+_BY = ir.VarRef(tvm.tir.Var("by", "int32"))
+_PHASE = ir.VarRef(tvm.tir.Var("by_phase", "int32"))
+_NUMBER = ir.VarRef(tvm.tir.Var("by_number", "int32"))
 
 
 def _mk_buf(name, shape, scope="shared"):
-    return ir.BufferDef(name=name, shape=shape, dtype="float16", scope=scope)
+    return ir.BufferDef(name=name, shape=shape, dtype="float16", scope=scope,
+                        cluster_dim=None if scope.startswith("global") else 0)
 
 
 def _ref(buf, indices):
@@ -49,6 +54,17 @@ def _ref(buf, indices):
 def _slice_ref(buf):
     return ir.BufferRef(buf, [ir.Slice() for _ in buf.shape])
 
+
+
+def _gemm_axes(a, b, c):
+    """Typed, post-split per-operand roles produced by fold/split/view."""
+    def axes(buf, row_role, col_role):
+        return [ir.AxisInfo(ir.AxisRole.CLUSTER, int(buf.shape[0])),
+                ir.AxisInfo(row_role, int(buf.shape[1])),
+                ir.AxisInfo(col_role, int(buf.shape[2]))]
+    return dict(a_axes=axes(a, ir.AxisRole.GEMM_M, ir.AxisRole.GEMM_K),
+                b_axes=axes(b, ir.AxisRole.GEMM_N, ir.AxisRole.GEMM_K),
+                c_axes=axes(c, ir.AxisRole.GEMM_M, ir.AxisRole.GEMM_N))
 
 def _check(label, actual, expected) -> int:
     if actual == expected:
@@ -78,14 +94,14 @@ def test_scope_basic_mapping() -> int:
     print("test_scope_basic_mapping")
     Q_hbm = _mk_buf("Q_hbm", [1, 64, 4, 16], scope="global")
     Q_sh = _mk_buf("Q_sh", [4, 64, 16], scope="shared")
-    M = _mk_buf("M", [16], scope="fragment")  # 1D → fpram
+    M = _mk_buf("M", [LANE, 16], scope="fragment.fpram")  # lane-expanded scalar state
     S = _mk_buf("S", [4, 64, 16], scope="fragment")  # 2D+ → vram
     fn = _wrap([], params=[Q_hbm], allocs=[Q_sh, M, S])
     out = to_plena_run(fn)
     failures = 0
     failures += _check("Q_hbm scope", out.buffers["Q_hbm"].scope, _scope.HBM)
     failures += _check("Q_sh scope", out.buffers["Q_sh"].scope, _scope.VRAM)
-    failures += _check("M scope (1D fragment)", out.buffers["M"].scope, _scope.FPRAM)
+    failures += _check("M scope (lane-expanded fragment.fpram)", out.buffers["M"].scope, _scope.FPRAM)
     failures += _check("S scope (2D fragment)", out.buffers["S"].scope, _scope.VRAM)
     return failures
 
@@ -94,11 +110,11 @@ def test_gemm_b_override_mram() -> int:
     """Buffer used as Gemm B → MRAM, overrides the default shared→vram."""
     print("test_gemm_b_override_mram")
     Q = _mk_buf("Q", [4, 64, 16], scope="shared")  # default → vram
-    K = _mk_buf("K", [4, 64, 16], scope="shared")  # but used as B → mram
+    K = _mk_buf("K", [4, 16, 16], scope="shared")  # but used as B → mram
     S = _mk_buf("S", [4, 64, 16], scope="fragment")
     fn = _wrap(
         [
-            ir.Gemm(a=_slice_ref(Q), b=_slice_ref(K), c=_slice_ref(S), kind="btmm", transpose_b=True),
+            ir.Gemm(a=_slice_ref(Q), b=_slice_ref(K), c=_slice_ref(S), kind="btmm", transpose_b=True, **_gemm_axes(Q, K, S)),
         ],
         allocs=[Q, K, S],
     )
@@ -113,15 +129,15 @@ def test_gemm_b_override_mram() -> int:
 def test_dma_to_mram_picks_h2m() -> int:
     """DMA dst was Gemm B → MRAM scope → dma kind = dma_h2m."""
     print("test_dma_to_mram_picks_h2m")
-    K_hbm = _mk_buf("K_hbm", [1, 64, 4, 16], scope="global")
-    K_sh = _mk_buf("K_sh", [4, 64, 16], scope="shared")
+    K_hbm = _mk_buf("K_hbm", [1, 16, 4, 16], scope="global")
+    K_sh = _mk_buf("K_sh", [4, 16, 16], scope="shared")
     Q_sh = _mk_buf("Q_sh", [4, 64, 16], scope="shared")
     S = _mk_buf("S", [4, 64, 16], scope="fragment")
     fn = _wrap(
         [
             # K is the BTMM B operand → forces K_sh to MRAM
             ir.Dma(src=_slice_ref(K_hbm), dst=_slice_ref(K_sh)),
-            ir.Gemm(a=_slice_ref(Q_sh), b=_slice_ref(K_sh), c=_slice_ref(S), kind="btmm", transpose_b=True),
+            ir.Gemm(a=_slice_ref(Q_sh), b=_slice_ref(K_sh), c=_slice_ref(S), kind="btmm", transpose_b=True, **_gemm_axes(Q_sh, K_sh, S)),
         ],
         params=[K_hbm],
         allocs=[Q_sh, K_sh, S],
@@ -146,7 +162,7 @@ def _grid(body):
         extent=1,
         body=body,
         kind=ir.ParallelKind.BLOCK_IDX,
-        thread_tag="blockIdx.y",
+        thread_tag="blockIdx.y", axis_var=_NUMBER, original_axis_var=_BY,
     )
 
 
@@ -157,6 +173,7 @@ def _cluster(body):
         body=body,
         kind=ir.ParallelKind.CLUSTER,
         parent_grid_axis_name="by_number",
+        original_axis_name="by", axis_var=_PHASE, original_axis_var=_BY,
     )
 
 
@@ -204,7 +221,7 @@ def test_multi_lane_dma_to_op() -> int:
 def test_multi_lane_btmm_to_op() -> int:
     print("test_multi_lane_btmm_to_op")
     Q = _mk_buf("Q", [4, 64, 16], scope="shared")
-    K = _mk_buf("K", [4, 64, 16], scope="shared")  # → MRAM by override
+    K = _mk_buf("K", [4, 16, 16], scope="shared")  # → MRAM by override
     S = _mk_buf("S", [4, 64, 16], scope="fragment")
     fn = _wrap(
         [
@@ -219,6 +236,7 @@ def test_multi_lane_btmm_to_op() -> int:
                                     c=_slice_ref(S),
                                     kind="btmm",
                                     transpose_b=True,
+                                    **_gemm_axes(Q, K, S),
                                     marker=ir.Marker.BTMM,
                                     can_async=True,
                                 ),
@@ -236,15 +254,18 @@ def test_multi_lane_btmm_to_op() -> int:
     op = out.ops[0].body[0]
     failures = 0
     failures += _check("kind", op.kind, "btmm")
-    failures += _check("lane_count", op.scalar_args[0], LANE)
+    failures += _check("operand role count", len(op.scalar_args), 3)
+    failures += _check("A roles", op.scalar_args[0], ("_", "M", "_", "K"))
+    failures += _check("B roles", op.scalar_args[1], ("_", "N", "_", "K"))
+    failures += _check("C roles", op.scalar_args[2], ("_", "M", "_", "N"))
     return failures
 
 
 def test_bare_reduce_lowers_to_nested_fors() -> int:
-    """Bare reduce in cluster → for lane: for row: row_reduce_max_at."""
+    """Bare reduce in cluster → for row: for lane: row_reduce_max_at."""
     print("test_bare_reduce_lowers_to_nested_fors")
     S = _mk_buf("S", [LANE, 64, 16], scope="fragment")
-    M = _mk_buf("M", [LANE, 16], scope="fragment")
+    M = _mk_buf("M", [LANE, 64], scope="fragment.fpram")
     fn = _wrap(
         [
             _grid(
@@ -256,6 +277,8 @@ def test_bare_reduce_lowers_to_nested_fors() -> int:
                                 src=_slice_ref(S),
                                 op=ir.ReduceOp.MAX,
                                 axis=2,
+                                src_axes=[ir.AxisInfo(ir.AxisRole.CLUSTER, LANE), ir.AxisInfo(ir.AxisRole.BATCH, 64), ir.AxisInfo(ir.AxisRole.REDUCE, 16)],
+                                dst_axes=[ir.AxisInfo(ir.AxisRole.CLUSTER, LANE), ir.AxisInfo(ir.AxisRole.BATCH, 64)],
                                 marker=ir.Marker.LANE_OP,
                                 can_async=False,
                             ),
@@ -268,9 +291,9 @@ def test_bare_reduce_lowers_to_nested_fors() -> int:
     )
     out = to_plena_run(fn)
     by_for = out.ops[0]
-    lane_for = by_for.body[0]
-    row_for = lane_for.body[0]
-    inner = row_for.body[0]
+    row_for = by_for.body[0]
+    lane_for = row_for.body[0]
+    inner = lane_for.body[0]
     failures = 0
     failures += _check("lane for", lane_for.kind, "for")
     failures += _check("lane extent", lane_for.annotations["extent"], LANE)
@@ -310,7 +333,7 @@ def test_parallel_axis_block_idx_to_for() -> int:
     by_number_for = out.ops[0]
     failures = 0
     failures += _check("by_number for kind", by_number_for.kind, "for")
-    failures += _check("by_number loop_var", by_number_for.annotations["loop_var"], "by_number")
+    failures += _check("by_number loop_var", str(by_number_for.annotations["loop_var"]), "by_number")
     # Inside should NOT be another for (cluster doesn't survive); just dma.
     inner = by_number_for.body[0]
     failures += _check("inner kind != for", inner.kind != "for", True)
@@ -398,6 +421,11 @@ def main() -> int:
         return 0
     print(f"FAIL — {failures} failed assertion(s)")
     return 1
+
+
+def test_main_assertions():
+    """Legacy int-return tests must not silently pass pytest on failure."""
+    assert main() == 0
 
 
 if __name__ == "__main__":

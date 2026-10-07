@@ -107,18 +107,41 @@ def compile_kernel(
     # preload by hand. See hoist_float_constants.py for the contract.
     func = _stmt_hoist_consts.run(func)
 
-    # ---------- 1. mid_ir pipeline ----------
-    func = _mid_infer_lane_axis.run(func)
-    midfn = _mid_fold.run(func, name=name)
-    midfn = _mid_mark.run(midfn)
-    midfn = _mid_split.run(midfn)
-    midfn = _mid_distribute.run(midfn)
-    midfn = _mid_async.run(midfn)
-    midfn = _mid_view.run(midfn)
-    midfn = _mid_fuse.run(midfn)
-    midfn = _mid_burn.run(midfn)
-    mod = _mid_to_plena.run(midfn, build_dir=midir_dump_dir, mlen=target.mlen)
-
+    # Explicit plena.* kernels are already lowered operations. Their frontend
+    # must preserve every call; sending them through TileLang folding discarded
+    # the calls and produced empty loops. Mixed styles are rejected explicitly.
+    extern_names = []
+    has_tile_ops = False
+    has_stores = False
+    def classify(node):
+        nonlocal has_tile_ops, has_stores
+        if isinstance(node, tir.BufferStore):
+            has_stores = True
+        if isinstance(node, tir.Call):
+            op_name = getattr(node.op, "name", "")
+            if op_name.startswith("tl."):
+                has_tile_ops = True
+            if op_name == "tir.call_extern" and node.args and isinstance(node.args[0], tir.StringImm):
+                extern_names.append(str(node.args[0].value))
+    tir.stmt_functor.post_order_visit(func.body, classify)
+    plena_externs = [n for n in extern_names if n.startswith("plena.")]
+    if plena_externs:
+        if has_tile_ops or has_stores or len(plena_externs) != len(extern_names):
+            raise ValueError("Mixed explicit plena.* calls and TileLang/arithmetic stores are unsupported; use one frontend profile")
+        from .codegen import PlenaCodegen
+        mod = PlenaCodegen(func, name=name).lower_to_hlir()
+    else:
+        # ---------- 1. mid_ir pipeline ----------
+        func = _mid_infer_lane_axis.run(func)
+        midfn = _mid_fold.run(func, name=name)
+        midfn = _mid_mark.run(midfn)
+        midfn = _mid_split.run(midfn)
+        midfn = _mid_distribute.run(midfn)
+        midfn = _mid_async.run(midfn)
+        midfn = _mid_view.run(midfn)
+        midfn = _mid_fuse.run(midfn)
+        midfn = _mid_burn.run(midfn)
+        mod = _mid_to_plena.run(midfn, build_dir=midir_dump_dir, mlen=target.mlen)
     # DEBUG: dump HLIR immediately after to_plena so we can inspect it
     # even when later passes fail.
     if midir_dump_dir is not None:

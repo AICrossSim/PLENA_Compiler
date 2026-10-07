@@ -43,7 +43,10 @@ def test_vector_shift_copies_unshifted_lanes_and_zero_fills_the_prefix():
 def test_true_zero_fill_clears_nan_inf_without_scalar_sram_scratch(width):
     from compiler.aten.plena import PlenaCompiler
 
-    p = PlenaCompiler(mlen=width, blen=1, vram_total_size=4 * width)
+    # The allocator owns a full MLEN-square storage tile even for two live
+    # rows; retain that physical reservation rather than under-budget it.
+    p = PlenaCompiler(mlen=width, blen=1,
+                      vram_total_size=max(4 * width, width * width))
     matrix = p.alloc("zero_target", 2, width, strict=False)
     fp_before = p.fpram_allocator.next_free
     p.vram_fill_zero(matrix, rows=[1])

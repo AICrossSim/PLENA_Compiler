@@ -27,7 +27,7 @@ Five raw-TIR shapes get collapsed into one mid_ir node each:
         → Elementwise(dst, [A, B], BinOp.<op>) or Reduce / Broadcast
 
 Anything that doesn't match one of the above is preserved as a raw
-``RawStmt`` wrapper for the next pass to look at — but for the
+``RawStore`` wrapper for the next pass to look at — but for the
 flash_attention_min op set everything is expected to fold.
 
 Structure-preserving wrappers (For with thread_tag, AttrStmt for
@@ -40,15 +40,15 @@ Scope
 
 Only handles the rounded ops the kernel test set exercises today:
 add / sub / mul / max / exp / reci / copy / 0-fill (zero_v) / sum-reduce
-/ max-reduce. Anything else (FloatImm in store other than 0, DivNode
-RHS, Cast in expr) raises ``FoldError`` so we notice early — better
-than silently emitting a malformed mid_ir node.
+/ max-reduce. A store that does not match these patterns remains a
+``RawStore`` with its original RHS and indexed destination. Lowering
+must recognize it explicitly or reject it; it is never discarded.
 
 Limitations / explicit gaps for later
 -------------------------------------
 
-  * Compound RHS (a*b + c*d) is rejected — relies on
-    ``lower_compound_fp_stores`` running first.
+  * Compound RHS (a*b + c*d) remains opaque — relies on
+    ``lower_compound_fp_stores`` running first for instruction lowering.
   * IfThenElse: kernels don't use it; raises FoldError.
   * Match-buffers / non-trivial Block.alloc_buffers: passed through
     via best-effort BufferDef synthesis.
@@ -1298,18 +1298,17 @@ def _walk_stmt(stmt, buf_table: dict[str, BufferDef], current_kind: str | None) 
             return [_fold_gemm(val, kind=current_kind or "overwrite", buf_table=buf_table)]
         if kind == _TILEOP_REDUCE:
             return [_fold_reduce(val, buf_table)]
-        # Unknown extern: drop with a deliberate marker. Production
-        # could accumulate these into a side list for diagnostics.
-        return []
+        # An unknown extern may carry side effects. Never emit an apparently
+        # valid empty loop after silently deleting the operation.
+        raise FoldError(f"unsupported Evaluate call {kind or str(val.op)!r}; no operation was emitted")
     if isinstance(stmt, tir.BufferStore):
         ew = _try_fold_store(stmt, parallel_var=None, buf_table=buf_table)
         if ew is not None:
             return [ew]
-        raise FoldError(
-            f"unrecognised BufferStore — every store must lower to a "
-            f"single elementwise / reduce / broadcast pattern. "
-            f"dst={stmt.buffer.name}{list(stmt.indices)} := {stmt.value!r}"
-        )
+        # Keep unmatched indexed stores opaque inside their enclosing loops.
+        # Lowering may recognize a supported scalar pattern later; it must
+        # reject anything it cannot express rather than silently dropping it.
+        return [_to_raw_store(stmt, buf_table)]
     raise FoldError(f"unhandled stmt type {type(stmt).__name__}")
 
 
