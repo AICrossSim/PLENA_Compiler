@@ -36,3 +36,10 @@ All conflicting blobs archived under `research/moe_dispatch/archive/local/archiv
 
 - `aten/plena/program_routed_moe.py`: 0 conflict block(s), chose current. Retain current stage-correct grouped route broadcasting and modern top-k APIs instead of incompatible older scalar broadcast refactor; older separated expert-FFN sources preserved for compatibility review. Retain HF-version compatibility comments in reference test.
 - `aten/tests/test_gpt_oss_moe_reference.py`: 2 conflict block(s), chose current. Retain current stage-correct grouped route broadcasting and modern top-k APIs instead of incompatible older scalar broadcast refactor; older separated expert-FFN sources preserved for compatibility review. Retain HF-version compatibility comments in reference test.
+
+## Merge `local/archive-old-topk-compiler-20260727` (`1468974f29828a7dea898943ca5fffaff4976ad4`)
+
+All conflicting blobs archived under `research/moe_dispatch/archive/local/archive-old-topk-compiler-20260727/conflicts`. Non-conflicting edits are retained.
+
+- `assembler/assembly_to_binary.py`: 1 conflict block(s), chose current. Retain C_SET_TOPK_REG opcode and masked-vector TOPK encoding; incoming archive predates programmable routing and would restore the obsolete funct/rstride encoding.
+- `doc/operation.svh`: 1 conflict block(s), chose current. Retain C_SET_TOPK_REG opcode and masked-vector TOPK encoding; incoming archive predates programmable routing and would restore the obsolete funct/rstride encoding.
