@@ -83,6 +83,9 @@ jobs:
       - name: Run VLM codegen tests
         run: |
           PYTHONPATH=. python3 generator/tests/test_vlm_code_gen.py
+      - name: Run batch4 route codegen tests
+        run: |
+          PYTHONPATH=. python3 -m pytest aten/tests/test_batch4_route_codegen.py -v
 
   codegen-smoke:
     name: Codegen + assembler smoke

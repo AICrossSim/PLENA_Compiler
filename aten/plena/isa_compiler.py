@@ -43,6 +43,7 @@ class IsaCompiler(
         real_data_ratio: float = 1.125,
         unroll_loops: bool = False,
         mram_tile_capacity: int = 4,
+        vram_total_size: int = 0,
     ):
         # MemoryStateMixin.__init__ sets dimensions, layout tables, and memory allocators.
         super().__init__(
@@ -50,6 +51,7 @@ class IsaCompiler(
             blen=blen,
             unroll_loops=unroll_loops,
             mram_tile_capacity=mram_tile_capacity,
+            vram_total_size=vram_total_size,
         )
         self.real_data_ratio = real_data_ratio
         self.register_allocator = RegisterAllocator()

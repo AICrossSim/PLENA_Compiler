@@ -28,11 +28,14 @@ class MemoryStateMixin:
         hbm_element_width: int = 8,
         hbm_block_size: int = 8,
         hbm_scale_width: int = 8,
+        vram_total_size: int = 0,
     ):
         if mlen <= 0:
             raise ValueError(f"mlen must be > 0, got {mlen}")
         if mram_tile_capacity <= 0:
             raise ValueError(f"mram_tile_capacity must be > 0, got {mram_tile_capacity}")
+        if vram_total_size < 0:
+            raise ValueError(f"vram_total_size must be >= 0, got {vram_total_size}")
 
         self.mlen = mlen
         self.blen = blen
@@ -56,7 +59,10 @@ class MemoryStateMixin:
         # Matrix ops consume VRAM in MLEN x MLEN tiles. Row-only alignment is
         # enough for vector reads/writes, but a matrix result can become the
         # next layer's M_MM input, so keep VRAM allocations tile-aligned.
-        self.vram_allocator = VRAMAllocator(alignment=mlen * mlen)
+        self.vram_allocator = VRAMAllocator(
+            alignment=mlen * mlen,
+            total_size=vram_total_size,
+        )
         self.mram_allocator = MRAMAllocator(mlen=mlen, tile_capacity=mram_tile_capacity)
         self.fpram_allocator = FPRAMAllocator()
 

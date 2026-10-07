@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import re
-from pathlib import Path
 
 
 def load_isa_definitions(file_path: str) -> dict:
@@ -88,7 +86,6 @@ class Instruction:
         self.funct1 = funct1
         self.funct2 = funct2
         self.imm = imm
-        self.rflag = rflag
         self.rmask = rstride
 
     def __repr__(self):
@@ -100,17 +97,7 @@ _REG_PREFIXES = ("gp", "f", "a")
 # .asm (millions of times for large programs), which dominated sim_env re-parse time.
 vector_masked_unary_or_reduction_ops = frozenset({"V_EXP_V", "V_RECI_V", "V_RED_SUM", "V_RED_MAX"})
 vector_masked_binary_ops = frozenset(
-    {
-        "V_ADD_VV",
-        "V_ADD_VF",
-        "V_MUL_VV",
-        "V_SUB_VV",
-        "V_MUL_VF",
-        "V_MAX_VF",
-        "V_MIN_VF",
-        "V_TOPK",
-        "V_ROUTE_MUL",
-    }
+    {"V_ADD_VV", "V_ADD_VF", "V_MUL_VV", "V_SUB_VV", "V_MUL_VF", "V_MAX_VF", "V_MIN_VF", "V_TOPK"}
 )
 
 
@@ -321,11 +308,12 @@ def parse_asm_file(file_path: str) -> list[Instruction]:
 
 
 if __name__ == "__main__":
-    import argparse
+    # Example usage
+    # file_path = '/home/george/Coprocessor_for_Llama/src/definitions/operation.svh'
+    # enum_dict = load_isa_definitions(file_path)
+    # print(enum_dict)
 
-    argument_parser = argparse.ArgumentParser(description="Parse a PLENA assembly file")
-    argument_parser.add_argument("asm_file", help="path to the assembly input")
-    args = argument_parser.parse_args()
-    loaded_instr = parse_asm_file(args.asm_file)
+    asm_file_path = "/home/george/Coprocessor_for_Llama/src/system/test/benchmarks/fixed.asm"
+    loaded_instr = parse_asm_file(asm_file_path)
     for instr in loaded_instr:
         print(instr)

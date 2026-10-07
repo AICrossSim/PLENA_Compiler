@@ -29,7 +29,9 @@ from pathlib import Path
 
 # Add parent repo's tools + testbench to sys.path (mirror existing testbench bootstrap).
 _COMPILER_ROOT = Path(__file__).resolve().parents[2]  # compiler/
-_REPO_ROOT = Path(os.environ.get("PLENA_REPO_ROOT", str(_COMPILER_ROOT.parent))).resolve()
+_REPO_ROOT = Path(
+    os.environ.get("PLENA_REPO_ROOT", str(_COMPILER_ROOT.parent))
+).resolve()
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / "tools"))
 sys.path.insert(0, str(_REPO_ROOT / "PLENA_Tools"))
