@@ -512,12 +512,14 @@ def test_diagnostic_snapshots_are_explicit_and_do_not_replace_persistent_state(s
         with pytest.raises(ValueError, match="snapshot"):
             lower_matrix_recurrence(spec, layout=layout, snapshot_hbm_base=bad_base)
 
+
 @pytest.mark.parametrize("field_base", [0, 64, KIMI_KDA.state_bytes_per_layer - 64])
 def test_explicit_prepared_fields_cannot_overlap_live_state(field_base):
     with pytest.raises(ValueError, match="fields overlap live recurrent state"):
         lower_matrix_recurrence(
             KIMI_KDA, layout="affine", state_hbm_base=0, field_hbm_base=field_base
         )
+
 
 def test_adjacent_state_and_field_arenas_are_legal_in_both_orders():
     working = build_recurrence_working_set(KIMI_KDA, layout="affine")
@@ -529,6 +531,7 @@ def test_adjacent_state_and_field_arenas_are_legal_in_both_orders():
         )
         assert "L_TILE_EXEC" in program
 
+
 @pytest.mark.parametrize("base", [2**32, 2**32 - 64])
 @pytest.mark.parametrize("arena", ["state", "field", "snapshot"])
 def test_dma_arenas_cannot_wrap_the_gp_address_window(arena, base):
@@ -536,6 +539,7 @@ def test_dma_arenas_cannot_wrap_the_gp_address_window(arena, base):
         lower_matrix_recurrence(
             KIMI_KDA, layout="affine", **{f"{arena}_hbm_base": base}
         )
+
 
 def test_exact_top_of_gp_window_is_legal_with_nonzero_hbm_base_register(tmp_path):
     working = build_recurrence_working_set(KIMI_KDA, layout="affine")

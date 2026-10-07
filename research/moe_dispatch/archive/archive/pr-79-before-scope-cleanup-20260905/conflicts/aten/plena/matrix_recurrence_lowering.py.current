@@ -45,8 +45,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import asdict, dataclass
-
-from compiler.utils.enum_compat import StrEnum
+from enum import StrEnum
 
 from compiler.asm_templates._imm import load_large_int
 from compiler.aten.plena.instruction_stream import (
@@ -73,7 +72,6 @@ BF16_BYTES = 2
 ONE_MIB = 1024 * 1024
 STATE_DMA_VIEW = 3
 STATE_PRECISION_SELECTOR = 2
-GP_ADDRESS_SPACE_BYTES = 1 << 32
 
 
 class RecurrenceLayout(StrEnum):
@@ -642,17 +640,6 @@ def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def _validate_hbm_offset_range(base: int, end: int, name: str) -> None:
-    """Keep a DMA arena inside its unsigned 32-bit GP offset window.
-
-    The selected architectural aN register can supply a higher HBM base; the
-    addresses loaded into GP registers by this lowering are offsets from it.
-    An exclusive end equal to 2**32 is valid: its last byte is 2**32 - 1.
-    """
-    if base < 0 or base >= GP_ADDRESS_SPACE_BYTES or end > GP_ADDRESS_SPACE_BYTES:
-        raise ValueError(f"{name} must fit the unsigned 32-bit GP DMA offset window")
-
-
 def build_recurrence_field_manifest(
     working_set: RecurrenceWorkingSet,
     *,
@@ -668,7 +655,6 @@ def build_recurrence_field_manifest(
 
     if field_hbm_base < 0 or field_hbm_base % 64:
         raise ValueError("field_hbm_base must be a non-negative 64-byte address")
-    _validate_hbm_offset_range(field_hbm_base, field_hbm_base, "prepared fields")
     packets: list[RecurrenceFieldPacket] = []
     cursor = field_hbm_base
 
@@ -724,7 +710,6 @@ def build_recurrence_field_manifest(
         else:  # pragma: no cover - all public specs are enumerated above
             raise ValueError(f"no recurrence-field ABI for {working_set.spec.name}")
 
-    _validate_hbm_offset_range(field_hbm_base, cursor, "prepared fields")
     return RecurrenceFieldManifest(
         base=field_hbm_base,
         end=cursor,
@@ -1345,8 +1330,6 @@ def lower_matrix_recurrence(
         raise ValueError("state_hbm_base must be a non-negative byte address")
     if state_hbm_base % 64:
         raise ValueError("state_hbm_base must be 64-byte aligned")
-    state_hbm_end = state_hbm_base + spec.state_bytes_per_layer
-    _validate_hbm_offset_range(state_hbm_base, state_hbm_end, "state")
     if not 0 <= hbm_address_register <= 15:
         raise ValueError("hbm_address_register must be in [0, 15]")
     working_set = build_recurrence_working_set(spec, layout=layout, point=point)
@@ -1359,14 +1342,11 @@ def lower_matrix_recurrence(
         working_set,
         field_hbm_base=field_hbm_base,
     )
-    if state_hbm_base < field_manifest.end and field_manifest.base < state_hbm_end:
-        raise ValueError("prepared fields overlap live recurrent state")
     if snapshot_hbm_base is not None:
         if snapshot_hbm_base < 0 or snapshot_hbm_base % 64:
             raise ValueError("snapshot_hbm_base must be a non-negative aligned byte address")
         snapshot_end = snapshot_hbm_base + spec.state_bytes_per_layer
-        _validate_hbm_offset_range(snapshot_hbm_base, snapshot_end, "snapshot")
-        for start, end in ((state_hbm_base, state_hbm_end),
+        for start, end in ((state_hbm_base, state_hbm_base + spec.state_bytes_per_layer),
                            (field_manifest.base, field_manifest.end)):
             if snapshot_hbm_base < end and start < snapshot_end:
                 raise ValueError("snapshot overlaps live state or prepared fields")
