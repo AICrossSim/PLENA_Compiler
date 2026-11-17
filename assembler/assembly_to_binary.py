@@ -117,6 +117,14 @@ class AssemblyToBinary:
             binary_instruction = (rd << opw) + opcode
         elif instruction.opcode == "C_LOOP_START":
             # C_LOOP_START rd, imm - uses 22-bit immediate like S_LUI_INT
+            if imm is None or imm < 1:
+                # The body runs before the count is tested, so there is no
+                # zero-trip loop: the hardware counter would wrap and run the
+                # body 2^IMM_WIDTH times.
+                raise ValueError(
+                    f"C_LOOP_START gp{rd}, {imm}: the loop count must be at least 1. "
+                    "Omit the loop when the trip count is 0."
+                )
             binary_instruction = (imm << (opw + ow)) + (rd << opw) + opcode
         elif instruction.opcode in _FUNCT_RSTRIDE_OPS:
             binary_instruction = (

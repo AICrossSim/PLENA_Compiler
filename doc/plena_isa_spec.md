@@ -769,6 +769,8 @@ Triggers a breakpoint exception for debugging purposes. **Note:** Programs do no
 
 Start a hardware loop. The loop count is set by `imm`. The register `rd` is used internally by the hardware to track remaining iterations.
 
+**Constraint:** `imm` must be at least 1. The body always runs before the count is tested at `C_LOOP_END`, so a zero-trip loop cannot be expressed; `C_LOOP_START rd, 0` is undefined behaviour and the assembler rejects it. Omit the loop when the trip count is 0.
+
 **IMPORTANT:** The loop counter register `rd` does NOT contain the current iteration index. You must maintain your own index variable and increment it manually inside the loop.
 
 **Example:**
@@ -785,11 +787,13 @@ C_LOOP_END gp4                     ; End of loop
 
 **Format:** `C_LOOP_END rd, 0`
 
-**Operation:** If `gp_reg<rd> > 0`, decrement counter and jump to matching `C_LOOP_START`.
+**Operation:** Decrement `gp_reg<rd>`; if the result is greater than 0, jump to the instruction after the matching `C_LOOP_START`.
 
 **Description:**
 
-End of a hardware loop. If the loop counter (in register `rd`) is greater than 0, it decrements the counter and jumps back to the corresponding `C_LOOP_START`.
+End of a hardware loop. The loop counter (in register `rd`) is decremented first; if it is still greater than 0, execution jumps back to the first instruction of the loop body, otherwise it falls through. A loop started with `C_LOOP_START rd, imm` therefore runs its body exactly `imm` times and leaves `gp_reg<rd> = 0`.
+
+A `C_LOOP_END` without a matching `C_LOOP_START` is undefined behaviour.
 
 ---
 
